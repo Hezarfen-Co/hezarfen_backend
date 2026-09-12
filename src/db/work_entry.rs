@@ -195,21 +195,25 @@ pub async fn remove(db: &Database, id: &WorkEntryId) -> Result<Option<WorkEntry>
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
     use crate::database;
 
     #[tokio::test]
     async fn check_in_is_exclusive_until_check_out() {
-        let db = database::init_mem().await.unwrap();
-        // A `record<user>` column checks the table of the id, not row
-        // existence — a fabricated id keeps this test free of user ceremony.
-        let user = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        // The stint's owner is a foreign key now: a real `app_user` row.
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'work-fixture', 'x')",
+        )
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
 
         let open = check_in(&db, &user).await.unwrap();
         assert!(open.is_open());
-        assert_eq!(open.get_id().key(), format!("open_{}", user.key()));
 
         // Second check-in must not create a second stint or reset the clock.
         let dup = check_in(&db, &user).await;

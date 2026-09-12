@@ -130,59 +130,77 @@ mod tests {
     use crate::domain::settings::Settings;
 
     /// The session twin's race, one table over
-    /// ([`crate::db::session_attendance::mark`]): a
-    /// `DEFINE EVENT` on `event` fires inside the delete's own transaction, and
-    /// the event's delete sweeps its attendance rows before removing the row, so
-    /// the `SLEEP` lands exactly between the sweep and the commit — the window
-    /// where a bare upsert wrote a mark nothing would ever sweep again.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject is the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, so this passes there on
-    /// broken code. Mutation-tested: turning the claim back into a read
-    /// (`SELECT VALUE id FROM $ev`) turns it red.
+    /// ([`crate::db::session_attendance::mark`]): the event's delete sweeps its
+    /// attendance rows and removes the row in one transaction, and a mark that
+    /// wrote into the gap was a bare upsert nothing would ever sweep again.
+    /// The mark now writes the event row too (its seats counter), so the two
+    /// transactions touch one row and Postgres refuses one of them; the barrier
+    /// releases both sides together so every interleaving gets its chance.
+    /// Mutation-tested: turning the claim back into a read turns it red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_mark_written_inside_a_delete_never_outlives_the_event() {
-        use crate::domain::event::{EventAudience, EventDescription, EventTitle};
-        let (db, _serialized) = crate::database::init_test_server("event_attendance_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE event WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        use crate::domain::event::{
+            EventAudience, EventAudienceKind, EventDescription, EventTitle,
+        };
 
+        // A real `app_user` row: markers, students and event creators are
+        // foreign keys now.
+        async fn a_person(db: &Database, label: &str) -> UserId {
+            let user = UserId::generate();
+            sqlx::query(
+                "INSERT INTO app_user (id, username, password_hash, role) \
+                 VALUES ($1, $2, 'x', 'teacher')",
+            )
+            .bind(user.uuid())
+            .bind(format!("{label}-{}", &user.key()[..8]))
+            .execute(db)
+            .await
+            .unwrap();
+            user
+        }
+
+        let (db, _leases) = crate::database::init_test_db().await;
         let allowed: Vec<String> = Settings::defaults().get_attendance_statuses().to_vec();
-        let marker = UserId::from_key("t");
+        let marker = a_person(&db, "marker").await;
         let (mut swept, mut orphans) = (0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let event = crate::db::event::create(
                 &db,
                 &marker,
                 EventTitle::try_new("gezi").unwrap(),
                 EventDescription::try_new("").unwrap(),
-                EventAudience::School,
+                EventAudience {
+                    kind: EventAudienceKind::School,
+                    role: None,
+                    course: None,
+                    class: None,
+                    capacity: None,
+                },
                 None,
                 None,
             )
             .await
             .unwrap();
             let id = event.get_id().clone();
+
+            // Delete and mark released together: both write the event row, so
+            // Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::event::delete(&db, event).await })
+                let (db, gate, event) = (db.clone(), gate.clone(), event);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::event::delete(&db, event).await
+                })
             };
-            // The mark starts inside the held window: the sweep has run and the
-            // event row is gone but uncommitted.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let marked = {
-                let (db, id, marker) = (db.clone(), id.clone(), marker.clone());
-                let student = UserId::from_key(&format!("s{round}"));
+                let (db, id, marker, gate) = (db.clone(), id.clone(), marker.clone(), gate);
+                let student = a_person(&db, "student").await;
                 let status = AttendanceStatus::try_new("present", &allowed).unwrap();
-                tokio::spawn(async move { mark(&db, &id, &student, status, &marker).await })
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    mark(&db, &id, &student, status, &marker).await
+                })
             };
             let (drop_it, marked) = (drop_it.await.unwrap(), marked.await.unwrap());
             assert!(
@@ -198,7 +216,7 @@ mod tests {
                 panic!("round {round}: the delete reported success but the event is still there");
             }
         }
-        eprintln!("Event::delete raced by a mark: {swept}/4 rounds deleted the event");
+        eprintln!("Event::delete raced by a mark: {swept}/8 rounds deleted the event");
         assert!(
             swept > 0,
             "no round ever deleted the event, so the window was never reached"

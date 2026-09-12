@@ -133,7 +133,9 @@ pub async fn update(
 /// The bank's subject is optional metadata, and blocking on it was a dead
 /// end — only the template's owner may re-tag it, so a manager could never
 /// clear their own 409, and a private template raising it leaked its
-/// existence. Its cascade runs *after* the guarded delete, so a refused
+/// existence. Its cascade clears the templates before the delete — the FK on
+/// `bank_question.subject` refuses the parent delete while a template still
+/// points at it — and the one transaction rolls everything back, so a refused
 /// delete leaves every template's subject where it was.
 pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError> {
     crate::database::tx_with_retry(db, false, async move |tx| {
@@ -157,6 +159,20 @@ pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError
                 "homework still references this subject — re-tag or delete it first",
             ));
         }
+        // The bank's cascade clears the templates *before* the delete:
+        // `bank_question.subject` carries a real foreign key, so a template
+        // still pointing at this row makes the `DELETE` itself fail (23503)
+        // — the old store had no enforced reference to release. The guard
+        // above has already decided, and the transaction makes the pair
+        // atomic, so ordering costs nothing: a refused delete (an error
+        // raised anywhere above) rolls the whole thing back and every
+        // template's subject stays where it was.
+        sqlx::query!(
+            r#"UPDATE bank_question SET subject = NULL WHERE subject = $1"#,
+            subject.id.uuid(),
+        )
+        .execute(&mut *tx)
+        .await?;
         let deleted = sqlx::query_as!(
             Subject,
             r#"DELETE FROM subject WHERE id = $1
@@ -167,12 +183,6 @@ pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError
             subject.id.uuid(),
         )
         .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"UPDATE bank_question SET subject = NULL WHERE subject = $1"#,
-            subject.id.uuid(),
-        )
-        .execute(&mut *tx)
         .await?;
         Ok(deleted)
     })
@@ -196,7 +206,6 @@ mod tests {
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_subject_never_outlives_its_course() {
         fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
             tokio::spawn(async move {
@@ -210,12 +219,7 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete(
-            "subject_orphan_race",
-            SUBJECT_TABLE,
-            make,
-        )
-        .await;
+        crate::db::course::assert_no_child_outlives_a_course_delete("subject", make).await;
     }
 
     /// GUARD, not a retry measurement — read the last paragraph before

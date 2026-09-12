@@ -254,22 +254,36 @@ pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppEr
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
     use crate::database;
     use crate::domain::pool_question::{PoolQuestion, PoolQuestionBody, PoolQuestionTitle};
     use crate::domain::timestamp::Timestamp;
     use crate::domain::user::UserId;
 
+    /// A real `app_user` row: askers and authors are foreign keys now.
+    async fn a_person(db: &Database, label: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, $2, 'x')",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[..8]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     /// A real question row: offering a solution moves its question's
     /// `asked_at` (that is what keeps a solution from outliving its question),
     /// so a minted id nothing wrote is a 404.
     async fn question_row(db: &Database) -> PoolQuestionId {
+        let asker = a_person(db, "asker").await;
         crate::db::pool_question::insert(
             db,
             PoolQuestion::new(
-                &UserId::from_key(&Ulid::generate().to_string()),
+                &asker,
                 PoolQuestionTitle::try_new("soru").unwrap(),
                 PoolQuestionBody::try_new("neden").unwrap(),
             ),
@@ -282,10 +296,10 @@ mod tests {
 
     #[tokio::test]
     async fn rows_scope_to_their_question_and_list_oldest_first() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question_a = question_row(&db).await;
         let question_b = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::generate().to_string());
+        let author = a_person(&db, "author").await;
 
         // Distinct offer times so the assertion pins the real contract —
         // older `offered_at` sorts first — not the same-millisecond `id`
@@ -341,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_set_replace_clear_report_the_replaced_blob() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
         let author = UserId::from_key(&Ulid::generate().to_string());
         let png = FileContentType::try_new("image/png").unwrap();
@@ -402,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_body_edits_in_place() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
         let author = UserId::from_key(&Ulid::generate().to_string());
 
@@ -443,11 +457,11 @@ mod tests {
 
     #[tokio::test]
     async fn counts_for_groups_per_question() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let two = question_row(&db).await;
         let one = question_row(&db).await;
         let none = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::generate().to_string());
+        let author = a_person(&db, "author").await;
 
         for (question, bodies) in [(&two, vec!["a", "b"]), (&one, vec!["c"])] {
             for body in bodies {
@@ -463,10 +477,10 @@ mod tests {
         let counts = counts_for(&db, &[two.clone(), one.clone(), none.clone()])
             .await
             .unwrap();
-        assert_eq!(counts.get(two.key()), Some(&2));
-        assert_eq!(counts.get(one.key()), Some(&1));
+        assert_eq!(counts.get(two.key().as_str()), Some(&2));
+        assert_eq!(counts.get(one.key().as_str()), Some(&1));
         // No solutions = no entry; the caller reads the miss as zero.
-        assert_eq!(counts.get(none.key()), None);
+        assert_eq!(counts.get(none.key().as_str()), None);
         assert!(counts_for(&db, &[]).await.unwrap().is_empty());
     }
 }

@@ -21,7 +21,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{
     app_and_db, create_course, create_exam_with, create_subject, enroll, id_of, login, login_as,
-    me_id, send,
+    me_id, send, ABSENT_ID,
 };
 use serde_json::json;
 
@@ -677,7 +677,7 @@ async fn the_review_gate_does_not_leak_allow_review_to_outsiders() {
 
     // The oracle: to a caller with no mark the two exams must be one answer —
     // and the same answer an exam that does not exist gives.
-    let nowhere = review_of(&outsider, "01J8XZ0K3Q8G7X2M4N5P6R7S8T").await;
+    let nowhere = review_of(&outsider, ABSENT_ID).await;
     assert_eq!(nowhere, StatusCode::NOT_FOUND);
     for (who, cookie) in [("unenrolled student", &outsider), ("parent", &parent)] {
         let on_open = review_of(cookie, &open).await;

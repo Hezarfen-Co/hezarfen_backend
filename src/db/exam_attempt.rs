@@ -377,7 +377,7 @@ pub async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::exam::{
         Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
     };
@@ -389,7 +389,7 @@ mod tests {
     /// An open exam with retakes allowed, plus one choice question — enough
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
-        let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
@@ -468,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn submitting_never_reverts_a_walk_out_that_raced_it() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 1).await;
         let user = student(&db).await;
 
@@ -478,7 +478,7 @@ mod tests {
 
         // The REST submit path reads the attempt, then checks the deadline and
         // the already-finished guard — several awaits before it writes.
-        let stale = read(&db, attempt.get_id())
+        let stale = read(&db, &attempt.get_id())
             .await
             .unwrap()
             .expect("attempt exists");
@@ -488,7 +488,7 @@ mod tests {
         // clears it) — a field-scoped write to the same row.
         set_left(
             &db,
-            read(&db, attempt.get_id())
+            read(&db, &attempt.get_id())
                 .await
                 .unwrap()
                 .expect("attempt exists"),
@@ -503,7 +503,7 @@ mod tests {
         let finished = finish(&db, stale).await.unwrap();
         assert!(finished.get_finished_at().is_some());
 
-        let after = read(&db, attempt.get_id())
+        let after = read(&db, &attempt.get_id())
             .await
             .unwrap()
             .expect("attempt still exists");
@@ -516,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn stamping_left_never_reverts_a_submission() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 1).await;
         let user = student(&db).await;
 
@@ -528,14 +528,14 @@ mod tests {
 
         // The exam-room teardown reads the attempt while it is still in
         // progress (`stamp_left`'s read) — a snapshot with `finished_at` unset.
-        let stale = read(&db, attempt.get_id())
+        let stale = read(&db, &attempt.get_id())
             .await
             .unwrap()
             .expect("attempt exists");
         assert!(stale.get_finished_at().is_none());
         let finished = finish(
             &db,
-            read(&db, attempt.get_id())
+            read(&db, &attempt.get_id())
                 .await
                 .unwrap()
                 .expect("attempt exists"),
@@ -552,7 +552,7 @@ mod tests {
         // finishing).
         set_left(&db, stale, Some(Timestamp::now())).await.unwrap();
 
-        let after = read(&db, attempt.get_id())
+        let after = read(&db, &attempt.get_id())
             .await
             .unwrap()
             .expect("attempt still exists");

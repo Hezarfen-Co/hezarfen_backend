@@ -331,7 +331,7 @@ mod tests {
     /// the meantime is a 404 — not a silent success.
     #[tokio::test]
     async fn field_scoped_writes_return_the_row_and_a_gone_board_refuses() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let creator = UserId::generate();
         let board = create(
             &db,
@@ -362,7 +362,7 @@ mod tests {
     /// board row, and deleting a board hands the seat back.
     #[tokio::test]
     async fn the_cap_refuses_and_delete_releases_the_seat() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let creator = UserId::generate();
         for index in 0..MAX_BOARDS_PER_CREATOR {
             create(

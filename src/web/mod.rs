@@ -380,7 +380,7 @@ mod tests {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let office = UserId::from_key("office");
         let teacher = crate::service::user::create(
             &db,

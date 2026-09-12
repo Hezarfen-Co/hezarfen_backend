@@ -136,7 +136,7 @@ mod tests {
     /// left.
     #[tokio::test]
     async fn insert_refuses_at_the_cap_without_leaking_a_slot() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = a_note(&db).await;
         for index in 0..MAX_NOTE_FILES {
             let file = NoteFile::new(
@@ -166,7 +166,7 @@ mod tests {
     /// accepted again, and the count never dips below zero.
     #[tokio::test]
     async fn delete_returns_the_slot_to_the_note() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = a_note(&db).await;
         let file = NoteFile::new(
             note.get_id(),

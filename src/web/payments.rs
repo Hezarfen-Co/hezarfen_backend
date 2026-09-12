@@ -333,7 +333,7 @@ async fn delete_plan(
 struct AssignFeePlan {
     /// The students to place on the plan, at most 200 per call. Each is
     /// reported on individually — one bad id does not lose the rest.
-    #[schema(max_items = 200, example = json!(["01JC0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z"]))]
+    #[schema(max_items = 200, example = json!(["019732e3-7b00-7000-8000-000000000a0b"]))]
     student_ids: Vec<String>,
 }
 
@@ -1086,7 +1086,7 @@ mod tests {
     /// shape of `source` links is exactly what the fold walks.
     #[tokio::test]
     async fn the_statement_rolls_each_charge_up_from_its_own_lines() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
         let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;

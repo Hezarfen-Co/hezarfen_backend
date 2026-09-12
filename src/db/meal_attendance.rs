@@ -113,7 +113,7 @@ pub async fn list_for_student(
          AND ($3::text IS NULL OR menu IN (SELECT id FROM menu WHERE date <= $3::text))",
         "ORDER BY marked_at DESC, menu DESC",
     )
-    .bind(student.key())
+    .bind(student.uuid())
     .bind(Param::OptText(from.map(|date| date.as_str().to_string())))
     .bind(Param::OptText(to.map(|date| date.as_str().to_string())))
     .run(limit, offset, db)

@@ -283,7 +283,7 @@ mod tests {
     }
 
     fn student() -> UserId {
-        UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA")
+        UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa")
     }
 
     /// The bite test for the exam-row touch in [`save`]: it exists
@@ -298,7 +298,17 @@ mod tests {
         use crate::domain::exam::{
             ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
         };
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The student is a foreign key now: a real row under the fixture's
+        // fixed key.
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'aaaa-fixture', 'x')",
+        )
+        .bind(student().uuid())
+        .execute(&db)
+        .await
+        .unwrap();
         let kinds = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
@@ -318,14 +328,12 @@ mod tests {
         .await
         .unwrap();
         let stored = async |db: &Database| -> Option<i64> {
-            let mut result = db
-                .query("SELECT VALUE result_count FROM ONLY $ex")
-                .bind(("ex", exam.get_id().record()))
+            sqlx::query_scalar::<_, i64>("SELECT result_count FROM exam WHERE id = $1")
+                .bind(exam.get_id().uuid())
+                .fetch_optional(db)
                 .await
                 .unwrap()
-                .check()
-                .unwrap();
-            result.take::<Option<i64>>(0).unwrap()
+                .flatten()
         };
         let question = choice_question(exam.get_id(), 10, 1);
         let pick = choice_id(&question, 1).as_str().to_string();
@@ -342,11 +350,10 @@ mod tests {
         );
 
         // …and a counter that marks have moved is put back at its own value.
-        db.query("UPDATE $ex SET result_count = 7")
-            .bind(("ex", exam.get_id().record()))
+        sqlx::query("UPDATE exam SET result_count = 7 WHERE id = $1")
+            .bind(exam.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         save(&db, &question, &student(), 2, Some(pick), None)
             .await
@@ -354,7 +361,7 @@ mod tests {
         assert_eq!(stored(&db).await, Some(7), "the touch moved a real count");
 
         // The gate that makes the touch worth having: no exam, no answer.
-        let orphan = choice_question(&ExamId::from_key("01NOSUCHEXAMAAAAAAAAAAAAAA"), 10, 0);
+        let orphan = choice_question(&ExamId::from_key("019732e3-7b00-7000-8000-00000000e0a0"), 10, 0);
         let pick = choice_id(&orphan, 0).as_str().to_string();
         let refused = save(&db, &orphan, &student(), 1, Some(pick), None).await;
         assert!(

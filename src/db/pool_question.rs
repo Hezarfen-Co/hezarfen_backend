@@ -324,48 +324,38 @@ pub async fn delete(
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
     use crate::database;
     use crate::domain::solution::SolutionBody;
+    use sqlx::Row as _;
 
-    /// The two counter columns plus a row to carry them: the `user` table is
-    /// SCHEMAFULL in production, and the counters are `option<int>` there.
+    /// A real `app_user` row: the asker and the approver are foreign keys on
+    /// the question, and the counters are plain `NOT NULL DEFAULT 0` columns.
     async fn a_user(db: &Database) -> UserId {
-        let user = UserId::from_key(&Ulid::generate().to_string());
-        db.query(format!(
-            "DEFINE FIELD IF NOT EXISTS {POOL_APPROVED_TOTAL_FIELD} ON user TYPE option<int>;
-             DEFINE FIELD IF NOT EXISTS {POOL_PUBLISHED_TOTAL_FIELD} ON user TYPE option<int>;
-             CREATE $usr SET username = $name, password_hash = 'x';"
-        ))
-        .bind(("usr", user.record()))
-        .bind(("name", user.key().to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("u{}", &user.key()[..8]))
+            .execute(db)
+            .await
+            .unwrap();
         user
     }
 
-    /// `(pool_approved_total, pool_published_total)` as stored — absent reads
-    /// zero, the way `BadgeStats::load` reads it.
+    /// `(pool_approved_total, pool_published_total)` as stored — the columns
+    /// read zero on a fresh row, the way `BadgeStats::load` reads them.
     async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({POOL_APPROVED_TOTAL_FIELD} ?? 0),
-                               ({POOL_PUBLISHED_TOTAL_FIELD} ?? 0)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
-        let row = rows.into_iter().next().unwrap_or_default();
+        let row = sqlx::query(
+            "SELECT pool_approved_total, pool_published_total \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
         (
-            row.first().copied().unwrap_or(0),
-            row.get(1).copied().unwrap_or(0),
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
         )
     }
 
@@ -380,9 +370,9 @@ mod tests {
 
     #[tokio::test]
     async fn approval_is_a_one_way_race_safe_transition() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::generate().to_string());
-        let teacher = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let teacher = a_user(&db).await;
 
         let q = insert(&db, question(&asker)).await.unwrap();
         assert_eq!(q.get_status(), STATUS_PENDING);
@@ -407,7 +397,7 @@ mod tests {
     /// published side, and neither on a second approve of the same question.
     #[tokio::test]
     async fn approval_moves_both_counters_once_and_only_once() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let asker = a_user(&db).await;
         let teacher = a_user(&db).await;
 
@@ -440,7 +430,7 @@ mod tests {
     /// neither counter moves when one person is both ends of the transition.
     #[tokio::test]
     async fn self_approval_still_approves_but_moves_neither_counter() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let teacher = a_user(&db).await;
 
         let q = insert(&db, question(&teacher)).await.unwrap();
@@ -464,10 +454,10 @@ mod tests {
 
     #[tokio::test]
     async fn visibility_hides_others_pending_questions() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::generate().to_string());
-        let other = UserId::from_key(&Ulid::generate().to_string());
-        let teacher = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let other = a_user(&db).await;
+        let teacher = a_user(&db).await;
 
         let pending = insert(&db, question(&asker)).await.unwrap();
         let published = insert(&db, question(&other)).await.unwrap();
@@ -488,9 +478,9 @@ mod tests {
 
     #[tokio::test]
     async fn image_attaches_only_while_pending_and_reports_the_replaced_blob() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::generate().to_string());
-        let teacher = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let teacher = a_user(&db).await;
         let png = FileContentType::try_new("image/png").unwrap();
 
         let q = insert(&db, question(&asker)).await.unwrap();
@@ -535,9 +525,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_cascades_solutions_and_returns_the_row() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::generate().to_string());
-        let helper = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let helper = a_user(&db).await;
 
         let q = insert(&db, question(&asker)).await.unwrap();
         let offered = crate::db::solution::insert(
@@ -609,8 +599,8 @@ mod tests {
 
         let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
         for round in 0..4 {
-            let asker = UserId::from_key(&Ulid::generate().to_string());
-            let helper = UserId::from_key(&Ulid::generate().to_string());
+            let asker = a_user(&db).await;
+            let helper = a_user(&db).await;
             let q = insert(&db, question(&asker)).await.unwrap();
             let id = q.get_id().clone();
 

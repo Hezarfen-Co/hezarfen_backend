@@ -111,7 +111,7 @@ pub async fn sync(db: &Database, user: &UserId) -> Result<(), AppError> {
                  SET earned_at = badge_award.earned_at \
                WHERE badge_award.earned_at IS NULL"
         )))
-        .bind(user.uuid())
+.bind(user.uuid())
         .bind(badge)
         .bind(now)
         .execute(db)
@@ -124,7 +124,7 @@ pub async fn sync(db: &Database, user: &UserId) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::constant::BADGE_AWARD_TABLE;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     async fn a_user(username: &str, db: &Database) -> crate::domain::user::User {
@@ -142,9 +142,9 @@ mod tests {
     }
 
     async fn count_awards(db: &Database, user: &UserId) -> i64 {
-        let (count,): (i64,) = sqlx::query_as(&format!(
+        let (count,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT count(*) FROM {BADGE_AWARD_TABLE} WHERE app_user = $1"
-        ))
+        )))
         .bind(user.uuid())
         .fetch_one(db)
         .await
@@ -161,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_defaults_every_counter_to_zero() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("badge-sifir", &db).await;
 
         let stats = load(&db, user.get_id()).await.unwrap();
@@ -177,12 +177,12 @@ mod tests {
 
     #[tokio::test]
     async fn sync_is_idempotent_and_keeps_the_first_stamp() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("badge-ali", &db).await;
 
         // Seed two submitted homeworks: enough for the first badge tier.
         sqlx::query("UPDATE app_user SET homework_submitted_total = 2 WHERE id = $1")
-            .bind(user.uuid())
+            .bind(user.get_id().uuid())
             .execute(&db)
             .await
             .unwrap();
@@ -195,7 +195,7 @@ mod tests {
         // A second sync with the counter moved *further* writes nothing: the
         // stamps are from the first crossing, and no row is duplicated.
         sqlx::query("UPDATE app_user SET homework_submitted_total = 5 WHERE id = $1")
-            .bind(user.uuid())
+            .bind(user.get_id().uuid())
             .execute(&db)
             .await
             .unwrap();
@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_writes_nothing_for_a_earned_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("badge-bos", &db).await;
         sync(&db, user.get_id()).await.unwrap();
         assert_eq!(

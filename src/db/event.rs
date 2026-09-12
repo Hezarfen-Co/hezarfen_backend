@@ -291,31 +291,61 @@ pub async fn delete(db: &Database, event: Event) -> Result<Event, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::REGISTRATION_FROZEN_GUARD;
-    use crate::domain::class_group::ClassGroupId;
+
+    /// A real `app_user` row: the creator is a foreign key now.
+    async fn a_person(db: &Database, label: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[..8]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
 
     /// The forcing function behind the one rule with two spellings: the freeze
-    /// this file decides in Rust ([`Event::registration_capacity`]) and
-    /// [`REGISTRATION_FROZEN_GUARD`], its SurrealQL copy, which
-    /// the role cascade (`service::user::set_role`) carries because it frees a demoted
-    /// parent's seats inside a transaction and cannot call Rust from there.
+    /// this file decides in Rust ([`Event::registration_capacity`]) and the
+    /// demotion sweep's SQL predicate, which `service::user::set_role` carries
+    /// because it frees a demoted parent's seats inside a transaction and
+    /// cannot call Rust from there. The predicate is copied here test-side on
+    /// purpose: the sweep lives in user.rs, and this test pins the copy.
     ///
     /// Every schedule shape is put to both, including the three the SQL is most
-    /// likely to get wrong: the ends_at-only event (`??` must fall through to
+    /// likely to get wrong: the ends_at-only event (`COALESCE` must fall through to
     /// it), the boundary itself (closed *at* the instant, not after it — `>=` in
-    /// Rust, `<=` in SQL, and the two read opposite ways round; `$now` is bound
+    /// Rust, `<=` in SQL, and the two read opposite ways round; `now` is bound
     /// to that exact instant so the boundary is really exercised), and an event
     /// that takes no registrations at all, which Rust refuses one arm *earlier*
     /// — so the SQL must not report it frozen, or a stray row on it would be
     /// preserved forever instead of swept.
     #[tokio::test]
     async fn the_sql_freeze_guard_matches_the_rust_one() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
+        let creator = a_person(&db, "event-guard").await;
+        // `audience_class` is a foreign key too: the class case needs a real group.
+        let class = ClassGroupId::generate();
+        sqlx::query("INSERT INTO class_group (id, name, creator) VALUES ($1, 'g1', $2)")
+            .bind(class.uuid())
+            .bind(creator.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        let no_payload = |kind| EventAudience {
+            kind,
+            role: None,
+            course: None,
+            class: None,
+            capacity: None,
+        };
         let now = Timestamp::now().as_millis();
         let past = Some(Timestamp::from_millis(now - 60_000));
         let future = Some(Timestamp::from_millis(now + 3_600_000));
         let later = Some(Timestamp::from_millis(now + 7_200_000));
-        let signup = EventAudience::Registration { capacity: None };
+        let signup = no_payload(EventAudienceKind::Registration);
         let cases = [
             ("timeless", signup.clone(), None, None),
             ("deadline ahead", signup.clone(), None, future),
@@ -331,11 +361,17 @@ mod tests {
             ),
             // No signup list to freeze: `registration_capacity` refuses these on
             // the audience, before it ever looks at the clock.
-            ("started school event", EventAudience::School, past, None),
+            (
+                "started school event",
+                no_payload(EventAudienceKind::School),
+                past,
+                None,
+            ),
             (
                 "started class event",
-                EventAudience::Class {
-                    class: ClassGroupId::from_key("g1"),
+                EventAudience {
+                    class: Some(class),
+                    ..no_payload(EventAudienceKind::Class)
                 },
                 past,
                 None,
@@ -344,7 +380,7 @@ mod tests {
         for (name, audience, starts_at, ends_at) in cases {
             let event = create(
                 &db,
-                &UserId::from_key("teacher"),
+                &creator,
                 EventTitle::try_new(name).unwrap(),
                 EventDescription::try_new("").unwrap(),
                 audience,
@@ -357,20 +393,19 @@ mod tests {
                 event.registration_capacity(),
                 Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
             );
-            let mut result = db
-                .query(format!(
-                    "SELECT VALUE id FROM $ev WHERE {REGISTRATION_FROZEN_GUARD}"
-                ))
-                .bind(("ev", event.get_id().record()))
-                .bind(("now", now))
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
-            let sql = !result
-                .take::<Vec<surrealdb::types::RecordId>>(0)
-                .unwrap()
-                .is_empty();
+            // Test-side copy of the sweep predicate in `service::user::set_role`
+            // (src/db/user.rs): frozen == the demotion sweep would leave the row.
+            let sql = !sqlx::query_scalar::<_, bool>(
+                "SELECT audience_kind = 'registration' \
+                 AND COALESCE(starts_at, ends_at) IS NOT NULL \
+                 AND COALESCE(starts_at, ends_at) <= $2 \
+                 FROM event WHERE id = $1",
+            )
+            .bind(event.get_id().uuid())
+            .bind(now)
+            .fetch_one(&db)
+            .await
+            .unwrap();
             assert_eq!(
                 sql, rust,
                 "the SQL freeze guard and registration_capacity disagree on a \

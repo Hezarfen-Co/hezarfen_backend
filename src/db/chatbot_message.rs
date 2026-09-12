@@ -315,16 +315,29 @@ mod tests {
         // `id` tie-break decides the thread's order. With a random ULID this
         // inverted a fifth of the pairs; here every pair must read back
         // question-then-answer, from both read paths.
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         // A real thread row: every turn is written through it, so a turn with
-        // no thread is refused (see [`insert`]).
-        db.query("CREATE chatbot_thread:c SET user_id = user:u, created_at = 0, updated_at = 0")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let thread = ChatbotThreadId::from_key("c");
-        let user = UserId::from_key("u");
+        // no thread is refused (see [`insert`]). The owner is a foreign key
+        // now, so both fixture rows are real, under fixed keys.
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000cafe");
+        let thread = ChatbotThreadId::from_key("019732e3-7b00-7000-8000-00000000beef");
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'chat-fixture', 'x')",
+        )
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chatbot_thread (id, user_id, created_at, updated_at) \
+             VALUES ($1, $2, 0, 0)",
+        )
+        .bind(thread.uuid())
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
         const TURNS: usize = 200;
 
         for turn in 0..TURNS {

@@ -266,7 +266,7 @@ mod tests {
     /// Asserts the *stored* order, not the mint order.
     #[tokio::test]
     async fn inbox_is_newest_first_within_a_millisecond() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let sender = UserId::from_key("a");
         let recipient = UserId::from_key("b");
         let mut sent = Vec::new();

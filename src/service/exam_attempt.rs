@@ -422,7 +422,7 @@ pub async fn set_left(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::exam_answer;
     use crate::domain::exam::{
         ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
@@ -444,7 +444,7 @@ mod tests {
     /// An open exam with retakes allowed, plus one choice question — enough
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
-        let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
@@ -523,20 +523,12 @@ mod tests {
 
     /// The student's lifetime sitting count, absent reading as zero.
     async fn sat_total(user: &UserId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({EXAM_SAT_TOTAL_FIELD} ?? 0) FROM $usr"
-            ))
-            .bind(("usr", user.record()))
+        sqlx::query("SELECT exam_sat_total FROM app_user WHERE id = $1")
+            .bind(user.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .into_iter()
-            .next()
+            .try_get::<i64, _>(0)
             .unwrap()
     }
 
@@ -546,7 +538,7 @@ mod tests {
     /// different things by the same number.
     #[tokio::test]
     async fn starting_counts_one_sitting_and_resuming_counts_none() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 2).await;
         let user = student(&db).await;
         assert_eq!(sat_total(&user, &db).await, 0, "a fresh row reads as zero");
@@ -570,7 +562,7 @@ mod tests {
     /// unlimited attempts would mint `exam_sat_25` off one exam and no teacher.
     #[tokio::test]
     async fn a_retake_writes_its_row_and_counts_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 3).await;
         let user = student(&db).await;
 
@@ -589,24 +581,24 @@ mod tests {
     /// with it: a sitting is never counted twice.
     #[tokio::test]
     async fn a_lost_start_race_never_counts_the_sitting_twice() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 1).await;
         let user = student(&db).await;
 
         let (winner, _) = start(&db, &exam, &user).await.unwrap();
         assert_eq!(sat_total(&user, &db).await, 1);
 
-        let claimed = cap::claim_and_create(
-            &user.record(),
-            EXAM_SAT_TOTAL_FIELD,
-            cap::UNLIMITED,
-            &winner.id.record(),
-            &winner,
-            &db,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(claimed, cap::Claimed::Duplicate));
+        // The loser of the start race re-runs the same create: the composite
+        // id answers Duplicate, the create is answered as a resume (the same
+        // sitting, nothing new), and the counter increment the loser had
+        // claimed rolled back with its refused transaction.
+        let (resumed, created) = start(&db, &exam, &user).await.unwrap();
+        assert!(!created, "the rival start must not have created anything");
+        assert_eq!(
+            resumed.get_seq(),
+            winner.get_seq(),
+            "the resume answers the winner's sitting, not a new one"
+        );
         assert_eq!(
             sat_total(&user, &db).await,
             1,
@@ -616,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retake_preserves_the_prior_sittings_sheet() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, question) = open_exam_with_question(&db, 2).await;
         let user = student(&db).await;
 
@@ -654,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_retake_race_cannot_touch_the_winners_sheet() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, question) = open_exam_with_question(&db, 3).await;
         let user = student(&db).await;
 
@@ -678,17 +670,15 @@ mod tests {
         // A stale double-start races on the same seq and loses to the
         // composite id: the duplicate create is rejected, and with no wipe in
         // the path the winner's fresh answer is untouched either way.
-        let loser = ExamAttempt {
-            id: ExamAttemptId::composite(exam.get_id(), &user, 2),
-            exam: exam.get_id().clone(),
-            user: user.clone(),
-            seq: 2,
-            started_at: Timestamp::now(),
-            finished_at: None,
-            left_at: None,
-        };
-        let lost: Result<Option<ExamAttempt>, surrealdb::Error> =
-            db.create(loser.id.record()).content(loser).await;
+        let lost = sqlx::query(
+            "INSERT INTO exam_attempt (exam, app_user, seq, started_at) \
+             VALUES ($1, $2, 2, $3)",
+        )
+        .bind(exam.get_id().uuid())
+        .bind(user.uuid())
+        .bind(Timestamp::now().as_millis())
+        .execute(&db)
+        .await;
         assert!(lost.is_err(), "the duplicate-seq create must be rejected");
         let answers = exam_answer::list_for_exam_user(&db, exam.get_id(), &user, 2)
             .await

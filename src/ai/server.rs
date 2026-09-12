@@ -1077,9 +1077,7 @@ mod tests {
     async fn armed(router: axum::Router) -> ApiHandle {
         ApiHandle {
             router,
-            tenants: crate::database::init_mem_tenants()
-                .await
-                .expect("in-memory deployment"),
+            tenants: crate::database::init_test_tenants().await,
             files_path: std::env::temp_dir(),
         }
     }

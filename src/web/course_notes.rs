@@ -68,7 +68,7 @@ async fn note_with_course(id: &str, db: &Database) -> Result<(CourseNote, Course
 
 #[derive(Deserialize, ToSchema)]
 struct CreateCourseNote {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     course: String,
     #[schema(example = "Chapter 3 recap", max_length = 200)]
     title: String,
@@ -153,7 +153,7 @@ async fn create(
 #[derive(Deserialize, IntoParams)]
 struct CourseFilter {
     /// The course to list notes for (required).
-    #[param(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[param(example = "019732e3-7b00-7000-8000-00000000dead")]
     course: String,
 }
 

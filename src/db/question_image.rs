@@ -248,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
@@ -293,7 +293,7 @@ mod tests {
     /// options keeps exactly their pictures, and drops only the removed one's.
     #[tokio::test]
     async fn only_the_dropped_options_lose_their_pictures() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
@@ -335,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_keep_set_clears_every_option_picture_but_not_the_illustration() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
@@ -362,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn exam_listing_scopes_by_exam() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam_a = exam_row(&db).await;
         let exam_b = exam_row(&db).await;
         upsert(

@@ -442,11 +442,15 @@ async fn ensure_no_orphans(
 
 /// Delete the homework and cascade its submissions, their files, and its
 /// results — one transaction, so a crash can't orphan a submission under a
-/// vanished homework. The submission file *blobs* are the web layer's to
-/// unlink: their names are returned (collected inside the transaction,
-/// before the wipes — a file row inserted after an out-of-transaction
-/// collection would be deleted here while its key was already gone from the
-/// list, stranding the blob) and removed after the rows are gone.
+/// vanished homework. The cascade runs children-first (every FK here is
+/// `ON DELETE NO ACTION`): files, then submissions — whose `graded_by_result`
+/// stamp points at a result row, so they must be gone before it — then the
+/// results, then the homework. The submission file *blobs* are the web
+/// layer's to unlink: their names are returned (collected inside the
+/// transaction, before the wipes — a file row inserted after an
+/// out-of-transaction collection would be deleted here while its key was
+/// already gone from the list, stranding the blob) and removed after the
+/// rows are gone.
 pub async fn delete(
     db: &Database,
     homework: Homework,
@@ -470,13 +474,13 @@ pub async fn delete(
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
-            "DELETE FROM homework_result WHERE homework = $1",
+            "DELETE FROM homework_submission WHERE homework = $1",
             homework.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
-            "DELETE FROM homework_submission WHERE homework = $1",
+            "DELETE FROM homework_result WHERE homework = $1",
             homework.get_id().uuid()
         )
         .execute(&mut *tx)
@@ -529,15 +533,27 @@ mod tests {
     }
 
     async fn homework_on(subject: &SubjectId, db: &Database) -> Homework {
+        // The course and the teacher are foreign keys now: a real course row
+        // (the subject's own fixture path mints one) and a real teacher.
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("homework-fixture-{}", &teacher.key()[..8]))
+        .execute(db)
+        .await
+        .unwrap();
         create(
             db,
-            &CourseId::from_key("course"),
+            &crate::db::course::a_test_course(db).await,
             subject,
             HomeworkTitle::try_new("essay").unwrap(),
             None,
             Timestamp::from_millis(1),
             None,
-            &UserId::from_key("teacher"),
+            &teacher,
         )
         .await
         .unwrap()
@@ -545,27 +561,21 @@ mod tests {
 
     /// The stored `homework_count` on one subject, absent counting as zero.
     async fn count_on(subject: &SubjectId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) FROM $sub"
-            ))
-            .bind(("sub", subject.record()))
+        sqlx::query_scalar::<_, i64>("SELECT homework_count FROM subject WHERE id = $1")
+            .bind(subject.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .first()
-            .copied()
-            .unwrap_or(0)
     }
 
     /// How many rows `sql` selects ids for.
     async fn rows(sql: &str, db: &Database) -> usize {
-        let mut result = db.query(sql).await.unwrap().check().unwrap();
-        result.take::<Vec<RecordId>>(0).unwrap().len()
+        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM ({sql}) AS t"
+        )))
+        .fetch_one(db)
+        .await
+        .unwrap() as usize
     }
 
     /// The invariant on the create path: the claim and the row it accounts for
@@ -574,7 +584,7 @@ mod tests {
     /// guard reads that count, so a stray one makes it undeletable forever).
     #[tokio::test]
     async fn a_refused_create_writes_neither_row_nor_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let subject = a_subject("algebra", &db).await;
         let id = subject.get_id().clone();
         crate::db::subject::delete(&db, subject).await.unwrap();
@@ -593,12 +603,12 @@ mod tests {
         .expect_err("a subject that is gone must not be taggable");
         assert!(error.to_string().contains("subject does not exist"));
         assert_eq!(
-            rows("SELECT VALUE id FROM homework", &db).await,
+            rows("SELECT id FROM homework", &db).await,
             0,
             "a refused create may write no row"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM subject", &db).await,
+            rows("SELECT id FROM subject", &db).await,
             0,
             "…and least of all a count on a subject it just brought back"
         );
@@ -608,7 +618,7 @@ mod tests {
     /// claim and the old one's release with the link itself.
     #[tokio::test]
     async fn a_subject_move_moves_the_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_subject("algebra", &db).await;
         let to = a_subject("geometry", &db).await;
         let homework = homework_on(from.get_id(), &db).await;
@@ -647,7 +657,7 @@ mod tests {
     /// keeps its tag and both counters read as if nothing ran.
     #[tokio::test]
     async fn a_move_to_a_dead_subject_leaves_everything_untouched() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_subject("algebra", &db).await;
         let dead = a_subject("geometry", &db).await;
         let gone = dead.get_id().clone();
@@ -674,7 +684,7 @@ mod tests {
             "the release rolled back with the claim"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM subject", &db).await,
+            rows("SELECT id FROM subject", &db).await,
             1,
             "the dead subject was not brought back by a count"
         );
@@ -690,7 +700,7 @@ mod tests {
     /// outright, and the counts must read as if it never ran.
     #[tokio::test]
     async fn a_stale_mover_is_refused_and_claims_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_subject("algebra", &db).await;
         let to = a_subject("geometry", &db).await;
         let other = a_subject("calculus", &db).await;
@@ -744,7 +754,7 @@ mod tests {
     /// *carrying* the column instead, which is why this is refused.
     #[tokio::test]
     async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_subject("algebra", &db).await;
         let to = a_subject("geometry", &db).await;
         let homework = homework_on(from.get_id(), &db).await;

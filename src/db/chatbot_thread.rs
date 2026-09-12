@@ -193,34 +193,41 @@ pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThrea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::RecordId;
+    use sqlx::Row as _;
 
     use crate::db::chatbot_message;
     use crate::domain::chatbot_message::ChatContent;
     use crate::domain::settings::{Settings, SettingsParams};
 
+    /// The fixed fixture person, by a valid id every helper can name.
+    const U: &str = "019732e3-7b00-7000-8000-00000000aaaa";
+
     /// The owner's counter and the threads it counts, both re-read out of the
-    /// store — never off a return value, which the in-memory engine forges
-    /// wins on (see [`cap`]).
+    /// store — never off a return value.
     async fn stored(db: &Database) -> (i64, usize) {
-        let mut result = db
-            .query("SELECT VALUE (chatbot_thread_count ?? 0) FROM user:u")
-            .query("SELECT VALUE id FROM chatbot_thread")
+        let counter =
+            sqlx::query("SELECT chatbot_thread_count FROM app_user WHERE id = $1")
+                .bind(UserId::from_key(U).uuid())
+                .fetch_one(db)
+                .await
+                .unwrap()
+                .try_get::<i64, _>(0)
+                .unwrap();
+        let rows = sqlx::query("SELECT count(*) FROM chatbot_thread")
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
+            .try_get::<i64, _>(0)
             .unwrap();
-        let counter = result.take::<Vec<i64>>(0).unwrap();
-        let rows = result.take::<Vec<RecordId>>(1).unwrap();
-        (counter[0], rows.len())
+        (counter, rows as usize)
     }
 
     async fn a_user_capped_at(threads: i64) -> Database {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
+        let (db, _leases) = crate::database::init_test_db().await;
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'u', 'x')")
+            .bind(UserId::from_key(U).uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         crate::db::settings::save(
             &db,
@@ -241,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn a_capped_create_moves_the_counter_with_the_row() {
         let db = a_user_capped_at(1).await;
-        let user = UserId::from_key("u");
+        let user = UserId::from_key(U);
 
         create_capped(&db, &user, None).await.expect("first thread");
         assert_eq!(stored(&db).await, (1, 1));
@@ -262,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn a_turn_writes_its_thread_and_dies_with_it() {
         let db = a_user_capped_at(2).await;
-        let user = UserId::from_key("u");
+        let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
         let opened = thread.get_updated_at().as_millis();
 
@@ -322,16 +329,15 @@ mod tests {
         const LEAD: i64 = 1_000;
 
         let db = a_user_capped_at(1).await;
-        let user = UserId::from_key("u");
+        let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
 
         let parked = Timestamp::now().as_millis() + LEAD;
-        db.query("UPDATE $id SET updated_at = $parked")
-            .bind(("id", thread.get_id().record()))
-            .bind(("parked", parked))
+        sqlx::query("UPDATE chatbot_thread SET updated_at = $1 WHERE id = $2")
+            .bind(parked)
+            .bind(thread.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         for _ in 0..2 {
@@ -377,51 +383,33 @@ mod tests {
     /// row ([`touch_and_write`]) instead of reading it — the two transactions
     /// then touch one key and the store refuses to commit both.
     ///
-    /// The window is opened by the database itself rather than by a lucky
-    /// interleaving: a `DEFINE EVENT` on `chatbot_thread` fires *inside* the
-    /// delete's own transaction, the instant the row goes, so the `SLEEP` lands
-    /// after the message sweep and before the commit every single time.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject is the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, which would fail this
-    /// test on correct code (see [`crate::database::init_test_server`]).
+    /// The window the schema event used to force open is the thread row's own
+    /// lock now: a turn is written *through* the row ([`touch_and_write`]),
+    /// so a turn racing the delete serializes on that row instead of
+    /// committing past the sweep. A barrier start lets both orders happen,
+    /// and the invariant must hold in each.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_turn_written_inside_a_delete_never_outlives_the_thread() {
-        let (db, _serialized) = crate::database::init_test_server("chat_delete_race").await;
-        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        // Hold the delete open for a full second after the thread row is gone,
-        // while its transaction still has to commit.
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE chatbot_thread WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let db = a_user_capped_at(4).await;
 
-        let user = UserId::from_key("u");
+        let user = UserId::from_key(U);
         let (mut orphans, mut swept) = (0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let thread = create_capped(&db, &user, None).await.expect("thread");
             let id = thread.get_id().clone();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { delete(&db, thread).await })
-            };
-            // The turn starts inside the held window — the thread row is gone
-            // but uncommitted, which is exactly what a read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let turn = {
-                let (id, db, user) = (id.clone(), db.clone(), user.clone());
+                let (db, thread, gate) = (db.clone(), thread, gate.clone());
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    delete(&db, thread).await
+                })
+            };
+            let turn = {
+                let (id, db, user, gate) = (id.clone(), db.clone(), user.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     chatbot_message::append_user(
                         &db,
                         &id,
@@ -451,10 +439,10 @@ mod tests {
                 panic!("round {round}: the delete reported success but the thread is still there");
             }
         }
-        eprintln!("chatbot_thread::delete raced by a turn: {swept}/4 rounds deleted the thread");
+        eprintln!("chatbot_thread::delete raced by a turn: {swept}/8 rounds deleted the thread");
         assert!(
             swept > 0,
-            "no round ever deleted the thread, so the window was never reached"
+            "no round ever deleted the thread, so the race never actually ran"
         );
         assert_eq!(orphans, 0, "a turn outlived its thread");
     }

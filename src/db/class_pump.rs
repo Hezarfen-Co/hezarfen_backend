@@ -379,7 +379,7 @@ pub(crate) async fn add_member(
     let added_at = Timestamp::now();
     let class = class.clone();
     let (user, by) = (*user, *by);
-    tx_with_retry(db, false, async move |tx| {
+    let outcome = tx_with_retry(db, false, async move |tx| {
         if let Some(early) =
             early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?
         {
@@ -439,11 +439,7 @@ pub(crate) async fn add_member(
         .fetch_all(&mut *tx)
         .await?;
         let pairs = courses.into_iter().map(|course| (course, user.uuid()));
-        match enroll_pairs(tx, &class, pairs, &by).await? {
-            Sweep::Done => {}
-            Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
-            Sweep::Full(course) => return Ok(Attached::Full(course)),
-        }
+        enroll_pairs(tx, &class, pairs, &by).await?;
         Ok(Attached::Made(ClassMember {
             class: class.clone(),
             user,
@@ -451,7 +447,8 @@ pub(crate) async fn add_member(
             added_at: Some(added_at),
         }))
     })
-    .await
+    .await;
+    map_sweep_abort(outcome)
 }
 
 /// Write the course link and enroll the class's whole roster into it, or
@@ -478,7 +475,7 @@ pub(crate) async fn attach_course(
     let course = course.clone();
     let by = *by;
     let source = source.cloned();
-    tx_with_retry(db, false, async move |tx| {
+    let outcome = tx_with_retry(db, false, async move |tx| {
         if let Some(early) = early_verdicts(
             tx,
             &class,
@@ -536,11 +533,7 @@ pub(crate) async fn attach_course(
         .fetch_all(&mut *tx)
         .await?;
         let pairs = members.into_iter().map(|user| (course.uuid(), user));
-        match enroll_pairs(tx, &class, pairs, &by).await? {
-            Sweep::Done => {}
-            Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
-            Sweep::Full(course) => return Ok(Attached::Full(course)),
-        }
+        enroll_pairs(tx, &class, pairs, &by).await?;
         Ok(Attached::Made(ClassCourse {
             class: class.clone(),
             course: course.clone(),
@@ -549,17 +542,31 @@ pub(crate) async fn attach_course(
             attached_at: Some(attached_at),
         }))
     })
-    .await
+    .await;
+    map_sweep_abort(outcome)
 }
 
-/// What the shared enrollment loop settled for its pairs.
-enum Sweep {
-    /// Every pair holds the row it owes.
-    Done,
-    /// One of the pairs' courses is gone, named by its key: a stale link.
-    CourseGone(String),
-    /// One of the pairs' courses has no free seat, named by its key.
-    Full(String),
+/// Abort markers the pair loop raises where the old transaction `THROW` did,
+/// in the [`crate::db::field_update`] style: a refusal found *after* earlier
+/// pairs wrote must take the whole run down with it — returning it as `Ok`
+/// would COMMIT the partial enrollment. The marker carries the course's key
+/// and is mapped back to [`Attached`] right after [`tx_with_retry`] returns
+/// ([`map_sweep_abort`]); it never reaches the wire.
+const COURSE_GONE_MARK: &str = "class_pump_course_gone:";
+const COURSE_FULL_MARK: &str = "class_pump_course_full:";
+
+/// The pair loop's abort markers back into their [`Attached`] refusals —
+/// every other outcome passes through untouched.
+fn map_sweep_abort<T>(outcome: Result<Attached<T>, AppError>) -> Result<Attached<T>, AppError> {
+    match outcome {
+        Err(AppError::Internal(m)) if m.starts_with(COURSE_GONE_MARK) => Ok(Attached::CourseGone(
+            m[COURSE_GONE_MARK.len()..].to_string(),
+        )),
+        Err(AppError::Internal(m)) if m.starts_with(COURSE_FULL_MARK) => {
+            Ok(Attached::Full(m[COURSE_FULL_MARK.len()..].to_string()))
+        }
+        other => other,
+    }
 }
 
 /// Enroll every `(course, user)` pair that has no row yet, each against its
@@ -583,7 +590,7 @@ async fn enroll_pairs(
     class: &ClassGroupId,
     pairs: impl Iterator<Item = (uuid::Uuid, uuid::Uuid)>,
     by: &UserId,
-) -> Result<Sweep, AppError> {
+) -> Result<(), AppError> {
     for (course, user) in pairs {
         let held = sqlx::query_scalar!(
             r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
@@ -601,7 +608,7 @@ async fn enroll_pairs(
             .await?
             .is_some();
         if !alive {
-            return Ok(Sweep::CourseGone(course.to_string()));
+            return Err(AppError::Internal(format!("{COURSE_GONE_MARK}{course}")));
         }
         let seat = sqlx::query_scalar!(
             r#"UPDATE course SET enrollment_count = enrollment_count + 1
@@ -614,7 +621,7 @@ async fn enroll_pairs(
         .await?
         .is_some();
         if !seat {
-            return Ok(Sweep::Full(course.to_string()));
+            return Err(AppError::Internal(format!("{COURSE_FULL_MARK}{course}")));
         }
         let wrote = sqlx::query_scalar!(
             r#"INSERT INTO enrollment (course, app_user, enrolled_by, source)
@@ -655,7 +662,7 @@ async fn enroll_pairs(
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(Sweep::Done)
+    Ok(())
 }
 
 // The sweep a role change *off` `student` owes — every class membership (each
@@ -900,10 +907,8 @@ async fn release(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::{CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE};
-    use crate::db::class_member::tests::{a_class, counter, rows};
+    use crate::db::class_member::tests::{a_class, counter, fixture_user, rows};
     use crate::domain::class_group::ClassGroupId;
-    use crate::domain::user::UserId;
     use crate::error::AppError;
     use crate::service::{class_course, class_member};
 
@@ -913,33 +918,32 @@ mod tests {
     /// does not exist.
     #[tokio::test]
     async fn an_attach_onto_a_missing_class_writes_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
-        let ghost = ClassGroupId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let ghost = ClassGroupId::from_key("019732e3-7b00-7000-8000-00000000dead");
 
         let refused = class_member::add(
             &db,
             &ghost,
-            &UserId::from_key("student"),
-            &UserId::from_key("manager"),
+            &fixture_user(&db, "student").await,
+            &fixture_user(&db, "manager").await,
         )
         .await;
         assert!(
             matches!(refused, Err(AppError::NotFound)),
             "a class that is gone is a 404, not a counter on nothing: {refused:?}"
         );
-        assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
-        assert_eq!(rows("SELECT VALUE id FROM class_group", &db).await, 0);
+        assert_eq!(rows("class_member", &db).await, 0);
+        assert_eq!(rows("class_group", &db).await, 0);
     }
 
-    /// [`detach`] is written to take *many* link rows at once — that is what
-    /// makes a user's whole membership one statement — and every one of them
-    /// releases its own class's counter. Called straight, because the public
-    /// `delete_for_user` throws the count away.
+    /// The role-change sweep takes a user's whole membership apart, link row
+    /// by link row (one transaction per pair since the Postgres port), and
+    /// every one of them releases its own class's counter.
     #[tokio::test]
     async fn a_detach_releases_every_class_it_unlinked() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = fixture_user(&db, "manager").await;
+        let student = fixture_user(&db, "student").await;
         let classes = [
             a_class("9-A", &db).await,
             a_class("9-B", &db).await,
@@ -951,37 +955,24 @@ mod tests {
                 .unwrap();
         }
 
-        let gone = detach(
-            &db,
-            &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
-            Axis::Member,
-            &[("usr".into(), student.record().into_value())],
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            gone, 3,
-            "every link row must be counted, not just the first"
-        );
+        for class in &classes {
+            class_member::remove(&db, class, &student).await.unwrap();
+        }
         for class in &classes {
             assert_eq!(
-                counter(CLASS_MEMBER_COUNT_FIELD, class.record(), &db).await,
+                counter("class_member_count", class.uuid(), &db).await,
                 0,
                 "each class gets its own counter back"
             );
         }
 
-        // And a run that unlinks nothing answers zero, which is what turns a
-        // single-pair detach into a 404 instead of a silent success.
-        let again = detach(
-            &db,
-            &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
-            Axis::Member,
-            &[("usr".into(), student.record().into_value())],
-        )
-        .await
-        .unwrap();
-        assert_eq!(again, 0);
+        // And unlinking nobody is a 404, not a silent success — the shape a
+        // single-pair detach answers with.
+        let again = class_member::remove(&db, &classes[0], &student).await;
+        assert!(
+            matches!(again, Err(AppError::NotFound)),
+            "a second removal is a 404, not a silent no-op: {again:?}"
+        );
     }
 
     /// The heir a sweep hands a shared enrollment to must still hold *both*
@@ -1004,19 +995,19 @@ mod tests {
     /// not have — it commits both sides and answers `Ok` to each, so this passes
     /// there on broken code.
     ///
-    /// The window is opened by the schema rather than by a lucky interleaving: a
-    /// `DEFINE EVENT` on `class_course` scoped to the *owner's* link holds that
-    /// detach open at its first statement, so the heir's two calls land inside
-    /// its transaction every time — and the heir's own detach, on another class,
-    /// is not slowed by it.
+    /// The window the old engine needed a schema event to open is the row
+    /// lock now: the owner's sweep claims the heir's class row before it
+    /// chooses the heir, so the heir's own member/course writes either land
+    /// wholly before the sweep reads them or wait behind it — and the
+    /// invariant below must hold in both orders. A barrier start lets every
+    /// interleaving happen instead of pinning one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_detached_row_is_never_handed_to_a_class_that_let_it_go() {
-        use crate::db::class_member::tests::{a_course, source_of};
+        use crate::db::class_member::tests::{a_course, fixture_user, source_of};
 
-        let (db, _serialized) = crate::database::init_test_server("class_heir_race").await;
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = fixture_user(&db, "manager").await;
+        let student = fixture_user(&db, "student").await;
         let (mut raced, mut stranded) = (0, 0);
         for round in 0..4 {
             let algebra = a_course(&format!("algebra{round}"), None, &db).await;
@@ -1035,31 +1026,29 @@ mod tests {
                 Some(Some(owner.clone())),
                 "round {round}: the row must start out owned by the first class"
             );
-            db.query(format!(
-                "DEFINE EVENT OVERWRITE hold_the_sweep ON TABLE {CLASS_COURSE_TABLE} \
-                 WHEN $event = 'DELETE' THEN {{ IF $before.class = \
-                 type::record('class_group', '{}') {{ SLEEP 2s }} }};",
-                owner.key()
-            ))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let detaching = {
-                let (db, owner, algebra) = (db.clone(), owner.clone(), algebra.clone());
-                tokio::spawn(async move { class_course::detach(&db, &owner, &algebra).await })
+                let (db, owner, algebra, gate) =
+                    (db.clone(), owner.clone(), algebra.clone(), gate.clone());
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    class_course::detach(&db, &owner, &algebra).await
+                })
             };
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            assert!(
-                !detaching.is_finished(),
-                "round {round}: the sweep was over before the heir moved"
-            );
-            // The heir lets the row go, twice over, while that sweep is still
-            // choosing it.
-            class_member::remove(&db, &heir, &student).await.unwrap();
-            class_course::detach(&db, &heir, &algebra).await.unwrap();
+            // The heir lets the row go, twice over, while the sweep is racing
+            // it for the same enrollment row.
+            let heir_moves = {
+                let (db, heir, algebra, gate) =
+                    (db.clone(), heir.clone(), algebra.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    class_member::remove(&db, &heir, &student).await?;
+                    class_course::detach(&db, &heir, &algebra).await
+                })
+            };
             let swept = detaching.await.unwrap();
+            heir_moves.await.unwrap().unwrap();
             assert!(
                 !matches!(swept, Err(AppError::Db(_))),
                 "round {round}: a raced detach must be answered, not 500: {swept:?}"
@@ -1081,25 +1070,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_abort_names_its_course() {
-        assert_eq!(
-            named_course("An error occurred: class_full:course:01J8XZ0K3Q", FULL_MARK),
-            Some("course:01J8XZ0K3Q".to_string())
-        );
-        assert_eq!(
-            named_course("class_full:course:algebra'", FULL_MARK),
-            Some("course:algebra".into())
-        );
-        assert_eq!(named_course("class_held", FULL_MARK), None);
-        assert_eq!(named_course("class_full:", FULL_MARK), None);
-        // And the stale-link abort reads off the same shape, without the two
-        // markers ever matching each other's text.
-        assert_eq!(
-            named_course("class_no_course:course:algebra'", MISSING_MARK),
-            Some("course:algebra".into())
-        );
-        assert_eq!(named_course("class_no_course:course:a", FULL_MARK), None);
-        assert_eq!(named_course("class_full:course:a", MISSING_MARK), None);
-    }
 }

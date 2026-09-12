@@ -116,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_builder_session_round_trips_and_deletes() {
-        let tenants = Tenants::new_mem().await.unwrap();
+        let tenants = crate::database::init_test_tenants().await;
         let control = tenants.control();
         builder::ensure(
             control,

@@ -392,7 +392,7 @@ fn contended() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, init_mem};
+    use crate::database::{Database, init_test_db};
     use crate::service::appointment_slot;
 
     fn at(millis: i64) -> Timestamp {
@@ -406,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn window_prefers_a_proposal_over_the_slot() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let (starts_at, ends_at) = (soon(60_000), soon(120_000));
         let slot = appointment_slot::create(&db, &teacher, starts_at, ends_at, None)
@@ -431,7 +431,7 @@ mod tests {
     /// to undo the resulting meeting, so the booking would be stuck for good.
     #[tokio::test]
     async fn a_started_slot_cannot_be_booked() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
         let started = appointment_slot::create(&db, &teacher, soon(-30_000), soon(60_000), None)
@@ -456,7 +456,7 @@ mod tests {
     /// come and gone cannot be accepted — the meeting would be uncancellable.
     #[tokio::test]
     async fn a_started_proposal_cannot_be_accepted() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
@@ -544,7 +544,7 @@ mod tests {
     /// primitive itself with the exact stale snapshot the race produces.
     #[tokio::test]
     async fn a_decision_built_on_a_stale_snapshot_never_lands() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
@@ -633,7 +633,7 @@ mod tests {
     /// second claim succeed and this fail (mutation-proved).
     #[tokio::test]
     async fn a_concurrent_claim_cannot_take_a_booked_slot() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
@@ -674,7 +674,7 @@ mod tests {
     /// bumped the counter would strand the slot forever.
     #[tokio::test]
     async fn a_refused_booking_moves_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
@@ -711,7 +711,7 @@ mod tests {
     /// cancel that moved one without the other would strand the slot forever.
     #[tokio::test]
     async fn cancelling_hands_the_seat_back_with_the_status() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
@@ -749,7 +749,7 @@ mod tests {
     /// Occupancy frees on reject, so the slot can be re-booked.
     #[tokio::test]
     async fn rejecting_frees_the_slot_for_re_booking() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = UserId::from_key("t1");
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await

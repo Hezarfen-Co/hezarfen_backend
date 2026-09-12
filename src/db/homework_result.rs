@@ -241,6 +241,21 @@ pub async fn remove(
         if alive.is_none() {
             return Ok(None);
         }
+        // The stamp clears *before* the delete: the submission's
+        // `graded_by_result` FK points at the grade row (`NO ACTION`), so the
+        // delete must not run while it stands. The subselect scopes the clear
+        // to *this* pair's grade id — it can never wipe a stamp a concurrent
+        // re-grade has just written (none can interleave: the homework row is
+        // locked above).
+        sqlx::query!(
+            r#"UPDATE homework_submission SET graded_by_result = NULL
+               WHERE homework = $1 AND app_user = $2 AND graded_by_result IN (
+                   SELECT id FROM homework_result WHERE homework = $1 AND app_user = $2)"#,
+            homework.uuid(),
+            user.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         let gone = sqlx::query!(
             r#"DELETE FROM homework_result WHERE homework = $1 AND app_user = $2
                RETURNING id AS "id: HomeworkResultId",
@@ -258,15 +273,6 @@ pub async fn remove(
         let Some(removed) = gone else {
             return Ok(None);
         };
-        sqlx::query!(
-            r#"UPDATE homework_submission SET graded_by_result = NULL
-               WHERE homework = $1 AND app_user = $2 AND graded_by_result = $3"#,
-            homework.uuid(),
-            user.uuid(),
-            removed.id.uuid()
-        )
-        .execute(&mut *tx)
-        .await?;
         sqlx::query!(
             "UPDATE app_user SET marks_given_total = GREATEST(marks_given_total - 1, 0) WHERE id = $1",
             removed.graded_by.uuid()
@@ -325,10 +331,10 @@ mod tests {
 
     #[tokio::test]
     async fn grade_upserts_one_row_per_pair_and_remove_unfreezes() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
+        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
 
         let first = grade(
             &db,
@@ -366,17 +372,27 @@ mod tests {
     /// touched at all — a homework grade is not a homework submission.
     #[tokio::test]
     async fn a_first_grade_credits_the_grader_and_a_regrade_does_not() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
+        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
         // `UPDATE` writes nothing to a user row that does not exist.
-        db.query("CREATE $usr SET username = 't', password_hash = 'x'")
-            .bind(("usr", teacher.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(teacher.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 'ali', 'x', 'student') ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
 
         for status in ["incomplete", "done"] {
             grade(
@@ -403,16 +419,26 @@ mod tests {
     /// mark given, with no exam, no mark and no submission behind them.
     #[tokio::test]
     async fn ungrading_gives_the_grader_credit_back() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
-        db.query("CREATE $usr SET username = 't', password_hash = 'x'")
-            .bind(("usr", teacher.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
+        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(teacher.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 'ali', 'x', 'student') ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
 
         for _ in 0..3 {
             grade(
@@ -439,20 +465,12 @@ mod tests {
     }
     /// The grader's badge counter, re-read out of the store.
     async fn marks_given(user: &UserId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) FROM $usr"
-            ))
-            .bind(("usr", user.record()))
+        sqlx::query("SELECT marks_given_total FROM app_user WHERE id = $1")
+            .bind(user.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
+            .try_get::<i64, _>(0)
             .unwrap()
-            .into_iter()
-            .next()
-            .unwrap_or(0)
     }
 }

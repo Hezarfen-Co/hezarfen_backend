@@ -3,10 +3,8 @@
 //! the study streak are all decided inside [`finish`]'s one transaction —
 //! the whole rule is the batch itself.
 
-use crate::constant::{
-    CAP_WRITE_TRIES, MAX_COUNTED_POMODORO_PER_DAY, MIN_COUNTED_POMODORO_MS,
-};
-use crate::database::{Database, backoff, tx_with_retry, unique_violation};
+use crate::constant::{MAX_COUNTED_POMODORO_PER_DAY, MIN_COUNTED_POMODORO_MS};
+use crate::database::{Database, tx_with_retry};
 use crate::domain::pomodoro::{PomodoroSession, PomodoroSessionId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -16,14 +14,19 @@ use sqlx::query_as;
 /// Start a session for `user`, stamped with the server clock. The open slot
 /// is the partial unique index (`pomodoro_session_open_stint`): one row per
 /// user with `finished_at IS NULL`. A dangling unfinished session (the
-/// browser died mid-timer) is deleted and replaced in the same statement —
-/// it never counted, and blocking the next start behind it would only
-/// punish the student for a crash.
+/// browser died mid-timer) is replaced by the same statement — the arbiter
+/// turns the insert into an in-place re-stamp (`DO UPDATE`), so the old row
+/// becomes the new stint; it never counted, and blocking the next start
+/// behind it would only punish the student for a crash.
 ///
-/// Two racing starts cannot both insert: the index refuses the second
-/// (`23505`), which is retried — the re-run deletes the winner's open row
-/// and replaces it, the same last-write-wins the old deterministic-key
-/// upsert had.
+/// The replace has to ride the arbiter. A `WITH gone AS (DELETE …) INSERT …`
+/// CTE cannot do it: both halves run on one snapshot, so the insert's
+/// uniqueness check still sees the row the CTE just deleted and refuses
+/// (23505) *deterministically* — a retry re-sends the identical statement and
+/// dies identically, which is the 500 the port briefly shipped. `DO UPDATE`
+/// is atomic: two racing starts cannot both win the slot, and the loser
+/// re-stamps the winner's row — the same last-write-wins the old
+/// deterministic-key upsert had.
 ///
 /// `label` is the student's own name for the stint, validated and trimmed
 /// upstream and stored verbatim. A `None` binds NULL — an unnamed start
@@ -35,42 +38,24 @@ pub async fn start(
 ) -> Result<PomodoroSession, AppError> {
     let started_at = Timestamp::now();
     let id = PomodoroSessionId::generate();
-    // The statement is one atomic delete-and-replace; the only contention
-    // is a rival start, and the index's verdict sends the loser around
-    // again to overwrite.
-    for attempt in 0..CAP_WRITE_TRIES {
-        backoff(attempt).await;
-        let started = match query_as!(
-            PomodoroSession,
-            "WITH gone AS (
-                 DELETE FROM pomodoro_session
-                 WHERE app_user = $1 AND finished_at IS NULL
-                 RETURNING 1)
-             INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
-             SELECT $2, $1, $3, NULL, NULL, $4
-             RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
-                       started_at AS \"started_at: Timestamp\", \
-                       finished_at AS \"finished_at: Timestamp\", counted, label",
-            user.uuid(),
-            id.uuid(),
-            started_at.as_millis(),
-            label
-        )
-        .fetch_one(db)
-        .await
-        {
-            Ok(row) => row,
-            // The winner of a race holds the open slot; one more round.
-            Err(err) if unique_violation(&err) == Some("pomodoro_session_open_stint") => {
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        return Ok(started);
-    }
-    Err(AppError::Internal(
-        "failed to start pomodoro session".into(),
-    ))
+    let started = query_as!(
+        PomodoroSession,
+        "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
+         VALUES ($2, $1, $3, NULL, NULL, $4)
+         ON CONFLICT (app_user) WHERE finished_at IS NULL DO UPDATE
+         SET started_at = EXCLUDED.started_at, finished_at = NULL, counted = NULL,
+             label = EXCLUDED.label
+         RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
+                   started_at AS \"started_at: Timestamp\", \
+                   finished_at AS \"finished_at: Timestamp\", counted, label",
+        user.uuid(),
+        id.uuid(),
+        started_at.as_millis(),
+        label
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(started)
 }
 
 /// Close `user`'s running session, deciding the counting verdict, the
@@ -252,22 +237,19 @@ pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<PomodoroS
 }
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
-    use crate::database;
+    use sqlx::Row as _;
 
-    /// A real `user` row: the counters land with `UPDATE`, which only ever
-    /// touches a record that exists, so a fabricated id would silently store
+    /// A real `app_user` row: the counters land with `UPDATE`, which only ever
+    /// touches a row that exists, so a fabricated id would silently store
     /// nothing. The tests above need no row — they read only the stint log.
     async fn a_user(db: &Database) -> UserId {
-        let user = UserId::from_key(&Ulid::generate().to_string());
-        db.query("CREATE $usr SET username = $name, password_hash = 'x'")
-            .bind(("usr", user.record()))
-            .bind(("name", user.key().to_string()))
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("u{}", &user.key()[..8]))
+            .execute(db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         user
     }
@@ -275,37 +257,37 @@ mod tests {
     /// `(finished_total, focus_ms_total)` re-read from the store — never off
     /// what `finish` returned, which proves nothing about what was written.
     async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({POMODORO_FINISHED_TOTAL_FIELD} ?? 0),
-                               ({POMODORO_FOCUS_MS_TOTAL_FIELD} ?? 0)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows: Vec<Vec<i64>> = result.take(0).unwrap();
-        let row = rows.into_iter().next().expect("the user row");
-        (row[0], row[1])
+        let row = sqlx::query(
+            "SELECT pomodoro_finished_total, pomodoro_focus_ms_total \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
+        (
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
+        )
     }
 
-    /// `(current, longest, last_day)` re-read from the store.
+    /// `(current, longest, last_day)` re-read from the store; the unset day
+    /// reads as the sentinel `-1` the streak arithmetic runs on.
     async fn streak(user: &UserId, db: &Database) -> (i64, i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({STUDY_STREAK_CURRENT_FIELD} ?? 0),
-                               ({STUDY_STREAK_LONGEST_FIELD} ?? 0),
-                               ({STUDY_STREAK_LAST_DAY_FIELD} ?? -1)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows: Vec<Vec<i64>> = result.take(0).unwrap();
-        let row = rows.into_iter().next().expect("the user row");
-        (row[0], row[1], row[2])
+        let row = sqlx::query(
+            "SELECT study_streak_current, study_streak_longest, \
+                    COALESCE(study_streak_last_day, -1) \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
+        (
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
+            row.try_get::<i64, _>(2).unwrap(),
+        )
     }
 
     /// Age *both* day buckets by `days`, so the next finish lands that many
@@ -322,16 +304,16 @@ mod tests {
     /// code to serve a test. Re-run before believing a failure that only ever
     /// happens near midnight UTC.
     async fn age_by_days(user: &UserId, db: &Database, days: i64) {
-        db.query(format!(
-            "UPDATE $usr SET
-                 {STUDY_STREAK_LAST_DAY_FIELD} = {STUDY_STREAK_LAST_DAY_FIELD} - $days,
-                 {POMODORO_COUNTED_DAY_FIELD} = ({POMODORO_COUNTED_DAY_FIELD} ?? -1) - $days"
-        ))
-        .bind(("usr", user.record()))
-        .bind(("days", days))
+        sqlx::query(
+            "UPDATE app_user SET
+                 study_streak_last_day = COALESCE(study_streak_last_day, -1) - $1,
+                 pomodoro_counted_day = COALESCE(pomodoro_counted_day, -1) - $1
+             WHERE id = $2",
+        )
+        .bind(days)
+        .bind(user.uuid())
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     }
 
@@ -340,16 +322,22 @@ mod tests {
     ///
     /// One `UPSERT`, not `start` followed by a backdate: the concurrent test
     /// races four of these onto the same open row, and a separate backdate can
-    /// be wiped by a rival's fresh `start`, handing whoever wins the `DELETE` a
-    /// zero-length stint and reddening the run for no defect. Same statement
-    /// `start` runs, one clock read earlier.
+    /// be wiped by a rival's fresh `start`, handing whoever wins the arbiter
+    /// a zero-length stint and reddening the run for no defect. The same
+    /// arbiter-riding statement `start` runs, one clock read earlier — the
+    /// `DO UPDATE` arm drops the loser onto the winner's row in place.
     async fn start_aged(user: &UserId, db: &Database, ms: i64) -> Result<(), AppError> {
-        db.query("UPSERT $open CONTENT { user: $usr, started_at: $at }")
-            .bind(("open", PomodoroSessionId::open_for(user).record()))
-            .bind(("usr", user.record()))
-            .bind(("at", Timestamp::now().as_millis() - ms))
-            .await?
-            .check()?;
+        sqlx::query(
+            "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
+             VALUES ($2, $1, $3, NULL, NULL, NULL)
+             ON CONFLICT (app_user) WHERE finished_at IS NULL DO UPDATE
+             SET started_at = EXCLUDED.started_at, finished_at = NULL, counted = NULL",
+        )
+        .bind(user.uuid())
+        .bind(PomodoroSessionId::generate().uuid())
+        .bind(Timestamp::now().as_millis() - ms)
+        .execute(db)
+        .await?;
         Ok(())
     }
 
@@ -362,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_days_extend_the_streak_and_a_repeat_day_does_not() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
         // The stale-data case: a row that predates all three columns reads as
         // no streak at all, and its first finish opens a run of one.
@@ -386,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gap_resets_the_run_but_never_the_high_water_mark() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
 
         one_stint(&user, &db).await;
@@ -442,9 +430,8 @@ mod tests {
     /// (a racer scheduled entirely after another's finish frees the slot) and
     /// the assertions allow it — the day count is per round, not per stint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn concurrent_finishes_commit_the_streak_with_the_stint_or_not_at_all() {
-        let (db, _serialized) = crate::database::init_test_server("pomodoro_streak_race").await;
+        let (db, _leases) = crate::crate::database::init_test_db().await;
         let user = a_user(&db).await;
         let (mut finished, mut conflicts, mut errors) = (0, 0, 0);
         let mut last_error = String::new();
@@ -511,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn finishing_bumps_the_stored_counters_and_an_open_stint_bumps_neither() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
         assert_eq!(counters(&user, &db).await, (0, 0));
 
@@ -537,17 +524,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_backwards_clock_adds_zero_ms_to_the_counter_never_a_negative() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
 
         start(&db, &user, None).await.unwrap();
-        db.query("UPDATE $open SET started_at = $future")
-            .bind(("open", PomodoroSessionId::open_for(&user).record()))
-            .bind(("future", Timestamp::now().as_millis() + 3_600_000))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        sqlx::query(
+            "UPDATE pomodoro_session SET started_at = $1
+             WHERE app_user = $2 AND finished_at IS NULL",
+        )
+        .bind(Timestamp::now().as_millis() + 3_600_000)
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
 
         // The clamp holds: zero milliseconds, never a negative — and a stint
         // measuring zero is below the minimum, so it moves neither counter.
@@ -569,7 +558,7 @@ mod tests {
     /// pair and a study session, not the last millisecond.
     #[tokio::test]
     async fn a_stint_under_the_minimum_is_logged_and_listed_but_counts_for_nothing() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
 
         start_aged(&user, &db, MIN_COUNTED_POMODORO_MS - 60_000)
@@ -609,7 +598,7 @@ mod tests {
     /// rolls at midnight UTC.
     #[tokio::test]
     async fn the_day_quota_caps_the_counter_and_rolls_at_midnight_utc() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
 
         for _ in 0..MAX_COUNTED_POMODORO_PER_DAY {
@@ -647,7 +636,7 @@ mod tests {
     /// and a badge is never taken back.
     #[tokio::test]
     async fn the_start_finish_farm_moves_no_counter_and_mints_no_badge() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
 
         for _ in 0..200 {
@@ -675,10 +664,10 @@ mod tests {
 
     #[tokio::test]
     async fn restart_replaces_the_open_session_and_finish_closes_it() {
-        let db = database::init_mem().await.unwrap();
-        // A `record<user>` column checks the table of the id, not row
-        // existence — a fabricated id keeps this test free of user ceremony.
-        let user = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The stint's owner is a real parent row now (the FK checks it), so
+        // the user ceremony stays — it is one helper call.
+        let user = a_user(&db).await;
 
         // Nothing running yet — finishing conflicts.
         assert!(matches!(
@@ -711,19 +700,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_backwards_clock_records_a_zero_stint_not_a_negative_one() {
-        let db = database::init_mem().await.unwrap();
-        let user = UserId::from_key(&Ulid::generate().to_string());
+        let (db, _leases) = crate::database::init_test_db().await;
+        let user = a_user(&db).await;
 
         start(&db, &user, None).await.unwrap();
         // Stand in for the NTP step: push the running stint's start an hour
         // ahead, so the server clock `finish` reads is *behind* it.
-        db.query("UPDATE $open SET started_at = $future")
-            .bind(("open", PomodoroSessionId::open_for(&user).record()))
-            .bind(("future", Timestamp::now().as_millis() + 3_600_000))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        sqlx::query(
+            "UPDATE pomodoro_session SET started_at = $1
+             WHERE app_user = $2 AND finished_at IS NULL",
+        )
+        .bind(Timestamp::now().as_millis() + 3_600_000)
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
 
         let closed = finish(&db, &user).await.unwrap();
         let started = closed.get_started_at().as_millis();

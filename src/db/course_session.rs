@@ -171,14 +171,24 @@ mod tests {
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_session_never_outlives_its_course() {
         fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
             tokio::spawn(async move {
+                // The creator is a foreign key now: a real `app_user` row.
+                let creator = UserId::generate();
+                sqlx::query(
+                    "INSERT INTO app_user (id, username, password_hash, role) \
+                     VALUES ($1, $2, 'x', 'teacher')",
+                )
+                .bind(creator.uuid())
+                .bind(format!("session-race-{}", &creator.key()[..8]))
+                .execute(&db)
+                .await
+                .unwrap();
                 create(
                     &db,
                     &course,
-                    &UserId::generate(),
+                    &creator,
                     SessionTopic::try_new("limits").unwrap(),
                     Timestamp::from_millis(1),
                     None,
@@ -187,11 +197,6 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete(
-            "session_orphan_race",
-            COURSE_SESSION_TABLE,
-            make,
-        )
-        .await;
+        crate::db::course::assert_no_child_outlives_a_course_delete("session", make).await;
     }
 }

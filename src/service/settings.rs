@@ -351,20 +351,30 @@ fn missing(before: &[String], after: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::settings::save;
 
     /// The `retired` bit as the store holds it, `None` when no counter row was
     /// ever written — read back, never inferred from a return value.
-    async fn bit(db: &Database, counter: RecordId) -> Option<bool> {
-        let mut result = db
-            .query("SELECT VALUE retired FROM $id")
-            .bind(("id", counter))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        result.take::<Vec<bool>>(0).unwrap().first().copied()
+    async fn ref_bit(db: &Database, table: &str, name: &str) -> Option<bool> {
+        let row = sqlx::query(&format!(
+            "SELECT retired FROM {table} WHERE name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(db)
+        .await
+        .unwrap();
+        row.map(|row| row.try_get::<bool, _>(0).unwrap())
+    }
+
+    /// [`ref_bit`] against the exam-kind counters.
+    async fn kind_bit(db: &Database, name: &str) -> Option<bool> {
+        ref_bit(db, "kind_ref", name).await
+    }
+
+    /// [`ref_bit`] against the meal-slot counters.
+    async fn slot_bit(db: &Database, name: &str) -> Option<bool> {
+        ref_bit(db, "slot_ref", name).await
     }
 
     /// Two managers drop the same exam kind at once; one of them loses the
@@ -377,29 +387,27 @@ mod tests {
     /// records no undo, so `restore` has nothing to take back.
     #[tokio::test]
     async fn the_loser_of_a_settings_race_cannot_un_retire_the_winner_s_kind() {
-        let db = init_mem().await.unwrap();
-        let counter = kind_ref("midterm");
-
-        // The winner's PATCH retires the kind.
-        assert!(matches!(
-            cap::retire_name(&counter, &db).await.unwrap(),
-            cap::Switched::Flipped
-        ));
-
-        // The loser's PATCH decides the same removal against the same snapshot,
-        // then its save is refused.
-        let mut undo = Vec::new();
-        if let cap::Switched::Flipped = cap::retire_name(&counter, &db).await.unwrap() {
-            undo.push(Undo::Retired(counter.clone()));
-        }
-        assert!(undo.is_empty(), "a no-op retirement records no undo");
-        restore(&undo, &db).await.unwrap();
+        let (db, _leases) = init_test_db().await;
+        // Two managers send the same removal, each having decided it against
+        // the same original list. The winner's attempt retires the kind and
+        // saves; the loser's save loses the compare-and-set, aborts — taking
+        // every write of its attempt back with it — and retries against the
+        // fresh list, where the same PATCH is a no-op that flips nothing.
+        // (The old engine needed a hand-rolled undo list for this; the
+        // transaction's own rollback is the undo now.)
+        let without_midterm = SettingsPatch {
+            exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
+            ..a_patch()
+        };
+        apply(&db, &without_midterm).await.unwrap(); // the winner
+        apply(&db, &without_midterm).await.unwrap(); // the loser, retried
 
         assert_eq!(
-            bit(&db, counter).await,
+            kind_bit(&db, "midterm").await,
             Some(true),
             "the winner's retirement must outlive the loser's rollback"
         );
+        assert!(!stored(&db).await.0.contains(&"midterm".to_string()));
     }
 
     /// The mirror hole: a re-*added* name is put back in service before the
@@ -407,20 +415,37 @@ mod tests {
     /// name is off the stored list with a counter that grades happily.
     #[tokio::test]
     async fn a_rollback_re_retires_a_name_this_attempt_put_back_in_service() {
-        let db = init_mem().await.unwrap();
-        let counter = slot_ref("lunch");
-        cap::retire_name(&counter, &db).await.unwrap();
+        let (db, _leases) = init_test_db().await;
+        // The stored list drops lunch; the slot counter carries the retirement.
+        let without = SettingsPatch {
+            meal_slots: Some(slots(&["breakfast", "snack"])),
+            ..a_patch()
+        };
+        apply(&db, &without).await.unwrap();
+        assert_eq!(slot_bit(&db, "lunch").await, Some(true));
 
-        // The attempt re-adds the slot, then its save is refused.
-        let mut undo = Vec::new();
-        if let cap::Switched::Flipped = cap::unretire_name(&counter, &db).await.unwrap() {
-            undo.push(Undo::Unretired(counter.clone()));
-        }
-        assert_eq!(undo.len(), 1, "a real un-retirement is undoable");
-        restore(&undo, &db).await.unwrap();
+        // An attempt re-adds the slot but judged the write against the row
+        // *before* a rival's unrelated edit landed: its guarded save writes
+        // zero rows, and — inside [`apply`] — the abort would take the
+        // attempt's un-retirement straight back with it. Driven here at the
+        // save the way the loser experiences it: refused, so nothing lands.
+        let stale_snapshot = load(&db).await.unwrap();
+        let elsewhere = SettingsPatch {
+            max_file_bytes: Some(2048),
+            ..a_patch()
+        };
+        apply(&db, &elsewhere).await.unwrap();
+
+        let mut params = Settings::defaults().params();
+        params.meal_slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
+        let re_added = Settings::try_new(params).unwrap();
+        let landed = crate::db::settings::save_if_unchanged(&db, re_added, &stale_snapshot)
+            .await
+            .unwrap();
+        assert!(landed.is_none(), "the stale save must be refused");
 
         assert_eq!(
-            bit(&db, counter).await,
+            slot_bit(&db, "lunch").await,
             Some(true),
             "a re-add that never landed must leave the slot retired"
         );
@@ -432,22 +457,33 @@ mod tests {
     /// overwrite of a live reference.
     #[tokio::test]
     async fn a_rollback_leaves_a_name_that_gained_a_reference_in_service() {
-        let db = init_mem().await.unwrap();
-        let counter = slot_ref("lunch");
-        cap::retire_name(&counter, &db).await.unwrap();
-        cap::unretire_name(&counter, &db).await.unwrap();
-        db.query("UPDATE $id SET count = 1")
-            .bind(("id", counter.clone()))
+        let (db, _leases) = init_test_db().await;
+        // Lunch goes away and comes back, and while it is in service a menu is
+        // published against it — the live reference the counter counts.
+        let without = SettingsPatch {
+            meal_slots: Some(slots(&["breakfast", "snack"])),
+            ..a_patch()
+        };
+        apply(&db, &without).await.unwrap();
+        let with = SettingsPatch {
+            meal_slots: Some(slots(&["breakfast", "lunch", "snack"])),
+            ..a_patch()
+        };
+        apply(&db, &with).await.unwrap();
+        sqlx::query("UPDATE slot_ref SET count = 1 WHERE name = 'lunch'")
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
-        restore(&[Undo::Unretired(counter.clone())], &db)
-            .await
-            .unwrap();
-
-        assert_eq!(bit(&db, counter).await, Some(false));
+        // The attempt that takes lunch away again now meets the reference: the
+        // removal is refused — honestly, with the published-menu 409, not by
+        // silently overwriting a live reference — and the slot stays usable.
+        let refused = apply(&db, &without).await;
+        assert!(
+            matches!(refused, Err(AppError::ConflictOwned(ref msg)) if msg.contains("'lunch'")),
+            "a referenced slot's removal must be refused: {refused:?}"
+        );
+        assert_eq!(slot_bit(&db, "lunch").await, Some(false));
     }
 
     // --- the whole edit, driven the way two managers drive it -------------
@@ -513,7 +549,7 @@ mod tests {
     /// legitimately removed — off the list and gradable.
     #[tokio::test]
     async fn two_edits_dropping_the_same_kind_leave_it_retired() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
             exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
             ..a_patch()
@@ -529,7 +565,7 @@ mod tests {
             "dropped from the list"
         );
         assert_eq!(
-            bit(&db, kind_ref("midterm")).await,
+            kind_bit(&db, "midterm").await,
             Some(true),
             "a kind the stored list no longer offers must not grade"
         );
@@ -548,29 +584,41 @@ mod tests {
     /// the other edit does may be visible until the pair completes.
     #[tokio::test]
     async fn a_rival_edit_cannot_run_between_a_retirement_and_its_save() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
             exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
             ..a_patch()
         };
 
-        let held = SETTINGS_LOCK.lock().await;
+        // The retire-then-save pair is one transaction, so a rival reading the
+        // store while the edit runs can see the pair wholly unlanded or wholly
+        // landed — never the retirement without the list commit that was the
+        // old lock's whole job to prevent. Poll the edit from the outside and
+        // assert that at every instant.
         let rival = tokio::spawn({
             let db = db.clone();
             async move { apply(&db, &without).await.map(|_| ()) }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        while !rival.is_finished() {
+            let (kinds, _) = stored(&db).await;
+            let retired = kind_bit(&db, "midterm").await;
+            if retired == Some(true) {
+                assert!(
+                    !kinds.contains(&"midterm".to_string()),
+                    "a retirement became visible before its list commit"
+                );
+            }
+            if retired == Some(false) {
+                assert!(
+                    kinds.contains(&"midterm".to_string()),
+                    "an un-retirement became visible before its list commit"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
 
-        assert_eq!(
-            bit(&db, kind_ref("midterm")).await,
-            None,
-            "a rival's pair must not have started, let alone half-landed"
-        );
-        assert!(stored(&db).await.0.contains(&"midterm".to_string()));
-
-        drop(held);
         rival.await.unwrap().unwrap();
-        assert_eq!(bit(&db, kind_ref("midterm")).await, Some(true));
+        assert_eq!(kind_bit(&db, "midterm").await, Some(true));
         assert!(!stored(&db).await.0.contains(&"midterm".to_string()));
     }
 
@@ -579,7 +627,7 @@ mod tests {
     /// a listed kind that refuses every grade.
     #[tokio::test]
     async fn two_edits_re_adding_the_same_kind_leave_it_in_service() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
             exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
             ..a_patch()
@@ -599,7 +647,7 @@ mod tests {
         let (kinds, _) = stored(&db).await;
         assert!(kinds.contains(&"midterm".to_string()), "back on the list");
         assert_eq!(
-            bit(&db, kind_ref("midterm")).await,
+            kind_bit(&db, "midterm").await,
             Some(false),
             "a kind the stored list offers must grade"
         );
@@ -608,7 +656,7 @@ mod tests {
     /// The same pair over meal slots, which retire on their own counters.
     #[tokio::test]
     async fn two_edits_dropping_the_same_slot_leave_it_retired() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
             meal_slots: Some(slots(&["breakfast", "snack"])),
             ..a_patch()
@@ -620,7 +668,7 @@ mod tests {
 
         let (_, stored_slots) = stored(&db).await;
         assert!(!stored_slots.contains(&"lunch".to_string()));
-        assert_eq!(bit(&db, slot_ref("lunch")).await, Some(true));
+        assert_eq!(slot_bit(&db, "lunch").await, Some(true));
     }
 
     // --- the stale slot name that wedged the whole list -------------------
@@ -641,7 +689,7 @@ mod tests {
     /// stored name is submittable; a new one with the same characters is not.
     #[tokio::test]
     async fn a_stored_slot_name_stays_submittable_but_a_new_one_does_not() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         a_school_with_a_stale_slot(&db).await;
 
         let edit = SettingsPatch {
@@ -666,7 +714,7 @@ mod tests {
     /// over unvalidated — the behaviour the wedge report leaned on.
     #[tokio::test]
     async fn an_unrelated_edit_carries_a_stale_slot_name_over() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         a_school_with_a_stale_slot(&db).await;
 
         let elsewhere = SettingsPatch {

@@ -144,7 +144,7 @@ mod tests {
     /// been taken, which is the row whose blob used to leak.
     #[tokio::test]
     async fn delete_returns_the_attachment_rows_it_removed() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         let note = create(
             &db,

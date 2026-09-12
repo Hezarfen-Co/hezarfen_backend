@@ -365,7 +365,7 @@ mod tests {
             PaymentRequestKey::try_new("abc_r").is_err(),
             "the key that spelled a reversal's id must not parse"
         );
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, _, manager) = one_charge(100, &db).await;
         let key = PaymentRequestKey::try_new("abc-r").unwrap();
         let credit_line = credit(
@@ -424,7 +424,7 @@ mod tests {
     /// a family unable to settle a bill the school itself refunded.
     #[tokio::test]
     async fn a_refund_frees_the_room_it_took_under_the_charge() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, student, manager) = one_charge(100, &db).await;
         let pay = |amount| {
             credit(
@@ -475,7 +475,7 @@ mod tests {
     /// out, so the room that refund freed is taken back.
     #[tokio::test]
     async fn a_reversed_refund_takes_its_room_back() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, _, manager) = one_charge(100, &db).await;
         let credit_line = credit(
             &db,
@@ -528,7 +528,7 @@ mod tests {
         use crate::db::fee_plan;
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
         let plan = fee_plan::create(

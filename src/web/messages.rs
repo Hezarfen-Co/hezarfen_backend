@@ -30,7 +30,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 #[derive(Deserialize, ToSchema)]
 struct SendMessage {
     /// The receiving user's id (find people via `GET /users/search`).
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     recipient_id: String,
     #[schema(example = "About today's study session", max_length = 200)]
     subject: String,

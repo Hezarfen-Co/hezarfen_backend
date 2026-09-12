@@ -309,27 +309,42 @@ pub async fn delete(
         .fetch_optional(&mut *tx)
         .await?
         .map(|row| row.due_at);
-        let gone = sqlx::query!(
-            r#"DELETE FROM homework_submission
+        // The gate runs as a lock-taking read, not a delete: the file rows
+        // must die BEFORE the submission row (their `submission` FK is
+        // `NO ACTION`), and that wipe is only honest if this delete has
+        // already won — so the open-not-frozen verdict and the row lock come
+        // first, files second, the submission row last. A rival withdrawal
+        // that beat us removed the row under its own lock; a grade that
+        // stamped it holds the homework lock first — either way `None`, one
+        // refusal as before.
+        let target = sqlx::query!(
+            r#"SELECT id AS "id: HomeworkSubmissionId",
+                      homework AS "homework: HomeworkId",
+                      app_user AS "user: UserId",
+                      text AS "text: SubmissionText",
+                      submitted_at AS "submitted_at: Timestamp",
+                      updated_at AS "updated_at: Timestamp",
+                      counted_on_time AS "counted_on_time: bool"
+               FROM homework_submission
                WHERE id = $1 AND graded_by_result IS NULL
-               RETURNING id AS "id: HomeworkSubmissionId",
-                         homework AS "homework: HomeworkId",
-                         app_user AS "user: UserId",
-                         text AS "text: SubmissionText",
-                         submitted_at AS "submitted_at: Timestamp",
-                         updated_at AS "updated_at: Timestamp",
-                         counted_on_time AS "counted_on_time: bool""#,
+               FOR UPDATE"#,
             submission.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(removed) = gone else {
+        let Some(removed) = target else {
             // Frozen, or already withdrawn by a rival — one refusal, as
             // before.
             return Ok(None);
         };
         sqlx::query!(
             "DELETE FROM homework_file WHERE submission = $1",
+            removed.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM homework_submission WHERE id = $1",
             removed.id.uuid()
         )
         .execute(&mut *tx)
@@ -361,9 +376,8 @@ pub async fn delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::{
-        HOMEWORK_ON_TIME_TOTAL_FIELD as ON_TIME, HOMEWORK_SUBMITTED_TOTAL_FIELD as SUBMITTED,
-    };
+    use sqlx::Row as _;
+
     use crate::db::homework as homework_db;
     use crate::domain::homework::HomeworkTitle;
     use crate::domain::subject::{SubjectDescription, SubjectName};
@@ -436,19 +450,13 @@ mod tests {
     /// The verdict `upsert` stored on the row — what `delete` debits off.
     /// `None` is a row from before the column existed.
     async fn stored_verdict(id: &HomeworkSubmissionId, db: &Database) -> Option<bool> {
-        let mut result = db
-            .query("SELECT VALUE counted_on_time FROM $sub")
-            .bind(("sub", id.record()))
+        let row = sqlx::query("SELECT counted_on_time FROM homework_submission WHERE id = $1")
+            .bind(id.uuid())
+            .fetch_optional(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<Option<bool>>>(0)
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .next()
+            .expect("the submission row exists");
+        row.try_get::<Option<bool>, _>(0).unwrap()
     }
 
     /// The web layer's computed flag, exactly as `SubmissionResponse::new`
@@ -464,41 +472,42 @@ mod tests {
 
     /// The two badge counters on a user row, absent counting as zero.
     async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({SUBMITTED} ?? 0), ({ON_TIME} ?? 0)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
-        let row = rows.first().cloned().unwrap_or_default();
+        let row = sqlx::query(
+            "SELECT homework_submitted_total, homework_on_time_total \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
         (
-            row.first().copied().unwrap_or(0),
-            row.get(1).copied().unwrap_or(0),
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
         )
     }
 
     #[tokio::test]
     async fn resubmit_keeps_submitted_at_and_restamps_updated_at() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        let first = upsert(
+        let (first, _) = upsert(
             &db,
             &homework,
             &user,
             Some(SubmissionText::try_new("draft").unwrap()),
+            false,
         )
         .await
         .unwrap()
         .unwrap();
         // A re-submit lands on the same row: submitted_at (the first hand-in)
         // pinned, updated_at moves forward, and the text can be cleared.
-        let second = upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        let (second, _) = upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         // ... and it is one submission, not two: the edit moves no counter.
         assert_eq!(counters(&user, &db).await, (1, 1));
         assert_eq!(first.get_id(), second.get_id());
@@ -529,16 +538,16 @@ mod tests {
         use crate::db::homework_result;
         use crate::domain::homework_result::HomeworkStatus;
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
         let graded = |value| {
             let text = SubmissionText::try_new(value).unwrap();
-            upsert(&db, &homework, &user, Some(text))
+            upsert(&db, &homework, &user, Some(text), false)
         };
 
-        let version_a = graded("version A").await.unwrap().unwrap();
+        let (version_a, _) = graded("version A").await.unwrap().unwrap();
         assert!(!is_graded(&db, version_a.get_id()).await.unwrap());
 
         assert_eq!(counters(&user, &db).await, (1, 1));
@@ -589,7 +598,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!is_graded(&db, version_a.get_id()).await.unwrap());
-        let reopened = graded("version B").await.unwrap().unwrap();
+        let (reopened, _) = graded("version B").await.unwrap().unwrap();
         assert_eq!(
             reopened.get_text().map(SubmissionText::as_str),
             Some("version B")
@@ -604,15 +613,16 @@ mod tests {
 
     #[tokio::test]
     async fn touch_moves_updated_at_but_not_submitted_at_or_text() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        let original = upsert(
+        let (original, _) = upsert(
             &db,
             &homework,
             &user,
             Some(SubmissionText::try_new("photo answer").unwrap()),
+            false,
         )
         .await
         .unwrap()
@@ -636,11 +646,14 @@ mod tests {
     /// and the last assertion reads `(2, 2)` — the farm.
     #[tokio::test]
     async fn submit_delete_submit_is_worth_one_submission() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
 
         let mine = read_for(&db, homework.get_id(), &user)
@@ -658,7 +671,10 @@ mod tests {
                 .is_none()
         );
 
-        upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
     }
 
@@ -668,13 +684,19 @@ mod tests {
     /// what it took.
     #[tokio::test]
     async fn a_late_submission_counts_as_submitted_but_not_on_time() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let punctual = a_homework(far_future(), &db).await;
         let overdue = a_homework(Timestamp::from_millis(1), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &punctual, &user, None).await.unwrap().unwrap();
-        upsert(&db, &overdue, &user, None).await.unwrap().unwrap();
+        upsert(&db, &punctual, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        upsert(&db, &overdue, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
 
         // Withdrawing the *late* one takes back only the submission, never the
@@ -707,20 +729,25 @@ mod tests {
     /// to prevent.
     #[tokio::test]
     async fn a_row_with_no_stored_verdict_falls_back_to_the_deadline() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let punctual = a_homework(far_future(), &db).await;
         let overdue = a_homework(Timestamp::from_millis(1), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &punctual, &user, None).await.unwrap().unwrap();
-        upsert(&db, &overdue, &user, None).await.unwrap().unwrap();
+        upsert(&db, &punctual, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        upsert(&db, &overdue, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
         // Aged into legacy rows: the counters keep the credit, the rows lose the
         // verdict — the exact state of every submission on an existing volume.
-        db.query("UPDATE homework_submission UNSET counted_on_time")
+        sqlx::query("UPDATE homework_submission SET counted_on_time = NULL")
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         let late = read_for(&db, overdue.get_id(), &user)
@@ -752,14 +779,17 @@ mod tests {
     /// stored `true` against a live `late = true`.
     #[tokio::test]
     async fn a_deadline_moved_under_the_caller_is_judged_by_the_stored_value() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_student("ogrenci", &db).await;
 
         // Extended at 23:59: the snapshot says the deadline has passed, the
         // store says it has not. A hand-in now is on time.
         let extended = a_homework(Timestamp::from_millis(1), &db).await;
         deadline_moves_to(&extended, far_future(), &db).await;
-        let landed = upsert(&db, &extended, &user, None).await.unwrap().unwrap();
+        let (landed, _) = upsert(&db, &extended, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
         assert_eq!(stored_verdict(landed.get_id(), &db).await, Some(true));
         assert!(!late_flag(&landed, &db).await);
@@ -768,7 +798,10 @@ mod tests {
         // the deadline is gone. The same hand-in is late.
         let pulled = a_homework(far_future(), &db).await;
         deadline_moves_to(&pulled, Timestamp::from_millis(1), &db).await;
-        let missed = upsert(&db, &pulled, &user, None).await.unwrap().unwrap();
+        let (missed, _) = upsert(&db, &pulled, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
         assert_eq!(stored_verdict(missed.get_id(), &db).await, Some(false));
         assert!(late_flag(&missed, &db).await);

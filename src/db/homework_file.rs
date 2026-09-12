@@ -301,10 +301,34 @@ mod tests {
             None,
             crate::domain::timestamp::Timestamp::from_millis(1),
             None,
-            &UserId::from_key("teacher"),
+            &a_teacher(db).await,
         )
         .await
         .unwrap()
+    }
+
+    /// A real `app_user` row: submitters are foreign keys too.
+    async fn a_student(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash, role) VALUES ($1, $2, 'x', 'student')")
+            .bind(user.uuid())
+            .bind(format!("s-{}", &user.key()[..8]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
+    /// A real `app_user` row: creators and submitters are foreign keys now.
+    async fn a_teacher(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash, role) VALUES ($1, $2, 'x', 'teacher')")
+            .bind(user.uuid())
+            .bind(format!("t-{}", &user.key()[..8]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
     }
 
     fn a_file(submission: &HomeworkSubmissionId) -> HomeworkFile {
@@ -319,32 +343,27 @@ mod tests {
     /// The counter as *stored* — the only witness that the seat and the row
     /// moved together, since every other read counts the rows themselves.
     async fn stored_count(submission: &HomeworkSubmissionId, db: &Database) -> i64 {
-        db.query("SELECT VALUE file_count FROM $sub")
-            .bind(("sub", submission.record()))
+        sqlx::query("SELECT file_count FROM homework_submission WHERE id = $1")
+            .bind(submission.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .take::<Vec<i64>>(0)
+            .try_get::<i64, _>(0)
             .unwrap()
-            .into_iter()
-            .next()
-            .unwrap_or(0)
     }
     #[tokio::test]
     async fn rows_scope_to_their_submission_gc_and_cap() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let hw = a_homework(&db).await;
         let homework = hw.get_id().clone();
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let user = a_student(&db).await;
         // A real submission row, so the GC join through it resolves.
-        let submission = crate::db::homework_submission::upsert(&db, &hw, &user, None)
+        let (submission, _) = crate::db::homework_submission::upsert(&db, &hw, &user, None, false)
             .await
             .unwrap()
             .unwrap();
         let sub_a = submission.get_id().clone();
-        let sub_b = HomeworkSubmissionId::composite(
-            &homework,
-            &UserId::from_key("01TESTUSERBBBBBBBBBBBBBBBB"),
-        );
+        let sub_b = HomeworkSubmissionId::generate();
 
         let stored = insert(&db, a_file(&sub_a)).await.unwrap().unwrap();
         // Readable under its own submission, invisible under another.
@@ -380,7 +399,7 @@ mod tests {
             read_in_homework(
                 &db,
                 stored.get_id(),
-                &HomeworkId::from_key("01TESTHWBBBBBBBBBBBBBBBBBB"),
+                &HomeworkId::from_key("019732e3-7b00-7000-8000-00000000ebbe"),
             )
             .await
             .unwrap()
@@ -422,11 +441,11 @@ mod tests {
         use crate::db::homework_result;
         use crate::domain::homework_result::HomeworkStatus;
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let hw = a_homework(&db).await;
         let homework = hw.get_id().clone();
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let submission = crate::db::homework_submission::upsert(&db, &hw, &user, None)
+        let user = a_student(&db).await;
+        let (submission, _) = crate::db::homework_submission::upsert(&db, &hw, &user, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -439,7 +458,7 @@ mod tests {
             &user,
             HomeworkStatus::try_new("done").unwrap(),
             None,
-            &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
+            &UserId::from_key("019732e3-7b00-7000-8000-00000000acdc"),
         )
         .await
         .unwrap();

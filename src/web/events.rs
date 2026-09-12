@@ -912,7 +912,7 @@ async fn unregister(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     /// A user at `role`, minted through the real create path.
@@ -936,7 +936,7 @@ mod tests {
     /// helper is what must hold when a future route arrives with `CurrentUser`.
     #[tokio::test]
     async fn demoted_event_creator_loses_management() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = user("ogretmen", Role::Teacher, &db).await;
         let event = service::event::create(
             &db,

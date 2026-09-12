@@ -14,7 +14,7 @@ use crate::service::exam_question;
 pub(crate) struct CreateQuestion {
     /// The subject this question belongs to — one of the exam's course's
     /// subjects (`GET /courses/{id}/subjects`). Required.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
     /// The question itself.
     #[schema(example = "What is 2 + 2?", max_length = 2000)]
@@ -435,7 +435,7 @@ pub(crate) async fn delete_question(
 pub(crate) struct InstantiateFromBank {
     /// The subject to file the new question under — one of the exam's course's
     /// subjects (the same-course rule the bank row itself is exempt from).
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
 }
 

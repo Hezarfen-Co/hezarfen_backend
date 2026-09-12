@@ -706,7 +706,7 @@ async fn my_students(
 /// A user's public profile. Contact details are not part of it, at any role.
 #[derive(Serialize, ToSchema)]
 struct ProfileResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "ada")]
     username: String,
@@ -763,7 +763,7 @@ struct ProfileAvatar {
 /// `GET /classes/{id}`, which is teacher+.
 #[derive(Serialize, ToSchema)]
 struct ProfileClassRef {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "9-A")]
     name: String,
@@ -774,7 +774,7 @@ struct ProfileClassRef {
 /// A course as a profile shows it — a label, nothing more.
 #[derive(Serialize, ToSchema)]
 struct ProfileCourseRef {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "Matematik")]
     title: String,

@@ -251,59 +251,6 @@ pub async fn remove(
 mod tests {
     use super::*;
 
-    /// The boot repair of `enrollment_count` **against a real server**, and
-    /// `#[ignore]`d for it: the pass counts rows off `enrollment`'s indexed
-    /// `course` field, and an aggregate over an indexed field is exactly where
-    /// the embedded engine and the server are known to differ (`count()` comes
-    /// back `{count: N}` from one and a bare int from the other, which
-    /// `option<int>` would refuse). `array::len` over ids is the spelling that
-    /// dodges it — this is what proves it on the store that bites.
-    ///
-    /// Both halves in one boot: `staff` is the row the sweep deletes (their
-    /// seat must come back), and `empty` is the course a *past* sweep already
-    /// stranded — count above zero with no rows left, so it forms no group and
-    /// only a per-course pass ever visits it. The second `migrate` pins that the
-    /// repair converges rather than overwriting: it must write nothing.
-    #[tokio::test]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
-    async fn the_count_repair_recounts_on_a_real_server() {
-        let (db, _serialized) = crate::database::init_test_server("enrollment_repair").await;
-        db.query(
-            "CREATE user:t SET username = 't', password_hash = 'x', role = 'teacher';
-             CREATE user:a SET username = 'a', password_hash = 'x', role = 'student';
-             CREATE user:b SET username = 'b', password_hash = 'x', role = 'student';
-             CREATE course:live SET creator = user:t, title = 'l', description = '',
-                 enrollment_count = 9;
-             CREATE course:empty SET creator = user:t, title = 'e', description = '',
-                 enrollment_count = 4;
-             CREATE enrollment:live_a SET course = course:live, user = user:a, enrolled_by = user:t;
-             CREATE enrollment:live_b SET course = course:live, user = user:b, enrolled_by = user:t;
-             CREATE enrollment:live_t SET course = course:live, user = user:t, enrolled_by = user:t;",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-
-        async fn counts(db: &Database) -> Vec<i64> {
-            let mut result = db
-                .query("SELECT VALUE enrollment_count FROM course ORDER BY id")
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
-            result.take::<Vec<i64>>(0).unwrap()
-        }
-
-        crate::database::migrate(db.as_ref()).await.unwrap();
-        // `course:empty` sorts before `course:live`: stranded count cleared, and
-        // the live course recounted to its two students — the teacher's row was
-        // swept and handed its seat back in the same boot.
-        assert_eq!(counts(&db).await, vec![0, 2]);
-
-        crate::database::migrate(db.as_ref()).await.unwrap();
-        assert_eq!(counts(&db).await, vec![0, 2], "the repair converges");
-    }
 
     /// A pumped row that vanishes under the disown — a concurrent unenroll, or
     /// the sweep a role change runs — must answer the row the caller was
@@ -312,10 +259,10 @@ mod tests {
     /// server error on an ordinary `POST /courses/{id}/enrollments`.
     #[tokio::test]
     async fn a_vanished_row_is_not_an_internal_error() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let class = crate::domain::class_group::ClassGroupId::from_key("9a");
-        let course = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
-        let student = UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8U");
+        let course = CourseId::from_key("019732e3-7b00-7000-8000-00000000dead");
+        let student = UserId::from_key("019732e3-7b00-7000-8000-00000000deae");
         // Never written: the same store state a delete in the window leaves.
         let ghost = Enrollment {
             id: EnrollmentId::composite(&course, &student),
@@ -337,7 +284,7 @@ mod tests {
     async fn a_hand_placed_enrollment_stores_no_source_key() {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("teacher");
         let course = crate::db::course::create(
             &db,

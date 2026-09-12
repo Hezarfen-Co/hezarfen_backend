@@ -192,7 +192,7 @@ mod tests {
     /// the count stays at the accepted rows.
     #[tokio::test]
     async fn insert_refuses_at_the_cap() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = note_of(&db, "n").await;
         for index in 0..MAX_COURSE_NOTE_FILES {
             let file = CourseNoteFile::new(
@@ -221,7 +221,7 @@ mod tests {
     /// delete hands its slot back to the note.
     #[tokio::test]
     async fn file_keys_and_delete_slot_release() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = note_of(&db, "n").await;
         let course = note.get_course().clone();
         let file = CourseNoteFile::new(

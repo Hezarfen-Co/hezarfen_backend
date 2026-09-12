@@ -58,7 +58,7 @@ struct PublishSlots {
 #[derive(Deserialize, ToSchema)]
 struct BookAppointment {
     /// The slot to take, from `GET /appointments/slots`.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     slot: String,
     /// Why you want the meeting — required, the teacher decides on it.
     #[schema(max_length = 1000, example = "Ders notlarını konuşmak istiyorum")]
@@ -103,7 +103,7 @@ struct AcceptReschedule {
 
 #[derive(Serialize, ToSchema)]
 struct SlotResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     /// Whose calendar this is.
     teacher: PersonRef,
@@ -134,7 +134,7 @@ impl SlotResponse {
 
 #[derive(Serialize, ToSchema)]
 struct AppointmentResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     /// The slot this booking sits on.
     slot: String,
@@ -901,7 +901,7 @@ async fn ensure_requester(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     /// A user at `role`, minted through the real create path.
@@ -922,7 +922,7 @@ mod tests {
     /// level that has to hold when the next route arrives with `CurrentUser`.
     #[tokio::test]
     async fn demoted_slot_owner_loses_management() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let owner = user("ogretmen", Role::Teacher, &db).await;
         let slot = service::appointment_slot::create(
             &db,

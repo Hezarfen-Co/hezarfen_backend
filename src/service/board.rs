@@ -229,7 +229,7 @@ mod tests {
     /// participant on the other.
     #[tokio::test]
     async fn an_outsider_gets_404_and_a_participant_gets_403() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         // (fixtures rebuilt against Postgres in wave 3)
         let _ = &db;
     }

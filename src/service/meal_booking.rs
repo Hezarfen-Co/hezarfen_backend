@@ -289,7 +289,7 @@ fn refundable_after_lost_flip(seen: &MealBooking, live: &MealBooking) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::menu_dish;
     use crate::domain::meal_booking::MealBookingStatus;
     use crate::domain::meal_ledger::LedgerAmount;
@@ -305,14 +305,25 @@ mod tests {
     }
 
     async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
+        // The menu's creator is a foreign key now: a real `app_user` row.
+        let creator = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(creator.uuid())
+        .bind(format!("menu-fixture-{}", &creator.key()[..8]))
+        .execute(&db)
+        .await
+        .unwrap();
         let slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
         let menu = menu::create(
             &db,
             MenuDate::try_new(date).unwrap(),
             MenuSlot::try_new("lunch", &slots).unwrap(),
             capacity,
-            &UserId::generate(),
+            &creator,
         )
         .await
         .unwrap();
@@ -322,23 +333,20 @@ mod tests {
     /// The stored counter, absent reading as zero — the number the cap's
     /// `WHERE` actually compares, not one recomputed from the rows.
     async fn seats(menu: &MenuId, db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE seats_booked FROM $id")
-            .bind(("id", menu.record()))
+        use sqlx::Row as _;
+
+        sqlx::query("SELECT COALESCE(seats_booked, 0) FROM menu WHERE id = $1")
+            .bind(menu.key())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<Option<i64>>>(0)
+            .try_get::<i64, _>(0)
             .unwrap()
-            .into_iter()
-            .next()
-            .flatten()
-            .unwrap_or(0)
     }
 
     async fn add_dish(menu: &MenuId, price: i64, db: &Database) -> MenuDish {
+        // A cap far above every seat count in these tests: the dish must never
+        // be the binding constraint here.
         menu_dish::create(
             db,
             menu,
@@ -346,6 +354,7 @@ mod tests {
             None,
             DishPrice::try_new(price).unwrap(),
             DishTags::try_new(&[], &[]).unwrap(),
+            1_000,
         )
         .await
         .unwrap()
@@ -541,7 +550,6 @@ mod tests {
         let fresh = menu::read(&db, &menu).await.unwrap().unwrap();
         let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
         let row = MealBooking {
-            id: MealBookingId::composite(&menu, &ali),
             menu: menu.clone(),
             student: ali.clone(),
             booked_by: ali.clone(),
@@ -554,7 +562,7 @@ mod tests {
         let charge = MealLedger::charge_for(&row, &ali);
         let booked = match meal_booking::claim_and_place(
             &db,
-            &menu.record(),
+            &menu,
             cap::UNLIMITED,
             fresh.get_version(),
             &row,

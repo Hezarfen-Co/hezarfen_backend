@@ -210,7 +210,7 @@ pub async fn set_preferences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, init_mem};
+    use crate::database::{Database, init_test_db};
     use crate::domain::user::Password;
 
     async fn a_user(username: &str, db: &Database) -> User {
@@ -236,7 +236,7 @@ mod tests {
     async fn the_cascade_returns_the_boards_it_stripped() {
         use crate::domain::board::BoardTitle;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
         let board = crate::db::board::create(
@@ -276,7 +276,7 @@ mod tests {
         use crate::domain::board::BoardTitle;
         use crate::domain::board_stroke::BOARD_CLOSED;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
         let board = crate::db::board::create(
@@ -352,7 +352,7 @@ mod tests {
         use crate::domain::timestamp::Timestamp;
         use crate::service::appointment;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let staff = |name: &'static str, db: Database| async move {
             let teacher = a_user(name, &db).await;
             set_role(&db, teacher.get_id(), Role::Teacher)

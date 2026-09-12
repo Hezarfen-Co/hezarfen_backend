@@ -106,18 +106,22 @@ pub async fn list_for_class(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::class_member::tests::{a_class, a_course, counter, exists, rows, source_of};
-    use crate::domain::class_course::ClassCourseId;
+    use crate::db::class_member::tests::{
+        a_class, a_course, counter, course_exists, link_exists, rows, source_of,
+    };
     use crate::service::class_member;
 
     /// Attaching seeds the course from the roster the class already holds.
     #[tokio::test]
     async fn an_attach_enrolls_the_whole_roster() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
-        let students = [UserId::from_key("a"), UserId::from_key("b")];
+        let students = [
+            crate::db::class_member::tests::fixture_user(&db, "a").await,
+            crate::db::class_member::tests::fixture_user(&db, "b").await,
+        ];
         for student in &students {
             class_member::add(&db, &class, student, &manager)
                 .await
@@ -131,8 +135,8 @@ mod tests {
                 Some(Some(class.clone()))
             );
         }
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 2);
-        assert_eq!(counter("class_course_count", class.record(), &db).await, 1);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 2);
+        assert_eq!(counter("class_course_count", class.uuid(), &db).await, 1);
 
         let again = attach(&db, &class, &algebra, &manager).await;
         assert!(
@@ -145,42 +149,41 @@ mod tests {
     /// enrollments, the counter unmoved, and no attachment row.
     #[tokio::test]
     async fn a_roster_that_does_not_fit_attaches_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let class = a_class("9-A", &db).await;
         let tight = a_course("algebra", Some(2), &db).await;
-        for student in ["a", "b", "c"] {
-            class_member::add(&db, &class, &UserId::from_key(student), &manager)
-                .await
-                .unwrap();
+        for name in ["a", "b", "c"] {
+            let student = crate::db::class_member::tests::fixture_user(&db, name).await;
+            class_member::add(&db, &class, &student, &manager).await.unwrap();
         }
 
         let refused = attach(&db, &class, &tight, &manager).await;
         assert!(
             matches!(refused, Err(AppError::ConflictCoded { code, ref message })
-                if code == "course_full" && message.contains(tight.key())),
+                if code == "course_full" && message.contains(tight.key().as_str())),
             "the refusal must be coded `course_full` and name the course: {refused:?}"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM enrollment", &db).await,
+            rows("enrollment", &db).await,
             0,
             "the two seats that did fit must be given back with the third"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM class_course", &db).await,
+            rows("class_course", &db).await,
             0,
             "…and no attachment row may survive"
         );
-        assert_eq!(counter("enrollment_count", tight.record(), &db).await, 0);
-        assert_eq!(counter("class_course_count", class.record(), &db).await, 0);
+        assert_eq!(counter("enrollment_count", tight.uuid(), &db).await, 0);
+        assert_eq!(counter("class_course_count", class.uuid(), &db).await, 0);
     }
 
     /// A hand-placed row is skipped on the way in and left standing on the way
     /// out — the class never owned it.
     #[tokio::test]
     async fn a_hand_placed_row_survives_the_detach() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let student = UserId::from_key("student");
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
@@ -198,14 +201,14 @@ mod tests {
             "an attach may not adopt a hand-placed row"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             1,
             "…nor charge a seat for it"
         );
 
         detach(&db, &class, &algebra).await.unwrap();
         assert_eq!(source_of(&algebra, &student, &db).await, Some(None));
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 1);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
         let again = detach(&db, &class, &algebra).await;
         assert!(
             matches!(again, Err(AppError::NotFound)),
@@ -217,8 +220,8 @@ mod tests {
     /// seats back.
     #[tokio::test]
     async fn a_detach_sweeps_the_rows_it_pumped() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let student = UserId::from_key("student");
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
@@ -229,10 +232,10 @@ mod tests {
 
         detach(&db, &class, &algebra).await.unwrap();
         assert_eq!(source_of(&algebra, &student, &db).await, None);
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 0);
-        assert_eq!(counter("class_course_count", class.record(), &db).await, 0);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
+        assert_eq!(counter("class_course_count", class.uuid(), &db).await, 0);
         assert_eq!(
-            rows("SELECT VALUE id FROM class_member", &db).await,
+            rows("class_member", &db).await,
             1,
             "the two axes are independent: dropping the course may not drop \
              the student out of the class as well"
@@ -246,8 +249,8 @@ mod tests {
     /// second then finds nobody left and takes the seat back.
     #[tokio::test]
     async fn a_detach_hands_a_shared_row_to_the_class_that_still_claims_it() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let student = UserId::from_key("student");
         let algebra = a_course("algebra", None, &db).await;
         let first = a_class("9-A", &db).await;
@@ -264,7 +267,7 @@ mod tests {
             "the second attach must skip the row the first wrote"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             1,
             "…and pay no second seat for it"
         );
@@ -276,7 +279,7 @@ mod tests {
             "the row must be handed to the class that still claims it"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             1,
             "a repair is not a release"
         );
@@ -287,15 +290,15 @@ mod tests {
             None,
             "the last claimant leaving takes the row with it"
         );
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 0);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
     }
 
     /// The same repair along the member axis: removing the student from the
     /// class that owns the row hands it to the other class they are in.
     #[tokio::test]
     async fn a_member_removal_hands_a_shared_row_over_too() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let student = UserId::from_key("student");
         let algebra = a_course("algebra", None, &db).await;
         let first = a_class("9-A", &db).await;
@@ -313,11 +316,11 @@ mod tests {
             Some(Some(second.clone())),
             "the student is still in the second class, so the row stays"
         );
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 1);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
 
         class_member::remove(&db, &second, &student).await.unwrap();
         assert_eq!(source_of(&algebra, &student, &db).await, None);
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 0);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
     }
 
     /// The restore half of the pivot claim: it bumps the course's counter to
@@ -327,7 +330,7 @@ mod tests {
     /// leftover bump behind.
     #[tokio::test]
     async fn the_pivot_claim_gives_the_courses_counter_back_untouched() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         let absent = "SELECT VALUE id FROM course WHERE enrollment_count = NONE";
@@ -373,19 +376,9 @@ mod tests {
     /// it commits both and answers `Ok` to each, so this passes there on broken
     /// code.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_class_course_link_never_outlives_the_course() {
-        let (db, _serialized) = crate::database::init_test_server("class_course_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE course WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let (mut orphans, mut swept, mut miscounted) = (0, 0, 0);
         for round in 0..4 {
             let class = a_class(&format!("9-{round}"), &db).await;
@@ -395,17 +388,25 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
+            // The old engine needed a schema event to hold the delete's
+            // window open; Postgres puts the racing delete and attach on the
+            // same rows, so a barrier start covers every interleaving — the
+            // link row may never outlive the course in any of them.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::course::delete(&db, course).await })
+                let (db, gate, course) = (db.clone(), gate.clone(), course.clone());
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::course::delete(&db, course).await
+                })
             };
-            // The attach starts inside the held window — the course row is gone
-            // but uncommitted, which is exactly what a course read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let child = {
-                let (db, class, algebra, manager) =
-                    (db.clone(), class.clone(), algebra.clone(), manager.clone());
-                tokio::spawn(async move { attach(&db, &class, &algebra, &manager).await })
+                let (db, class, algebra, manager, gate) =
+                    (db.clone(), class.clone(), algebra.clone(), manager.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    attach(&db, &class, &algebra, &manager).await
+                })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
             // A 404 for the attach, or a refusal for the delete, is a correct
@@ -416,13 +417,12 @@ mod tests {
             );
 
             // Stored state is the whole verdict; a return value is not evidence.
-            if !exists(algebra.record(), &db).await {
+            if !course_exists(&algebra, &db).await {
                 swept += 1;
-                let link = ClassCourseId::composite(&class, &algebra);
-                if exists(link.record(), &db).await {
+                if link_exists(&class, &algebra, &db).await {
                     orphans += 1;
                 }
-                miscounted += counter("class_course_count", class.record(), &db).await;
+                miscounted += counter("class_course_count", class.uuid(), &db).await;
             } else if matches!(drop_it, Ok(true)) {
                 panic!("round {round}: the delete reported success but the course is still there");
             }
@@ -430,7 +430,7 @@ mod tests {
         eprintln!("Course::delete raced by an attach: {swept}/4 rounds deleted the course");
         assert!(
             swept > 0,
-            "no round ever deleted the course, so the window was never reached"
+            "no round ever deleted the course, so the race never actually ran"
         );
         assert_eq!(orphans, 0, "a class_course link outlived its course");
         assert_eq!(miscounted, 0, "a class counts a course that is gone");

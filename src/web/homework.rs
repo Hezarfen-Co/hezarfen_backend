@@ -407,7 +407,7 @@ async fn delete_homework(
 /// separately from `GET /homework/{id}/submission/files/{fid}`.
 #[derive(Serialize, ToSchema)]
 struct HomeworkFileResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     /// The uploader's original filename.
     #[schema(example = "odev.pdf")]
@@ -886,7 +886,7 @@ async fn delete_submission_file(
 #[derive(Deserialize, ToSchema)]
 struct GradeHomework {
     /// The student being graded.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user: String,
     /// The verdict: `done`, `incomplete`, or `missing`.
     #[schema(example = "done")]

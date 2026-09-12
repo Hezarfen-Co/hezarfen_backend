@@ -183,7 +183,7 @@ struct GradeResult {
     #[schema(example = 85, minimum = 0, maximum = 100)]
     mark: i64,
     /// The student being graded.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user_id: String,
 }
 

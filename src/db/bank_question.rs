@@ -414,33 +414,33 @@ mod tests {
         .unwrap()
     }
 
-    /// A row stored before `visibility` existed has no such key — it must decode
-    /// as `private`, the safe value. Asserted on the decoder itself, so no
-    /// schema DEFAULT can paper over it: a `school` default here would publish
-    /// every pre-existing template in the school at once.
+    /// A row without a visibility of its own must decode as `private`, the
+    /// safe value. The old engine could store a row with the field absent;
+    /// Postgres carries the same guarantee in the schema instead — the column
+    /// is `NOT NULL DEFAULT 'private'`, so a `school` default here would
+    /// publish every pre-existing template in the school at once. The insert
+    /// below is written exactly as a pre-visibility row arrives: no column.
     #[tokio::test]
     async fn a_row_without_the_field_decodes_private() {
-        use surrealdb::types::Value;
-
-        let db = crate::database::init_mem().await.unwrap();
-        let question = create(
-            &db,
-            UserId::generate(),
-            SubjectId::generate(),
-            QuestionText::try_new("q").unwrap(),
-            QuestionPoints::try_new(1).unwrap(),
-            spec(),
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'q', 'x')")
+            .bind(owner.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        let id = BankQuestionId::generate();
+        sqlx::query(
+            "INSERT INTO bank_question (id, owner, text, kind, points, created_at) \
+             VALUES ($1, $2, 'q', 'multiple_choice', 1, 0)",
         )
+        .bind(id.uuid())
+        .bind(owner.uuid())
+        .execute(&db)
         .await
         .unwrap();
-        assert_eq!(question.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
 
-        let mut stored = question.into_value();
-        let Value::Object(map) = &mut stored else {
-            panic!("a bank question serializes to an object");
-        };
-        assert!(map.remove("visibility").is_some());
-        let old = BankQuestion::from_value(stored).unwrap();
+        let old = read(&db, &id).await.unwrap().expect("the row is there");
         assert_eq!(old.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
         assert!(!old.get_visibility().is_school());
     }
@@ -449,7 +449,7 @@ mod tests {
     /// page can contain — never someone else's private templates.
     #[tokio::test]
     async fn list_hides_private_templates_from_others() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         let other = UserId::generate();
         let private = create(
@@ -516,7 +516,7 @@ mod tests {
     /// still answer `Ok`.
     #[tokio::test]
     async fn a_merge_built_on_a_stale_snapshot_is_refused() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         let stale = create(
             &db,
@@ -564,7 +564,7 @@ mod tests {
     /// row, and `private` means "my own drafts" for everyone but an admin.
     #[tokio::test]
     async fn visibility_filter_narrows_never_widens() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         let other = UserId::generate();
         let mine = |text: &str| {
@@ -638,14 +638,10 @@ mod tests {
     /// "0"), and questions authored by hand never counted.
     #[tokio::test]
     async fn usage_counts_tallies_a_page_in_one_statement() {
-        // One statement, so a page costs one round trip — a `;` here would mean
-        // the per-row N+1 crept back in.
-        assert!(
-            !USAGE_COUNTS_SQL.contains(';'),
-            "usage_counts must be one statement"
-        );
-
-        let db = crate::database::init_mem().await.unwrap();
+        // One statement, so a page costs one round trip: the tally is a single
+        // static `query!` (a `GROUP BY` with no loop around it), which the
+        // compiler now checks the way the old constant asserted.
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         let template = |text: &str| {
             create(
@@ -712,10 +708,10 @@ mod tests {
 
         let ids = [used_twice.get_id(), used_once.get_id(), unused.get_id()];
         let counts = usage_counts(&db, &ids).await.unwrap();
-        assert_eq!(counts.get(used_twice.get_id().key()).copied(), Some(2));
-        assert_eq!(counts.get(used_once.get_id().key()).copied(), Some(1));
+        assert_eq!(counts.get(&used_twice.get_id().key()).copied(), Some(2));
+        assert_eq!(counts.get(&used_once.get_id().key()).copied(), Some(1));
         assert_eq!(
-            counts.get(unused.get_id().key()),
+            counts.get(&unused.get_id().key()),
             None,
             "unused stays absent"
         );
@@ -724,14 +720,14 @@ mod tests {
         // A template outside the page is never counted into it.
         let narrow = usage_counts(&db, &[used_once.get_id()]).await.unwrap();
         assert_eq!(narrow.len(), 1);
-        assert_eq!(narrow.get(used_once.get_id().key()).copied(), Some(1));
+        assert_eq!(narrow.get(&used_once.get_id().key()).copied(), Some(1));
         // An empty page asks nothing at all.
         assert!(usage_counts(&db, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn list_is_school_wide() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         for _ in 0..2 {
             create(
                 &db,
@@ -755,7 +751,7 @@ mod tests {
     /// The window is SQL, not an in-memory slice, and `total` ignores it.
     #[tokio::test]
     async fn list_pages_newest_first_and_filters_text() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let owner = UserId::generate();
         for i in 0..5 {
             create(
@@ -806,7 +802,7 @@ mod tests {
     /// Turkish `İ`/`ı` must not split the search into two disjoint halves.
     #[tokio::test]
     async fn list_text_filter_folds_turkish_casing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         create(
             &db,
             UserId::generate(),

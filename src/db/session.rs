@@ -87,14 +87,27 @@ mod tests {
 
     #[tokio::test]
     async fn purge_expired_removes_only_past_sessions() {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query(
-            "CREATE session SET user = type::record('user', 'u'), token = 'past', expires_at = 1;
-             CREATE session SET user = type::record('user', 'u'), token = 'future', expires_at = 99999999999999;",
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The session's owner is a foreign key now: a real `app_user` row
+        // under the fixture's fixed key, then two rows either side of `now`.
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000cab0");
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'purge-fixture', 'x')",
         )
+        .bind(user.uuid())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_session (id, app_user, token, expires_at) \
+             VALUES ($1, $3, 'past', 1), ($2, $3, 'future', 99999999999999)",
+        )
+        .bind(UserId::generate().uuid())
+        .bind(UserId::generate().uuid())
+        .bind(user.uuid())
+        .execute(&db)
+        .await
         .unwrap();
 
         assert_eq!(purge_expired(&db).await.unwrap(), 1);

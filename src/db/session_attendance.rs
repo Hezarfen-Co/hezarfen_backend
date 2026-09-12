@@ -299,7 +299,7 @@ pub async fn remove(
 mod tests {
     use super::*;
     use crate::constant::DEFAULT_ATTENDANCE_STATUSES;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::course_session::SessionTopic;
     use crate::domain::role::Role;
 
@@ -307,15 +307,19 @@ mod tests {
     /// writes nothing at all to a record that does not exist), and the live
     /// role is what decides whether the attended counter moves.
     async fn a_user(key: &str, role: Role, db: &Database) -> UserId {
-        let user = UserId::from_key(key);
-        db.query("CREATE $usr SET username = $name, password_hash = 'x', role = $role")
-            .bind(("usr", user.record()))
-            .bind(("name", key.to_string()))
-            .bind(("role", role))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        // Minted fresh: the id is a real parent row now, and the minted uuid
+        // keeps repeated calls (same label, new person) collision-free.
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{key}-{}", &user.key()[..8]))
+        .bind(role.as_str())
+        .execute(db)
+        .await
+        .unwrap();
         user
     }
 
@@ -376,7 +380,7 @@ mod tests {
     /// a re-mark and a swap within the same class are both no-ops.
     #[tokio::test]
     async fn the_counter_follows_every_crossing_and_no_other_move() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
         let session = a_session(&teacher, &db).await;
@@ -410,7 +414,7 @@ mod tests {
     /// once: the whole roster, and every later correction, ride the same stamp.
     #[tokio::test]
     async fn the_first_roll_call_counts_the_lesson_once() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let other = a_teacher("o", &db).await;
         let session = a_session(&teacher, &db).await;
@@ -439,7 +443,7 @@ mod tests {
     /// two hundred lessons for next week and hold all of them this afternoon.
     #[tokio::test]
     async fn a_lesson_that_has_not_started_holds_nothing_yet() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
         let next_week =
@@ -474,7 +478,7 @@ mod tests {
     /// lesson held.
     #[tokio::test]
     async fn a_teacher_marked_present_earns_nothing_for_attending() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let session = a_session(&teacher, &db).await;
 
@@ -501,7 +505,7 @@ mod tests {
     /// Two lessons are two counts — the counter is per row, not per student.
     #[tokio::test]
     async fn each_lesson_counts_once_for_the_student_marked() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
         let other = a_student("o", &db).await;
@@ -519,7 +523,7 @@ mod tests {
     /// that was counted.
     #[tokio::test]
     async fn removing_a_row_gives_back_only_what_it_took() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
 
@@ -562,7 +566,7 @@ mod tests {
     /// a stale row starts from, the counter never goes negative.
     #[tokio::test]
     async fn the_counter_never_goes_below_zero() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
 
@@ -577,14 +581,11 @@ mod tests {
                 .unwrap();
             sessions.push(session);
         }
-        db.query(format!(
-            "UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} = 0"
-        ))
-        .bind(("usr", student.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        sqlx::query("UPDATE app_user SET lessons_attended_total = 0 WHERE id = $1")
+            .bind(student.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
 
         for session in &sessions {
             mark(&db, session, &student, status("absent"), &teacher)
@@ -601,7 +602,7 @@ mod tests {
     /// the ruling every other counter here carries.
     #[tokio::test]
     async fn deleting_the_session_leaves_the_counters_alone() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
         let session = a_session(&teacher, &db).await;
@@ -620,7 +621,7 @@ mod tests {
     /// a count behind either.
     #[tokio::test]
     async fn a_refused_mark_moves_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let teacher = a_teacher("t", &db).await;
         let student = a_student("s", &db).await;
         let session = a_session(&teacher, &db).await;

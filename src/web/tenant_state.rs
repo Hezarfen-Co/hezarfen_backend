@@ -180,7 +180,7 @@ mod tests {
     use axum::{Router, body::Body, http::Request};
     use tower::ServiceExt;
 
-    use crate::database::init_mem_tenants;
+    use crate::database::init_test_tenants;
     use crate::db::session;
     use crate::domain::user::{Password, Username};
     use crate::tenant::DEMO_SLUG;
@@ -197,7 +197,7 @@ mod tests {
     /// A two-route app, one live cookie of each kind, and the registry behind
     /// them.
     async fn harness() -> (Router, String, String, crate::tenant::Tenants) {
-        let tenants = init_mem_tenants().await.expect("in-memory deployment");
+        let tenants = init_test_tenants().await;
         let school = tenants
             .get(&Slug::try_new(DEMO_SLUG).unwrap())
             .await
@@ -343,7 +343,7 @@ mod tests {
     /// still passes — the verdict came from the memoized extension.
     #[tokio::test]
     async fn a_request_resolves_its_school_exactly_once() {
-        let tenants = init_mem_tenants().await.expect("in-memory deployment");
+        let tenants = init_test_tenants().await;
         let demo = Slug::try_new(DEMO_SLUG).unwrap();
         let state = AppState {
             db: tenants.control().clone(),

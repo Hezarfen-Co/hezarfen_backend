@@ -207,7 +207,7 @@ mod tests {
     /// the note cascade takes every row of the note with it.
     #[tokio::test]
     async fn create_reads_back_and_cascades_from_the_note() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = note_of(&db, "n").await;
         let file = a_file(&db, &note).await;
         let row = create(
@@ -231,7 +231,7 @@ mod tests {
     /// drops a row built from a file that is gone.
     #[tokio::test]
     async fn replace_is_newest_wins_and_source_cascade_drops() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = note_of(&db, "n").await;
         let file = a_file(&db, &note).await;
         let first = create(
@@ -265,7 +265,7 @@ mod tests {
     /// Deleting one row returns it; deleting it again is a 404.
     #[tokio::test]
     async fn delete_returns_the_row_then_refuses() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let note = note_of(&db, "n").await;
         let row = create(&db, note.get_id(), note.get_course(), Vec::new(), json!({}))
             .await

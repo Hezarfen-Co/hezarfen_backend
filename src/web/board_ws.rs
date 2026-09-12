@@ -674,7 +674,7 @@ mod tests {
         use crate::domain::board::BoardTitle;
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let password = Password::try_new("secret1").unwrap();
         let creator = crate::service::user::create(
             &db,

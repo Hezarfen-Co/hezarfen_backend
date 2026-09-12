@@ -437,7 +437,7 @@ mod tests {
     /// outlives the row it accounts for makes its subject undeletable forever.
     mod counters {
         use super::*;
-        use crate::database::init_mem;
+        use crate::database::init_test_db;
         use crate::domain::exam::{
             Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
         };
@@ -446,10 +446,21 @@ mod tests {
         use crate::domain::user::UserId;
 
         async fn an_exam(db: &Database) -> Exam {
+            // The creator is a foreign key now: a real `app_user` row under
+            // the fixture's fixed key.
+            let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+            sqlx::query(
+                "INSERT INTO app_user (id, username, password_hash) \
+                 VALUES ($1, 'acdc-fixture', 'x')",
+            )
+            .bind(creator.uuid())
+            .execute(db)
+            .await
+            .unwrap();
             let kinds = Settings::defaults().get_exam_kinds().to_vec();
             crate::db::exam::create(
                 db,
-                &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
+                &creator,
                 &crate::db::course::a_test_course(db).await,
                 ExamTitle::try_new("practice").unwrap(),
                 ExamDescription::try_new("").unwrap(),
@@ -503,26 +514,22 @@ mod tests {
 
         /// The stored `exam_question_count` on one subject, absent = zero.
         async fn count_on(subject: &SubjectId, db: &Database) -> i64 {
-            let mut result = db
-                .query(format!(
-                    "SELECT VALUE ({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) FROM $sub"
-                ))
-                .bind(("sub", subject.record()))
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
-            result
-                .take::<Vec<i64>>(0)
-                .unwrap()
-                .first()
-                .copied()
-                .unwrap_or(0)
+            sqlx::query_scalar::<_, i64>(
+                "SELECT exam_question_count FROM subject WHERE id = $1",
+            )
+            .bind(subject.uuid())
+            .fetch_one(db)
+            .await
+            .unwrap()
         }
 
         async fn rows(sql: &str, db: &Database) -> usize {
-            let mut result = db.query(sql).await.unwrap().check().unwrap();
-            result.take::<Vec<RecordId>>(0).unwrap().len()
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM ({sql}) AS t"
+            )))
+            .fetch_one(db)
+            .await
+            .unwrap() as usize
         }
 
         /// The freeze outranks the counter move, on both paths — and because
@@ -530,7 +537,7 @@ mod tests {
         /// the counters read as if nothing ran.
         #[tokio::test]
         async fn a_frozen_exam_leaves_the_subject_counters_untouched() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let (from, to) = (a_subject(&db).await, a_subject(&db).await);
             let (from, to) = (from.get_id().clone(), to.get_id().clone());
@@ -575,7 +582,7 @@ mod tests {
         /// nor a count — least of all on a subject it would have to invent.
         #[tokio::test]
         async fn a_create_on_a_dead_subject_writes_neither_row_nor_count() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let subject = a_subject(&db).await;
             let id = subject.get_id().clone();
@@ -587,12 +594,12 @@ mod tests {
                 .expect_err("a subject that is gone must not be taggable");
             assert!(error.to_string().contains("subject does not exist"));
             assert_eq!(
-                rows("SELECT VALUE id FROM exam_question", &db).await,
+                rows("SELECT id FROM exam_question", &db).await,
                 0,
                 "a refused create may write no row"
             );
             assert_eq!(
-                rows("SELECT VALUE id FROM subject", &db).await,
+                rows("SELECT id FROM subject", &db).await,
                 0,
                 "…and least of all a count on a subject it just brought back"
             );
@@ -600,7 +607,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_subject_move_moves_the_count() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let (from, to) = (a_subject(&db).await, a_subject(&db).await);
             let (from, to) = (from.get_id().clone(), to.get_id().clone());
@@ -614,7 +621,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_move_to_a_dead_subject_leaves_everything_untouched() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let from = a_subject(&db).await.get_id().clone();
             let dead = a_subject(&db).await;
@@ -633,7 +640,7 @@ mod tests {
                 1,
                 "the release rolled back with the claim"
             );
-            assert_eq!(rows("SELECT VALUE id FROM subject", &db).await, 1);
+            assert_eq!(rows("SELECT id FROM subject", &db).await, 1);
         }
 
         /// The double-claim guard. Both movers compute their claim and release
@@ -649,7 +656,7 @@ mod tests {
         /// assertion — the stale mover is happily applied.
         #[tokio::test]
         async fn a_stale_mover_is_refused_and_claims_nothing() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let from = a_subject(&db).await.get_id().clone();
             let to = a_subject(&db).await.get_id().clone();
@@ -685,7 +692,7 @@ mod tests {
         /// on the first assertion — the re-state lands 200.
         #[tokio::test]
         async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let from = a_subject(&db).await.get_id().clone();
             let to = a_subject(&db).await.get_id().clone();
@@ -715,7 +722,7 @@ mod tests {
         /// re-stating the subject the row really holds passes it trivially.
         #[tokio::test]
         async fn a_no_op_re_state_still_lands() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let on = a_subject(&db).await.get_id().clone();
             let question = a_question(&exam, &on, &db).await;
@@ -740,7 +747,7 @@ mod tests {
         /// not the stale-mover 409 — the two empty-`$row` cases stay apart.
         #[tokio::test]
         async fn a_move_of_a_deleted_question_is_still_a_404() {
-            let db = init_mem().await.unwrap();
+            let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let from = a_subject(&db).await.get_id().clone();
             let to = a_subject(&db).await.get_id().clone();

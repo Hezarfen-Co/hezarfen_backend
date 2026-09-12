@@ -208,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_publish_shares_one_series_and_orders_its_ids() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         let slots = publish_weekly(
             &db,
@@ -236,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_publish_is_refused_but_touching_is_allowed() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         create(&db, &teacher, at(1_000), at(2_000), None)
             .await
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn weekly_publish_overlapping_an_existing_slot_writes_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         // A lone slot on the third week of the coming series.
         create(
@@ -301,7 +301,7 @@ mod tests {
     /// the batch's boundaries must still be allowed.
     #[tokio::test]
     async fn the_batch_wide_conflict_read_still_sees_the_last_week_and_lets_touching_through() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         let last = 1_000 + 4 * MILLIS_PER_WEEK;
         // Touching both ends of the envelope: ends where the first occurrence
@@ -319,7 +319,7 @@ mod tests {
         );
 
         // One millisecond into the last occurrence → the whole publish is 409.
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         create(&db, &teacher, at(last + 999), at(last + 3_000), None)
             .await
             .unwrap();
@@ -339,7 +339,7 @@ mod tests {
     /// and the free weeks must survive the refusal.
     #[tokio::test]
     async fn a_taken_slot_is_never_deleted_and_takes_its_series_with_it() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         let slots = publish_weekly(
             &db,
@@ -394,7 +394,7 @@ mod tests {
     /// teacher+ passes through untouched.
     #[tokio::test]
     async fn a_publish_by_someone_who_lost_the_role_is_refused() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         // Written as a row rather than through `User` — the password hasher is
         // private to that module, and the only column this asks about is `role`.
         db.query("CREATE user:eski SET username = 'eski', password_hash = 'x', role = 'student'")
@@ -535,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn weekly_publish_that_self_overlaps_is_refused() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let teacher = UserId::from_key("t1");
         // A window longer than the weekly step collides with the next week.
         assert!(matches!(

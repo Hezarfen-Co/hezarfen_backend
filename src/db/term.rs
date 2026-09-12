@@ -173,7 +173,7 @@ mod tests {
     /// refuse it with the same error, having written nothing.
     #[tokio::test]
     async fn a_moved_end_is_refused_against_the_stored_other_end() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
         let term = create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
             .await
@@ -202,7 +202,7 @@ mod tests {
     /// tie-break on identical `starts_at` — stored read-back, then page by page.
     #[tokio::test]
     async fn identical_starts_at_still_pages_each_term_exactly_once() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
         let mut minted = Vec::new();
         for i in 0..12 {

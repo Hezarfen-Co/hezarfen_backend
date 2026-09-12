@@ -211,7 +211,7 @@ pub async fn list_for_student(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::fee_plan::{FeePlanName, Installment};
     use crate::domain::payment_ledger::LedgerAmount;
 
@@ -231,7 +231,7 @@ mod tests {
     /// must not double a family's debt.
     #[tokio::test]
     async fn assigning_bills_every_installment_and_a_replay_bills_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
         let plan = a_plan(

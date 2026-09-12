@@ -77,7 +77,7 @@ struct CreateChatbotThread {
 /// sorted by it, so the thread just written to is always first.
 #[derive(Serialize, ToSchema)]
 struct ChatbotThreadResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "Fizik ödevi")]
     title: Option<String>,
@@ -261,7 +261,7 @@ struct SendChatbotMessage {
 #[derive(Serialize, ToSchema)]
 struct AcceptedResponse {
     /// The assistant row reserved for the answer.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     message_id: String,
     /// Always `pending` — that is what "accepted" means here.
     #[schema(example = "pending")]
@@ -272,9 +272,9 @@ struct AcceptedResponse {
 /// set only when `status` is `failed`.
 #[derive(Serialize, ToSchema)]
 struct ChatbotMessageResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     thread_id: String,
     /// `user` or `assistant`.
     #[schema(example = "assistant")]
@@ -900,7 +900,7 @@ mod tests {
         // A run of failed answers must make the window reach further back, not
         // shrink it: filtering a fixed-size tail after the fact handed the
         // service a handful of unanswered prompts and nothing older.
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         // A real thread row: every turn is written through it, so a turn with
         // no thread is refused.
         db.query("CREATE chatbot_thread:c SET user_id = user:u, created_at = 0, updated_at = 0")

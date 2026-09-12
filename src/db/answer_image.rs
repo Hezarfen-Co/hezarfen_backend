@@ -240,12 +240,12 @@ mod tests {
     }
 
     fn student() -> UserId {
-        UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA")
+        UserId::from_key("019732e3-7b00-7000-8000-00000000a11a")
     }
 
     #[tokio::test]
     async fn upsert_replaces_within_a_sitting_but_not_across_them() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let user = student();
@@ -287,7 +287,7 @@ mod tests {
         );
 
         // Another student's drawing for the same question/sitting is its own row.
-        let other = UserId::from_key("01TESTSTUDENTBBBBBBBBBBBBB");
+        let other = UserId::from_key("019732e3-7b00-7000-8000-00000000b22b");
         upsert(&db, AnswerImage::new(&exam, &question, &other, 1, png(), 7))
             .await
             .unwrap();
@@ -297,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn listing_scopes_by_exam_and_user() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam_a = exam_row(&db).await;
         let exam_b = exam_row(&db).await;
         let user = student();

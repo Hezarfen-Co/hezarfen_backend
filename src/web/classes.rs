@@ -1496,7 +1496,7 @@ mod tests {
         use crate::domain::role::Role;
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         assert!(teacher_or_none(None, &db).await.unwrap().is_none());
         assert!(teacher_or_none(Some(""), &db).await.unwrap().is_none());
 

@@ -187,11 +187,16 @@ pub async fn update(
 /// no meaning without its menu, and the menu key cannot be re-homed.
 ///
 /// Refused (409) while a seat is still held, and the *row itself* decides
-/// that: the delete carries the seat counter in its `WHERE`, so a booking
-/// landing at that instant either takes its seat before the delete (which
-/// then finds a non-zero counter and refuses) or after it (and finds no
-/// menu). A read-then-delete pair had a window where both happened — a
-/// paid seat on a menu that no longer exists.
+/// that: the guard that unlocks the sweep reads the seat counter in its own
+/// `WHERE` under `FOR UPDATE`, so a booking landing at that instant either
+/// takes its seat before the delete (which then finds a non-zero counter
+/// and refuses) or after it (and finds no menu). A read-then-delete pair
+/// had a window where both happened — a paid seat on a menu that no longer
+/// exists. The lock is also what makes the sweep's order safe: the dishes
+/// and marks go first (both FKs are `ON DELETE NO ACTION`, so the parent
+/// row cannot leave while they stand) and the menu row goes last, with no
+/// window in between in which the children of a surviving menu could be
+/// destroyed.
 ///
 /// The slot gets its reference back in that same transaction — a slot no
 /// menu is published for any more may leave the settings again. Released
@@ -218,15 +223,39 @@ pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
     let key = menu.id.key().to_string();
     let counter = slot_ref(menu.slot.as_str());
     let deleted = tx_with_retry(db, true, async move |tx| {
-        let deleted = sqlx::query_as!(
+        // The row itself decides the guard, under its own lock: a booking
+        // racing this delete either committed first (the guard reads its
+        // seat and refuses before any child is touched) or queues on the
+        // lock and lands after the commit — and finds no menu.
+        let guard = sqlx::query!(
+            "SELECT 1 AS deletable FROM menu WHERE id = $1 AND seats_booked = 0 FOR UPDATE",
+            key,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if guard.is_none() {
+            return Ok(None);
+        }
+        // The children go first: both `menu_dish.menu` and
+        // `meal_attendance.menu` are `ON DELETE NO ACTION`, so the parent
+        // row cannot leave while they stand.
+        sqlx::query!("DELETE FROM meal_attendance WHERE menu = $1", key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM menu_dish WHERE menu = $1", key)
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query_as!(
             Menu,
-            "DELETE FROM menu WHERE id = $1 AND seats_booked = 0
+            "DELETE FROM menu WHERE id = $1
              RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
             key,
         )
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(row) = deleted else {
+        // Unreachable while the guard holds the row's lock, but the match
+        // keeps the shape honest: `row` exists iff the guard passed.
+        let Some(row) = row else {
             return Ok(None);
         };
         sqlx::query!(
@@ -235,12 +264,6 @@ pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!("DELETE FROM meal_attendance WHERE menu = $1", key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!("DELETE FROM menu_dish WHERE menu = $1", key)
-            .execute(&mut *tx)
-            .await?;
         Ok(Some(row))
     })
     .await?;
@@ -256,20 +279,26 @@ pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::meal_attendance;
     use crate::db::menu_dish;
     use crate::domain::meal_attendance::MealAttendanceStatus;
     use crate::domain::menu_dish::{DishName, DishPrice, DishTags};
     use crate::domain::settings::MealSlotDef;
 
+    /// The one fixture person, by a fixed valid id every publish can name.
+    const TEACHER: &str = "019732e3-7b00-7000-8000-00000000acdc";
+
     async fn school() -> Database {
-        let db = init_mem().await.unwrap();
-        db.query("CREATE user:teacher SET username = 'teacher', password_hash = 'x';")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let (db, _leases) = init_test_db().await;
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 'teacher', 'x', 'teacher')",
+        )
+        .bind(UserId::from_key(TEACHER).uuid())
+        .execute(&db)
+        .await
+        .unwrap();
         db
     }
 
@@ -280,19 +309,27 @@ mod tests {
     /// The reference count, re-read out of the store — never off a return
     /// value, which the in-memory engine forges wins on.
     async fn refs(db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE (count ?? 0) FROM $id")
-            .bind(("id", slot_ref("lunch")))
+        sqlx::query("SELECT count FROM slot_ref WHERE name = 'lunch'")
+            .fetch_optional(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .into_iter()
-            .next()
+            .map(|row| row.try_get::<i64, _>(0).unwrap())
             .unwrap_or(0)
+    }
+
+    /// The settings guard's retire switch, driven straight: `true` only when
+    /// this call flipped the bit.
+    async fn retire_lunch(db: &Database) -> bool {
+        sqlx::query(
+            "INSERT INTO slot_ref (name, count, retired) VALUES ('lunch', 0, TRUE)
+             ON CONFLICT (name) DO UPDATE SET retired = TRUE
+             WHERE slot_ref.count = 0 AND slot_ref.retired IS DISTINCT FROM TRUE
+             RETURNING 1",
+        )
+        .fetch_optional(db)
+        .await
+        .unwrap()
+        .is_some()
     }
 
     async fn publish(date: &str, db: &Database) -> Result<Menu, AppError> {
@@ -301,7 +338,7 @@ mod tests {
             MenuDate::try_new(date).unwrap(),
             lunch(),
             None,
-            &UserId::from_key("teacher"),
+            &UserId::from_key(TEACHER),
         )
         .await
     }
@@ -309,15 +346,15 @@ mod tests {
     /// Plant a menu row the pre-check will (or will not) find, without going
     /// through the claim — a row published before the counter existed.
     async fn plant(id: &MenuId, date: &str, db: &Database) {
-        db.query(
-            "CREATE $id SET date = $date, slot = 'lunch', \
-             created_by = user:teacher, created_at = 1",
+        sqlx::query(
+            "INSERT INTO menu (id, date, slot, created_by, created_at) \
+             VALUES ($1, $2, 'lunch', $3, 1)",
         )
-        .bind(("id", id.record()))
-        .bind(("date", date.to_string()))
+        .bind(id.key())
+        .bind(date)
+        .bind(UserId::from_key(TEACHER).uuid())
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     }
 
@@ -340,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn a_retired_slot_refuses_and_writes_nothing() {
         let db = school().await;
-        assert!(cap::retire(&slot_ref("lunch"), &db).await.unwrap());
+        assert!(retire_lunch(&db).await);
 
         let refused = publish("2026-08-02", &db)
             .await
@@ -438,7 +475,7 @@ mod tests {
         assert!(matches!(gone, AppError::NotFound), "got {gone:?}");
         assert_eq!(refs(&db).await, 1);
         assert!(
-            !cap::retire(&slot_ref("lunch"), &db).await.unwrap(),
+            !retire_lunch(&db).await,
             "a slot a menu is still published for may not be retired"
         );
 
@@ -465,41 +502,16 @@ mod tests {
     /// menu row too ([`bump_menu_and_write`]) instead of reading it: the two
     /// transactions then touch one key and the store refuses to commit both.
     ///
-    /// The window is opened by the database itself rather than by a lucky
-    /// interleaving — a `DEFINE EVENT` on `menu` fires *inside* the delete's own
-    /// transaction, the instant the row goes, so the `SLEEP` lands exactly
-    /// between the delete and its sweep every single time. Nothing in `src/`
-    /// knows about it; the seam is the schema.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, which would fail this
-    /// test on correct code (see [`crate::database::init_test_server`]).
-    /// Mutation-tested: putting [`meal_attendance::mark`] back on a menu *read*
-    /// (`UPSERT (SELECT VALUE $id FROM $menu) …`, the shape it shipped with)
-    /// turns this red at **both** of its two rounds — the mark commits, the
-    /// sweep misses it, and the row is left pointing at a menu that is gone.
+    /// The window the schema event used to force open is the menu row's own
+    /// lock now: every child write also writes the menu row, so a child racing
+    /// the delete serializes on that row instead of committing into a range
+    /// the sweep has already passed. A barrier start lets both orders happen;
+    /// the invariant must hold in each.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_child_written_inside_a_delete_never_outlives_the_menu() {
         use crate::domain::menu_dish::DishDescription;
 
-        let (db, _serialized) = crate::database::init_test_server("menu_delete_race").await;
-        db.query("CREATE user:teacher SET username = 'teacher', password_hash = 'x';")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        // Hold the delete open for a full second after the row is gone, while
-        // its cascade still has to run.
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE menu WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let db = school().await;
 
         let (mut dishes, mut marks, mut swept) = (0, 0, 0);
         for round in 0..4 {
@@ -508,19 +520,21 @@ mod tests {
                 .unwrap();
             let id = menu.get_id().clone();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { delete(&db, menu).await })
+                let (db, gate, menu) = (db.clone(), gate.clone(), menu);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    delete(&db, menu).await
+                })
             };
-            // The child starts inside the held window — the delete's row is
-            // gone but uncommitted, which is exactly what a menu read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             // One child per round, never both: whichever wrote first forces the
             // delete to re-send, and its second pass sweeps the other's row —
             // which would mask exactly the defect this test exists to catch.
             let child = {
-                let (id, db, dish) = (id.clone(), db.clone(), round % 2 == 0);
+                let (id, db, dish, gate) = (id.clone(), db.clone(), round % 2 == 0, gate);
                 tokio::spawn(async move {
+                    gate.wait().await;
                     if dish {
                         menu_dish::create(
                             &db,
@@ -529,6 +543,7 @@ mod tests {
                             None::<DishDescription>,
                             DishPrice::try_new(1).unwrap(),
                             DishTags::try_new(&[], &[]).unwrap(),
+                            1_000,
                         )
                         .await
                         .map(|_| ())
@@ -536,9 +551,9 @@ mod tests {
                         meal_attendance::mark(
                             &db,
                             &id,
-                            &UserId::from_key("teacher"),
+                            &UserId::from_key(TEACHER),
                             MealAttendanceStatus::try_new("served").unwrap(),
-                            &UserId::from_key("teacher"),
+                            &UserId::from_key(TEACHER),
                         )
                         .await
                         .map(|_| ())

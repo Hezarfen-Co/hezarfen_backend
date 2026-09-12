@@ -232,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
 
         let (first, retired) = upsert(&db, BankQuestionImage::new(&question, None, png(), 3))
@@ -255,7 +255,7 @@ mod tests {
     /// picture, and only a removed option's picture goes.
     #[tokio::test]
     async fn only_the_dropped_options_lose_their_pictures() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
         let ids = choice_ids();
         upsert(&db, BankQuestionImage::new(&question, None, png(), 1))
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_keep_set_clears_every_option_picture() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
         let ids = choice_ids();
         upsert(&db, BankQuestionImage::new(&question, None, png(), 1))

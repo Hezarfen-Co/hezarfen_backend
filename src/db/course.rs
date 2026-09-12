@@ -573,9 +573,21 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
 /// way a minted subject id already is for an exam question.
 #[cfg(test)]
 pub(crate) async fn a_test_course(db: &Database) -> CourseId {
+    // The creator is a foreign key now: a real row, minted per call so
+    // repeated calls are new people, not the same one.
+    let creator = UserId::generate();
+    sqlx::query(
+        "INSERT INTO app_user (id, username, password_hash, role) \
+         VALUES ($1, $2, 'x', 'teacher')",
+    )
+    .bind(creator.uuid())
+    .bind(format!("course-fixture-{}", &creator.key()[..8]))
+    .execute(db)
+    .await
+    .unwrap();
     create(
         db,
-        &UserId::generate(),
+        &creator,
         CourseTitle::try_new("test course").unwrap(),
         CourseDescription::try_new("").unwrap(),
         CourseKind::course(),
@@ -615,28 +627,26 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
 /// on broken code.
 #[cfg(test)]
 pub(crate) async fn assert_no_child_outlives_a_course_delete(
-    scratch: &str,
     table: &str,
     make: fn(CourseId, Database) -> tokio::task::JoinHandle<Result<(), AppError>>,
 ) {
-    // The guard is held for the whole test: these bursts are sub-millisecond,
-    // and a sibling race test's burst pushes a delete clean out of its window.
-    let (db, _serialized) = crate::database::init_test_server(scratch).await;
-    db.query(
-        "DEFINE EVENT hold_the_window ON TABLE course WHEN $event = 'DELETE' \
-         THEN { SLEEP 1s; };",
-    )
-    .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    use sqlx::Row as _;
+
+    let (db, _leases) = crate::database::init_test_db().await;
 
     let (mut swept, mut orphans) = (0, 0);
-    for round in 0..4 {
+    for round in 0..8 {
         let course = a_test_course(&db).await;
+        // The old engine needed a schema event to hold the delete's window
+        // open; Postgres puts the racing create and delete on the same rows
+        // (the FK claims and the cascade), so a barrier start covers every
+        // interleaving — and the child may never outlive the course in any
+        // of them.
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let drop_it = {
-            let (course, db) = (course.clone(), db.clone());
+            let (course, db, gate) = (course.clone(), db.clone(), gate.clone());
             tokio::spawn(async move {
+                gate.wait().await;
                 delete(
                     &db,
                     read(&db, &course)
@@ -647,9 +657,17 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
                 .await
             })
         };
-        // The create starts inside the held window.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let child = make(course.clone(), db.clone()).await.unwrap();
+        let child = {
+            let (course, db, gate) = (course.clone(), db.clone(), gate);
+            tokio::spawn(async move {
+                gate.wait().await;
+                // The inner task joins here: a `Db` answer stays `Err`, only a
+                // panic inside `make` (or the outer join) would panic.
+                make(course, db).await.unwrap()
+            })
+        }
+        .await
+        .unwrap();
         let dropped = drop_it.await.unwrap();
 
         // A 404 for the create, or a refusal for the delete, is a correct
@@ -666,24 +684,23 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
         // Stored state is the whole verdict; a return value is not evidence.
         if read(&db, &course).await.unwrap().is_none() {
             swept += 1;
-            let mut left = db
-                .query(format!(
-                    "SELECT VALUE id FROM {table} WHERE course = $course"
-                ))
-                .bind(("course", course.record()))
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
-            orphans += left.take::<Vec<RecordId>>(0).unwrap().len();
+            orphans += sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE course = $1"
+            )))
+            .bind(course.uuid())
+            .fetch_one(&db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
+            .unwrap() as usize;
         } else if matches!(dropped, Ok(true)) {
             panic!("{table} round {round}: the delete reported success, the course is still there");
         }
     }
-    eprintln!("Course::delete raced by a {table} create: {swept}/4 rounds deleted the course");
+    eprintln!("Course::delete raced by a {table} create: {swept}/8 rounds deleted the course");
     assert!(
         swept > 0,
-        "{table}: no round ever deleted the course, so the window was never reached"
+        "{table}: no round ever deleted the course, so the race never actually ran"
     );
     assert_eq!(orphans, 0, "{table}: a child outlived its course");
 }
@@ -691,12 +708,31 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row as _;
     use crate::domain::term::{Term, TermName};
+
+    /// A real `app_user` row: creators, students and enrollers are foreign
+    /// keys now. The label names the row's username; the id is minted, so
+    /// repeated calls are new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[..8]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
 
     async fn course_on(term: Option<TermId>, db: &Database) -> Course {
         create(
             db,
-            &UserId::from_key("teacher"),
+            &a_person(db, "teacher", "teacher").await,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
@@ -713,9 +749,9 @@ mod tests {
     /// included. A `>= 0` guard passes the roster branch and fails here.
     #[tokio::test]
     async fn a_course_with_a_roster_refuses_to_delete() {
-        let db = crate::database::init_mem().await.unwrap();
-        let teacher = UserId::from_key("teacher");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let teacher = a_person(&db, "teacher", "teacher").await;
+        let student = a_person(&db, "student", "student").await;
         let course = course_on(None, &db).await;
         crate::db::enrollment::enroll(&db, course.get_id(), &student, &teacher)
             .await
@@ -758,7 +794,7 @@ mod tests {
     /// back. Dropping the release in `delete` leaves the term deletable never.
     #[tokio::test]
     async fn a_term_is_deletable_only_once_no_course_links_it() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let term =
             crate::db::term::create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
@@ -797,10 +833,10 @@ mod tests {
     /// web layer's pre-flight lookup gives.
     #[tokio::test]
     async fn a_course_cannot_link_a_term_that_is_gone() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let error = create(
             &db,
-            &UserId::from_key("teacher"),
+            &a_person(&db, "teacher", "teacher").await,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
@@ -814,27 +850,23 @@ mod tests {
 
     /// The stored `course_count` on one term, absent counting as zero.
     async fn count_on(term: &TermId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({COURSE_COUNT_FIELD} ?? 0) FROM $term"
-            ))
-            .bind(("term", term.record()))
+        sqlx::query("SELECT COALESCE(course_count, 0) FROM term WHERE id = $1")
+            .bind(term.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
+            .try_get::<i64, _>(0)
             .unwrap()
-            .first()
-            .copied()
-            .unwrap_or(0)
     }
 
     /// How many rows `sql` selects ids for.
     async fn rows(sql: &str, db: &Database) -> usize {
-        let mut result = db.query(sql).await.unwrap().check().unwrap();
-        result.take::<Vec<RecordId>>(0).unwrap().len()
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
+            .unwrap() as usize
     }
 
     async fn a_term(name: &str, db: &Database) -> Term {
@@ -851,14 +883,14 @@ mod tests {
     /// stray one makes the term undeletable forever).
     #[tokio::test]
     async fn a_refused_create_writes_neither_row_nor_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term("2026", &db).await;
         let id = term.get_id().clone();
         assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
             &db,
-            &UserId::from_key("teacher"),
+            &a_person(&db, "teacher", "teacher").await,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
@@ -884,7 +916,7 @@ mod tests {
     /// term's claim and the old term's release with the link itself.
     #[tokio::test]
     async fn a_term_move_moves_the_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
         let course = course_on(Some(from.get_id().clone()), &db).await;
@@ -921,7 +953,7 @@ mod tests {
     /// counts must read as if it never ran.
     #[tokio::test]
     async fn a_stale_mover_is_refused_and_claims_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
         let other = a_term("2028", &db).await;
@@ -1012,7 +1044,7 @@ mod tests {
     /// *carrying* the column instead, which is why this is refused.
     #[tokio::test]
     async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
         let course = course_on(Some(from.get_id().clone()), &db).await;
@@ -1083,7 +1115,7 @@ mod tests {
     /// The title moves in the same PATCH, and must not stick either.
     #[tokio::test]
     async fn a_term_move_to_a_dead_term_leaves_everything_untouched() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let dead = a_term("2027", &db).await;
         let dead_id = dead.get_id().clone();
@@ -1148,9 +1180,16 @@ mod tests {
     /// current-thread runtime never interleaves the two, and the embedded
     /// engine does not conflict-check concurrent writes to one record at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_an_enroll_never_answers_500() {
-        let (db, _serialized) = crate::database::init_test_server("course_delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The roster rows are foreign keys now: the burst's six racers and
+        // their enroller are real people, reused every round (each round's
+        // delete cascade frees the seats back).
+        let mgr = a_person(&db, "mgr", "manager").await;
+        let mut students = Vec::new();
+        for seat in 0..6 {
+            students.push(a_person(&db, &format!("stu{seat}"), "student").await);
+        }
         let (mut delete_500, mut enroll_500, mut enrolled) = (0, 0, 0);
         let (mut last_delete, mut last_enroll) = (String::new(), String::new());
         for round in 0..20 {
@@ -1172,11 +1211,10 @@ mod tests {
             };
             let joins: Vec<_> = (0..6)
                 .map(|seat| {
-                    let (id, db) = (course.get_id().clone(), db.clone());
-                    let student = UserId::from_key(&format!("stu{round}_{seat}"));
+                    let (id, db, mgr) = (course.get_id().clone(), db.clone(), mgr.clone());
+                    let student = students[seat].clone();
                     tokio::spawn(async move {
-                        crate::db::enrollment::enroll(&db, &id, &student, &UserId::from_key("mgr"))
-                            .await
+                        crate::db::enrollment::enroll(&db, &id, &student, &mgr).await
                     })
                 })
                 .collect();

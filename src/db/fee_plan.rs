@@ -176,7 +176,7 @@ mod tests {
     /// shape and the stored one agree. A past due date is legal on purpose.
     #[tokio::test]
     async fn installments_survive_a_round_trip_through_the_schema() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let manager = UserId::from_key("mgr1");
         let installments = vec![
             Installment::new(

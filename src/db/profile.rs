@@ -126,7 +126,7 @@ mod tests {
              VALUES ($1, $2, 1000, 3000), ($3, $2, 5000, 6000)",
         )
         .bind(uuid::Uuid::now_v7())
-        .bind(user.uuid())
+        .bind(user.get_id().uuid())
         .bind(uuid::Uuid::now_v7())
         .execute(&db)
         .await
@@ -136,7 +136,7 @@ mod tests {
             "INSERT INTO pomodoro_session (id, app_user, started_at) VALUES ($1, $2, 9000)",
         )
         .bind(uuid::Uuid::now_v7())
-        .bind(user.uuid())
+        .bind(user.get_id().uuid())
         .execute(&db)
         .await
         .unwrap();
@@ -158,7 +158,7 @@ mod tests {
              VALUES ($1, $2, 5000, 1000)",
         )
         .bind(uuid::Uuid::now_v7())
-        .bind(user.uuid())
+        .bind(user.get_id().uuid())
         .execute(&db)
         .await
         .unwrap();
