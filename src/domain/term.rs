@@ -41,17 +41,7 @@ impl TermId {
         self.0.to_string()
     }
 
-    /// The inner uuid, for binding the id through the runtime-checked
-    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
-    pub(crate) fn uuid(&self) -> Uuid {
-        self.0
-    }
 }
-
-/// The answer every link to a term that is not there gets — the claim is a
-/// conditional write on the term row, so a term a delete already removed
-/// matches nothing and the caller says exactly what the link resolver's
-/// pre-flight lookup ([`crate::service::term::resolve`]) would have.
 pub fn gone_error() -> AppError {
     AppError::Validation(ValidationError::Invalid {
         field: "term_id",

@@ -41,17 +41,7 @@ impl SubjectId {
         self.0.to_string()
     }
 
-    /// The inner uuid, for binding the id through the runtime-checked
-    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
-    pub(crate) fn uuid(&self) -> Uuid {
-        self.0
-    }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Type)]
-#[sqlx(transparent)]
-pub struct SubjectName(String);
-
 impl SubjectName {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
         validate_required("name", value, MAX_SUBJECT_NAME_LEN)?;

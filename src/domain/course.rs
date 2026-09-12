@@ -34,17 +34,7 @@ impl CourseId {
         self.0.to_string()
     }
 
-    /// The inner uuid, for binding the id through the runtime-checked
-    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
-    pub(crate) fn uuid(&self) -> uuid::Uuid {
-        self.0
-    }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct CourseTitle(String);
-
 impl CourseTitle {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
         validate_required("title", value, MAX_COURSE_TITLE_LEN)?;
