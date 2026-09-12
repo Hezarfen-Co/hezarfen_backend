@@ -6,7 +6,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Res, app_and_db, create_course, login_as, me_id, send, total};
+use common::{ABSENT_ID, GHOST_ID, Res, app_and_db, create_course, login_as, me_id, send, total};
 use hezarfen_backend::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_group::ClassName;
@@ -15,25 +15,62 @@ use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
 use hezarfen_backend::service::{class_course, class_group, class_member};
 use serde_json::json;
+use sqlx::Row as _;
 
-/// One counter, re-read out of the store — never off a response body.
-async fn counter(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<i64>>(0)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0)
+/// One counter, re-read out of the store — never off a response body. `sql`
+/// is a whole scalar query; each call spells the aggregate it asserts on.
+async fn counter(sql: &'static str, db: &Database) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
 }
 
-/// How many rows `sql` selects ids for.
-async fn rows(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
+/// How many rows `sql` counts.
+async fn rows(sql: &'static str, db: &Database) -> i64 {
+    counter(sql, db).await
+}
+
+/// A real `app_user` row for the fixture actor or member a domain call must
+/// name: the actor and member columns are foreign keys now, so they are rows,
+/// not fabricated ids. The username is unique, so every call for the same name
+/// shares one row, whichever call minted it. These rows never log in, so the
+/// hash is a stub.
+async fn fixture_user(db: &Database, username: &str) -> UserId {
+    sqlx::query(
+        "INSERT INTO app_user (id, username, password_hash, role) \
+         VALUES ($1, $2, 'x', 'student') ON CONFLICT DO NOTHING",
+    )
+    .bind(UserId::generate().uuid())
+    .bind(username)
+    .execute(db)
+    .await
+    .unwrap();
+    let id: uuid::Uuid = sqlx::query("SELECT id FROM app_user WHERE username = $1")
+        .bind(username)
+        .fetch_one(db)
+        .await
         .unwrap()
-        .len() as i64
+        .try_get(0)
+        .unwrap();
+    UserId::from_key(&id.to_string())
+}
+
+/// Delete a row the way a racing write that lost would have left it: the row
+/// gone, its referring rows untouched. Real FKs refuse that state, so the
+/// delete is forced the one way Postgres allows: FK triggers suspended for the
+/// one transaction.
+async fn wipe_row(table: &str, id: uuid::Uuid, db: &Database) {
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {table} WHERE id = $1"
+    )))
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
 }
 
 /// Delete a course row the way a *concurrent* `DELETE /courses/{id}` racing an
@@ -42,12 +79,12 @@ async fn rows(sql: &str, db: &Database) -> i64 {
 /// the state from a test — and the state the pump's in-transaction claim exists
 /// to make unreachable in the first place.
 async fn wipe_course_row(course: &str, db: &Database) {
-    db.query("DELETE type::record('course', $key)")
-        .bind(("key", course.to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    wipe_row(
+        "course",
+        uuid::Uuid::parse_str(course).expect("a uuid course id"),
+        db,
+    )
+    .await;
 }
 
 /// B1(a). A class with *zero* members makes the pump's pair loop empty, so the
@@ -57,7 +94,7 @@ async fn wipe_course_row(course: &str, db: &Database) {
 #[tokio::test]
 async fn an_attach_onto_a_deleted_course_writes_no_link() {
     let (_app, db) = app_and_db().await;
-    let manager = UserId::from_key("manager");
+    let manager = fixture_user(&db, "manager").await;
     let class = class_group::create(
         &db,
         &manager,
@@ -70,7 +107,7 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
     .unwrap();
     // A course id nothing ever created: the same row a delete that won the race
     // leaves behind.
-    let ghost = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
+    let ghost = CourseId::from_key(GHOST_ID);
 
     let refused = class_course::attach(&db, class.get_id(), &ghost, &manager).await;
     assert!(
@@ -78,12 +115,12 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
         "attaching a course that is gone must be refused: {refused:?}"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_course", &db).await,
+        rows("SELECT count(*) FROM class_course", &db).await,
         0,
         "no link row may point at a course that does not exist"
     );
     assert_eq!(
-        counter("SELECT VALUE class_course_count ?? 0 FROM class_group", &db).await,
+        counter("SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group", &db).await,
         0,
         "…and the class must not count one either, or it is undeletable forever"
     );
@@ -222,7 +259,7 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
         refused.body
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_member", &db).await,
+        rows("SELECT count(*) FROM class_member", &db).await,
         0,
         "a refused add writes nothing"
     );
@@ -294,7 +331,7 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
         "a hand enroll must take the row off the class"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM enrollment WHERE source != NONE", &db).await,
+        rows("SELECT count(*) FROM enrollment WHERE source IS NOT NULL", &db).await,
         0,
         "…in the stored row, not just the response"
     );
@@ -311,12 +348,12 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
     .await;
     assert_eq!(removed.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        rows("SELECT VALUE id FROM enrollment", &db).await,
+        rows("SELECT count(*) FROM enrollment", &db).await,
         1,
         "the class may not unenroll a student an operator enrolled by hand"
     );
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
         1,
         "…and the seat it never paid for may not be released"
     );
@@ -362,7 +399,7 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
         Some(json!({ "user_id": student_id })),
     )
     .await;
-    assert_eq!(rows("SELECT VALUE id FROM enrollment", &db).await, 1);
+    assert_eq!(rows("SELECT count(*) FROM enrollment", &db).await, 1);
 
     let promoted = send(
         &app,
@@ -374,19 +411,19 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
     .await;
     assert_eq!(promoted.status, StatusCode::OK);
 
-    assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM class_member", &db).await, 0);
     assert_eq!(
-        rows("SELECT VALUE id FROM enrollment", &db).await,
+        rows("SELECT count(*) FROM enrollment", &db).await,
         0,
         "a non-student holds no roster row, whoever wrote it"
     );
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
         0,
         "the seat comes back exactly once"
     );
     assert_eq!(
-        counter("SELECT VALUE class_member_count ?? 0 FROM class_group", &db).await,
+        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
         0
     );
     // Nothing is left tagged with the class, so letting it go strands nothing.
@@ -463,7 +500,7 @@ async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
     // off the (full) counter, and costs no seat.
     assert_eq!(enroll(first_id.clone()).await.status, StatusCode::OK);
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
         1
     );
 
@@ -480,7 +517,7 @@ async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
     assert_eq!(raised.status, StatusCode::OK);
     assert_eq!(enroll(second_id.clone()).await.status, StatusCode::OK);
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
         2
     );
 
@@ -488,10 +525,9 @@ async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
     // conditional write matches nothing either way, and only that path pays for
     // the read that tells them apart.
     wipe_course_row(&course, &db).await;
-    db.query("DELETE enrollment")
+    sqlx::query("DELETE FROM enrollment")
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     assert_eq!(enroll(first_id).await.status, StatusCode::NOT_FOUND);
 }
@@ -504,7 +540,7 @@ async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
 #[tokio::test]
 async fn a_roster_is_ordered_by_when_a_student_was_added() {
     let (_app, db) = app_and_db().await;
-    let manager = UserId::from_key("manager");
+    let manager = fixture_user(&db, "manager").await;
     let class = class_group::create(
         &db,
         &manager,
@@ -518,25 +554,27 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
     .get_id()
     .clone();
 
-    // Keys chosen so `id DESC` (c, b, a) is not the reverse of the insertion
-    // order (a, c, b): only a real stamp can tell the two apart. The waits are
-    // what keep the millisecond stamps distinct — a tie falls back to the id,
-    // which is the very order under test.
-    let added = ["a", "c", "b"];
-    for key in added {
-        class_member::add(&db, &class, &UserId::from_key(key), &manager)
+    // Members added in an order no id ordering reproduces: only a real stamp
+    // can tell the two apart. The waits are what keep the stamps distinct —
+    // a tie falls back to the id, which is the very order under test. The
+    // minted rows carry uuid ids, so the assertions read back through the
+    // name -> id map.
+    let mut names: Vec<(&str, UserId)> = Vec::new();
+    for key in ["a", "c", "b"] {
+        let member = fixture_user(&db, key).await;
+        class_member::add(&db, &class, &member, &manager)
             .await
             .unwrap();
+        names.push((key, member));
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
+    let name_of =
+        |id: &UserId| names.iter().find(|(_, mid)| mid == id).map(|(k, _)| *k).unwrap();
 
     let (roster, _) = class_member::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
-    let order: Vec<&str> = roster
-        .iter()
-        .map(|member| member.get_user().key())
-        .collect();
+    let order: Vec<&str> = roster.iter().map(|member| name_of(member.get_user())).collect();
     assert_eq!(
         order,
         vec!["b", "c", "a"],
@@ -547,19 +585,20 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
     // all — the state a real volume is in. It is of unknown age, and NONE
     // sorting last under DESC is what makes that the oldest, rather than an
     // invented number putting it anywhere else.
-    db.query("UPDATE class_member SET added_at = NONE WHERE user = $usr")
-        .bind(("usr", UserId::from_key("c").record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    sqlx::query(
+        "UPDATE class_member SET added_at = NULL
+         WHERE app_user = (SELECT id FROM app_user WHERE username = 'c')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     let (roster, _) = class_member::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
     assert_eq!(
         roster
             .iter()
-            .map(|member| member.get_user().key())
+            .map(|member| name_of(member.get_user()))
             .collect::<Vec<_>>(),
         vec!["b", "a", "c"],
         "a stamp-less row must sort oldest, not first"
@@ -586,7 +625,7 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
     .get_id()
     .clone();
 
-    // Courses are ULID-keyed, so their ids rise with creation; attaching them
+    // Course ids rise with creation (monotonic mint); attaching them
     // back-to-front makes id order and attach order disagree.
     let mut courses = Vec::new();
     for title in ["first", "second", "third"] {
@@ -604,7 +643,7 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
     let (attached, _) = class_course::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
-    let order: Vec<&str> = attached
+    let order: Vec<String> = attached
         .iter()
         .map(|link| link.get_course().key())
         .collect();
@@ -626,7 +665,7 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
 #[tokio::test]
 async fn a_class_refuses_the_member_past_its_ceiling() {
     let (_app, db) = app_and_db().await;
-    let manager = UserId::from_key("manager");
+    let manager = fixture_user(&db, "manager").await;
     let class = class_group::create(
         &db,
         &manager,
@@ -639,18 +678,19 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
     .unwrap()
     .get_id()
     .clone();
-    db.query("UPDATE $class SET class_member_count = $at")
-        .bind(("class", class.record()))
-        .bind(("at", MAX_CLASS_MEMBERS - 1))
+    sqlx::query("UPDATE class_group SET class_member_count = $1 WHERE id = $2")
+        .bind(MAX_CLASS_MEMBERS - 1)
+        .bind(class.clone())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
-    class_member::add(&db, &class, &UserId::from_key("last"), &manager)
+    let last = fixture_user(&db, "last").await;
+    class_member::add(&db, &class, &last, &manager)
         .await
         .expect("the place under the ceiling is still free");
-    let refused = class_member::add(&db, &class, &UserId::from_key("over"), &manager).await;
+    let over = fixture_user(&db, "over").await;
+    let refused = class_member::add(&db, &class, &over, &manager).await;
     assert!(
         matches!(refused, Err(AppError::ConflictCoded { code, ref message })
             if code == "class_at_roster_ceiling"
@@ -659,22 +699,18 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
          must name the ceiling the prose does — the roster, not the course list: {refused:?}"
     );
     assert_eq!(
-        counter("SELECT VALUE class_member_count ?? 0 FROM class_group", &db).await,
+        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
         MAX_CLASS_MEMBERS,
         "a refused add may not tick the counter past the cap"
     );
-    assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 1);
+    assert_eq!(rows("SELECT count(*) FROM class_member", &db).await, 1);
 
     // And the refusal a *deleted* class earns must stay a 404: both come out of
     // the same counter claim matching nothing, and only one of them is a
     // ceiling anybody can make room under.
-    db.query("DELETE $class")
-        .bind(("class", class.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    let gone = class_member::add(&db, &class, &UserId::from_key("ghost"), &manager).await;
+    wipe_row("class_group", class.uuid(), &db).await;
+    let ghost = fixture_user(&db, "ghost").await;
+    let gone = class_member::add(&db, &class, &ghost, &manager).await;
     assert!(
         matches!(gone, Err(AppError::NotFound)),
         "a class that is gone is a 404: {gone:?}"
@@ -709,12 +745,11 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
     .get_id()
     .clone();
     let algebra = CourseId::from_key(&create_course(&app, &cookie, "algebra").await);
-    db.query("UPDATE $class SET class_member_count = $over")
-        .bind(("class", class.record()))
-        .bind(("over", MAX_CLASS_MEMBERS + 1))
+    sqlx::query("UPDATE class_group SET class_member_count = $1 WHERE id = $2")
+        .bind(MAX_CLASS_MEMBERS + 1)
+        .bind(class.clone())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
     let refused = class_course::attach(&db, &class, &algebra, &manager).await;
@@ -725,24 +760,23 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         "the refusal must name the axis that is over, not the one with room: {refused:?}"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_course", &db).await,
+        rows("SELECT count(*) FROM class_course", &db).await,
         0,
         "a refused attach may not leave the link behind"
     );
     assert_eq!(
-        counter("SELECT VALUE class_course_count ?? 0 FROM class_group", &db).await,
+        counter("SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group", &db).await,
         0,
         "…nor tick the axis it was refused on"
     );
 
     // Back under the ceiling, the very same attach goes through: the refusal is
     // the standing count, not the class.
-    db.query("UPDATE $class SET class_member_count = $at")
-        .bind(("class", class.record()))
-        .bind(("at", MAX_CLASS_MEMBERS))
+    sqlx::query("UPDATE class_group SET class_member_count = $1 WHERE id = $2")
+        .bind(MAX_CLASS_MEMBERS)
+        .bind(class.clone())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     class_course::attach(&db, &class, &algebra, &manager)
         .await
@@ -754,7 +788,7 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
 #[tokio::test]
 async fn a_class_over_the_course_ceiling_takes_no_member() {
     let (_app, db) = app_and_db().await;
-    let manager = UserId::from_key("manager");
+    let manager = fixture_user(&db, "manager").await;
     let class = class_group::create(
         &db,
         &manager,
@@ -767,15 +801,15 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
     .unwrap()
     .get_id()
     .clone();
-    db.query("UPDATE $class SET class_course_count = $over")
-        .bind(("class", class.record()))
-        .bind(("over", MAX_CLASS_COURSES + 1))
+    sqlx::query("UPDATE class_group SET class_course_count = $1 WHERE id = $2")
+        .bind(MAX_CLASS_COURSES + 1)
+        .bind(class.clone())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
-    let refused = class_member::add(&db, &class, &UserId::from_key("ali"), &manager).await;
+    let ali = fixture_user(&db, "ali").await;
+    let refused = class_member::add(&db, &class, &ali, &manager).await;
     assert!(
         matches!(refused, Err(AppError::ConflictCoded { code, ref message })
             if code == "class_course_list_too_large"
@@ -783,9 +817,9 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
         "the refusal must name the courses, not the roster — in its code as well as \
          its prose: {refused:?}"
     );
-    assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM class_member", &db).await, 0);
     assert_eq!(
-        counter("SELECT VALUE class_member_count ?? 0 FROM class_group", &db).await,
+        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
         0
     );
 }
@@ -908,7 +942,7 @@ async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
     let manager = login_as(&app, &db, "manager", "manager").await;
     let student = login_as(&app, &db, "ali", "student").await;
     let student_id = me_id(&app, &student).await;
-    let ghost = "01J8XZ0K3Q8G7X2M4N5P6R7S8T";
+    let ghost = GHOST_ID;
 
     for bad in [student_id.as_str(), ghost] {
         let refused = send(
@@ -922,7 +956,7 @@ async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
         assert_eq!(refused.status, StatusCode::BAD_REQUEST, "create with {bad}");
     }
     assert_eq!(
-        rows("SELECT VALUE id FROM class_group", &db).await,
+        rows("SELECT count(*) FROM class_group", &db).await,
         0,
         "a refused create may write no class"
     );
@@ -1249,7 +1283,7 @@ async fn only_staff_and_a_linked_parent_read_another_users_classes() {
     let ghost = send(
         &app,
         "GET",
-        "/classes/user/01J8XZ0K3Q8G7X2M4N5P6R7S8T",
+        &format!("/classes/user/{ABSENT_ID}"),
         Some(&teacher),
         None,
     )
@@ -1292,12 +1326,12 @@ async fn a_membership_whose_class_is_gone_is_counted_but_skipped() {
     }
     // The guard would refuse this, so it is spelled as the raw row loss it
     // stands in for; the membership row is deliberately left behind.
-    db.query("DELETE type::record('class_group', $key)")
-        .bind(("key", classes[0].clone()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    wipe_row(
+        "class_group",
+        uuid::Uuid::parse_str(&classes[0]).expect("a uuid class id"),
+        &db,
+    )
+    .await;
 
     let res = send(&app, "GET", "/classes/me", Some(&student), None).await;
     assert_eq!(
@@ -1339,28 +1373,38 @@ async fn a_membership_whose_class_is_gone_is_counted_but_skipped() {
 // single time. Nothing in `src/` knows about it — the seam is the schema, and
 // these tests are what stop the three `undo_if_demoted` calls being deleted.
 
-/// Demote `user` from inside the next write to `table`, the instant it lands.
+/// Demote `user` from inside the next write to `table`, the instant it lands:
+/// an AFTER trigger fires inside the write's own transaction, between the
+/// handler's role check and its post-write re-read.
 async fn demote_during_writes_to(table: &str, event: &str, user: &str, db: &Database) {
-    db.query(format!(
-        "DEFINE EVENT demote_mid_write ON TABLE {table} WHEN $event = '{event}' THEN {{ \
-         UPDATE type::record('user', '{user}') SET role = 'student'; }};"
-    ))
+    let firing = match event {
+        "CREATE" => "INSERT",
+        "UPDATE" => "UPDATE",
+        other => panic!("unknown event kind {other}"),
+    };
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION heztest_demote_mid_write() RETURNS trigger AS $$
+         BEGIN
+           UPDATE app_user SET role = 'student' WHERE id = '{user}';
+           RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_demote_mid_write AFTER {firing} ON {table}
+         FOR EACH ROW EXECUTE FUNCTION heztest_demote_mid_write();"
+    )))
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .expect("define the demote trigger");
 }
 
 /// The homeroom teacher's live role, straight out of the store.
 async fn role_of(user: &str, db: &Database) -> String {
-    let mut result = db
-        .query("SELECT VALUE role FROM user WHERE id = type::record('user', $k)")
-        .bind(("k", user.to_string()))
+    sqlx::query_scalar("SELECT role FROM app_user WHERE id = $1")
+        .bind(UserId::from_key(user))
+        .fetch_one(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap().pop().unwrap()
 }
 
 /// `POST /classes` naming a teacher who is demoted while the row is being
@@ -1407,12 +1451,12 @@ async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
     );
     assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
     assert_eq!(
-        rows("SELECT VALUE id FROM class_group", &db).await,
+        rows("SELECT count(*) FROM class_group", &db).await,
         0,
         "the 409 promises nothing was created — so nothing may be there"
     );
     assert_eq!(
-        counter("SELECT VALUE class_count ?? 0 FROM term", &db).await,
+        counter("SELECT COALESCE(sum(class_count), 0)::bigint FROM term", &db).await,
         0,
         "…and least of all a reference stranded on the term"
     );
@@ -1471,12 +1515,12 @@ async fn a_rolled_back_create_at_a_blueprinted_grade_leaves_nothing_behind() {
         res.body
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_group", &db).await,
+        rows("SELECT count(*) FROM class_group", &db).await,
         0,
         "the rollback must still have been able to delete the class"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_course", &db).await,
+        rows("SELECT count(*) FROM class_course", &db).await,
         0,
         "…which it only can because nothing was stocked onto it first"
     );
@@ -1516,8 +1560,8 @@ async fn a_patch_whose_teacher_is_demoted_mid_write_undoes_the_column() {
     assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
     assert_eq!(
         counter(
-            "SELECT VALUE (IF teacher = NONE { 0 } ELSE { 1 }) FROM class_group",
-            &db
+            "SELECT count(*) FROM class_group WHERE teacher IS NOT NULL",
+            &db,
         )
         .await,
         0,
@@ -1566,7 +1610,7 @@ async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
     );
     assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
     assert_eq!(
-        counter("SELECT VALUE array::len(teachers ?? []) FROM course", &db).await,
+        counter("SELECT COALESCE(sum(cardinality(teachers)), 0)::bigint FROM course", &db).await,
         0,
         "the assignment must be dropped again, not left granting nothing"
     );
@@ -1589,15 +1633,21 @@ async fn a_rollback_the_guard_refuses_is_a_500_not_a_lying_409() {
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
 
-    db.query(format!(
-        "DEFINE EVENT demote_and_occupy ON TABLE class_group WHEN $event = 'CREATE' THEN {{ \
-         UPDATE type::record('user', '{teacher_id}') SET role = 'student'; \
-         UPDATE $after.id SET class_member_count = 1; }};"
-    ))
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION heztest_demote_and_occupy() RETURNS trigger AS $$
+         BEGIN
+           UPDATE app_user SET role = 'student' WHERE id = '{teacher_id}';
+           UPDATE class_group SET class_member_count = 1 WHERE id = NEW.id;
+           RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_demote_and_occupy AFTER INSERT ON class_group
+         FOR EACH ROW EXECUTE FUNCTION heztest_demote_and_occupy();"
+    )))
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .expect("define the demote-and-occupy trigger");
 
     let res = send(
         &app,
@@ -1615,14 +1665,14 @@ async fn a_rollback_the_guard_refuses_is_a_500_not_a_lying_409() {
         res.body
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_group", &db).await,
+        rows("SELECT count(*) FROM class_group", &db).await,
         1,
         "the class really is still there — which is why the 409 would have lied"
     );
     assert_eq!(
         counter(
-            "SELECT VALUE (IF teacher = NONE { 0 } ELSE { 1 }) FROM class_group",
-            &db
+            "SELECT count(*) FROM class_group WHERE teacher IS NOT NULL",
+            &db,
         )
         .await,
         0,
@@ -1759,7 +1809,7 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
     let (app, db) = app_and_db().await;
     let staff = login_as(&app, &db, "manager", "manager").await;
     let manager = UserId::from_key(&me_id(&app, &staff).await);
-    let student = UserId::from_key("student");
+    let student = fixture_user(&db, "heir_ogrenci").await;
     let algebra = CourseId::from_key(&create_course(&app, &staff, "algebra").await);
     let mut made = Vec::new();
     for name in ["9-B", "9-A"] {
@@ -1784,35 +1834,29 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
     }
     let (owner, heir) = (made[0].clone(), made[1].clone());
     assert_eq!(
-        rows(
-            &format!(
-                "SELECT VALUE id FROM enrollment WHERE source = class_group:{}",
-                owner.key()
-            ),
-            &db
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM enrollment WHERE source = $1",
         )
-        .await,
+        .bind(owner.clone())
+        .fetch_one(&db)
+        .await
+        .unwrap(),
         1,
         "the second attach skips the row the first wrote, so the first owns it"
     );
 
     // The heir's class row goes while both of its link rows stay: the state a
     // class deleted out from under its own links leaves.
-    db.query("DELETE $c")
-        .bind(("c", heir.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    wipe_row("class_group", heir.uuid(), &db).await;
 
     class_course::detach(&db, &owner, &algebra).await.unwrap();
     assert_eq!(
-        rows("SELECT VALUE id FROM enrollment", &db).await,
+        rows("SELECT count(*) FROM enrollment", &db).await,
         0,
         "a row handed to a class that is not there is one nothing can ever sweep"
     );
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
         0,
         "…and its seat must come back with it"
     );

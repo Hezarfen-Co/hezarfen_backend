@@ -13,10 +13,10 @@
 //! The lock-level races pin the handlers.
 //!
 //! Every race here is judged on the *store*, never on what a request answered:
-//! the in-memory engine forges wins under concurrency (src/domain/cap.rs), so a
-//! 404 or a 204 is evidence of nothing. The windows are opened by the database
-//! itself — a `DEFINE EVENT` on the table under write fires *inside* the
-//! writing transaction — rather than by a lucky interleaving.
+//! under concurrency a 404 or a 204 is evidence of nothing. The windows are
+//! opened by the database itself — an AFTER trigger on the table under write
+//! sleeps *inside* the writing transaction — rather than by a lucky
+//! interleaving.
 
 mod common;
 
@@ -26,44 +26,32 @@ use common::{
     id_of, items, login_as, me_id, multipart_file, send, send_raw, unenroll, upload_file_at,
 };
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::user::UserId;
 use serde_json::{Value, json};
-use surrealdb::types::RecordId;
-
-/// `HOMEWORK_LOCK` is process-wide, and every race below holds a lease of it
-/// for seconds. Two of them running at once starve each other's window — the
-/// second one's gates then run *after* the staging meant to happen inside them,
-/// and the test judges an interleaving that never happened. One at a time; the
-/// deterministic tests need no ticket.
-static ONE_RACE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use sqlx::Row as _;
 
 /// A due date comfortably clear of the 60s past-scheduling grace.
 fn far_future() -> i64 {
     hezarfen_backend::domain::timestamp::Timestamp::now().as_millis() + 7_200_000
 }
 
-/// How many rows `sql` selects ids for — the stored state, out of the store.
-async fn rows(db: &Database, sql: &str) -> usize {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result.take::<Vec<RecordId>>(0).unwrap().len()
+/// How many rows `sql` counts — the stored state, out of the store.
+async fn rows(db: &Database, sql: &'static str) -> usize {
+    sqlx::query_scalar::<_, i64>(sql)
+        .fetch_one(db)
+        .await
+        .unwrap() as usize
 }
 
 /// One integer field off one user row, absent counting as zero.
 async fn counter(db: &Database, user: &str, field: &str) -> i64 {
-    let mut result = db
-        .query(format!(
-            "SELECT VALUE ({field} ?? 0) FROM type::record('user', $key)"
-        ))
-        .bind(("key", user.to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<i64>>(0)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COALESCE({field}, 0) FROM app_user WHERE id = $1"
+    )))
+    .bind(UserId::from_key(user))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// Upload `bytes` onto the caller's submission to `hw` — no assertion.
@@ -114,22 +102,25 @@ async fn course_with_student(
 /// green over the hole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_inside_a_homework_delete_never_orphans() {
-    let _serial = ONE_RACE_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "ogretmen_odev", "teacher").await;
     let (course, subject, student, student_id) =
         course_with_student(&app, &db, &teacher, "fizik").await;
     let hw = create_homework(&app, &teacher, &course, &subject, "deneme", far_future()).await;
 
-    // Hold the delete open once the cascade has run but before it commits.
-    db.query(
-        "DEFINE EVENT hold_the_window ON TABLE homework WHEN $event = 'DELETE' \
-         THEN { SLEEP 3s; };",
+    // Hold the delete open once the cascade has run but before it commits: an
+    // AFTER DELETE trigger sleeping inside the delete's own transaction.
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_the_window() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(3.0); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_the_window AFTER DELETE ON homework
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_the_window();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let drop_it = {
         let (app, teacher, hw) = (app.clone(), teacher.clone(), hw.clone());
@@ -176,12 +167,12 @@ async fn an_upload_inside_a_homework_delete_never_orphans() {
 
     // Stored state is the whole verdict.
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_submission").await,
+        rows(&db, "SELECT count(*) FROM homework_submission").await,
         0,
         "a submission outlived its homework"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_file").await,
+        rows(&db, "SELECT count(*) FROM homework_file").await,
         0,
         "a file outlived its homework"
     );
@@ -211,7 +202,6 @@ async fn an_upload_inside_a_homework_delete_never_orphans() {
 /// is committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_inside_an_audience_patch_is_refused() {
-    let _serial = ONE_RACE_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "ogretmen_kapsam", "teacher").await;
     let course = create_course(&app, &teacher, "Coğrafya").await;
@@ -241,14 +231,17 @@ async fn an_upload_inside_an_audience_patch_is_refused() {
     );
     let hw = id_of(&res.body);
 
-    db.query(
-        "DEFINE EVENT hold_the_patch ON TABLE homework WHEN $event = 'UPDATE' \
-         THEN { SLEEP 3s; };",
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_the_patch() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(3.0); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_the_patch AFTER UPDATE ON homework
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_the_patch();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let narrowing = {
         let (app, teacher, hw, kept_id) =
@@ -291,12 +284,12 @@ async fn an_upload_inside_an_audience_patch_is_refused() {
         "a student the homework no longer names must be answered 404"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_submission").await,
+        rows(&db, "SELECT count(*) FROM homework_submission").await,
         0,
         "a submission landed for a student outside the audience"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_file").await,
+        rows(&db, "SELECT count(*) FROM homework_file").await,
         0,
         "... with a file on it"
     );
@@ -347,13 +340,13 @@ async fn a_submission_under_a_vanished_homework_is_refused() {
         "delete the homework"
     );
 
-    let refused = upsert(&db, &stale, &user, None).await;
+    let refused = upsert(&db, &stale, &user, None, false).await;
     assert!(
         refused.is_err(),
         "a submission to a homework that is gone must be refused, got {refused:?}"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_submission").await,
+        rows(&db, "SELECT count(*) FROM homework_submission").await,
         0,
         "the refused write must leave no row"
     );
@@ -427,7 +420,7 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
         "a grade on a homework that is gone must be refused, got {refused:?}"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_result").await,
+        rows(&db, "SELECT count(*) FROM homework_result").await,
         0,
         "the refused write must leave no row"
     );
@@ -479,7 +472,6 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
 /// why it is kept and documented rather than trusted to a red test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grade_inside_a_course_delete_never_orphans() {
-    let _serial = ONE_RACE_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "ogretmen_ders", "teacher").await;
     let (course, subject, _student, student_id) =
@@ -490,14 +482,17 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
     // seconds against a one-second wait below: under a loaded test binary the
     // spawned request can take a while to be polled at all, and the window has
     // to still be open when it gets there.
-    db.query(
-        "DEFINE EVENT hold_the_grade ON TABLE homework_result WHEN $event = 'CREATE' \
-         THEN { SLEEP 3s; };",
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_the_grade() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(3.0); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_the_grade AFTER INSERT ON homework_result
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_the_grade();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let grading = {
         let (app, teacher, hw, target) =
@@ -550,12 +545,12 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
 
     // Stored state is the whole verdict.
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework").await,
+        rows(&db, "SELECT count(*) FROM homework").await,
         0,
         "the homework survived its course"
     );
     assert_eq!(
-        rows(&db, "SELECT VALUE id FROM homework_result").await,
+        rows(&db, "SELECT count(*) FROM homework_result").await,
         0,
         "a grade outlived the homework it was written against"
     );
@@ -667,7 +662,6 @@ async fn a_student_sees_only_themselves_in_an_assigned_subset() {
 /// would fail a *correct* implementation too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_add_racing_a_file_delete_never_500s() {
-    let _serial = ONE_RACE_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "ogretmen_dosya", "teacher").await;
     let (course, subject, student, _student_id) =
@@ -688,14 +682,17 @@ async fn a_file_add_racing_a_file_delete_never_500s() {
     .await;
     let first = listed.body["files"][0]["id"].as_str().unwrap().to_string();
 
-    db.query(
-        "DEFINE EVENT hold_the_delete ON TABLE homework_file WHEN $event = 'DELETE' \
-         THEN { SLEEP 150ms; };",
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_the_delete() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(0.15); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_the_delete AFTER DELETE ON homework_file
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_the_delete();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let removing = {
         let (app, student, hw, first) = (app.clone(), student.clone(), hw.clone(), first.clone());
@@ -730,14 +727,11 @@ async fn a_file_add_racing_a_file_delete_never_500s() {
     );
     // Whatever the order, the stored count matches the stored rows: the
     // submission's seat counter is what the cap reads next time.
-    let files = rows(&db, "SELECT VALUE id FROM homework_file").await;
-    let mut result = db
-        .query("SELECT VALUE (file_count ?? 0) FROM homework_submission")
+    let files = rows(&db, "SELECT count(*) FROM homework_file").await;
+    let counted: Vec<i64> = sqlx::query_scalar("SELECT file_count FROM homework_submission")
+        .fetch_all(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
-    let counted: Vec<i64> = result.take(0).unwrap();
     assert_eq!(
         counted.first().copied().unwrap_or(0),
         files as i64,

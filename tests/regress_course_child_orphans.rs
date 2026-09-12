@@ -15,33 +15,23 @@
 //!   `must_exist` still accepts its id, so a bank template can be
 //!   tagged with a subject nobody can reach.
 //!
-//! All three creates now go through `cap::touch_and_create`, which *moves* the
-//! course's roster counter (bumped, gated, put back by captured value) inside
-//! the create's own transaction: the write lands on the very record the delete
-//! removes, so the store refuses one of the two. `SET x = x` would not do —
-//! SurrealDB elides an `UPDATE` that leaves the document unchanged, and an
-//! elided write sits in no write set at all.
+//! All three creates now go through a claim that locks the course row inside
+//! the create's own transaction: the write lands on the very row the delete
+//! removes, so the store refuses one of the two.
 //!
 //! Two halves, and they are not interchangeable. **This file is the sequential
-//! one**: it runs anywhere, on the in-memory engine, and pins the existence
-//! contract (a create against a course that is already gone must be a 404, not
-//! an orphan) plus the restore (the borrowed counter comes back exactly as it
-//! was, or the course is undeletable forever — a worse bug than the one being
-//! fixed).
+//! one**: it pins the existence contract (a create against a course that is
+//! already gone must be a 404, not an orphan) plus the restore (the borrowed
+//! counter comes back exactly as it was, or the course is undeletable forever —
+//! a worse bug than the one being fixed).
 //!
 //! The **race** half drives the real interleaving and lives in-crate, one pin
 //! per child beside the create it pins —
 //! `db::exam::tests::an_exam_never_outlives_its_course`,
 //! `db::course_session::tests::a_session_never_outlives_its_course`,
 //! `db::subject::tests::a_subject_never_outlives_its_course` — over the
-//! shared harness `db::course::assert_no_child_outlives_a_course_delete`.
-//! It is `#[ignore]`d and needs a real server, because the subject there *is*
-//! the store's conflict detection, which the embedded engine does not have: it
-//! commits both sides and answers `Ok` to each, so a race test on `memory`
-//! passes over the hole (same reason `domain::class_course`'s twin is ignored).
-//! Only in-crate tests can reach `database::init_test_server` and the
-//! `RACE_LOCK` that serializes them, and a hand-copied bootstrap here would
-//! drift out of the real one silently.
+//! shared harness `db::course::assert_no_child_outlives_a_course_delete`,
+//! against the same per-test Postgres this file runs on.
 
 mod common;
 
@@ -63,16 +53,34 @@ use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
 use serde_json::json;
+use sqlx::Row as _;
 use tokio::task::JoinHandle;
 
-fn teacher() -> UserId {
-    UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA")
+async fn teacher(db: &Database) -> UserId {
+    // Creator columns are foreign keys now, so the fixture teacher is a row,
+    // not a fabricated id. It never logs in, so the hash is a stub.
+    sqlx::query(
+        "INSERT INTO app_user (id, username, password_hash, role) \
+         VALUES ($1, 'doktor', 'x', 'teacher') ON CONFLICT DO NOTHING",
+    )
+    .bind(UserId::generate().uuid())
+    .execute(db)
+    .await
+    .unwrap();
+    let id: uuid::Uuid = sqlx::query("SELECT id FROM app_user WHERE username = 'doktor'")
+        .fetch_one(db)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    UserId::from_key(&id.to_string())
 }
 
 async fn a_course(db: &Database) -> CourseId {
+    let teacher = teacher(db).await;
     course::create(
         db,
-        &teacher(),
+        &teacher,
         CourseTitle::try_new("Fizik").unwrap(),
         CourseDescription::try_new("").unwrap(),
         CourseKind::course(),
@@ -102,10 +110,11 @@ async fn drop_course(course: &CourseId, db: &Database) -> Result<bool, AppError>
 
 fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
+        let teacher = teacher(&db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         hezarfen_backend::db::exam::create(
             &db,
-            &teacher(),
+            &teacher,
             &course,
             ExamTitle::try_new("quiz").unwrap(),
             ExamDescription::try_new("").unwrap(),
@@ -123,10 +132,11 @@ fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
 
 fn make_session(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
+        let teacher = teacher(&db).await;
         db_course_session::create(
             &db,
             &course,
-            &teacher(),
+            &teacher,
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(1),
             None,
@@ -151,10 +161,11 @@ fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
 
 fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
+        let teacher = teacher(&db).await;
         hezarfen_backend::db::course_note::create(
             &db,
             &course,
-            &teacher(),
+            &teacher,
             CourseNoteTitle::try_new("plan").unwrap(),
             CourseNoteContent::try_new("").unwrap(),
         )
@@ -166,19 +177,13 @@ fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
 /// How many rows of `table` name `course`. Stored state, never a return value:
 /// the whole point is what the store kept.
 async fn children(table: &str, course: &CourseId, db: &Database) -> usize {
-    let mut result = db
-        .query(format!(
-            "SELECT VALUE id FROM {table} WHERE course = $course"
-        ))
-        .bind(("course", course.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len()
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table} WHERE course = $1"
+    )))
+    .bind(course.clone())
+    .fetch_one(db)
+    .await
+    .unwrap() as usize
 }
 
 // --- the sequential half: the existence contract ---------------------------
@@ -191,7 +196,7 @@ async fn a_create_against_a_deleted_course_refuses(
     table: &str,
     make: fn(CourseId, Database) -> JoinHandle<Result<(), AppError>>,
 ) {
-    let db = database::init_mem().await.unwrap();
+    let (db, _dbs) = database::init_test_db().await;
     let course = a_course(&db).await;
     assert!(drop_course(&course, &db).await.unwrap(), "the course goes");
 
@@ -227,28 +232,27 @@ async fn a_course_note_under_a_deleted_course_is_refused() {
     a_create_against_a_deleted_course_refuses("course_note", make_note).await;
 }
 
-/// The counter the three creates borrow is *given back* — absent stays absent.
-/// A bump left behind is not a smaller bug than the orphan it prevents: the
-/// course's delete guard is `WHERE (enrollment_count ?? 0) = 0`, so a course
-/// that once had an exam created under it would be undeletable forever, and the
-/// boot backfill keys on the column being `NONE`.
+/// The counter the three creates borrow is *given back*. A bump left behind is
+/// not a smaller bug than the orphan it prevents: the course's delete guard
+/// reads `enrollment_count`, so a course that once had an exam created under it
+/// would be undeletable forever.
 #[tokio::test]
 async fn the_creates_give_the_courses_roster_counter_back_untouched() {
-    let db = database::init_mem().await.unwrap();
+    let (db, _dbs) = database::init_test_db().await;
     let course = a_course(&db).await;
-    let absent = "SELECT VALUE id FROM course WHERE enrollment_count = NONE";
 
     for make in [make_exam, make_session, make_subject, make_note] {
         make(course.clone(), db.clone()).await.unwrap().unwrap();
     }
-    let mut result = db.query(absent).await.unwrap().check().unwrap();
+    let bumped = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM course WHERE enrollment_count <> 0",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
     assert_eq!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .unwrap()
-            .len(),
-        1,
-        "the borrowed counter must be restored to absent, not to 0"
+        bumped, 0,
+        "the borrowed counter must be restored to 0, not left bumped"
     );
     // The proof that matters to a user: the course is still deletable.
     assert!(
@@ -262,12 +266,13 @@ async fn the_creates_give_the_courses_roster_counter_back_untouched() {
 /// `course_note_file` children with it too, not just itself.
 #[tokio::test]
 async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
-    let db = database::init_mem().await.unwrap();
+    let (db, _dbs) = database::init_test_db().await;
     let course = a_course(&db).await;
+    let teacher = teacher(&db).await;
     let note = hezarfen_backend::db::course_note::create(
         &db,
         &course,
-        &teacher(),
+        &teacher,
         CourseNoteTitle::try_new("plan").unwrap(),
         CourseNoteContent::try_new("body").unwrap(),
     )
@@ -292,18 +297,15 @@ async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
         0,
         "a course_note survived its course's delete"
     );
-    let mut result = db
-        .query("SELECT VALUE id FROM course_note_file WHERE course_note = $note")
-        .bind(("note", note.get_id().record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    let files = sqlx::query_as::<_, (uuid::Uuid,)>(
+        "SELECT id FROM course_note_file WHERE course_note = $1",
+    )
+    .bind(note.get_id().clone())
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .unwrap()
-            .len(),
+        files.len(),
         0,
         "a course_note_file survived its note's course's delete"
     );
@@ -316,12 +318,13 @@ async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
 /// three creates above.
 #[tokio::test]
 async fn a_course_note_file_under_a_deleted_note_is_refused() {
-    let db = database::init_mem().await.unwrap();
+    let (db, _dbs) = database::init_test_db().await;
     let course = a_course(&db).await;
+    let teacher = teacher(&db).await;
     let note = hezarfen_backend::db::course_note::create(
         &db,
         &course,
-        &teacher(),
+        &teacher,
         CourseNoteTitle::try_new("plan").unwrap(),
         CourseNoteContent::try_new("").unwrap(),
     )
@@ -348,29 +351,19 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
         matches!(file, Err(AppError::Conflict(_))),
         "a file upload under a deleted note must refuse, not {file:?}"
     );
-    let mut result = db
-        .query("SELECT VALUE id FROM course_note_file WHERE course_note = $note")
-        .bind(("note", note.get_id().record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    let files = sqlx::query_as::<_, (uuid::Uuid,)>(
+        "SELECT id FROM course_note_file WHERE course_note = $1",
+    )
+    .bind(note.get_id().clone())
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .unwrap()
-            .len(),
+        files.len(),
         0,
         "a refused upload left a row naming a note that is gone"
     );
 }
-
-/// #22, the course's own children over HTTP: a course in an archived term is a
-/// past year, so its subjects and course notes (and note files) refuse every
-/// write with the coded 409 while all their reads keep answering. The guard
-/// sits in each write handler after its authorization check — 403 before 409 —
-/// on the `course` the shared loaders already hand back, never inside those
-/// loaders, which the read handlers share.
 #[tokio::test]
 async fn an_archived_term_freezes_a_course_s_subjects_and_notes() {
     let (app, db) = app_and_db().await;
