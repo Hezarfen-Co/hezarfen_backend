@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM menu WHERE id = $1 AND seats_booked = 0\n             RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
+  "query": "DELETE FROM menu WHERE id = $1\n             RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
   "describe": {
     "columns": [
       {
@@ -96,5 +96,5 @@
       false
     ]
   },
-  "hash": "df805341cc2335a4a2167b41d5739322505953c3b4cfcf818ff0b9ab89af353f"
+  "hash": "f81cadd9716849756ac7d2710b6e9bfd592cce8eedeacd043e7e4d7f4eb58ea0"
 }

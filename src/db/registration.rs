@@ -73,6 +73,10 @@ pub async fn claim_seat(
              UPDATE event SET registration_count = registration_count + 1
              WHERE id = $1
                AND (audience_capacity IS NULL OR registration_count < audience_capacity)
+               -- The role gate rides the bump's WHERE: a data-modifying CTE
+               -- executes even when the INSERT below matches nothing, so the
+               -- count must refuse exactly when the seat refuses.
+               AND EXISTS (SELECT 1 FROM app_user WHERE id = $2 AND role IS DISTINCT FROM 'parent')
              RETURNING 1),
          person AS (
              SELECT 1 FROM app_user WHERE id = $2 AND role IS DISTINCT FROM 'parent'

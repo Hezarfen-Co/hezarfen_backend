@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE homework_submission SET graded_by_result = NULL\n               WHERE homework = $1 AND app_user = $2 AND graded_by_result IN (\n                   SELECT id FROM homework_result WHERE homework = $1 AND app_user = $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad1364869335c3002f06a079c0060bf25312bd2749d712cd3d9c68d7a0d9c95b"
+}

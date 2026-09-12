@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM homework_submission\n               WHERE id = $1 AND graded_by_result IS NULL\n               RETURNING id AS \"id: HomeworkSubmissionId\",\n                         homework AS \"homework: HomeworkId\",\n                         app_user AS \"user: UserId\",\n                         text AS \"text: SubmissionText\",\n                         submitted_at AS \"submitted_at: Timestamp\",\n                         updated_at AS \"updated_at: Timestamp\",\n                         counted_on_time AS \"counted_on_time: bool\"",
+  "query": "SELECT id AS \"id: HomeworkSubmissionId\",\n                      homework AS \"homework: HomeworkId\",\n                      app_user AS \"user: UserId\",\n                      text AS \"text: SubmissionText\",\n                      submitted_at AS \"submitted_at: Timestamp\",\n                      updated_at AS \"updated_at: Timestamp\",\n                      counted_on_time AS \"counted_on_time: bool\"\n               FROM homework_submission\n               WHERE id = $1 AND graded_by_result IS NULL\n               FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -96,5 +96,5 @@
       true
     ]
   },
-  "hash": "07c76d04dc27e98446cd6f8be79267ce82f37763281be7dd44f8787c50f86da7"
+  "hash": "9f1e912082c61931ac4b9a0f1d23270e2e7f10a342cbb7b4e4ebaaf7cb3f3b4b"
 }
