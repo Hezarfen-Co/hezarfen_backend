@@ -31,7 +31,11 @@ impl ExamAnswerId {
 
     /// The underscore-joined wire form (`{question}_{user}[_{seq}]`).
     pub fn key(&self) -> String {
-        key::sitting(self.question.key().as_str(), self.user.key().as_str(), self.seq)
+        key::sitting(
+            self.question.key().as_str(),
+            self.user.key().as_str(),
+            self.seq,
+        )
     }
 }
 
@@ -59,6 +63,7 @@ impl AnswerText {
 pub struct ExamAnswer {
     pub(crate) exam: ExamId,
     pub(crate) question: ExamQuestionId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) selected: Option<ChoiceId>,

@@ -72,6 +72,7 @@ impl Mark {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamResult {
     pub(crate) exam: ExamId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) mark: Mark,

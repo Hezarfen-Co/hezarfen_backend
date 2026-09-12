@@ -54,6 +54,7 @@ impl AttendanceStatus {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Attendance {
     pub(crate) event: EventId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: AttendanceStatus,
     pub(crate) marked_by: UserId,

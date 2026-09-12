@@ -37,6 +37,7 @@ impl EnrollmentId {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Enrollment {
     pub(crate) course: CourseId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) enrolled_by: UserId,
     pub(crate) source: Option<ClassGroupId>,

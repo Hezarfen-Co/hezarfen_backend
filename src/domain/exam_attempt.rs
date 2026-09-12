@@ -64,6 +64,7 @@ impl AttemptStatus {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamAttempt {
     pub(crate) exam: ExamId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) started_at: Timestamp,

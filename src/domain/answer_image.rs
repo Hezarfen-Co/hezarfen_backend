@@ -44,7 +44,11 @@ impl AnswerImageId {
 
     /// The underscore-joined wire form (`{question}_{user}[_{seq}]`).
     pub fn key(&self) -> String {
-        key::sitting(self.question.key().as_str(), self.user.key().as_str(), self.seq)
+        key::sitting(
+            self.question.key().as_str(),
+            self.user.key().as_str(),
+            self.seq,
+        )
     }
 }
 
@@ -56,6 +60,7 @@ impl AnswerImageId {
 pub struct AnswerImage {
     pub(crate) exam: ExamId,
     pub(crate) question: ExamQuestionId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     /// Which sitting this drawing belongs to — 1 for the first attempt,
     /// counting up, so retakes accumulate instead of overwriting.
