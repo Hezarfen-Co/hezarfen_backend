@@ -1,49 +1,55 @@
 //! The `enrollment` table: the roster read and listing, the seat-returning
-//! delete, and the enroll claim — the one transaction that checks the pair
-//! free, the member still a student, and the roster under capacity while it
+//! delete, and the enroll claim — one transaction that checks the pair free,
+//! the member still a student, and the roster under capacity while it
 //! spends the seat. The target-user gates the HTTP handlers pay live in
 //! [`crate::service::enrollment`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::ENROLLMENT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::cap;
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
-use crate::domain::enrollment::{Enrollment, EnrollmentId};
+use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// The `THROW` markers [`enroll`]'s claim aborts with: this pair
-/// already holds a row, the roster is full, and the person being enrolled is no
-/// longer a student.
-const HELD_MARK: &str = "enroll_held";
-const FULL_MARK: &str = "enroll_full";
-const UNFIT_MARK: &str = "enroll_not_student";
+/// What [`enroll`]'s transaction settled on — the three old `THROW` markers
+/// (`enroll_held`, `enroll_not_student`, `enroll_full`) as Rust verdicts.
+enum Verdict {
+    /// This pair already holds a row.
+    Held,
+    /// The person being enrolled is no longer a student.
+    Unfit,
+    /// The roster is full — or the course is gone; the caller reads which.
+    Full,
+    /// The seat is spent and the row is written.
+    Made(Enrollment),
+}
 
-/// Enroll (idempotently) `user` into `course`. One row per (course, user),
-/// keyed by a deterministic composite id, so concurrent enrolls of the same
-/// pair converge on one row instead of racing the unique index into a 500:
-/// the loser of the `CREATE` reads the winner's row back and returns it.
-/// When the course carries a capacity, a full roster refuses new members
-/// (409) — the seat is taken by a single-record conditional write on the
-/// course row whose bound is the row's *own* `capacity` column, read inside
-/// the same statement that spends the seat. A snapshot integer taken by a
-/// read beforehand would be exactly the number a concurrent capacity PATCH
-/// invalidates, which is what this promised and did not do. An already
-/// enrolled user is returned as-is even when the roster is full, and never
-/// charged a seat. The same claim is the delete guard's other half: it
-/// matches nothing once the course row is gone, and while it holds a seat
-/// the course cannot be deleted — so no roster row can outlive its course.
+/// The primary key the natural composite PK carries — the constraint name
+/// that surfaces in SQLSTATE 23505 when a rival lands first.
+const PAIR_CONSTRAINT: &str = "enrollment_course_user";
+
+/// Enroll (idempotently) `user` into `course`. The table's primary key *is*
+/// the (course, user) pair, so concurrent enrolls of the same pair converge
+/// on one row instead of racing into a 500: the loser reads the winner's row
+/// back and returns it. When the course carries a capacity, a full roster
+/// refuses new members (409) — the seat is taken by a single-record
+/// conditional write on the course row whose bound is the row's *own*
+/// `capacity` column, read inside the same statement that spends the seat. A
+/// snapshot integer taken by a read beforehand would be exactly the number a
+/// concurrent capacity PATCH invalidates. An already enrolled user is
+/// returned as-is even when the roster is full, and never charged a seat.
+/// The same claim is the delete guard's other half: it matches nothing once
+/// the course row is gone, and while it holds a seat the course cannot be
+/// deleted — so no roster row can outlive its course.
 ///
-/// On admissibility ([`crate::database::transaction_with_retry`]): the
-/// `CREATE` here *can* answer "already exists", but only to a rival that
-/// landed inside this very window — and the re-send then sees that row at
-/// the `$held` gate and takes the other branch, so the loop converges
-/// instead of re-asking a settled question. Same shape, same reason, as
-/// [`crate::db::class_pump::attach`].
+/// Gate order is the old THROW order: an existing pair outranks the role
+/// check, which outranks a full roster. The role check takes the user row
+/// `FOR NO KEY UPDATE`, the same row a demotion cascade updates before its
+/// sweep, so grant and demotion serialize on the row lock in both
+/// directions — a row landing after the sweep is impossible, and a demotion
+/// landing before this check refuses it.
 pub async fn enroll(
     db: &Database,
     course: &CourseId,
@@ -53,112 +59,89 @@ pub async fn enroll(
     if let Some(existing) = read_for_user(db, course, user).await? {
         return disown_if_pumped(db, existing).await;
     }
-    let enrollment = Enrollment {
-        id: EnrollmentId::composite(course, user),
-        course: course.clone(),
-        user: user.clone(),
-        enrolled_by: enrolled_by.clone(),
-        // Hand-placed: no source key at all is written, which is what makes
-        // a class sweep unable to take this row back.
-        source: None,
+    let verdict = tx_with_retry(db, false, async |tx| {
+        // The duplicate gate rides ahead of the role check, so "you are
+        // already in" still outranks everything.
+        let held = sqlx::query!(
+            r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
+            course,
+            user,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if held.is_some() {
+            return Ok(Verdict::Held);
+        }
+        // The role handshake: the live role decides, and the row lock makes
+        // the check and the insert one decision against a concurrent
+        // demotion (see the doc above).
+        let role = sqlx::query!(
+            r#"SELECT role FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
+            user,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if role.map(|row| row.role).as_deref() != Some(Role::Student.as_str()) {
+            return Ok(Verdict::Unfit);
+        }
+        // The seat and the row in one statement (the cap recipe): a refused
+        // insert takes its own seat bump back; zero rows means the roster is
+        // full or the course is gone — only the caller pays for the read
+        // that tells those apart.
+        let row = sqlx::query_as!(
+            Enrollment,
+            r#"WITH seat AS (
+                 UPDATE course
+                    SET enrollment_count = enrollment_count + 1
+                  WHERE id = $1
+                    AND enrollment_count < COALESCE(capacity, $2)
+                  RETURNING 1)
+               INSERT INTO enrollment (course, app_user, enrolled_by, source)
+               SELECT $1, $3, $4, NULL WHERE EXISTS (SELECT 1 FROM seat)
+               RETURNING course, app_user AS "user", enrolled_by, source"#,
+            course,
+            cap::UNLIMITED,
+            user,
+            enrolled_by,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        match row {
+            Some(row) => Ok(Verdict::Made(row)),
+            None => Ok(Verdict::Full),
+        }
+    })
+    .await;
+    // The 23505 backstop folds into the Held verdict before the mapping:
+    // someone placed this pair between the gate and the insert, and their
+    // row is the answer — no seat was spent finding that out.
+    let verdict = match verdict {
+        Err(AppError::Db(err)) if unique_violation(&err) == Some(PAIR_CONSTRAINT) => {
+            Ok(Verdict::Held)
+        }
+        other => other,
     };
-    // CREATE, not UPSERT, and in the seat's own transaction: a duplicate has
-    // to be *seen*, or the pair's second writer would keep the seat it
-    // claimed for a row that already existed and the counter would drift
-    // above the roster forever.
-    //
-    // Parenthesized `??` throughout: `n ?? 0 < cap` parses as
-    // `n ?? (0 < cap)`, which is truthy for every row and would enroll past
-    // the capacity.
-    //
-    // The seat is claimed on the *course*, so the student's own row is
-    // claimed beside it ([`cap::role_claim`]): a demotion's sweep runs on a
-    // snapshot, and a row landing after it would count a seat for someone
-    // who may not hold one, with nothing left to re-sweep. It rides between
-    // the duplicate gate and the seat, so "you are already in" still
-    // outranks it and it outranks a full roster.
-    let held_by = cap::role_claim(
-        "usr",
-        &format!("!= '{}'", Role::Student.as_str()),
-        UNFIT_MARK,
-    );
-    let hold = held_by.join(";\n             ");
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $held = (SELECT VALUE id FROM $id);
-         IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
-         {hold};
-         LET $seat = (UPDATE $course SET {ENROLLMENT_COUNT_FIELD} = \
-             ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 \
-             WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) < (capacity ?? $unlimited) \
-             RETURN VALUE id);
-         IF array::len($seat) = 0 {{ THROW '{FULL_MARK}' }};
-         CREATE $id CONTENT $row;
-         COMMIT TRANSACTION;"
-    );
-    // The process still sends its counter writes one at a time (see
-    // [`cap::counter_lock`]); this statement moves the same counter every
-    // cap claim does.
-    let _guard = cap::counter_lock().await;
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[
-            ("id".into(), enrollment.id.record().into_value()),
-            ("row".into(), enrollment.clone().into_value()),
-            ("course".into(), course.record().into_value()),
-            ("usr".into(), user.record().into_value()),
-            ("unlimited".into(), cap::UNLIMITED.into_value()),
-        ],
-        &[HELD_MARK, FULL_MARK, UNFIT_MARK],
-    )
-    .await?;
-    // Someone placed this pair first; their row is the answer, and no seat
-    // was spent finding that out. It is read first: it outranks the refusal
-    // below, and the gate aborts before the seat is touched.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(HELD_MARK))
-    {
-        return match read_for_user(db, course, user).await? {
+    match verdict {
+        Ok(Verdict::Made(row)) => Ok(row),
+        Ok(Verdict::Held) => match read_for_user(db, course, user).await? {
             Some(existing) => disown_if_pumped(db, existing).await,
             None => Err(AppError::Internal("failed to enroll user".into())),
-        };
-    }
-    // Demoted while this ran: the same refusal the service's own gate makes
-    // a moment earlier, and the only one that can arrive after it.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(UNFIT_MARK))
-    {
-        return Err(AppError::Validation(ValidationError::Invalid {
+        },
+        // Demoted while this ran: the same refusal the service's own gate
+        // makes a moment earlier, and the only one that can arrive after it.
+        Ok(Verdict::Unfit) => Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "only students can be enrolled in a course",
-        }));
-    }
-    // Full, or the course is gone — the conditional write matches nothing
-    // either way, and only this path pays for the read that tells them
-    // apart.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(FULL_MARK))
-    {
-        return match crate::db::course::read(db, course).await? {
+        })),
+        // Full, or the course is gone — the conditional write matches
+        // nothing either way, and only this path pays for the read that
+        // tells them apart.
+        Ok(Verdict::Full) => match crate::db::course::read(db, course).await? {
             Some(_) => Err(AppError::Conflict("the course is full")),
             None => Err(AppError::NotFound),
-        };
+        },
+        Err(err) => Err(err),
     }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, two LETs and two IFs, plus the holder claim's own
-    // statements — counted, not tallied by hand, so a statement added there
-    // cannot read back the wrong result.
-    result
-        .take::<Vec<Enrollment>>(5 + held_by.len())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to enroll user".into()))
 }
 
 /// A hand enroll landing on a row a class pumped takes the row *off* the
@@ -167,28 +150,30 @@ pub async fn enroll(
 /// holds in the other direction — a manual unenroll wins, permanently — and
 /// without it "hand-placed" was a state only a first enroll could reach.
 ///
-/// `UNSET`, not `= NONE`: absence *is* the meaning of this column (see the
-/// struct doc), and it is what a hand enroll writes on the create path.
+/// `NULL`, not absence: the column is a nullable uuid whose NULL *is* the
+/// meaning a missing key used to carry (see the struct doc), and it is what
+/// a hand enroll writes on the create path too.
 async fn disown_if_pumped(db: &Database, existing: Enrollment) -> Result<Enrollment, AppError> {
-    if existing.source.is_none() {
+    if existing.get_source().is_none() {
         return Ok(existing);
     }
-    let mut result = db
-        .query("UPDATE $id UNSET source RETURN AFTER")
-        .bind(("id", existing.id.record()))
-        .await?
-        .check()?;
+    let disowned = sqlx::query_as!(
+        Enrollment,
+        r#"UPDATE enrollment SET source = NULL
+           WHERE course = $1 AND app_user = $2
+           RETURNING course, app_user AS "user", enrolled_by, source"#,
+        existing.get_course(),
+        existing.get_user(),
+    )
+    .fetch_optional(db)
+    .await?;
     // A row that is no longer there is not an internal error: an unenroll
     // (or the class sweep a role change runs) landing between the read
     // above and this write matches nothing, and the caller asked to be
     // enrolled — which they were, by the row this call was handed. The
     // disown is all that is lost, and it is lost to a delete that took the
     // whole row with it.
-    Ok(result
-        .take::<Vec<Enrollment>>(0)?
-        .into_iter()
-        .next()
-        .unwrap_or(existing))
+    Ok(disowned.unwrap_or(existing))
 }
 
 /// Some(_) iff `user` is enrolled in `course` — the grading gate.
@@ -197,13 +182,16 @@ pub async fn read_for_user(
     course: &CourseId,
     user: &UserId,
 ) -> Result<Option<Enrollment>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM enrollment WHERE course = $course AND user = $usr LIMIT 1")
-        .bind(("course", course.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Enrollment>>(0)?.into_iter().next())
+    let row = sqlx::query_as!(
+        Enrollment,
+        r#"SELECT course, app_user AS "user", enrolled_by, source
+           FROM enrollment WHERE course = $1 AND app_user = $2"#,
+        course,
+        user,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 pub async fn list_for_course(
@@ -212,32 +200,44 @@ pub async fn list_for_course(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Enrollment>, i64), AppError> {
-    PagedList::new("enrollment WHERE course = $course", "ORDER BY id DESC")
-        .bind("course", course.record())
-        .run(limit, offset, db)
-        .await
+    // The old composite key `{course}_{user}` sorted by user within a
+    // course — its course prefix was constant — so the natural-PK columns
+    // sort the same way.
+    PagedList::new(
+        "enrollment WHERE course = $1",
+        "ORDER BY course DESC, app_user DESC",
+    )
+    .bind(course.uuid())
+    .run::<Enrollment>(limit, offset, db)
+    .await
 }
 
+/// Take the row and give its seat back in one statement, so nothing but a
+/// lost transaction can drift the counter. `None` when the pair held no row.
 pub async fn remove(
     db: &Database,
     course: &CourseId,
     user: &UserId,
 ) -> Result<Option<Enrollment>, AppError> {
-    // The seat comes back in the same transaction as the row that held it,
-    // so nothing but a lost transaction can drift the counter.
-    let mut result = db
-        .query(
-            "BEGIN TRANSACTION;
-             LET $gone = (DELETE enrollment WHERE course = $course AND user = $usr RETURN BEFORE);
-             UPDATE $course SET enrollment_count = math::max([(enrollment_count ?? 0) - array::len($gone), 0]);
-             RETURN $gone;
-             COMMIT TRANSACTION;",
-        )
-        .bind(("course", course.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Enrollment>>(3)?.into_iter().next())
+    let gone = sqlx::query_as!(
+        Enrollment,
+        r#"WITH gone AS (
+             DELETE FROM enrollment
+              WHERE course = $1 AND app_user = $2
+              RETURNING course, app_user, enrolled_by, source),
+           seated AS (
+             UPDATE course
+                SET enrollment_count = GREATEST(
+                    enrollment_count - (SELECT count(*) FROM gone), 0)
+              WHERE id = $1
+              RETURNING 1)
+           SELECT course, app_user AS "user", enrolled_by, source FROM gone"#,
+        course,
+        user,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(gone)
 }
 
 #[cfg(test)]
