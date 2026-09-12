@@ -20,7 +20,7 @@ impl CourseNoteId {
 
     /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
     /// cannot take the newtype. Static `query!` binds take `self` directly.
-    pub fn uuid(&self) -> Uuid {
+    pub fn uuid(&self) -> uuid::Uuid {
         self.0
     }
 
