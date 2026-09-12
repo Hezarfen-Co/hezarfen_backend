@@ -1,12 +1,11 @@
-use crate::constant::{
-    MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
-};
+use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+use uuid::Uuid;
 
 /// The one spelling of the re-draft refusal, shared by the update workflow's
 /// pre-flight gate ([`crate::service::exam::update`]) and the in-transaction

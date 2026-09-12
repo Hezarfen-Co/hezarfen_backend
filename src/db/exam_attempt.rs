@@ -1,29 +1,59 @@
 //! The `exam_attempt` table: sitting reads, the two field-scoped writes
-//! (`finished_at`, `left_at`), and the `write_unfrozen` transaction gateway
-//! that ties exam-child writes to their exam row.
+//! (`finished_at`, `left_at`), the guarded sitting create, and the freeze
+//! gate — the in-transaction check every exam-child write runs before it
+//! touches anything.
 
-use surrealdb::types::{RecordId, SurrealValue};
+use sqlx::PgConnection;
 
-use crate::constant::EXAM_RESULT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry, unique_violation};
+use crate::db::cap::Claimed;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_attempt::{ExamAttempt, ExamAttemptId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The `THROW` marker the freeze gate aborts with, and the one 409 both it and
-/// the handler's pre-flight check answer with — a client cannot tell which of
-/// the two refused.
-const FROZEN_MARK: &str = "questions_frozen";
-
-/// The `THROW` marker the exam-existence touch aborts with — the exam row this
-/// write hangs off is gone, so the write is a 404 and nothing lands.
-const GONE_MARK: &str = "no_exam";
-
-/// The 409 the freeze gate's marker means.
+/// The 409 the freeze gate answers — the same one the handlers' pre-flight
+/// check ([`crate::service::exam_question::ensure_questions_editable`])
+/// answers, so a client cannot tell which of the two refused.
 fn frozen_error() -> AppError {
     AppError::Conflict("cannot change questions after attempts have started")
+}
+
+/// The freeze gate, run inside a caller's transaction on that caller's own
+/// connection: take the exam row `FOR UPDATE`, then refuse unless the exam
+/// still exists and nobody has started an attempt.
+///
+/// This is the whole of the old `write_unfrozen` machinery — the
+/// `questions_frozen` THROW and the bump-and-restore existence touch — with
+/// Postgres doing the work the tricks stood in for. The row lock makes the
+/// check-and-write one unit against [`crate::db::exam::delete`] (which locks
+/// the same row before its cascade) and against a sitting create (whose
+/// guard below locks it too): a question edit can no longer sail past an
+/// attempt that started in the gate's gap, and a child whose exam died
+/// mid-flight finds no row here and is the same 404 the old `no_exam` THROW
+/// answered with. Real foreign keys retire the bump-and-restore: the child
+/// inserts themselves refuse a parent that is gone.
+pub(crate) async fn freeze_gate(conn: &mut PgConnection, exam: &ExamId) -> Result<(), AppError> {
+    let row = sqlx::query!(
+        r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
+        exam as &ExamId,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let sat = sqlx::query!(
+        r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat"#,
+        exam as &ExamId,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if sat.sat {
+        return Err(frozen_error());
+    }
+    Ok(())
 }
 
 /// Stamp the submission time. The caller has already checked the deadline
@@ -36,17 +66,23 @@ fn frozen_error() -> AppError {
 /// A whole-row write from the pre-read snapshot would carry its stale
 /// `left_at` back over that stamp, erasing the recorded walk-out.
 pub async fn finish(db: &Database, attempt: ExamAttempt) -> Result<ExamAttempt, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET finished_at = $at RETURN AFTER")
-        .bind(("id", attempt.id.record()))
-        .bind(("at", Some(Timestamp::now())))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<ExamAttempt>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let id = attempt.get_id();
+    let updated = sqlx::query_as!(
+        ExamAttempt,
+        r#"UPDATE exam_attempt SET finished_at = $1
+           WHERE exam = $2 AND app_user = $3 AND seq = $4
+           RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                     started_at AS "started_at: Timestamp",
+                     finished_at AS "finished_at: Option<Timestamp>",
+                     left_at AS "left_at: Option<Timestamp>""#,
+        Timestamp::now(),
+        id.exam,
+        id.user,
+        id.seq,
+    )
+    .fetch_optional(db)
+    .await?;
+    updated.ok_or(AppError::NotFound)
 }
 
 /// Stamp (or clear) the walked-out marker. The exam room sets it when the
@@ -63,23 +99,73 @@ pub async fn set_left(
     attempt: ExamAttempt,
     left_at: Option<Timestamp>,
 ) -> Result<ExamAttempt, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET left_at = $left RETURN AFTER")
-        .bind(("id", attempt.id.record()))
-        .bind(("left", left_at))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<ExamAttempt>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let id = attempt.get_id();
+    let updated = sqlx::query_as!(
+        ExamAttempt,
+        r#"UPDATE exam_attempt SET left_at = $1
+           WHERE exam = $2 AND app_user = $3 AND seq = $4
+           RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                     started_at AS "started_at: Timestamp",
+                     finished_at AS "finished_at: Option<Timestamp>",
+                     left_at AS "left_at: Option<Timestamp>""#,
+        left_at,
+        id.exam,
+        id.user,
+        id.seq,
+    )
+    .fetch_optional(db)
+    .await?;
+    updated.ok_or(AppError::NotFound)
+}
+
+/// Stamp `left_at` on one sitting, but only while it is genuinely in
+/// progress: nothing stamped yet, nothing submitted, and the exam's *live*
+/// schedule has not run past the sitting's deadline. One conditional
+/// statement — the exam-room teardown's whole stamp, with the re-derive
+/// [`crate::domain::exam_attempt::ExamAttempt::status`] used to do folded
+/// into the `WHERE` (joined to `exam` so a deleted exam's sitting is simply
+/// not stamped, and concurrent last-outs are harmless: only the first finds
+/// `left_at IS NULL`).
+pub async fn stamp_left_if_running(
+    db: &Database,
+    attempt_id: &ExamAttemptId,
+    now: Timestamp,
+) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"UPDATE exam_attempt a SET left_at = $4
+           FROM exam e
+           WHERE e.id = a.exam
+             AND a.exam = $1 AND a.app_user = $2 AND a.seq = $3
+             AND a.left_at IS NULL AND a.finished_at IS NULL
+             AND (e.duration_ms IS NULL OR $4 < a.started_at + e.duration_ms)
+             AND (e.duration_ms IS NOT NULL OR e.ends_at IS NULL OR $4 < e.ends_at)"#,
+        attempt_id.exam,
+        attempt_id.user,
+        attempt_id.seq,
+        now,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// One sitting by id — the exam room re-reads its own attempt this way,
 /// so a retake started elsewhere can never be mistaken for it.
 pub async fn read(db: &Database, id: &ExamAttemptId) -> Result<Option<ExamAttempt>, AppError> {
-    Ok(db.select(id.record()).await?)
+    Ok(sqlx::query_as!(
+        ExamAttempt,
+        r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                  started_at AS "started_at: Timestamp",
+                  finished_at AS "finished_at: Option<Timestamp>",
+                  left_at AS "left_at: Option<Timestamp>"
+           FROM exam_attempt
+           WHERE exam = $1 AND app_user = $2 AND seq = $3"#,
+        id.exam,
+        id.user,
+        id.seq,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// The student's current sitting — the highest `seq` for the pair. All
@@ -89,16 +175,21 @@ pub async fn read_latest_for_user(
     exam: &ExamId,
     user: &UserId,
 ) -> Result<Option<ExamAttempt>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM exam_attempt WHERE exam = $ex AND user = $usr
-             ORDER BY seq DESC LIMIT 1",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAttempt>>(0)?.into_iter().next())
+    Ok(sqlx::query_as!(
+        ExamAttempt,
+        r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                  started_at AS "started_at: Timestamp",
+                  finished_at AS "finished_at: Option<Timestamp>",
+                  left_at AS "left_at: Option<Timestamp>"
+           FROM exam_attempt
+           WHERE exam = $1 AND app_user = $2
+           ORDER BY seq DESC
+           LIMIT 1"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Every sitting of `user` at `exam`, newest first.
@@ -107,187 +198,180 @@ pub async fn list_for_user(
     exam: &ExamId,
     user: &UserId,
 ) -> Result<Vec<ExamAttempt>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM exam_attempt WHERE exam = $ex AND user = $usr
-             ORDER BY seq DESC",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAttempt>>(0)?)
+    Ok(sqlx::query_as!(
+        ExamAttempt,
+        r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                  started_at AS "started_at: Timestamp",
+                  finished_at AS "finished_at: Option<Timestamp>",
+                  left_at AS "left_at: Option<Timestamp>"
+           FROM exam_attempt
+           WHERE exam = $1 AND app_user = $2
+           ORDER BY seq DESC"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Every sitting of `user` nobody has submitted yet, across all exams. Only
 /// the *candidates* for "in progress": a deadline comes off the exam's live
 /// schedule, so the caller still judges [`ExamAttempt::status`] per exam rather
-/// than re-spelling that rule in SurrealQL.
+/// than re-spelling that rule in SQL.
 pub async fn list_unfinished_for_user(
     db: &Database,
     user: &UserId,
 ) -> Result<Vec<ExamAttempt>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM exam_attempt WHERE user = $usr AND finished_at = NONE")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAttempt>>(0)?)
+    Ok(sqlx::query_as!(
+        ExamAttempt,
+        r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                  started_at AS "started_at: Timestamp",
+                  finished_at AS "finished_at: Option<Timestamp>",
+                  left_at AS "left_at: Option<Timestamp>"
+           FROM exam_attempt
+           WHERE app_user = $1 AND finished_at IS NULL
+           ORDER BY started_at, exam"#,
+        user as &UserId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamAttempt>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM exam_attempt WHERE exam = $ex ORDER BY id DESC")
-        .bind(("ex", exam.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAttempt>>(0)?)
+    Ok(sqlx::query_as!(
+        ExamAttempt,
+        r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                  started_at AS "started_at: Timestamp",
+                  finished_at AS "finished_at: Option<Timestamp>",
+                  left_at AS "left_at: Option<Timestamp>"
+           FROM exam_attempt
+           WHERE exam = $1
+           ORDER BY started_at DESC, seq DESC"#,
+        exam as &ExamId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Whether anyone has started this exam — the gate that freezes `mode`
 /// edits once an attempt exists.
 pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError> {
-    let mut result = db
-        .query("SELECT VALUE id FROM exam_attempt WHERE exam = $ex LIMIT 1")
-        .bind(("ex", exam.record()))
-        .await?
-        .check()?;
-    Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    let row = sqlx::query!(
+        r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat"#,
+        exam as &ExamId,
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.sat)
 }
 
-/// Send `statements` wrapped in a transaction that refuses to run them at
-/// all once `exam` has an attempt — the freeze gate, made atomic with the
-/// write it guards instead of merely preceding it. `freeze_exam` is bound
-/// here; the caller binds the rest and reads its own results from
-/// [`FROZEN_SLOT`] onwards.
-///
-/// The same transaction *writes* the exam row — bumping its mark counter
-/// and putting it straight back — which is what ties every child written
-/// through here to its exam. The freeze gate only *reads* `exam_attempt`,
-/// and a read does not survive [`delete`](crate::db::exam::delete)'s
-/// window: a question or picture landing after that delete removed the exam
-/// but before it committed reads a row that is still there, while the
-/// cascade's `DELETE exam_question WHERE exam = $ex` ran on a snapshot
-/// predating this insert — so both commit and the child outlives the exam,
-/// with neither caller told anything. Writing a key the delete also writes
-/// makes the two collide and the store refuses one side. It is the shape
-/// [`crate::db::exam_answer::save`] and
-/// [`crate::db::menu::bump_menu_and_write`] already use.
-///
-/// An orphan here is not merely untidy: an `exam_question` that outlives
-/// its exam keeps the reference it claimed on its subject (the cascade's
-/// per-subject decrement counted the rows it could see), and
-/// [`crate::db::subject::delete`] is gated on that count
-/// reading zero — a subject nobody can ever delete again.
-///
-/// The bump is restored *by captured value*, `NONE` included, so the row is
-/// byte-identical afterwards: the boot backfill still finds the rows it
-/// keys on (`WHERE result_count = NONE`) and a teacher's PATCH, which pins
-/// that counter, is not refused because somebody added a question. Writing
-/// the same value back would not do — an `UPDATE` that leaves the document
-/// unchanged is elided and never reaches the store's write set, so it
-/// collides with nothing.
-///
-/// This replaces a process-wide `EXAM_LOCK.write()` held across the check
-/// and the write. That lock ordered the two requests but still read the
-/// attempt table a round trip before it wrote; the gate checks inside the
-/// writing statement, so a question edit can no longer sail past an attempt
-/// that started in that gap.
-///
-/// The send lives here rather than at the five call sites because a lost
-/// round has to be re-sent, and only whoever owns the send can re-send: the
-/// gate reads the very table its rival writes, so the two contend by design
-/// and a raced edit used to answer 500. The refusal outranks the conflict —
-/// `FROZEN_MARK` is a decision and stays the 409 the pre-flight check
-/// answers with, and only exhausting the tries becomes a 500. See
-/// [`transaction_with_retry`] for why the whole error map is scanned: an
-/// aborted transaction errors *every* slot and all but one say a generic
-/// "not executed".
-///
-/// Returning only on an empty error map is what keeps [`FROZEN_SLOT`]
-/// (and any slot counted off `num_statements`) correct — `take_errors`
-/// `swap_remove`s errored slots, so a fixed slot read is meaningless once
-/// anything failed.
-//
-// corner-cut: the count and a concurrent `CREATE exam_attempt` are still not
-// serialized against each other — SurrealDB does not conflict-check a
-// cross-record count (the write skew `db::cap` exists for), so an
-// attempt landing in the same instant as an edit can still interleave
-// either way. The mutex this replaces closed that inside one process only,
-// and there are two, so nothing is lost. Closing it properly means the
-// cap.rs shape: an attempt counter on the exam row, incremented by the
-// attempt create, and the write conditioned on `count ?? 0 = 0`.
-pub async fn write_unfrozen(
-    db: &Database,
+/// The sitting-create guard: the exam row locked `FOR UPDATE` and
+/// re-judged *inside the inserting transaction* — draft (a 404, a draft is
+/// invisible to students), no mode (a 409: visible, nothing to sit), the
+/// window not yet open, the window already closed. This is what the old
+/// writer lease `EXAM_LOCK` used to buy the sittable/window gates: they are
+/// now judged against the locked row the attempt lands under, so a mode
+/// change or re-draft cannot slip between a gate and the insert. The
+/// refusal texts are [`crate::service::exam_attempt`]'s own — the same
+/// words that pre-flight answers, so a client cannot tell which fired.
+pub(crate) async fn guard_start(
+    conn: &mut PgConnection,
     exam: &ExamId,
-    statements: &str,
-    bindings: Vec<(String, surrealdb::types::Value)>,
-) -> Result<surrealdb::IndexedResults, AppError> {
-    write_unfrozen_with(db, exam, statements, bindings, Vec::new()).await
-}
-
-/// [`write_unfrozen`] for statements that carry gates of their own:
-/// each `(marker, refusal)` names a `THROW` the caller's SQL aborts with and
-/// the error it means. The markers are handed to [`transaction_with_retry`]
-/// too, so an abort on one is a refusal rather than a round to re-send.
-///
-/// The freeze still outranks every one of them: a caller folding a counter
-/// claim in here is refused as frozen even when its own gate would also have
-/// fired, which is the answer the pre-flight check has always given.
-pub async fn write_unfrozen_with(
-    db: &Database,
-    exam: &ExamId,
-    statements: &str,
-    bindings: Vec<(String, surrealdb::types::Value)>,
-    refusals: Vec<(&str, AppError)>,
-) -> Result<surrealdb::IndexedResults, AppError> {
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         IF array::len((SELECT VALUE id FROM exam_attempt \
-         WHERE exam = $freeze_exam LIMIT 1)) > 0 {{ THROW '{FROZEN_MARK}' }};
-         LET $was_results = \
-             (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $freeze_exam);
-         LET $touched = (UPDATE $freeze_exam SET {EXAM_RESULT_COUNT_FIELD} = \
-             ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-         IF array::len($touched) = 0 {{ THROW '{GONE_MARK}' }};
-         UPDATE $freeze_exam SET {EXAM_RESULT_COUNT_FIELD} = $was_results;
-         {statements}
-         COMMIT TRANSACTION;"
-    );
-    let mut bound = vec![("freeze_exam".into(), exam.record().into_value())];
-    bound.extend(bindings);
-    let mut marks = vec![FROZEN_MARK, GONE_MARK];
-    marks.extend(refusals.iter().map(|(marker, _)| *marker));
-    let (result, mut errors) = transaction_with_retry(db, &sql, &bound, &marks).await?;
-    let thrown = |marker: &str| {
-        errors
-            .values()
-            .any(|error| error.to_string().contains(marker))
+    now: Timestamp,
+) -> Result<(), AppError> {
+    let row = sqlx::query!(
+        r#"SELECT draft AS "draft: bool", mode AS "mode: Option<ExamMode>",
+                  starts_at AS "starts_at: Option<Timestamp>",
+                  ends_at AS "ends_at: Option<Timestamp>"
+           FROM exam WHERE id = $1 FOR UPDATE"#,
+        exam as &ExamId,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Err(AppError::NotFound);
     };
-    if thrown(FROZEN_MARK) {
-        return Err(frozen_error());
-    }
-    // The exam is gone: the same 404 every one of these writes' handlers
-    // answers a missing exam with, and it outranks the callers' own gates
-    // for the freeze's reason — there is nothing left to refuse *about*.
-    if thrown(GONE_MARK) {
+    if row.draft {
         return Err(AppError::NotFound);
     }
-    for (marker, refusal) in refusals {
-        if thrown(marker) {
-            return Err(refusal);
-        }
+    if row.mode.is_none() {
+        return Err(AppError::Conflict(
+            "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
+        ));
     }
-    match errors.drain().map(|(_, error)| error).next() {
-        Some(error) => Err(error.into()),
-        None => Ok(result),
+    if row.starts_at.is_some_and(|starts_at| now < starts_at) {
+        return Err(AppError::Conflict("the exam has not started yet"));
+    }
+    if row.ends_at.is_some_and(|ends_at| now >= ends_at) {
+        return Err(AppError::Conflict("the exam has already ended"));
+    }
+    Ok(())
+}
+
+/// Insert the sitting row, claiming the student's `exam_sat_total` in the
+/// same statement when — and only when — this is a first sitting (`seq ==
+/// 1`): that counter is *exams sat*, not sittings, and a retake counts
+/// nothing. The claim-CTE recipe ([`cap`]): bump the counter row, insert
+/// the child only if the bump landed, and let the sitting's natural
+/// composite primary key (`exam_attempt_exam_user_seq`) answer "another
+/// writer started this very sitting first" as `Claimed::Duplicate`. The
+/// bump rides the insert's own transaction, so a refused insert takes its
+/// increment straight back.
+///
+/// `Claimed::Full` here can only mean the student's account row is missing
+/// — nothing caps sittings — which the caller surfaces as its own internal.
+pub(crate) async fn create_in(
+    conn: &mut PgConnection,
+    attempt: &ExamAttempt,
+    count_sitting: bool,
+) -> Result<Claimed<ExamAttempt>, AppError> {
+    let bump = i64::from(count_sitting);
+    let created = sqlx::query_as!(
+        ExamAttempt,
+        r#"WITH seat AS (
+               UPDATE app_user SET exam_sat_total = app_user.exam_sat_total + $4
+               WHERE id = $2
+               RETURNING 1)
+           INSERT INTO exam_attempt (exam, app_user, seq, started_at, finished_at, left_at)
+           SELECT $1, $2, $3, $5, NULL, NULL WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
+                     started_at AS "started_at: Timestamp",
+                     finished_at AS "finished_at: Option<Timestamp>",
+                     left_at AS "left_at: Option<Timestamp>""#,
+        attempt.exam,
+        attempt.user,
+        attempt.seq,
+        bump,
+        attempt.started_at,
+    )
+    .fetch_optional(&mut *conn)
+    .await;
+    match created {
+        Err(err) if unique_violation(&err) == Some("exam_attempt_exam_user_seq") => {
+            Ok(Claimed::Duplicate)
+        }
+        Err(err) => Err(err.into()),
+        Ok(None) => Ok(Claimed::Full),
+        Ok(Some(attempt)) => Ok(Claimed::Made(attempt)),
     }
 }
 
-/// The first slot a [`write_unfrozen`] caller's own statements land
-/// in: `BEGIN`, the freeze `IF`, and the exam touch's two `LET`s, `IF` and
-/// restoring `UPDATE` take one each.
-pub const FROZEN_SLOT: usize = 6;
+/// The sitting create as one transaction: [`guard_start`], then
+/// [`create_in`]. Retried while Postgres answers "contended"; a duplicate
+/// or a missing student row is a verdict, not a conflict, and is never
+/// re-sent.
+pub async fn create(
+    db: &Database,
+    attempt: &ExamAttempt,
+    count_sitting: bool,
+    now: Timestamp,
+) -> Result<Claimed<ExamAttempt>, AppError> {
+    tx_with_retry(db, false, async |conn| {
+        guard_start(conn, &attempt.exam, now).await?;
+        create_in(conn, attempt, count_sitting).await
+    })
+    .await
+}
 
 #[cfg(test)]
 mod tests {

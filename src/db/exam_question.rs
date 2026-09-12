@@ -6,27 +6,19 @@
 
 use std::collections::HashSet;
 
-use surrealdb::types::{RecordId, SurrealValue};
+use sqlx::PgConnection;
 
-use crate::constant::SUBJECT_QUESTION_COUNT_FIELD;
-use crate::database::Database;
-use crate::db::cap;
-use crate::db::page::PagedList;
+use crate::database::{Database, tx_with_retry};
+use crate::db::exam_attempt::freeze_gate;
+use crate::db::page::{PagedList, Param};
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{
-    ExamQuestion, ExamQuestionId, QuestionPoints, QuestionSpec, QuestionText,
+    Choice, ExamQuestion, ExamQuestionId, QuestionPoints, QuestionSpec, QuestionText,
 };
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
-
-/// The `THROW` markers the folded counter moves abort with: the subject the
-/// reference was to be claimed on is gone, the question being patched is gone,
-/// and the subject this move started from is no longer the one the handler
-/// read. File-local like every other marker set (`cap`'s, `subject`'s).
-const SUBJECT_MARK: &str = "question_subject_gone";
-const ROW_MARK: &str = "question_row_gone";
-const STALE_MARK: &str = "question_stale_move";
+use sqlx::types::Json;
 
 /// The one answer for a subject that isn't there — a claim missing it and the
 /// web layer's pre-flight lookup missing it are the same 400.
@@ -72,7 +64,6 @@ async fn insert(
     spec: QuestionSpec,
     from_bank: Option<BankQuestionId>,
 ) -> Result<ExamQuestion, AppError> {
-    let counted = subject.record();
     let question = ExamQuestion {
         id: ExamQuestionId::generate(),
         exam: exam.clone(),
@@ -89,61 +80,87 @@ async fn insert(
     // The freeze gate and the subject's reference ride in the same
     // transaction as the insert: a question cannot appear under an exam
     // somebody has already started, and the claim that accounts for it
-    // cannot outlive a row that never landed. Claiming in its own query
-    // (with a release on failure, as this did) leaves a window where a
-    // crash strands the count — and the subject delete is conditioned on
-    // that count reading zero, so a stranded one makes the subject
-    // undeletable forever. A missed claim means the subject is already gone
-    // — the same 400 the web layer's pre-flight check answers with.
+    // cannot outlive a row that never landed. A missed claim means the
+    // subject is already gone — the same 400 the web layer's pre-flight
+    // check answers with.
     //
-    // Re-sendable despite the `CREATE`: a lost round aborts having written
-    // nothing and `$id` is a ULID minted once per call, so the re-send
-    // cannot answer "already exists" (there is no UNIQUE index on
-    // `exam_question`) — the one thing the retry cannot survive.
-    let id = question.id.record();
-    // One counter write in flight at a time, like every other counter write.
-    let _guard = cap::counter_lock().await;
-    let mut result = crate::db::exam_attempt::write_unfrozen_with(
-        db,
-        exam,
-        &format!(
-            "LET $seat = (UPDATE $subject SET {SUBJECT_QUESTION_COUNT_FIELD} = \
-             ({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($seat) = 0 {{ THROW '{SUBJECT_MARK}' }};
-             CREATE $id CONTENT $question;"
-        ),
-        vec![
-            ("subject".into(), counted.into_value()),
-            ("id".into(), id.into_value()),
-            ("question".into(), question.into_value()),
-        ],
-        vec![(SUBJECT_MARK, dead_subject())],
+    // The id is a freshly minted UUIDv7, so no rival can aim at it: the
+    // only possible duplicate key is one this call minted, which is none.
+    tx_with_retry(db, false, async |conn| {
+        freeze_gate(conn, exam).await?;
+        claim_subject_and_insert(conn, &question).await
+    })
+    .await
+}
+
+/// The subject's reference claim and the row insert as one statement — the
+/// counter and the row commit together, and zero rows out means the subject
+/// was already gone (the claim's `UPDATE` found nothing to increment). The
+/// same verdict as the old `question_subject_gone` THROW, which nothing
+/// else could reach: the insert is refused with its claim, atomically.
+async fn claim_subject_and_insert(
+    conn: &mut PgConnection,
+    question: &ExamQuestion,
+) -> Result<ExamQuestion, AppError> {
+    let created = sqlx::query_as!(
+        ExamQuestion,
+        r#"WITH seat AS (
+               UPDATE subject SET exam_question_count = subject.exam_question_count + 1
+               WHERE id = $1
+               RETURNING 1)
+           INSERT INTO exam_question (id, exam, subject, text, kind, points,
+                                      choices, correct, from_bank, banked_as)
+           SELECT $2, $3, $1, $4, $5, $6, $7, $8, $9, NULL
+           WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
+                     subject AS "subject: SubjectId", text AS "text: QuestionText",
+                     kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                     choices AS "choices: Option<Json<Vec<Choice>>>",
+                     correct AS "correct: Option<ChoiceId>",
+                     from_bank AS "from_bank: Option<BankQuestionId>",
+                     banked_as AS "banked_as: Option<BankQuestionId>""#,
+        question.subject,
+        question.id,
+        question.exam,
+        question.text,
+        question.kind,
+        question.points,
+        question.choices,
+        question.correct,
+        question.from_bank,
     )
+    .fetch_optional(&mut *conn)
     .await?;
-    // Counted off the statements that actually ran rather than a fixed
-    // slot, so folding another gate in above can never mis-read the row.
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<ExamQuestion>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to create exam question".into()))
+    created.ok_or_else(dead_subject)
 }
 
 pub async fn read(db: &Database, id: &ExamQuestionId) -> Result<Option<ExamQuestion>, AppError> {
-    Ok(db.select(id.record()).await?)
+    Ok(sqlx::query_as!(
+        ExamQuestion,
+        r#"SELECT id AS "id: ExamQuestionId", exam AS "exam: ExamId",
+                  subject AS "subject: SubjectId", text AS "text: QuestionText",
+                  kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                  choices AS "choices: Option<Json<Vec<Choice>>>",
+                  correct AS "correct: Option<ChoiceId>",
+                  from_bank AS "from_bank: Option<BankQuestionId>",
+                  banked_as AS "banked_as: Option<BankQuestionId>"
+           FROM exam_question WHERE id = $1"#,
+        id as &ExamQuestionId,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
-/// The exam's questions in presentation order (ULID ids sort by creation).
+/// The exam's questions in presentation order (UUIDv7 ids sort by creation).
 pub async fn list_for_exam(
     db: &Database,
     exam: &ExamId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ExamQuestion>, i64), AppError> {
-    PagedList::new("exam_question WHERE exam = $ex", "ORDER BY id ASC")
-        .bind("ex", exam.record())
-        .run(limit, offset, db)
+    PagedList::new("exam_question WHERE exam = $1", "ORDER BY id ASC")
+        .bind(Param::Uuid(exam.uuid()))
+        .run::<ExamQuestion>(limit, offset, db)
         .await
 }
 
@@ -166,8 +183,7 @@ pub async fn list_for_exam(
 ///
 /// So: collect every template id reachable from a live exam by either
 /// column, then name any of `exam`'s questions pointing at one by either
-/// column. `$shared` is built from `!= NONE` filters, so it never holds a
-/// `NONE` for an unlinked question's absent column to match against.
+/// column.
 pub async fn list_shared_with(
     db: &Database,
     exam: &ExamId,
@@ -176,28 +192,24 @@ pub async fn list_shared_with(
     if live.is_empty() {
         return Ok(HashSet::new());
     }
-    let mut result = db
-        .query(
-            "LET $shared = array::union(
-               (SELECT VALUE from_bank FROM exam_question
-                WHERE exam IN $live AND from_bank != NONE),
-               (SELECT VALUE banked_as FROM exam_question
-                WHERE exam IN $live AND banked_as != NONE));
-             SELECT VALUE id FROM exam_question
-             WHERE exam = $ex AND (from_bank IN $shared OR banked_as IN $shared)",
-        )
-        .bind(("ex", exam.record()))
-        .bind((
-            "live",
-            live.iter().map(ExamId::record).collect::<Vec<RecordId>>(),
-        ))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<ExamQuestionId>>(1)?
-        .iter()
-        .map(|id| id.key().to_string())
-        .collect())
+    let live = live.iter().map(ExamId::uuid).collect::<Vec<_>>();
+    let rows = sqlx::query!(
+        r#"WITH shared AS (
+               SELECT from_bank AS t FROM exam_question
+               WHERE exam = ANY($1) AND from_bank IS NOT NULL
+               UNION
+               SELECT banked_as FROM exam_question
+               WHERE exam = ANY($1) AND banked_as IS NOT NULL)
+           SELECT q.id AS "id: ExamQuestionId" FROM exam_question q
+           WHERE q.exam = $2
+             AND (q.from_bank IN (SELECT t FROM shared)
+                  OR q.banked_as IN (SELECT t FROM shared))"#,
+        live,
+        exam as &ExamId,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.id.key()).collect())
 }
 
 /// Write the editable fields, refused outright once the exam has an
@@ -208,7 +220,7 @@ pub async fn list_shared_with(
 /// `from_bank`/`banked_as`, which [`link_banked_as`] writes from a
 /// *different* request: re-stating this snapshot's copy of them would
 /// revert a to-bank save that landed in between. That is exactly what the
-/// caller's `EXAM_LOCK.write()` used to order (inside one process), and
+/// caller's old `EXAM_LOCK.write()` used to order (inside one process), and
 /// naming the columns removes the need for any ordering at all.
 pub async fn update(
     db: &Database,
@@ -225,8 +237,7 @@ pub async fn update(
     // undeletable forever).
     //
     // The two are armed on *different* conditions, which is the whole of
-    // the rule ([`crate::db::field_update::FieldUpdate::refcount`] states
-    // it the same way): the counter statements only when the link actually
+    // the rule: the counter statements only when the link actually
     // changes, but the CAS whenever this write *carries* the link — and it
     // always does, because the handler fills an omitted `subject_id` from
     // the row it read (`web::exams::questions`), so `subject` is in the
@@ -235,88 +246,81 @@ pub async fn update(
     // subject its own stale snapshot held, sent while a rival's move
     // already landed, writes that stale subject straight back over the
     // winner — a revert with the counters left pointing at the move.
-    let retag =
-        (subject != question.subject).then(|| (subject.record(), question.subject.record()));
-    let write = "UPDATE $id SET subject = $subject, text = $text, points = $points,
-         kind = $kind, choices = $choices, correct = $correct";
-    let mut bindings = vec![
-        ("id".into(), question.id.record().into_value()),
-        ("subject".into(), subject.record().into_value()),
-        ("text".into(), text.into_value()),
-        ("points".into(), points.into_value()),
-        ("kind".into(), spec.kind.into_value()),
-        ("choices".into(), spec.choices.into_value()),
-        ("correct".into(), spec.correct.into_value()),
-    ];
-    let mut statements: Vec<String> = Vec::new();
-    let mut refusals: Vec<(&str, AppError)> = Vec::new();
-    if let Some((next, previous)) = &retag {
-        statements.push(format!(
-            "UPDATE $ref_release SET {SUBJECT_QUESTION_COUNT_FIELD} = \
-             math::max([({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) - 1, 0])"
-        ));
-        statements.push(format!(
-            "LET $seat = (UPDATE $ref_claim SET {SUBJECT_QUESTION_COUNT_FIELD} = \
-             ({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id)"
-        ));
-        statements.push(format!(
-            "IF array::len($seat) = 0 {{ THROW '{SUBJECT_MARK}' }}"
-        ));
-        bindings.push(("ref_claim".into(), next.clone().into_value()));
-        bindings.push(("ref_release".into(), previous.clone().into_value()));
-        refusals.push((SUBJECT_MARK, dead_subject()));
-    }
-    // The CAS: the row write matches only while the question still sits on
-    // the subject this handler read. A genuine no-op re-state passes it
-    // trivially (the row holds exactly what is expected); a stale one —
-    // whether it moves the link or restates it — matches nothing, aborts
-    // the whole transaction, and so claims nothing and answers 409.
-    bindings.push((
-        "ref_expected".into(),
-        question.subject.record().into_value(),
-    ));
-    statements.push(format!(
-        "LET $row = ({write} WHERE subject = $ref_expected RETURN AFTER)"
-    ));
-    statements.push(format!(
-        "IF array::len($row) = 0 {{ \
-         LET $live = (UPDATE $id WHERE subject != $ref_expected RETURN VALUE id); \
-         IF array::len($live) = 0 {{ THROW '{ROW_MARK}' }} \
-         ELSE {{ THROW '{STALE_MARK}' }} }}"
-    ));
-    statements.push("RETURN $row".into());
-    refusals.push((
-        STALE_MARK,
-        AppError::Conflict(
-            "the subject this question was read on changed since; re-read and retry",
-        ),
-    ));
-    // The row is gone: the same 404 an empty write answers with, so the
-    // deleted-row case is unchanged.
-    refusals.push((ROW_MARK, AppError::NotFound));
-    let statements = format!("{};", statements.join("; "));
-    // One counter write in flight at a time — only a move writes one.
-    let _guard = match &retag {
-        Some(_) => Some(cap::counter_lock().await),
-        None => None,
-    };
-    let mut result = crate::db::exam_attempt::write_unfrozen_with(
-        db,
-        &question.exam,
-        &statements,
-        bindings,
-        refusals,
-    )
-    .await?;
-    // Read off the trailing `RETURN` rather than a fixed slot: a re-tag
-    // arms three more statements than a plain PATCH does (and an `IF`
-    // block is one slot whether or not it is taken).
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<ExamQuestion>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let retag = (subject != question.subject).then(|| (subject, question.subject.clone()));
+    tx_with_retry(db, false, async |conn| {
+        // Freeze first, as always: it outranks every caller gate, and a
+        // frozen exam answers the same 409 the pre-flight check gave.
+        freeze_gate(conn, &question.exam).await?;
+        if let Some((next, previous)) = &retag {
+            sqlx::query!(
+                r#"UPDATE subject SET exam_question_count =
+                       GREATEST(exam_question_count - 1, 0)
+                   WHERE id = $1"#,
+                previous as &SubjectId,
+            )
+            .execute(&mut *conn)
+            .await?;
+            let claimed = sqlx::query!(
+                r#"UPDATE subject SET exam_question_count = subject.exam_question_count + 1
+                   WHERE id = $1 RETURNING 1"#,
+                next as &SubjectId,
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
+            if claimed.is_none() {
+                return Err(dead_subject());
+            }
+        }
+        // The CAS: the row write matches only while the question still sits on
+        // the subject this handler read. A genuine no-op re-state passes it
+        // trivially (the row holds exactly what is expected); a stale one —
+        // whether it moves the link or restates it — matches nothing, aborts
+        // the whole transaction, and so claims nothing and answers 409.
+        let written = sqlx::query_as!(
+            ExamQuestion,
+            r#"UPDATE exam_question
+               SET subject = $2, text = $3, points = $4, kind = $5,
+                   choices = $6, correct = $7
+               WHERE id = $1 AND subject = $8
+               RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
+                         subject AS "subject: SubjectId", text AS "text: QuestionText",
+                         kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                         choices AS "choices: Option<Json<Vec<Choice>>>",
+                         correct AS "correct: Option<ChoiceId>",
+                         from_bank AS "from_bank: Option<BankQuestionId>",
+                         banked_as AS "banked_as: Option<BankQuestionId>""#,
+            question.id as &ExamQuestionId,
+            subject,
+            text,
+            points,
+            spec.kind,
+            spec.choices,
+            spec.correct,
+            question.subject as &SubjectId,
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(written) = written else {
+            // The row is gone, or it moved under the snapshot. The same
+            // 404 an empty write used to answer with distinguishes the
+            // deleted-row case; anything still standing is a stale read,
+            // which is the 409.
+            let live = sqlx::query!(
+                r#"SELECT EXISTS(SELECT 1 FROM exam_question WHERE id = $1) AS live"#,
+                question.id as &ExamQuestionId,
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if !live.live {
+                return Err(AppError::NotFound);
+            }
+            return Err(AppError::Conflict(
+                "the subject this question was read on changed since; re-read and retry",
+            ));
+        };
+        Ok(written)
+    })
+    .await
 }
 
 /// Point the question's `banked_as` at the bank template it was just saved
@@ -330,26 +334,28 @@ pub async fn update(
 /// Field-scoped write, unlike [`update`]: the caller awaits a bank
 /// insert plus the whole blob-copy loop between reading this row and
 /// linking it, so the row it holds is long stale by now — a whole-row save
-/// would silently revert whatever landed in that window. (The caller takes
-/// `EXAM_LOCK.read()` around this call, which is what keeps
-/// [`update`]'s whole-row save from clobbering the link in the other
-/// direction; the lease guards the ordering, not the staleness.)
+/// would silently revert whatever landed in that window.
 pub async fn link_banked_as(
     db: &Database,
     question: ExamQuestion,
     template: BankQuestionId,
 ) -> Result<ExamQuestion, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET banked_as = $bank RETURN AFTER")
-        .bind(("id", question.id.record()))
-        .bind(("bank", template.record()))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<ExamQuestion>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let linked = sqlx::query_as!(
+        ExamQuestion,
+        r#"UPDATE exam_question SET banked_as = $2 WHERE id = $1
+           RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
+                     subject AS "subject: SubjectId", text AS "text: QuestionText",
+                     kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                     choices AS "choices: Option<Json<Vec<Choice>>>",
+                     correct AS "correct: Option<ChoiceId>",
+                     from_bank AS "from_bank: Option<BankQuestionId>",
+                     banked_as AS "banked_as: Option<BankQuestionId>""#,
+        question.id as &ExamQuestionId,
+        template as &BankQuestionId,
+    )
+    .fetch_optional(db)
+    .await?;
+    linked.ok_or(AppError::NotFound)
 }
 
 /// Delete the question and cascade-remove its answers and image rows, so
@@ -359,33 +365,50 @@ pub async fn link_banked_as(
 /// delete — and the cascade now shares that transaction too, so a failure
 /// mid-way can no longer strand answers whose question survived.
 pub async fn delete(db: &Database, question: ExamQuestion) -> Result<ExamQuestion, AppError> {
-    let mut result = crate::db::exam_attempt::write_unfrozen(
-        db,
-        &question.exam,
-        &format!(
-            "DELETE exam_answer WHERE question = $q;
-             DELETE question_image WHERE question = $q;
-             LET $gone = (DELETE $q RETURN BEFORE);
-             FOR $sub IN ($gone.subject ?? []) {{
-                 UPDATE $sub SET {SUBJECT_QUESTION_COUNT_FIELD} =
-                     math::max([({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) - 1, 0])
-             }};
-             RETURN $gone;"
-        ),
-        vec![("q".into(), question.id.record().into_value())],
-    )
-    .await?;
-    // The subject's reference is given back inside this same transaction,
-    // driven off what the delete actually removed — a question that wasn't
-    // there decrements nothing. Read through the trailing `RETURN` rather
-    // than a hand-counted slot, so inserting a cascade statement above can
-    // never turn a delete into a 404 (see [`crate::domain::exam::Exam`]).
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<ExamQuestion>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    tx_with_retry(db, false, async |conn| {
+        freeze_gate(conn, &question.exam).await?;
+        sqlx::query!(
+            r#"DELETE FROM exam_answer WHERE question = $1"#,
+            question.id as &ExamQuestionId,
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query!(
+            r#"DELETE FROM question_image WHERE question = $1"#,
+            question.id as &ExamQuestionId,
+        )
+        .execute(&mut *conn)
+        .await?;
+        let deleted = sqlx::query_as!(
+            ExamQuestion,
+            r#"DELETE FROM exam_question WHERE id = $1
+               RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
+                         subject AS "subject: SubjectId", text AS "text: QuestionText",
+                         kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                         choices AS "choices: Option<Json<Vec<Choice>>>",
+                         correct AS "correct: Option<ChoiceId>",
+                         from_bank AS "from_bank: Option<BankQuestionId>",
+                         banked_as AS "banked_as: Option<BankQuestionId>""#,
+            question.id as &ExamQuestionId,
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        // The subject's reference is given back inside this same transaction,
+        // driven off what the delete actually removed — a question that wasn't
+        // there decrements nothing.
+        if let Some(deleted) = &deleted {
+            sqlx::query!(
+                r#"UPDATE subject SET exam_question_count =
+                       GREATEST(exam_question_count - 1, 0)
+                   WHERE id = $1"#,
+                deleted.subject as &SubjectId,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        deleted.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -4,114 +4,94 @@
 //! ids and the fresh-blob-name constructor — lives in
 //! [`crate::domain::answer_image`]; the blob bytes stay the web layer's.
 
-use surrealdb::types::SurrealValue;
+use sqlx::PgConnection;
 
-use crate::constant::EXAM_RESULT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
-use crate::domain::answer_image::{AnswerImage, AnswerImageId};
+use crate::database::{Database, tx_with_retry};
+use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::ExamQuestionId;
+use crate::domain::note_file::FileContentType;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// What one [`upsert`] transaction returns: the row it stored and
-/// the blob name it replaced. Both are arrays because SurrealDB drops an object
-/// key valued `NONE` on the way out, while an empty array survives — "nothing
-/// was replaced" has to be readable, not missing.
-#[derive(SurrealValue)]
-struct UpsertOutcome {
-    stored: Vec<AnswerImage>,
-    replaced: Vec<String>,
-}
-
-/// Create or replace the student's drawing for the question — the
-/// deterministic id makes this the whole "one drawing per student per
-/// question" story — handing back what it stored plus the blob name it
-/// replaced, for the caller to take off disk.
+/// Create or replace the student's drawing for the question — the natural
+/// (question, user, seq) primary key makes this the whole "one drawing per
+/// student per question per sitting" story — handing back what it stored
+/// plus the blob name it replaced, for the caller to take off disk.
 ///
-/// The replaced name is read *here*, inside this transaction, not by the
-/// caller in front of it: two uploads to one (question, user, seq) both
-/// write this row, so they contend and the loser re-reads the winner's blob
-/// name, where two pre-reads both saw the *old* blob and left the loser's
-/// fresh one on disk with nothing pointing at it. Same shape as
+/// The replaced name is read *inside this transaction*, not by the caller
+/// in front of it: two uploads to one (question, user, seq) both write this
+/// row, so they contend and the loser re-reads the winner's blob name,
+/// where two pre-reads both saw the *old* blob and left the loser's fresh
+/// one on disk with nothing pointing at it. Same shape as
 /// [`crate::db::question_image::upsert`].
 ///
 /// `NotFound` = the exam is gone, and the drawing was *not* written. The
-/// write moves the exam's mark counter and puts it straight back, in this
-/// one transaction, so the exam's existence is something this write
-/// *writes* rather than something a gate read a moment earlier: a bare
-/// upsert landing after [`delete`](crate::db::exam::delete)
-/// removed the exam but before it committed was swept by nothing — its
-/// `DELETE answer_image WHERE exam = $ex` ran on a snapshot predating this
-/// row — and both sides reported success. That stranded the blob as well as
-/// the row: `delete_exam` collects the names to unlink *before* it calls
-/// the delete, so bytes written after that snapshot stay on disk forever.
-/// This is the shape [`crate::db::exam_answer::save`] takes
-/// for the text half of the same answer sheet, and for the same reason.
-///
-/// The restore is by captured value, `NONE` included, so the row is
-/// byte-identical afterwards and a teacher's PATCH — which pins that
-/// counter — is not refused because a student drew. Writing the same value
-/// back would buy nothing: an `UPDATE` that leaves the document unchanged
-/// is elided and never reaches the store's write set.
-///
-/// Admissible for [`transaction_with_retry`]: the `UPDATE`s, `SELECT`,
-/// `IF`/`THROW` and `RETURN` can never answer "already exists", and the
-/// `UPSERT`'s id is bijective with the (question, user, seq) triple this
-/// table keys — a lost round wrote nothing, and re-sending resolves onto
-/// the same row rather than colliding with it.
+/// write locks the exam row before upserting, in this one transaction, so
+/// the exam's existence is something this write *locks* rather than
+/// something a gate read a moment earlier: a bare upsert landing after
+/// [`delete`](crate::db::exam::delete) removed the exam but before it
+/// committed was swept by nothing — its `DELETE answer_image WHERE exam`
+/// ran on a snapshot predating this row — and both sides reported success.
+/// That stranded the blob as well as the row: `delete_exam` collects the
+/// names to unlink *before* it calls the delete, so bytes written after
+/// that snapshot stay on disk forever. Locking the key the delete removes
+/// serializes the pair — this is the shape
+/// [`crate::db::exam_answer::save`] takes for the text half of the same
+/// answer sheet, and for the same reason.
 pub async fn upsert(
     db: &Database,
     image: AnswerImage,
 ) -> Result<(AnswerImage, Option<String>), AppError> {
-    // whole-row-save-ok: image is built in place from the request, never read back, and the (question, user, seq) id is deterministic — replacing the row *is* the operation
-    let (exam, id) = (image.exam.record(), image.id.record());
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was = (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $ex);
-             LET $touched = (UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = \
-                 ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($touched) = 0 {{ THROW 'no_exam' }};
-             UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = $was;
-             LET $replaced = (SELECT VALUE file FROM $id);
-             LET $row = (UPSERT $id CONTENT $image RETURN AFTER);
-             RETURN {{ stored: $row, replaced: $replaced }};
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("ex".into(), exam.into_value()),
-            ("id".into(), id.into_value()),
-            ("image".into(), image.into_value()),
-        ],
-        &["no_exam"],
+    tx_with_retry(db, false, async |conn| upsert_in(conn, image).await).await
+}
+
+/// The locked exam-row probe plus the upsert, on one connection.
+pub(crate) async fn upsert_in(
+    conn: &mut PgConnection,
+    image: &AnswerImage,
+) -> Result<(AnswerImage, Option<String>), AppError> {
+    let touched = sqlx::query!(
+        r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
+        image.exam as &ExamId,
     )
+    .fetch_optional(&mut *conn)
     .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_exam"))
-    {
+    if touched.is_none() {
         return Err(AppError::NotFound);
     }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    let failed = || AppError::Internal("failed to store answer image".into());
-    let outcome = result
-        .take::<Vec<UpsertOutcome>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(failed)?;
-    let stored = outcome.stored.into_iter().next().ok_or_else(failed)?;
-    Ok((stored, outcome.replaced.into_iter().next()))
+    let replaced = sqlx::query!(
+        r#"SELECT file FROM answer_image
+           WHERE question = $1 AND app_user = $2 AND seq = $3"#,
+        image.question as &ExamQuestionId,
+        image.user as &UserId,
+        image.seq,
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(|row| row.file);
+    let stored = sqlx::query_as!(
+        AnswerImage,
+        r#"INSERT INTO answer_image (exam, question, app_user, file, content_type, size, seq)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (question, app_user, seq) DO UPDATE
+               SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,
+                   size = EXCLUDED.size
+           RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                     app_user AS "user: UserId", seq, file,
+                     content_type AS "content_type: FileContentType", size"#,
+        image.exam as &ExamId,
+        image.question as &ExamQuestionId,
+        image.user as &UserId,
+        image.file,
+        image.content_type,
+        image.size,
+        image.seq,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok((stored, replaced))
 }
 
 /// The student's drawing for one question in one sitting, if any.
@@ -121,19 +101,33 @@ pub async fn read(
     user: &UserId,
     seq: i64,
 ) -> Result<Option<AnswerImage>, AppError> {
-    Ok(db
-        .select(AnswerImageId::composite(question, user, seq).record())
-        .await?)
+    Ok(sqlx::query_as!(
+        AnswerImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq, file,
+                  content_type AS "content_type: FileContentType", size
+           FROM answer_image
+           WHERE question = $1 AND app_user = $2 AND seq = $3"#,
+        question as &ExamQuestionId,
+        user as &UserId,
+        seq,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Every answer drawing of the exam — one query for the exam-delete cascade.
 pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<AnswerImage>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM answer_image WHERE exam = $ex")
-        .bind(("ex", exam.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<AnswerImage>>(0)?)
+    Ok(sqlx::query_as!(
+        AnswerImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq, file,
+                  content_type AS "content_type: FileContentType", size
+           FROM answer_image WHERE exam = $1"#,
+        exam as &ExamId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// One student's answer drawings for a single sitting — the parallel to
@@ -145,14 +139,18 @@ pub async fn list_for_exam_user(
     user: &UserId,
     seq: i64,
 ) -> Result<Vec<AnswerImage>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM answer_image WHERE exam = $ex AND user = $usr AND seq = $seq")
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .bind(("seq", seq))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<AnswerImage>>(0)?)
+    Ok(sqlx::query_as!(
+        AnswerImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq, file,
+                  content_type AS "content_type: FileContentType", size
+           FROM answer_image WHERE exam = $1 AND app_user = $2 AND seq = $3"#,
+        exam as &ExamId,
+        user as &UserId,
+        seq,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// The distinct sittings (`seq`, ascending) this student has any answer
@@ -162,18 +160,15 @@ pub async fn list_seqs_for_user(
     exam: &ExamId,
     user: &UserId,
 ) -> Result<Vec<i64>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE seq FROM answer_image \
-             WHERE exam = $ex AND user = $usr ORDER BY seq",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    let mut seqs = result.take::<Vec<i64>>(0)?;
-    seqs.dedup();
-    Ok(seqs)
+    let rows = sqlx::query!(
+        r#"SELECT DISTINCT seq FROM answer_image
+           WHERE exam = $1 AND app_user = $2 ORDER BY seq ASC"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.seq).collect())
 }
 
 /// The blob names behind every answer drawing of every exam of `course` —
@@ -182,36 +177,49 @@ pub async fn file_keys_for_course(
     db: &Database,
     course: &CourseId,
 ) -> Result<Vec<String>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE file FROM answer_image \
-             WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course)",
-        )
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<String>>(0)?)
+    let rows = sqlx::query!(
+        r#"SELECT ai.file FROM answer_image ai
+           JOIN exam e ON e.id = ai.exam WHERE e.course = $1"#,
+        course as &CourseId,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.file).collect())
 }
 
 pub async fn delete(db: &Database, image: AnswerImage) -> Result<AnswerImage, AppError> {
-    let deleted: Option<AnswerImage> = db.delete(image.id.record()).await?;
+    let deleted = sqlx::query_as!(
+        AnswerImage,
+        r#"DELETE FROM answer_image WHERE question = $1 AND app_user = $2 AND seq = $3
+           RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                     app_user AS "user: UserId", seq, file,
+                     content_type AS "content_type: FileContentType", size"#,
+        image.question as &ExamQuestionId,
+        image.user as &UserId,
+        image.seq,
+    )
+    .fetch_optional(db)
+    .await?;
     deleted.ok_or(AppError::NotFound)
 }
 
 /// Drop one student's answer drawings across an exam — a retake starts from
-/// a blank sheet. Rows only; the caller GCs the blobs. The retake path itself
-/// wipes rows inside `ExamAttempt::wipe_and_create`'s transaction; this is
-/// the standalone mirror of [`crate::db::exam_answer::delete_for_exam_user`].
+/// a blank sheet. Rows only; the caller GCs the blobs. The retake path
+/// itself wipes nothing: a retake's rows live at their own `seq`, and this
+/// is the standalone mirror of
+/// [`crate::db::exam_answer::delete_for_exam_user`].
 pub async fn delete_for_exam_user(
     db: &Database,
     exam: &ExamId,
     user: &UserId,
 ) -> Result<(), AppError> {
-    db.query("DELETE answer_image WHERE exam = $ex AND user = $usr")
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        r#"DELETE FROM answer_image WHERE exam = $1 AND app_user = $2"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
