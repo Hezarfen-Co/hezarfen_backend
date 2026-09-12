@@ -1,13 +1,10 @@
 //! The `subject` table: the count-and-create that pins a topic to a live
 //! course row, the bulk id listing, the field-scoped PATCH, and the guarded
-//! delete whose `WHERE` reads the row's own reference counters. The type and
+//! delete whose guard reads the row's own reference counters. The type and
 //! its validation live in [`crate::domain::subject`].
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::ENROLLMENT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::SUBJECT_TABLE;
+use crate::database::Database;
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
@@ -26,24 +23,40 @@ pub async fn create(
         name,
         description,
     };
-    // The course row is *written* (bumped and put back), not read, so this
-    // collides with `Course::delete`'s cascade: a topic that outlives its
-    // course 404s through `subject_with_course` forever, while
-    // `must_exist` still accepts its id — so a bank template can be
-    // tagged with a subject nobody can reach. See [`cap::touch_and_create`].
-    cap::touch_and_create(
-        &course.record(),
-        ENROLLMENT_COUNT_FIELD,
-        &subject.id.record(),
-        &subject,
-        db,
+    // The course foreign key is the existence proof the old bump-and-restore
+    // "touch" trick faked: a topic whose course is already gone — or which is
+    // deleted while this insert is in flight — is refused here, so a subject
+    // can never outlive its course and a bank template can never be tagged
+    // with a subject nobody can reach. `23503` is the parent-gone refusal,
+    // the same answer the touch produced.
+    let created = sqlx::query_as!(
+        Subject,
+        r#"INSERT INTO subject (id, course, name, description, exam_question_count, homework_count)
+           VALUES ($1, $2, $3, $4, 0, 0)
+           RETURNING id, course, name, description"#,
+        subject.id,
+        subject.course,
+        subject.name,
+        subject.description,
     )
-    .await?
-    .ok_or(AppError::NotFound)
+    .fetch_one(db)
+    .await;
+    match created {
+        Ok(created) => Ok(created),
+        Err(err) if crate::database::foreign_key_violation(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub async fn read(db: &Database, id: &SubjectId) -> Result<Option<Subject>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let subject = sqlx::query_as!(
+        Subject,
+        r#"SELECT id, course, name, description FROM subject WHERE id = $1"#,
+        id,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(subject)
 }
 
 /// Several subjects in one query — the bulk half of a list endpoint that
@@ -52,25 +65,27 @@ pub async fn list_by_ids(db: &Database, ids: &[&SubjectId]) -> Result<Vec<Subjec
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-    let mut result = db
-        .query("SELECT * FROM subject WHERE id IN $ids")
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Subject>>(0)?)
+    let keys: Vec<SubjectId> = ids.iter().map(|id| **id).collect();
+    let rows = sqlx::query_as!(
+        Subject,
+        r#"SELECT id, course, name, description FROM subject WHERE id = ANY($1)"#,
+        keys,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
-/// The course's subjects in curriculum order (ULID ids sort by creation).
+/// The course's subjects in curriculum order (uuid ids sort by creation).
 pub async fn list_for_course(
     db: &Database,
     course: &CourseId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Subject>, i64), AppError> {
-    PagedList::new("subject WHERE course = $course", "ORDER BY id ASC")
-        .bind("course", course.record())
-        .run(limit, offset, db)
+    PagedList::new("subject WHERE course = $1", "ORDER BY id ASC")
+        .bind(course.uuid())
+        .run::<Subject>(limit, offset, db)
         .await
 }
 
@@ -86,9 +101,9 @@ pub async fn update(
     name: Option<SubjectName>,
     description: Option<SubjectDescription>,
 ) -> Result<Subject, AppError> {
-    FieldUpdate::new(subject.id.record())
-        .set("name", name)
-        .set("description", description)
+    FieldUpdate::new(SUBJECT_TABLE, subject.id.uuid())
+        .set("name", name.map(|name| name.as_str().to_owned()))
+        .set("description", description.map(|d| d.as_str().to_owned()))
         .run::<Subject>(db)
         .await
 }
@@ -99,72 +114,63 @@ pub async fn update(
 ///
 /// Exam questions and homework are *not* cascaded: their `subject` is a
 /// required field that may not be orphaned, so either one still refuses the
-/// delete with a 409. That refusal is the delete's own `WHERE`, read off the
-/// two reference counters this row carries
-/// ([`crate::constant::SUBJECT_QUESTION_COUNT_FIELD`] and its homework
-/// twin), which is what makes it hold against a question created by a
-/// request racing this one — the cross-table `SELECT … LIMIT 1` it replaces
-/// was a count-then-delete no transaction serializes, pinned by three
-/// process-wide locks that could not cover the round trip between them.
+/// delete with a 409. That refusal is this transaction's own check, read
+/// off the two reference counters this row carries (`exam_question_count`
+/// and its homework twin) under a `FOR UPDATE` row lock — the lock *is*
+/// the guard, because every counter writer must update this same row, so
+/// no question can land between the check and the delete. The old store
+/// could not conflict-check the cross-table shape, which is why the check
+/// had to be the `DELETE`'s own `WHERE`; here the row lock does it and the
+/// check reads the same columns.
 ///
 /// Which of the two blocked is read off the counters *before* the delete,
 /// purely to pick the message; the decision itself was already made by the
-/// `WHERE`.
+/// check.
 ///
 /// The bank's subject is optional metadata, and blocking on it was a dead
 /// end — only the template's owner may re-tag it, so a manager could never
 /// clear their own 409, and a private template raising it leaked its
-/// existence. Its cascade runs *after* the conditional delete, so a refused
+/// existence. Its cascade runs *after* the guarded delete, so a refused
 /// delete leaves every template's subject where it was.
 pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             LET $held = (SELECT exam_question_count AS q, homework_count AS h FROM $sub);
-             LET $before = (DELETE $sub
-                 WHERE (exam_question_count ?? 0) = 0 AND (homework_count ?? 0) = 0
-                 RETURN BEFORE);
-             IF array::len($before) = 0 {
-                 THROW IF array::len($held) = 0 { 'subject_missing' }
-                     ELSE IF ($held[0].q ?? 0) > 0 { 'subject_questions' }
-                     ELSE { 'subject_homework' }
-             };
-             UPDATE bank_question SET subject = NONE WHERE subject = $sub;
-             RETURN $before;
-             COMMIT TRANSACTION;",
-        &[("sub".into(), subject.id.record().into_value())],
-        &["subject_missing", "subject_questions", "subject_homework"],
-    )
-    .await?;
-    // An aborted transaction errors every slot; only the THROW's own slot
-    // names the marker (the [`crate::db::appointment_slot`] treatment),
-    // and a lost round is re-sent rather than reported.
-    let thrown = |marker: &str| {
-        errors
-            .values()
-            .any(|error| error.to_string().contains(marker))
-    };
-    if thrown("subject_questions") {
-        return Err(AppError::Conflict(
-            "exam questions still reference this subject — re-tag or delete them first",
-        ));
-    }
-    if thrown("subject_homework") {
-        return Err(AppError::Conflict(
-            "homework still references this subject — re-tag or delete it first",
-        ));
-    }
-    if thrown("subject_missing") {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Read through the trailing `RETURN`, not a counted slot — see
-    // [`crate::db::exam::delete`].
-    let slot = result.num_statements().saturating_sub(2);
-    let deleted: Option<Subject> = result.take::<Vec<Subject>>(slot)?.into_iter().next();
-    deleted.ok_or(AppError::NotFound)
+    crate::database::tx_with_retry(db, false, async |tx| {
+        // The pre-image read and the guard in one locked statement: the row
+        // (and its counters) cannot change under this transaction.
+        let held = sqlx::query!(
+            r#"SELECT exam_question_count, homework_count
+               FROM subject WHERE id = $1 FOR UPDATE"#,
+            subject.id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let held = held.ok_or(AppError::NotFound)?;
+        if held.exam_question_count > 0 {
+            return Err(AppError::Conflict(
+                "exam questions still reference this subject — re-tag or delete them first",
+            ));
+        }
+        if held.homework_count > 0 {
+            return Err(AppError::Conflict(
+                "homework still references this subject — re-tag or delete it first",
+            ));
+        }
+        let deleted = sqlx::query_as!(
+            Subject,
+            r#"DELETE FROM subject WHERE id = $1
+               RETURNING id, course, name, description"#,
+            subject.id,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"UPDATE bank_question SET subject = NULL WHERE subject = $1"#,
+            subject.id,
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(deleted)
+    })
+    .await
 }
 
 #[cfg(test)]
