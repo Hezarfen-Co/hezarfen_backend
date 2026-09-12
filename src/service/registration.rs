@@ -3,9 +3,7 @@
 //! [`crate::db::registration`]; the seat itself is [`cap`]'s
 //! claim-on-the-event-row.
 
-use crate::constant::REGISTRATION_COUNT_FIELD;
 use crate::database::Database;
-use crate::db::cap;
 use crate::db::registration;
 use crate::domain::event::EventId;
 use crate::domain::registration::{Registration, RegistrationId};
@@ -47,28 +45,7 @@ pub async fn register(
         .await?
         .ok_or(AppError::NotFound)?
         .registration_capacity()?;
-    let registration_row = Registration {
-        id: RegistrationId::composite(event, user),
-        event: event.clone(),
-        user: user.clone(),
-        registered_by: registered_by.clone(),
-    };
-    match cap::claim_live_and_create(
-        &event.record(),
-        REGISTRATION_COUNT_FIELD,
-        // An uncapped registration list stores no `capacity` key at all
-        // (SurrealDB drops a `NONE`-valued object key), so the coalesce is
-        // what "unlimited" reads as.
-        "audience.capacity ?? $num",
-        cap::UNLIMITED,
-        // Staff hold their own seats, so the bar is not "still a student"
-        // but "still someone who can be taken off the list".
-        Some((&user.record(), &format!("= '{}'", Role::Parent.as_str()))),
-        (&registration_row.id.record(), &registration_row),
-        db,
-    )
-    .await?
-    {
+    match registration::claim_seat(db, event, user, registered_by).await? {
         cap::Claimed::Made(created) => Ok(created),
         // A concurrent placement of the same pair got there first: hand its
         // row over, the same no-op the early return above would have made,

@@ -63,20 +63,11 @@ pub async fn delete(db: &Database, event: Event) -> Result<Event, AppError> {
 
 /// Is `user` in the event's audience roster right now — the point check
 /// behind marking.
-pub async fn includes(
-    db: &Database,
-    audience: &EventAudience,
-    event: &EventId,
-    user: &User,
-) -> Result<bool, AppError> {
-    event::includes(db, audience, event, user).await
+pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool, AppError> {
+    event::includes(db, event, user).await
 }
 
 /// The event's full expected-attendee roster, resolved live.
-pub async fn members(
-    db: &Database,
-    audience: &EventAudience,
-    event: &EventId,
-) -> Result<Vec<UserId>, AppError> {
-    event::members(db, audience, event).await
+pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppError> {
+    event::members(db, event).await
 }

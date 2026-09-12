@@ -4,15 +4,13 @@
 //! flight. The task that owns the bridge round trip then flips it to
 //! `complete` (with the text) or `failed` (with a code), and the boot sweep
 //! in `database.rs` fails whatever a process death left behind past the
-//! staleness window. Every turn is written *through* its thread's own row
-//! ([`touch_and_write`]), so a turn can never outlive the thread it belongs
-//! to. The row shape lives in [`crate::domain::chatbot_message`].
-
-use surrealdb::types::SurrealValue;
+//! staleness window. Every turn is written *through* its thread's own row —
+//! its guarded statement bumps `updated_at`, so a turn can never outlive
+//! the thread it belongs to. The row shape lives in
+//! [`crate::domain::chatbot_message`].
 
 use crate::constant::MAX_ERROR_CODE_LEN;
 use crate::database::Database;
-use crate::db::chatbot_thread::touch_and_write;
 use crate::db::page::PagedList;
 use crate::domain::chatbot_message::{
     ChatContent, ChatbotMessage, ChatbotMessageId, MessageStatus,
@@ -21,31 +19,50 @@ use crate::domain::chatbot_thread::ChatbotThreadId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::query_as;
 
-/// Write one turn *through its thread's own row* ([`touch_and_write`]),
-/// which is what makes the thread's existence something this write writes
-/// rather than something the caller read and then trusted: a
-/// [`delete`](crate::db::chatbot_thread::delete)
-/// racing it touches the very key this transaction moves, so the two cannot
-/// both commit and no turn is left under a thread that is gone. It also
+/// Write one turn *through its thread's own row*: the thread's activity
+/// bump and the turn's insert are a single guarded statement, which is what
+/// makes the thread's existence something this write writes rather than
+/// something the caller read and then trusted — a
+/// [`delete`](crate::db::chatbot_thread::delete) racing it touches the very
+/// row this statement's gate updates, so under Postgres's row locking the
+/// two serialize and no turn is left under a thread that is gone. It also
 /// carries the thread's activity stamp, so a turn and its `updated_at` land
-/// together.
+/// together. The stamp is written strictly upwards —
+/// `GREATEST($now, updated_at + 1)` — because a turn's two rows routinely
+/// land inside one millisecond and `updated_at` is the thread list's
+/// ordering key.
 ///
 /// [`AppError::NotFound`] = the thread is gone, and nothing was written.
 async fn insert(db: &Database, message: ChatbotMessage) -> Result<ChatbotMessage, AppError> {
-    let thread = message.thread_id.clone();
-    let id = message.id.record();
-    touch_and_write(
-        db,
-        &thread,
-        "CREATE $id CONTENT $row RETURN AFTER",
-        vec![
-            ("id".into(), id.into_value()),
-            ("row".into(), message.into_value()),
-        ],
+    let inserted = query_as!(
+        ChatbotMessage,
+        "WITH touch AS (
+             UPDATE chatbot_thread SET updated_at = GREATEST($2, updated_at + 1)
+             WHERE id = $1
+             RETURNING 1)
+         INSERT INTO chatbot_message (id, thread_id, user_id, role, content, status, \
+                                      truncated, error_code, created_at, completed_at)
+         SELECT $3, $1, $4, $5, $6, $7, $8, $9, $10, $11
+         WHERE EXISTS (SELECT 1 FROM touch)
+         RETURNING id, thread_id, user_id, role, content, status, truncated, error_code, \
+                   created_at, completed_at",
+        message.get_thread_id(),
+        Timestamp::now().as_millis(),
+        message.get_id(),
+        &message.user_id,
+        message.role,
+        message.content.as_str(),
+        message.status,
+        message.truncated,
+        message.error_code,
+        message.created_at,
+        message.completed_at,
     )
-    .await?
-    .ok_or_else(|| AppError::Internal("failed to create chat message".into()))
+    .fetch_optional(db)
+    .await?;
+    inserted.ok_or_else(|| AppError::Internal("failed to create chat message".into()))
 }
 
 /// Append the user's prompt. Nothing is awaited for it, so it is born
@@ -109,10 +126,10 @@ pub async fn list_for_thread(
     offset: i64,
 ) -> Result<(Vec<ChatbotMessage>, i64), AppError> {
     let (rows, total) = PagedList::new(
-        "chatbot_message WHERE thread_id = $conv",
+        "chatbot_message WHERE thread_id = $1",
         "ORDER BY created_at ASC, id ASC",
     )
-    .bind("conv", thread.record())
+    .bind(thread)
     .run::<ChatbotMessage>(limit, offset, db)
     .await?;
     Ok((
@@ -129,20 +146,17 @@ pub async fn list_tail(
     thread: &ChatbotThreadId,
     limit: usize,
 ) -> Result<Vec<ChatbotMessage>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM chatbot_message WHERE thread_id = $conv \
-             ORDER BY created_at DESC, id DESC LIMIT $limit",
-        )
-        .bind(("conv", thread.record()))
-        .bind(("limit", limit as i64))
-        .await?
-        .check()?;
-    let mut messages: Vec<ChatbotMessage> = result
-        .take::<Vec<ChatbotMessage>>(0)?
-        .into_iter()
-        .map(ChatbotMessage::projected)
-        .collect();
+    let mut messages: Vec<ChatbotMessage> = query_as!(
+        ChatbotMessage,
+        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
+                created_at, completed_at \
+         FROM chatbot_message WHERE thread_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+        thread,
+        limit as i64
+    )
+    .fetch_all(db)
+    .await?;
     messages.reverse();
     Ok(messages)
 }
@@ -158,17 +172,18 @@ pub async fn list_settled_tail(
     thread: &ChatbotThreadId,
     limit: usize,
 ) -> Result<Vec<ChatbotMessage>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM chatbot_message WHERE thread_id = $conv \
-             AND status = 'complete' AND content != '' \
-             ORDER BY created_at DESC, id DESC LIMIT $limit",
-        )
-        .bind(("conv", thread.record()))
-        .bind(("limit", limit as i64))
-        .await?
-        .check()?;
-    let mut messages: Vec<ChatbotMessage> = result.take(0)?;
+    let mut messages: Vec<ChatbotMessage> = query_as!(
+        ChatbotMessage,
+        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
+                created_at, completed_at \
+         FROM chatbot_message WHERE thread_id = $1 \
+           AND status = 'complete' AND content <> '' \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+        thread,
+        limit as i64
+    )
+    .fetch_all(db)
+    .await?;
     messages.reverse();
     Ok(messages)
 }
@@ -185,7 +200,16 @@ pub async fn prompt_of(
     db: &Database,
     id: &ChatbotMessageId,
 ) -> Result<Option<ChatbotMessage>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let message = query_as!(
+        ChatbotMessage,
+        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
+                created_at, completed_at \
+         FROM chatbot_message WHERE id = $1",
+        id
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(message)
 }
 
 /// Read one turn only if `user` owns it — the poll loop's read.
@@ -194,7 +218,15 @@ pub async fn read_for(
     id: &ChatbotMessageId,
     user: &UserId,
 ) -> Result<Option<ChatbotMessage>, AppError> {
-    let message: Option<ChatbotMessage> = db.select(id.record()).await?;
+    let message = query_as!(
+        ChatbotMessage,
+        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
+                created_at, completed_at \
+         FROM chatbot_message WHERE id = $1",
+        id
+    )
+    .fetch_optional(db)
+    .await?;
     Ok(message
         .filter(|message| &message.user_id == user)
         .map(ChatbotMessage::projected))
@@ -236,29 +268,24 @@ async fn settle(
     } else {
         MessageStatus::Failed
     };
-    let mut result = db
-        .query(
-            "UPDATE $id SET content = $content, status = $status, truncated = $truncated, \
-             error_code = $code, completed_at = $now WHERE status = 'pending' RETURN AFTER",
-        )
-        .bind(("id", id.record()))
-        .bind(("content", text.map(|t| t.0).unwrap_or_default()))
-        .bind(("status", status.as_str().to_string()))
-        .bind(("truncated", truncated))
-        .bind((
-            "code",
-            error_code.map(|code| code.chars().take(MAX_ERROR_CODE_LEN).collect::<String>()),
-        ))
-        .bind(("now", Timestamp::now().as_millis()))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<ChatbotMessage>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let settled = query_as!(
+        ChatbotMessage,
+        "UPDATE chatbot_message SET content = $2, status = $3, truncated = $4, \
+             error_code = $5, completed_at = $6 \
+         WHERE id = $1 AND status = 'pending' \
+         RETURNING id, thread_id, user_id, role, content, status, truncated, error_code, \
+                   created_at, completed_at",
+        id,
+        text.map(|t| t.as_str().to_string()).unwrap_or_default(),
+        status,
+        truncated,
+        error_code.map(|code| code.chars().take(MAX_ERROR_CODE_LEN).collect::<String>()),
+        Timestamp::now().as_millis(),
+    )
+    .fetch_optional(db)
+    .await?;
+    settled.ok_or(AppError::NotFound)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

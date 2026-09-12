@@ -2,91 +2,103 @@
 //! audience's live membership resolution — the point check behind marking
 //! ([`includes`]) and the who-missed report's backbone ([`members`]).
 
-use surrealdb::types::SurrealValue;
-
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
-use crate::domain::class_member::{ClassMember, ClassMemberId};
+use crate::db::page::Param;
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
+use sqlx::query_as;
 
-/// Is `user` in `audience`'s roster right now? The point check behind
-/// marking — cheaper than resolving the whole roster when the target is
-/// known. `event` must be the event this audience came from: the
-/// registration kind resolves against that event's signup rows.
-pub async fn includes(
-    db: &Database,
-    audience: &EventAudience,
-    event: &EventId,
-    user: &User,
-) -> Result<bool, AppError> {
-    match audience {
-        EventAudience::School => Ok(true),
-        EventAudience::Role { role } => Ok(user.get_role() == *role),
-        EventAudience::Course { course } => {
-            Ok(
-                crate::db::enrollment::read_for_user(db, course, user.get_id())
+/// Is `user` in this event's audience roster right now? The point check
+/// behind marking — cheaper than resolving the whole roster when the target
+/// is known. The audience comes off the row itself: the registration kind
+/// resolves against that event's signup rows.
+pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool, AppError> {
+    match event.get_audience_kind() {
+        crate::domain::event::EventAudienceKind::School => Ok(true),
+        crate::domain::event::EventAudienceKind::Role => {
+            Ok(Some(user.get_role()) == event.get_audience_role())
+        }
+        crate::domain::event::EventAudienceKind::Course => {
+            match event.get_audience_course() {
+                Some(course) => Ok(crate::db::enrollment::read_for_user(db, course, user.get_id())
                     .await?
-                    .is_some(),
-            )
+                    .is_some()),
+                None => Ok(false),
+            }
         }
-        // The (class, user) pair is the membership row's own id, so the
-        // point check is a single select — no scan, no index needed.
-        EventAudience::Class { class } => {
-            let member: Option<ClassMember> = db
-                .select(ClassMemberId::composite(class, user.get_id()).record())
+        // The (class, user) pair is the membership row's own primary key, so
+        // the point check is one existence probe — no scan, no index needed.
+        crate::domain::event::EventAudienceKind::Class => match event.get_audience_class() {
+            Some(class) => {
+                let row = sqlx::query!(
+                    "SELECT EXISTS(SELECT 1 FROM class_member WHERE class = $1 AND app_user = $2)
+                     AS present",
+                    class,
+                    user.get_id()
+                )
+                .fetch_one(db)
                 .await?;
-            Ok(member.is_some())
-        }
-        EventAudience::Registration { .. } => {
-            Ok(crate::db::registration::read_for_user(db, event, user.get_id())
+                Ok(row.present)
+            }
+            None => Ok(false),
+        },
+        crate::domain::event::EventAudienceKind::Registration => {
+            Ok(crate::db::registration::read_for_user(db, event.get_id(), user.get_id())
                 .await?
                 .is_some())
         }
     }
 }
 
-/// `event`'s full roster, as it stands right now — the who-missed
+/// The event's full roster, as it stands right now — the who-missed
 /// report's backbone. Registered ids that no longer resolve to a user row
 /// are kept; the caller degrades their display like any stale reference.
-pub async fn members(
-    db: &Database,
-    audience: &EventAudience,
-    event: &EventId,
-) -> Result<Vec<UserId>, AppError> {
-    match audience {
-        EventAudience::School => Ok(crate::db::user::list_all(db, None, 0)
+pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppError> {
+    match event.get_audience_kind() {
+        crate::domain::event::EventAudienceKind::School => Ok(crate::db::user::list_all(db, None, 0)
             .await?
             .0
             .iter()
             .map(|user| user.get_id().clone())
             .collect()),
-        EventAudience::Role { role } => Ok(crate::db::user::list_by_role(db, *role)
-            .await?
-            .iter()
-            .map(|user| user.get_id().clone())
-            .collect()),
-        EventAudience::Course { course } => {
-            Ok(crate::db::enrollment::list_for_course(db, course, None, 0)
+        crate::domain::event::EventAudienceKind::Role => {
+            match event.get_audience_role() {
+                Some(role) => Ok(crate::db::user::list_by_role(db, role)
+                    .await?
+                    .iter()
+                    .map(|user| user.get_id().clone())
+                    .collect()),
+                None => Ok(Vec::new()),
+            }
+        }
+        crate::domain::event::EventAudienceKind::Course => match event.get_audience_course() {
+            Some(course) => Ok(crate::db::enrollment::list_for_course(db, course, None, 0)
                 .await?
                 .0
                 .iter()
                 .map(|enrollment| enrollment.get_user().clone())
+                .collect()),
+            None => Ok(Vec::new()),
+        },
+        crate::domain::event::EventAudienceKind::Class => match event.get_audience_class() {
+            Some(class) => Ok(crate::db::class_member::list_for_class(db, class, None, 0)
+                .await?
+                .0
+                .iter()
+                .map(|member| member.get_user().clone())
+                .collect()),
+            None => Ok(Vec::new()),
+        },
+        crate::domain::event::EventAudienceKind::Registration => {
+            Ok(crate::db::registration::list_for_event(db, event.get_id())
+                .await?
+                .iter()
+                .map(|registration| registration.get_user().clone())
                 .collect())
         }
-        EventAudience::Class { class } => Ok(crate::db::class_member::list_for_class(db, class, None, 0)
-            .await?
-            .0
-            .iter()
-            .map(|member| member.get_user().clone())
-            .collect()),
-        EventAudience::Registration { .. } => Ok(crate::db::registration::list_for_event(db, event)
-            .await?
-            .iter()
-            .map(|registration| registration.get_user().clone())
-            .collect()),
     }
 }
 
@@ -99,29 +111,55 @@ pub async fn create(
     starts_at: Option<Timestamp>,
     ends_at: Option<Timestamp>,
 ) -> Result<Event, AppError> {
-    let event = Event {
-        id: EventId::generate(),
-        creator: creator.clone(),
+    // The audience payload moves as one unit with its kind; the validated
+    // bundle guarantees only the matching payload is ever non-NULL.
+    let created = query_as!(
+        Event,
+        "INSERT INTO event (id, creator, title, description, audience_kind, audience_role, \
+                            audience_course, audience_class, audience_capacity, starts_at, ends_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id, creator, title, description, audience_kind, audience_role, \
+                   audience_course, audience_class, audience_capacity, starts_at, ends_at",
+        EventId::generate(),
+        creator,
         title,
         description,
-        audience,
+        audience.kind,
+        audience.role,
+        audience.course,
+        audience.class,
+        audience.capacity,
         starts_at,
         ends_at,
-    };
-    let created: Option<Event> = db.create(event.id.record()).content(event).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create event".into()))
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(created)
 }
 
 pub async fn read(db: &Database, id: &EventId) -> Result<Option<Event>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let event = query_as!(
+        Event,
+        "SELECT id, creator, title, description, audience_kind, audience_role, audience_course, \
+                audience_class, audience_capacity, starts_at, ends_at \
+         FROM event WHERE id = $1",
+        id
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(event)
 }
 
 pub async fn list_all(db: &Database) -> Result<Vec<Event>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM event ORDER BY id DESC")
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Event>>(0)?)
+    let events = query_as!(
+        Event,
+        "SELECT id, creator, title, description, audience_kind, audience_role, audience_course, \
+                audience_class, audience_capacity, starts_at, ends_at \
+         FROM event ORDER BY id DESC",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(events)
 }
 
 /// Request-scoped: the handler reads the event, then awaits the clock and a
@@ -131,6 +169,10 @@ pub async fn list_all(db: &Database) -> Result<Vec<Event>, AppError> {
 /// alone does not prevent that, the values have to come from the request.
 /// The schedule columns are nullable, so they take the outer/inner
 /// `Option<Option<_>>`: `None` = omitted (keep), `Some(None)` = clear.
+///
+/// The audience is five columns moving as one unit: when the request
+/// carries an audience, all five are written (the non-matching payload as
+/// NULL); when it carries none, none are.
 pub async fn update(
     db: &Database,
     event: Event,
@@ -140,12 +182,47 @@ pub async fn update(
     starts_at: Option<Option<Timestamp>>,
     ends_at: Option<Option<Timestamp>>,
 ) -> Result<Event, AppError> {
-    FieldUpdate::new(event.id.record())
-        .set("title", title)
-        .set("description", description)
-        .set("audience", audience)
-        .set("starts_at", starts_at)
-        .set("ends_at", ends_at)
+    FieldUpdate::new("event", event.get_id().uuid())
+        .set(
+            "title",
+            title.map(|title| Param::Text(title.as_str().to_string())),
+        )
+        .set(
+            "description",
+            description.map(|d| Param::Text(d.as_str().to_string())),
+        )
+        .set(
+            "audience_kind",
+            audience
+                .as_ref()
+                .map(|a| Param::Text(a.kind.as_str().to_string())),
+        )
+        .set(
+            "audience_role",
+            audience
+                .as_ref()
+                .map(|a| Param::OptText(a.role.map(|r| r.as_str().to_string()))),
+        )
+        .set(
+            "audience_course",
+            audience.as_ref().map(|a| Param::OptUuid(a.course.map(|c| c.uuid()))),
+        )
+        .set(
+            "audience_class",
+            audience.as_ref().map(|a| Param::OptUuid(a.class.map(|c| c.uuid()))),
+        )
+        .set(
+            "audience_capacity",
+            audience.as_ref().map(|a| Param::OptI64(a.capacity)),
+        )
+        .set(
+            "starts_at",
+            starts_at.map(|at| Param::OptI64(at.map(|at| at.as_millis()))),
+        )
+        .set(
+            "ends_at",
+            ends_at.map(|at| Param::OptI64(at.map(|at| at.as_millis()))),
+        )
         .ordered("starts_at", "ends_at", range_error())
         .run::<Event>(db)
         .await
@@ -153,44 +230,37 @@ pub async fn update(
 
 /// Delete the event and cascade-remove its attendance and signup rows.
 ///
-/// Children first, and all of it in one transaction the way
-/// [`crate::db::course::delete`] does it: run as two queries, a
-/// registration or a mark that committed in between outlived its event —
-/// an orphan no read path can ever reach and no delete can ever reclaim,
-/// since every one of them is keyed on the event that is now gone.
+/// Children first, all of it in one guarded transaction: run as separate
+/// statements, a registration or a mark committing in between would outlive
+/// its event — an orphan no read path can ever reach and no delete can ever
+/// reclaim, since every one of them is keyed on the event that is now gone.
 ///
-/// Re-sent while the store answers "conflict, retry", the way
-/// [`crate::db::course_session::delete`] is: now that
-/// [`crate::domain::attendance::Attendance::mark`] writes the event row to
-/// prove it exists, a mark landing in this window really does contend for
-/// it — and without the retry the *delete* is the side that loses, turning
-/// a race the store resolved correctly into a 500 (measured 4 rounds in 4).
-/// Admissible: every statement is a `DELETE`, which can never answer
-/// "already exists", and a lost round wrote nothing.
+/// `cascade` retry: a mark landing while the cascade is in flight contends
+/// for the event row (its insert's foreign key proves the event the moment
+/// it lands), so a lost round re-sends instead of answering 500.
 pub async fn delete(db: &Database, event: Event) -> Result<Event, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             DELETE attendance WHERE event = $ev;
-             DELETE registration WHERE event = $ev;
-             LET $gone = (DELETE $ev RETURN BEFORE);
-             RETURN $gone;
-             COMMIT TRANSACTION;",
-        &[("ev".into(), event.id.record().into_value())],
-        // No THROW of its own — an unconditional cascade.
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Read through the trailing `RETURN`, never a hand-counted slot.
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<Event>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    tx_with_retry(db, true, async |tx| {
+        sqlx::query!("DELETE FROM attendance WHERE event = $1", event.get_id())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!(
+            "DELETE FROM registration WHERE event = $1",
+            event.get_id()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let gone = query_as!(
+            Event,
+            "DELETE FROM event WHERE id = $1 \
+             RETURNING id, creator, title, description, audience_kind, audience_role, \
+                       audience_course, audience_class, audience_capacity, starts_at, ends_at",
+            event.get_id()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        gone.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 #[cfg(test)]
