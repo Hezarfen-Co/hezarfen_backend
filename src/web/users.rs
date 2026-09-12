@@ -422,9 +422,10 @@ async fn update_user_preferences(
 /// Set a user's role. Admin only. An admin cannot change their own role, and
 /// the school's **last** admin cannot be demoted by anyone (`409`) — together
 /// those keep role management from locking everyone out, including when two
-/// admins demote each other at the same instant (the floor is serialized, see
-/// `ADMIN_FLOOR_LOCK`). A school that has already lost its admins is recovered
-/// with the SurrealQL in the README, since the seed never promotes.
+/// admins demote each other at the same instant (the floor is a predicate on
+/// the role write itself, so the racing demotions serialize on row locks).
+/// A school that has already lost its admins is recovered by hand against the
+/// database, since the seed never promotes.
 /// Setting any non-`student` role also drops the user's course enrollments —
 /// only students enroll, so a promoted user leaves every roster. Demoting below
 /// `teacher` drops their course teaching assignments for the mirror reason, and
@@ -1151,7 +1152,7 @@ async fn upload_my_avatar(
     let upload = read_image_upload(&st, &mut multipart).await?;
     let size = upload.size();
 
-    let file = ulid::Ulid::generate().to_string();
+    let file = crate::domain::monotonic_id::next_uuid().to_string();
     store_blob(&st, &file, &upload.data, || async {
         match crate::service::user::set_avatar(
             &st.db,

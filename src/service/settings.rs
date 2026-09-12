@@ -1,45 +1,22 @@
-//! The settings edit workflow: one edit at a time under [`SETTINGS_LOCK`],
-//! a snapshot-merge-retire-save pair whose halves cannot interleave, and the
-//! compare-and-set retry that keeps two managers' patches from silently
-//! reverting each other. The singleton's queries live in
-//! [`crate::db::settings`].
-
-use surrealdb::types::RecordId;
-use tokio::sync::Mutex;
+//! The settings edit workflow: snapshot-merge-guard-save, with every name-list
+//! guard and the compare-and-set riding ONE transaction, so two managers'
+//! patches can neither silently revert each other nor strand a half-applied
+//! removal. The singleton's queries live in [`crate::db::settings`].
 
 use crate::constant::CAS_UPDATE_RETRIES;
-use crate::database::Database;
-use crate::db::cap;
-use crate::domain::exam_result::kind_ref;
-use crate::domain::menu::slot_ref;
+use crate::database::{Database, tx_with_retry};
 use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, Settings};
 use crate::error::AppError;
 
-/// One settings edit at a time, over the whole process.
-///
-/// A list edit is a **pair** of writes, and the pair is the guard: every name
-/// the edit drops is retired on its reference counter first (which refuses
-/// every later claim), and only then is the list itself committed with a
-/// compare-and-set against the snapshot the removals were judged from. Neither
-/// write can be made to cover the other. Both retirement and un-retirement are
-/// *idempotent*, so a rival that decided the same removal against the same
-/// snapshot is told "already retired" and records no rollback — and when it is
-/// that rival's save that wins the compare-and-set, the attempt which really
-/// flipped the bit rolls it back, leaving the name off the stored list with a
-/// counter reading "in service": gradable again, and unremovable for good once
-/// a mark lands. No per-name bit can close that, because `Unchanged` has
-/// erased which attempt owns the flip.
-///
-/// So the pair is serialized instead. Every writer of the singleton goes
-/// through `PATCH /settings`, and the deployment runs one process by contract
-/// (stop-the-world upgrades), so process-wide is deployment-wide here — the
-/// same argument [`crate::db::cap`]'s own lock makes for `retire_name`'s
-/// two statements, one level up. The compare-and-set stays: it is what keeps a
-/// crashed or rolled-back attempt from writing a list nobody merged.
-///
-/// **Lock order:** `SETTINGS_LOCK` → `cap`'s `CLAIM_LOCK`, never the reverse —
-/// the retirements are taken while this is held.
-pub(crate) static SETTINGS_LOCK: Mutex<()> = Mutex::const_new(());
+/// The abort marker the edit transaction's closure raises when the guarded
+/// save wrote zero rows — the stored row moved under the snapshot this
+/// attempt was judged against. It never reaches the wire: [`apply`] maps it
+/// to another loop turn right here, and the transaction's rollback already
+/// took every retirement back with it. (Same abort-through-`Internal`
+/// pattern as `crate::db::field_update`'s markers: a refusal is a decision,
+/// so it must not be retried — this one is *un*-decided, which is exactly
+/// why the loop re-runs.)
+const STALE_SAVE: &str = "settings_save_lost_cas";
 
 /// The stored policy, or the defaults when no row exists yet.
 pub async fn load(db: &Database) -> Result<Settings, AppError> {
@@ -60,8 +37,8 @@ pub async fn save_if_unchanged(
 /// A `PATCH /settings` body after wire mapping: only the fields the school
 /// sent. Lists stay raw on purpose — validating them is the workflow's own
 /// step, in its own order, and keeping a stored meal-slot name skips the
-/// URL-charset rule (`MealSlotDef::try_kept`), which only [`apply`], holding
-/// the lock and the stored list, can decide.
+/// URL-charset rule (`MealSlotDef::try_kept`), which only [`apply`],
+/// holding the stored list, can decide.
 pub struct SettingsPatch {
     pub exam_kinds: Option<Vec<ExamKindInput>>,
     pub attendance_statuses: Option<Vec<String>>,
@@ -94,14 +71,27 @@ pub struct MealSlotInput {
     pub serving_minute: Option<i64>,
 }
 
-/// The whole edit — snapshot, merge, retire, save — as one operation, so the
+/// The whole edit — snapshot, merge, guard, save — as one operation, so the
 /// tests can drive it the way two managers do.
+///
+/// The guards and the save share one transaction, and that is the whole
+/// guard: a list edit is a *pair* of writes — every name the edit drops is
+/// retired on its reference counter first (which refuses every later
+/// claim), and only then is the list itself committed with a
+/// compare-and-set against the snapshot the removals were judged from. The
+/// old engine could not serialize that pair on its own, so a process-wide
+/// lock held it together, and the winner-loses-rollback interaction between
+/// two same-snapshot attempts needed a hand-rolled undo list
+/// (`Unchanged`-erased which attempt owned a flip, so a no-op could undo a
+/// rival). Postgres needs neither: retirement and save commit together or
+/// not at all, a stale save rolls its retirements back by aborting, and the
+/// row-locked retire switch serializes two attempts dropping the same name.
+///
+/// Retired before the save, never after: the other order leaves a window in
+/// which a mark lands under a kind the settings no longer list. A save that
+/// then does not land undoes them — by transaction abort, before the next
+/// try, with no undo list to get wrong.
 pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, AppError> {
-    // One settings edit at a time: the removals below are decided against the
-    // snapshot this loop loads and written *before* the save that justifies
-    // them, and no per-name bookkeeping can make that pair survive a rival's
-    // pair interleaving with it (see `SETTINGS_LOCK`).
-    let _guard = SETTINGS_LOCK.lock().await;
     // Merge over a snapshot, then save only while the row still matches it —
     // otherwise a concurrent PATCH of a *different* field would be silently
     // reverted by whichever whole-row write lands second. A refused save
@@ -179,93 +169,159 @@ pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, App
 
         let settings = Settings::try_new(params)?;
 
-        // The removal guards. A name leaves a list by being *retired* on its
-        // reference counter — one conditional write on one record, which lands
-        // only while nothing references the name and refuses every claim from
-        // that instant on. That is the whole guard: the check and the removal
-        // used to be a cross-table count and a save held together by a
-        // process-wide lock that was released around the round trip between
-        // them.
-        //
-        // Retired before the save, never after: the other order leaves a window
-        // in which a mark lands under a kind the settings no longer list. A save
-        // that then does not land undoes them (`restore`) before the next try.
-        //
-        // Only a write that actually *flipped* a bit is recorded for that undo.
-        // Retirement is idempotent, so two PATCHes dropping the same kind are
-        // both told "retired" — and the one whose save then loses the row's CAS
-        // used to un-retire the winner's kind, leaving it off the list with its
-        // counter in service: gradable again, its count then non-zero, and so
-        // impossible to remove ever after.
-        let mut undo: Vec<Undo> = Vec::new();
-        let mut refused = None;
-        for gone in missing(&was_kinds, &now_kinds) {
-            let counter = kind_ref(&gone);
-            match cap::retire_name(&counter, db).await? {
-                cap::Switched::Flipped => undo.push(Undo::Retired(counter)),
-                cap::Switched::Unchanged => {}
-                cap::Switched::InUse => {
-                    refused = Some(AppError::ConflictOwned(format!(
-                        "exams of kind '{gone}' are already graded — the kind cannot be removed"
-                    )));
-                    break;
-                }
+        // Guards + save, one transaction. The removal refusals are the same
+        // 409s as ever; a stale save is the `STALE_SAVE` marker, answered by
+        // another loop turn below; everything else surfaces.
+        let attempted = tx_with_retry(db, false, async |tx| {
+            // A name leaves a list by being *retired* on its reference
+            // counter — one row-locked switch, which lands only while
+            // nothing references the name and refuses every claim from that
+            // instant on. A refused removal aborts the transaction, taking
+            // any earlier retirement in this same attempt back with it.
+            for gone in missing(&was_kinds, &now_kinds) {
+                retire_kind(&mut *tx, &gone).await?;
             }
-        }
-        // Same shape for meal slots: a slot a menu was already published for
-        // cannot leave the list — the menu snapshotted the name as text, and a
-        // slot no longer offered would leave that menu unreachable from the
-        // school's own list.
-        if refused.is_none() {
+            // Same shape for meal slots: a slot a menu was already published
+            // for cannot leave the list — the menu snapshotted the name as
+            // text, and a slot no longer offered would leave that menu
+            // unreachable from the school's own list.
             for gone in missing(&was_slots, &now_slots) {
-                let counter = slot_ref(&gone);
-                match cap::retire_name(&counter, db).await? {
-                    cap::Switched::Flipped => undo.push(Undo::Retired(counter)),
-                    cap::Switched::Unchanged => {}
-                    cap::Switched::InUse => {
-                        refused = Some(AppError::ConflictOwned(format!(
-                            "menus are already published for the '{gone}' slot — it cannot be removed"
-                        )));
-                        break;
-                    }
-                }
+                retire_slot(&mut *tx, &gone).await?;
             }
-        }
-        if let Some(refused) = refused {
-            restore(&undo, db).await?;
-            return Err(refused);
-        }
-        // A name re-entering a list is back in service: its counter still
-        // carries the retirement from the edit that dropped it, and a mark (or
-        // a menu) under a kind the school offers again must not be refused.
-        // Recorded for the same undo as the retirements — a re-add whose save
-        // does not land leaves a name off the list that grades happily.
-        for back in missing(&now_kinds, &was_kinds) {
-            if let cap::Switched::Flipped = cap::unretire_name(&kind_ref(&back), db).await? {
-                undo.push(Undo::Unretired(kind_ref(&back)));
+            // A name re-entering a list is back in service: its counter still
+            // carries the retirement from the edit that dropped it, and a mark
+            // (or a menu) under a kind the school offers again must not be
+            // refused. Inside the transaction, "in service" stands only if
+            // the save below lands — a stale save aborts and re-retires it.
+            for back in missing(&now_kinds, &was_kinds) {
+                unretire_kind(&mut *tx, &back).await?;
             }
-        }
-        for back in missing(&now_slots, &was_slots) {
-            if let cap::Switched::Flipped = cap::unretire_name(&slot_ref(&back), db).await? {
-                undo.push(Undo::Unretired(slot_ref(&back)));
+            for back in missing(&now_slots, &was_slots) {
+                unretire_slot(&mut *tx, &back).await?;
             }
-        }
 
-        match save_if_unchanged(db, settings, &current).await {
-            Ok(Some(saved)) => return Ok(saved),
-            // The row moved under the snapshot these guards were judged against:
-            // put the names back and re-merge, or the next attempt would decide
-            // against a list nobody asked for.
-            Ok(None) => restore(&undo, db).await?,
-            Err(err) => {
-                restore(&undo, db).await?;
-                return Err(err);
+            match crate::db::settings::save_if_unchanged(&mut *tx, settings.clone(), &current)
+                .await?
+            {
+                Some(saved) => Ok(saved),
+                // The row moved under the snapshot these guards were judged
+                // against: the abort puts the names back, and the caller's
+                // loop re-merges — or the next attempt would decide against a
+                // list nobody asked for.
+                None => Err(AppError::Internal(STALE_SAVE.to_string())),
             }
+        })
+        .await;
+
+        match attempted {
+            Ok(saved) => return Ok(saved),
+            Err(AppError::Internal(marker)) if marker == STALE_SAVE => continue,
+            Err(err) => return Err(err),
         }
     }
     Err(AppError::Conflict(
         "the settings kept changing underneath this update — try again",
     ))
+}
+
+/// Retire an exam kind on its reference counter, inside the caller's
+/// transaction — the row-locked switch of the `cap` module's retire recipe:
+/// the row is read `FOR UPDATE` first, so the read of `retired` and the flip
+/// are one unit against a concurrent claim or retire. The flip landing and
+/// the flip already standing are both success — the transaction that follows
+/// decides whether the retired state stands, so `Unchanged` needs no
+/// bookkeeping (the database owns the rollback).
+///
+/// The name still referenced (`count > 0`) is the caller's removal refusal,
+/// byte for byte the old 409.
+async fn retire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
+    let was = sqlx::query!(
+        r#"SELECT retired AS "retired!: bool" FROM kind_ref WHERE name = $1 FOR UPDATE"#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?
+    .map(|row| row.retired)
+    .unwrap_or(false);
+    let landed = sqlx::query!(
+        r#"INSERT INTO kind_ref (name, count, retired) VALUES ($1, 0, TRUE)
+           ON CONFLICT (name) DO UPDATE SET retired = TRUE
+           WHERE kind_ref.count = 0 AND kind_ref.retired IS DISTINCT FROM TRUE
+           RETURNING 1 AS "landed!: i64""#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?
+    .is_some();
+    match (landed, was) {
+        // Still in use, and not already retired: the removal is refused.
+        (false, false) => Err(AppError::ConflictOwned(format!(
+            "exams of kind '{name}' are already graded — the kind cannot be removed"
+        ))),
+        // Flipped, or already retired by the rival that decided the same
+        // removal: nothing to do — the transaction decides whether it stands.
+        _ => Ok(()),
+    }
+}
+
+/// [`retire_kind`] against the meal-slot counters.
+async fn retire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
+    let was = sqlx::query!(
+        r#"SELECT retired AS "retired!: bool" FROM slot_ref WHERE name = $1 FOR UPDATE"#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?
+    .map(|row| row.retired)
+    .unwrap_or(false);
+    let landed = sqlx::query!(
+        r#"INSERT INTO slot_ref (name, count, retired) VALUES ($1, 0, TRUE)
+           ON CONFLICT (name) DO UPDATE SET retired = TRUE
+           WHERE slot_ref.count = 0 AND slot_ref.retired IS DISTINCT FROM TRUE
+           RETURNING 1 AS "landed!: i64""#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?
+    .is_some();
+    match (landed, was) {
+        (false, false) => Err(AppError::ConflictOwned(format!(
+            "menus are already published for the '{name}' slot — it cannot be removed"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Put an exam kind back in service, inside the caller's transaction. One
+/// guarded write: the flip lands only while the name is actually retired, so
+/// it is idempotent. Whether the name *stays* in service is the save's
+/// decision — a stale save aborts this transaction and the retirement stands
+/// again, with no undo list to get wrong.
+async fn unretire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"INSERT INTO kind_ref (name, count, retired) VALUES ($1, 0, FALSE)
+           ON CONFLICT (name) DO UPDATE SET retired = FALSE
+           WHERE kind_ref.retired IS DISTINCT FROM FALSE
+           RETURNING 1 AS "landed!: i64""#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?;
+    Ok(())
+}
+
+/// [`unretire_kind`] against the meal-slot counters.
+async fn unretire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"INSERT INTO slot_ref (name, count, retired) VALUES ($1, 0, FALSE)
+           ON CONFLICT (name) DO UPDATE SET retired = FALSE
+           WHERE slot_ref.retired IS DISTINCT FROM FALSE
+           RETURNING 1 AS "landed!: i64""#,
+        name
+    )
+    .fetch_optional(tx)
+    .await?;
+    Ok(())
 }
 
 fn kind_names(kinds: &[ExamKindDef]) -> Vec<String> {
@@ -290,39 +346,6 @@ fn missing(before: &[String], after: &[String]) -> Vec<String> {
         .filter(|name| !after.contains(name))
         .cloned()
         .collect()
-}
-
-/// One `retired` bit this attempt moved, and which way — what `restore` needs
-/// to put it back. Only bits this attempt actually *flipped* are listed: a
-/// write that changed nothing has nothing to take back, and taking it back
-/// would undo the concurrent edit that really did move it.
-enum Undo {
-    /// Retired for a removal; put it back in service.
-    Retired(RecordId),
-    /// Put back in service for a re-add; retire it again.
-    Unretired(RecordId),
-}
-
-/// Undo every bit this attempt moved: the edit that justified them did not
-/// land, so the lists the school offers are still the ones it started with.
-async fn restore(undo: &[Undo], db: &Database) -> Result<(), AppError> {
-    for step in undo {
-        match step {
-            Undo::Retired(name) => {
-                cap::unretire_name(name, db).await?;
-            }
-            // A re-retirement can be refused: a mark (or a menu) landed under
-            // the name during the window it was in service. Refusing to undo is
-            // then the honest answer — the reference is real, and retiring over
-            // it would make the row's kind ungradable while nothing lists it.
-            // The name is left in service, matching the list this attempt is
-            // about to re-read.
-            Undo::Unretired(name) => {
-                cap::retire_name(name, db).await?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

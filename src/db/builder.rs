@@ -3,36 +3,56 @@
 //! credential newtypes are [`crate::domain::user`]'s; the seed workflow that
 //! decides whether an account exists is [`crate::service::builder::ensure`].
 
-use surrealdb::types::RecordId;
-use ulid::Ulid;
-
 use crate::constant::SESSION_DURATION_DAYS;
 use crate::database::Database;
-use crate::domain::builder::{BUILDER_SESSION_TABLE, Builder, BuilderId, BuilderSession};
+use crate::domain::builder::{Builder, BuilderId, BuilderSession};
 use crate::domain::session::SessionToken;
 use crate::domain::timestamp::Timestamp;
+use crate::domain::user::{PasswordHash, Username};
 use crate::error::AppError;
 
 pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Builder>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM builder WHERE username = $u LIMIT 1")
-        .bind(("u", username.trim().to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Builder>>(0)?.into_iter().next())
+    let builder = sqlx::query_as!(
+        Builder,
+        r#"SELECT id AS "id: BuilderId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash"
+           FROM builder WHERE username = $1"#,
+        username.trim()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(builder)
 }
 
 pub async fn read(db: &Database, id: &BuilderId) -> Result<Option<Builder>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let builder = sqlx::query_as!(
+        Builder,
+        r#"SELECT id AS "id: BuilderId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash"
+           FROM builder WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(builder)
 }
 
 /// The raw account insert behind [`crate::service::builder::ensure`]'s seed.
+/// The unique index on `username` is the whole availability check: a racing
+/// second seed is a `23505` on `builder_username`, and the seed's
+/// find-then-insert order makes that unreachable in practice — but the
+/// constraint stands guard regardless.
 pub async fn create(db: &Database, builder: Builder) -> Result<(), AppError> {
-    let created: Option<Builder> = db
-        .create(builder.get_id().record())
-        .content(builder.clone())
-        .await?;
-    created.ok_or_else(|| AppError::Internal("failed to create the builder account".into()))?;
+    sqlx::query!(
+        "INSERT INTO builder (id, username, password_hash) VALUES ($1, $2, $3)",
+        builder.id.uuid(),
+        builder.username.as_str(),
+        builder.password_hash.as_str(),
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -41,32 +61,49 @@ pub async fn create_session(
     db: &Database,
     builder: &BuilderId,
 ) -> Result<BuilderSession, AppError> {
-    let key = RecordId::new(BUILDER_SESSION_TABLE, Ulid::generate().to_string());
-    let session = BuilderSession {
-        id: key.clone(),
-        builder: builder.clone(),
-        token: SessionToken::generate()?,
-        created_at: Timestamp::now(),
-        expires_at: Timestamp::in_days(SESSION_DURATION_DAYS),
-    };
-    let created: Option<BuilderSession> = db.create(key).content(session).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create the builder session".into()))
+    let token = SessionToken::generate()?;
+    let created_at = Timestamp::now();
+    let expires_at = Timestamp::in_days(SESSION_DURATION_DAYS);
+    let session = sqlx::query_as!(
+        BuilderSession,
+        r#"INSERT INTO builder_session (id, builder, token, created_at, expires_at)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id,
+                     builder AS "builder: BuilderId",
+                     token AS "token: SessionToken",
+                     created_at AS "created_at: Timestamp",
+                     expires_at AS "expires_at: Timestamp""#,
+        crate::domain::monotonic_id::next_uuid(),
+        builder.uuid(),
+        token.as_str(),
+        created_at.as_millis(),
+        expires_at.as_millis(),
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(session)
 }
 
 pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<BuilderSession>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM builder_session WHERE token = $tok LIMIT 1")
-        .bind(("tok", token.to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<BuilderSession>>(0)?.into_iter().next())
+    let session = sqlx::query_as!(
+        BuilderSession,
+        r#"SELECT id,
+                  builder AS "builder: BuilderId",
+                  token AS "token: SessionToken",
+                  created_at AS "created_at: Timestamp",
+                  expires_at AS "expires_at: Timestamp"
+           FROM builder_session WHERE token = $1"#,
+        token
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(session)
 }
 
 pub async fn delete_by_token(db: &Database, token: &str) -> Result<(), AppError> {
-    db.query("DELETE builder_session WHERE token = $tok")
-        .bind(("tok", token.to_string()))
-        .await?
-        .check()?;
+    sqlx::query!("DELETE FROM builder_session WHERE token = $1", token)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
