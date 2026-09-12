@@ -76,6 +76,7 @@ impl HomeworkStatus {
 pub struct HomeworkResult {
     pub(crate) id: HomeworkResultId,
     pub(crate) homework: HomeworkId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: HomeworkStatus,
     pub(crate) mark: Option<Mark>,

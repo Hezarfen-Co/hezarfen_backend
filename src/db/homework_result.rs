@@ -5,48 +5,51 @@
 //! validated status and mark types in
 //! [`crate::domain::homework_result`].
 
-use crate::constant::{MARKS_GIVEN_TOTAL_FIELD, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD};
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_result::{HomeworkResult, HomeworkResultId, HomeworkStatus};
-use crate::domain::homework_submission::HomeworkSubmissionId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-use surrealdb::types::SurrealValue;
 
-/// Record (or overwrite) the grade for (homework, user). One row per pair,
-/// keyed by the deterministic composite id, so this is a single atomic
-/// UPSERT — concurrent grades for the same pair converge on one row instead
-/// of racing a unique index into a 500. Grading before the due date, or
-/// before any submission exists, is allowed (the caller's policy call).
+/// Record (or overwrite) the grade for (homework, user). One row per pair by
+/// the pair's UNIQUE constraint, so grading is one atomic UPSERT —
+/// concurrent grades for the same pair converge on one row instead of
+/// racing a duplicate into a 500. Grading before the due date, or before any
+/// submission exists, is allowed (the caller's policy call).
 ///
 /// In the same transaction the grade *stamps* the student's submission
-/// ([`crate::constant::SUBMISSION_GRADED_FIELD`]), which is what freezes it:
-/// every student-side write to that row then fails its own
-/// `graded_by_result = NONE` condition, with no cross-table read for a
-/// concurrent write to slip past. A submission that does not exist yet is
-/// left alone — grading absent work must not conjure a hand-in (the report reads
-/// `submitted`/`missing`/`late` straight off that row).
+/// (`graded_by_result`), which is what freezes it: every student-side write
+/// to that row then fails its own `graded_by_result IS NULL` condition, with
+/// no cross-table read for a concurrent write to slip past. A submission
+/// that does not exist yet is left alone — grading absent work must not
+/// conjure a hand-in (the report reads `submitted`/`missing`/`late` straight
+/// off that row).
 ///
-/// That one case is where this function stops defending itself: a student's
+/// That one case is where this statement stops defending itself: a student's
 /// *first* hand-in committing between this grade and nothing-to-stamp would
-/// land unstamped, leaving a grade beside an editable submission. Nothing
-/// here forbids it — what forbids it is the caller. Grading holds
-/// `HOMEWORK_LOCK` (see [`crate::service::homework`]) for writing across this
-/// whole transaction while every student-side write holds it for reading across
-/// its own, and the two leases are mutually exclusive in the one process
-/// this backend runs as, so the interleaving never gets a window.
-//
-// corner-cut: that makes the freeze depend on lock discipline at the call
-// sites, not on this row. Moving a student write's lease to *after* its
-// database write — or sharding HOMEWORK_LOCK per homework — reopens the
-// window with nothing to catch it. Closing it in the db layer needs a
-// record both sides own (a per-(homework, user) row the grade can always
-// stamp); a tombstone submission is not it, since every read path would
-// have to learn to ignore it and one missed filter fabricates a hand-in.
+/// land unstamped, leaving a grade beside an editable submission. What
+/// forbids it here is the homework row's lock: every student-side write
+/// locks the homework row across its write, and so does this transaction, so
+/// the interleaving is ordered away instead of leased away — either the
+/// grade saw the row to stamp, or the submission saw no grade and created
+/// under a lock this transaction already held.
+///
+/// Whether the pair was already graded is read one statement ahead of the
+/// write, under the same lock — it is what keeps a regrade from crediting
+/// the grader a second time. No mark counter here: a homework mark is
+/// optional and most grades are status-only, so `high_mark` is an exam-only
+/// family.
+///
+/// The homework row's `FOR UPDATE` is also the parent gate: the id is minted
+/// fresh, so a grade landing inside a homework (or course) delete's window
+/// would otherwise *re-create* a result row under a homework that is gone,
+/// readable ever after at `GET /homework/{id}/result` (no existence check
+/// there) with a `marks_given_total` no ungrade can reach, because every
+/// route to the grade goes through the homework. A vanished row answers
+/// `Err(NotFound)` — the 404 the web layer's own lookup would have answered.
 pub async fn grade(
     db: &Database,
     homework: &HomeworkId,
@@ -55,102 +58,73 @@ pub async fn grade(
     mark: Option<Mark>,
     graded_by: &UserId,
 ) -> Result<HomeworkResult, AppError> {
-    let id = HomeworkResultId::composite(homework, user);
-    let submission = HomeworkSubmissionId::composite(homework, user);
-    let result = HomeworkResult {
-        id: id.clone(),
-        homework: homework.clone(),
-        user: user.clone(),
-        status,
-        mark,
-        graded_by: graded_by.clone(),
-        created_at: Timestamp::now(),
-    };
-    // Whether the pair was already graded is read one statement ahead of
-    // the write, inside the same transaction — it is what keeps a regrade
-    // from crediting the grader a second time. No mark counter here: a
-    // homework mark is optional and most grades are status-only, so
-    // `high_mark` is an exam-only family.
-    //
-    // The first three statements are the parent gate, the twin of
-    // [`crate::db::homework_submission::upsert`]'s
-    // and written the same way on purpose: the id is deterministic, so a
-    // grade landing inside a homework (or course) delete's window does not
-    // fail — it *re-creates* a result row under a homework that is gone,
-    // readable ever after at `GET /homework/{id}/result` (no existence check
-    // there) with a `marks_given_total` no ungrade can reach, because every
-    // route to the grade goes through the homework. Reading the homework
-    // first — which the web layer does, under the lease — cannot close that:
-    // the store conflict-checks write sets, not read sets. So the gate
-    // *moves* a value on the homework row (`due_at` up by one and straight
-    // back to the captured value, leaving the row byte-identical) and the
-    // cascade's delete of that same row is what refuses it. `homework` owns
-    // no counter column and is SCHEMAFULL, so `due_at` is the one `int` it
-    // already has; do not invent a second spelling.
-    //
-    // Not [`crate::db::cap::touch_and_create`], which is the same shape
-    // for a bare `CREATE`: a grade is an UPSERT (a regrade must overwrite),
-    // and the freeze stamp and the grader's counter have to ride the same
-    // transaction, which that helper has no room for.
-    //
-    // Sound to re-send, which is what the gate needed first — a `THROW`
-    // inside a plain `db.query` would have turned every lost round into a
-    // 500. `SELECT`, `UPDATE` and the `IF`/`THROW` can never answer "already
-    // exists", and the `UPSERT`'s id is bijective with the (homework, user)
-    // pair the table keys, on a table whose only index is non-unique
-    // (`homework_result_homework`), so its index entry can only ever point
-    // at the row the id already names: it resolves onto that row instead of
-    // colliding with it. A lost round wrote nothing.
-    let (mut saved, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was_due = (SELECT VALUE due_at FROM ONLY $hw);
-             LET $alive = (UPDATE $hw SET due_at = due_at + 1 RETURN VALUE id);
-             IF array::len($alive) = 0 {{ THROW 'no_homework' }};
-             UPDATE $hw SET due_at = $was_due;
-             LET $before = (SELECT VALUE id FROM ONLY $id);
-             LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
-             UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = $id \
-                 WHERE {SUBMISSION_OPEN_GUARD};
-             IF $before = NONE {{
-                 UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
-                     ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) + 1
-             }};
-             RETURN $after;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("hw".into(), homework.record().into_value()),
-            ("id".into(), id.record().into_value()),
-            ("sub".into(), submission.record().into_value()),
-            ("grader".into(), graded_by.record().into_value()),
-            ("row".into(), result.into_value()),
-        ],
-        &["no_homework"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_homework"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`,
-    // so its slot follows the statement count instead of a hand-kept
-    // number — which the gate above would otherwise have shifted, silently
-    // handing back something else.
-    let slot = saved.num_statements().saturating_sub(2);
-    saved
-        .take::<Vec<HomeworkResult>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to record homework result".into()))
+    let id = HomeworkResultId::generate();
+    let now = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        let alive = sqlx::query!(
+            r#"SELECT 1 AS "row: i32" FROM homework WHERE id = $1 FOR UPDATE"#,
+            homework
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if alive.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let before = sqlx::query!(
+            r#"SELECT 1 AS "row: i32" FROM homework_result
+               WHERE homework = $1 AND app_user = $2 FOR UPDATE"#,
+            homework,
+            user
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        // A regrade overwrites status, mark, grader and stamp — `id` and
+        // `homework`/`app_user` are the row's identity and stay.
+        let graded = sqlx::query_as!(
+            HomeworkResult,
+            r#"INSERT INTO homework_result (id, homework, app_user, status, mark, graded_by, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (homework, app_user) DO UPDATE
+                   SET status = EXCLUDED.status, mark = EXCLUDED.mark,
+                       graded_by = EXCLUDED.graded_by, created_at = EXCLUDED.created_at
+               RETURNING id AS "id: HomeworkResultId",
+                         homework AS "homework: HomeworkId",
+                         app_user AS "user: UserId",
+                         status AS "status: HomeworkStatus",
+                         mark AS "mark: Option<Mark>",
+                         graded_by AS "graded_by: UserId",
+                         created_at AS "created_at: Timestamp""#,
+            id,
+            homework,
+            user,
+            status,
+            mark,
+            graded_by,
+            now,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"UPDATE homework_submission SET graded_by_result = $3
+               WHERE homework = $1 AND app_user = $2 AND graded_by_result IS NULL"#,
+            homework,
+            user,
+            graded.id
+        )
+        .execute(&mut *tx)
+        .await?;
+        if !before {
+            sqlx::query!(
+                "UPDATE app_user SET marks_given_total = marks_given_total + 1 WHERE id = $1",
+                graded_by
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(graded)
+    })
+    .await
 }
 
 /// `user`'s grade for `homework`, if graded.
@@ -159,9 +133,21 @@ pub async fn read_for(
     homework: &HomeworkId,
     user: &UserId,
 ) -> Result<Option<HomeworkResult>, AppError> {
-    Ok(db
-        .select(HomeworkResultId::composite(homework, user).record())
-        .await?)
+    Ok(sqlx::query_as!(
+        HomeworkResult,
+        r#"SELECT id AS "id: HomeworkResultId",
+                  homework AS "homework: HomeworkId",
+                  app_user AS "user: UserId",
+                  status AS "status: HomeworkStatus",
+                  mark AS "mark: Option<Mark>",
+                  graded_by AS "graded_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework_result WHERE homework = $1 AND app_user = $2"#,
+        homework,
+        user
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Every grade for `homework` — the roster joins these onto the submissions.
@@ -169,12 +155,20 @@ pub async fn list_for_homework(
     db: &Database,
     homework: &HomeworkId,
 ) -> Result<Vec<HomeworkResult>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM homework_result WHERE homework = $hw ORDER BY id DESC")
-        .bind(("hw", homework.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<HomeworkResult>>(0)?)
+    Ok(sqlx::query_as!(
+        HomeworkResult,
+        r#"SELECT id AS "id: HomeworkResultId",
+                  homework AS "homework: HomeworkId",
+                  app_user AS "user: UserId",
+                  status AS "status: HomeworkStatus",
+                  mark AS "mark: Option<Mark>",
+                  graded_by AS "graded_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework_result WHERE homework = $1 ORDER BY id DESC"#,
+        homework
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// `user`'s homework grades across one course — the raw rows behind the
@@ -185,17 +179,24 @@ pub async fn list_for_user_in_course(
     course: &CourseId,
     user: &UserId,
 ) -> Result<Vec<HomeworkResult>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM homework_result WHERE user = $usr
-             AND homework IN (SELECT VALUE id FROM homework WHERE course = $course)
-             ORDER BY id DESC",
-        )
-        .bind(("usr", user.record()))
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<HomeworkResult>>(0)?)
+    Ok(sqlx::query_as!(
+        HomeworkResult,
+        r#"SELECT id AS "id: HomeworkResultId",
+                  homework AS "homework: HomeworkId",
+                  app_user AS "user: UserId",
+                  status AS "status: HomeworkStatus",
+                  mark AS "mark: Option<Mark>",
+                  graded_by AS "graded_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework_result
+           WHERE app_user = $1
+             AND homework IN (SELECT id FROM homework WHERE course = $2)
+           ORDER BY id DESC"#,
+        user,
+        course
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Un-grade (homework, user), returning the removed row (`None` if there
@@ -212,53 +213,70 @@ pub async fn list_for_user_in_course(
 /// submission behind it — permanently, since an award is never revoked.
 /// Given back to the *removed row's own* grader, not the caller: a manager
 /// may un-grade what a teacher graded, and the credit is the teacher's.
-///
-/// Sound to re-send while the store answers "conflict, retry" — this is the
-/// upgrade `grade` still wants, taken here because the counter above is what
-/// makes it necessary: the grader's row is written by exam grading too, so
-/// the delete now contends with another domain, and only `DELETE`/`UPDATE`
-/// are in the batch, none of which can legitimately answer "already exists".
 pub async fn remove(
     db: &Database,
     homework: &HomeworkId,
     user: &UserId,
 ) -> Result<Option<HomeworkResult>, AppError> {
-    let id = HomeworkResultId::composite(homework, user);
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $gone = (DELETE $id RETURN BEFORE);
-             UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = NONE \
-                 WHERE {SUBMISSION_GRADED_FIELD} = $id;
-             IF array::len($gone) > 0 {{
-                 LET $grader = $gone[0].graded_by;
-                 UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
-                     math::max([({MARKS_GIVEN_TOTAL_FIELD} ?? 0) - 1, 0])
-             }};
-             RETURN $gone;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("id".into(), id.record().into_value()),
-            (
-                "sub".into(),
-                HomeworkSubmissionId::composite(homework, user)
-                    .record()
-                    .into_value(),
-            ),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`, so
-    // its slot follows the statement count — the hand-kept "slot 1" this
-    // replaces was one added statement away from handing back the unstamp.
-    let slot = result.num_statements().saturating_sub(2);
-    Ok(result.take::<Vec<HomeworkResult>>(slot)?.into_iter().next())
+    tx_with_retry(db, false, async |tx| {
+        // The homework row's lock orders this against a concurrent grade
+        // (which locks the same row before inserting): either this delete
+        // wins and the re-grade lands after as a fresh grade, or the grade
+        // lands first and this removes *it*. A homework already cascaded
+        // away left no result rows behind — `None`, the 404 the web layer
+        // answers.
+        let alive = sqlx::query!(
+            r#"SELECT 1 AS "row: i32" FROM homework WHERE id = $1 FOR UPDATE"#,
+            homework
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if alive.is_none() {
+            return Ok(None);
+        }
+        let gone = sqlx::query!(
+            r#"DELETE FROM homework_result WHERE homework = $1 AND app_user = $2
+               RETURNING id AS "id: HomeworkResultId",
+                         homework AS "homework: HomeworkId",
+                         app_user AS "user: UserId",
+                         status AS "status: HomeworkStatus",
+                         mark AS "mark: Option<Mark>",
+                         graded_by AS "graded_by: UserId",
+                         created_at AS "created_at: Timestamp""#,
+            homework,
+            user
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(removed) = gone else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE homework_submission SET graded_by_result = NULL
+               WHERE homework = $1 AND app_user = $2 AND graded_by_result = $3"#,
+            homework,
+            user,
+            removed.id
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE app_user SET marks_given_total = GREATEST(marks_given_total - 1, 0) WHERE id = $1",
+            removed.graded_by
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(HomeworkResult {
+            id: removed.id,
+            homework: removed.homework,
+            user: removed.user,
+            status: removed.status,
+            mark: removed.mark,
+            graded_by: removed.graded_by,
+            created_at: removed.created_at,
+        }))
+    })
+    .await
 }
 
 #[cfg(test)]

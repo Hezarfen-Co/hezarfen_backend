@@ -4,8 +4,9 @@
 //! and the per-course listing live under `/courses/{id}/homework` (see
 //! [`super::courses`]); everything shares the visibility rule
 //! ([`Homework::student_sees`](crate::domain::homework::Homework::student_sees))
-//! and the [`HOMEWORK_LOCK`](crate::service::homework::HOMEWORK_LOCK), whose
-//! leases the workflows take in [`crate::service::homework`] and its siblings.
+//! The freeze and the audience interlock are conditions of the writes
+//! themselves ([`crate::db::homework_submission`]), serialized on the
+//! homework row's lock inside each transaction.
 
 use crate::web::tenant_state::State;
 use axum::Json;
@@ -26,9 +27,7 @@ use crate::domain::exam_result::Mark;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::homework_file::{HomeworkFile, HomeworkFileId};
 use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
-use crate::domain::homework_submission::{
-    HomeworkSubmission, HomeworkSubmissionId, SubmissionText,
-};
+use crate::domain::homework_submission::{HomeworkSubmission, SubmissionText};
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -310,11 +309,11 @@ async fn update_homework(
     }
     crate::service::course::require_open(&st.db, &course).await?;
 
-    // The writer lease of [`HOMEWORK_LOCK`], the orphan guard, and the write
-    // are one unit in [`service::homework::update`]: the guard reads the live
-    // submissions and results, and the row write depends on what it saw —
-    // without the lease a submission (a reader) could land between the check
-    // and the write, orphaned by the narrowing that just missed it.
+    // The orphan guard and the write are one unit in
+    // [`service::homework::update`]: the guard reads the live submissions and
+    // results inside the write's transaction, under the homework row's lock —
+    // a submission (which locks the same row before writing) cannot land
+    // between the check and the narrowing that just missed it.
 
     // Only what the request carried: an omitted field stays `None` and is never
     // written, so a concurrent PATCH of another field survives. The two
@@ -333,7 +332,9 @@ async fn update_homework(
     // A kept (absent) due date may already be past; a newly set one may not be.
     check_not_past("due_at", due_at)?;
     let subject = match &req.subject_id {
-        Some(subject_id) => Some(crate::service::subject::in_course(&st.db, subject_id, course.get_id()).await?),
+        Some(subject_id) => {
+            Some(crate::service::subject::in_course(&st.db, subject_id, course.get_id()).await?)
+        }
         None => None,
     };
     // The orphan guard runs on exactly the requests that re-scope the audience.
@@ -360,11 +361,11 @@ async fn update_homework(
 
 /// Delete a homework and everything under it — submissions, their files, and
 /// results — then unlink the file blobs from disk. Requires teacher+ and
-/// management rights over its course. Held under [`HOMEWORK_LOCK`]'s write lease
-/// so no submission can land under the homework mid-delete; the blob names are
-/// collected before the rows are wiped (the cascade is one transaction, children
-/// first) and removed after, so a crash in between strands at worst an
-/// unreachable file.
+/// management rights over its course. The cascade is one transaction whose
+/// homework-row lock keeps a submission from landing under the homework
+/// mid-delete; the blob names are collected inside that transaction, before
+/// the rows are wiped, and removed after, so a crash in between strands at
+/// worst an unreachable file.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -391,7 +392,7 @@ async fn delete_homework(
         ));
     }
     crate::service::course::require_open(&st.db, &course).await?;
-    // The writer lease, the blob-key collection, and the cascade are
+    // The blob-key collection and the cascade are
     // [`service::homework::delete`]'s; unlinking the blobs stays here because
     // only the web layer knows `files_path`.
     let blob_keys = service::homework::delete(&st.db, homework).await?;
@@ -548,10 +549,9 @@ async fn submit(
         Some(text) if !text.is_empty() => Some(SubmissionText::try_new(text)?),
         _ => None,
     };
-    // The reader lease of [`HOMEWORK_LOCK`], the gate, the term wall, the
-    // graded check, and the upsert are one unit in
-    // [`service::homework_submission::submit`] — the audience interlock, not
-    // the freeze (that is the stamp on the row).
+    // The gate, the term wall, the graded check, and the upsert are one
+    // unit in [`service::homework_submission::submit`] — the audience
+    // interlock, not the freeze (that is the stamp on the row).
     let landed = service::homework_submission::submit(&st.db, &user, &id, text).await?;
     let files =
         service::homework_file::list_for_submission(&st.db, landed.submission.get_id()).await?;
@@ -721,19 +721,15 @@ async fn upload_submission_file(
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before adding files",
     );
-    // Reader lease as in `submit` — the audience interlock, not the freeze.
-    // Taken before the cap claim inside the insert, never after (the lock
-    // order is HOMEWORK_LOCK, then the counter lock). The lock lives in
-    // [`service::homework`]; the blob write stays here, inside the lease,
-    // because the row's "stored row points at a real blob" ordering does.
-    let _guard = service::homework::HOMEWORK_LOCK.read().await;
-    // Re-read the homework *under* the lease. Streaming the body takes as long
-    // as the client wants it to, and a homework delete (a writer) both takes
-    // and releases its lease inside that window — so the pre-flight snapshot
-    // can name a homework that no longer exists, and this handler would then
-    // auto-create a submission, credit the badge counters and write a file
-    // under it, all unreachable afterwards. A gate read before the body is a
-    // pre-flight; a gate read after it is the decision.
+    // Re-read the homework. Streaming the body takes as long as the client
+    // wants it to, and a homework delete can commit inside that window — so
+    // the pre-flight snapshot can name a homework that no longer exists, and
+    // this handler would then auto-create a submission, credit the badge
+    // counters and write a file under it, all unreachable afterwards. A gate
+    // read before the body is a pre-flight; a gate read after it is the
+    // decision. The writes below are still ordered against a delete, a grade
+    // and a PATCH narrowing the audience — each contends on the homework
+    // row's lock inside its own transaction.
     let homework = service::homework::gate_own_submission(&id, &user, &st.db).await?;
     // Re-walled too: the term can be archived while the body streams.
     service::homework::require_open_term(&homework, &st.db).await?;
@@ -801,8 +797,11 @@ async fn download_submission_file(
     let file = if user.get_role() == Role::Student {
         // Student: only their own file, behind the full submission gate.
         let homework = service::homework::gate_own_submission(&id, &user, &st.db).await?;
-        let submission = HomeworkSubmissionId::composite(homework.get_id(), user.get_id());
-        service::homework_file::read_for(&st.db, &file_id, &submission)
+        let submission =
+            service::homework_submission::read_for(&st.db, homework.get_id(), user.get_id())
+                .await?
+                .ok_or(AppError::NotFound)?;
+        service::homework_file::read_for(&st.db, &file_id, submission.get_id())
             .await?
             .ok_or(AppError::NotFound)?
     } else {
@@ -850,19 +849,23 @@ async fn delete_submission_file(
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before deleting files",
     );
-    // Reader lease as in `submit` — the audience interlock, not the freeze.
-    let _guard = service::homework::HOMEWORK_LOCK.read().await;
     if service::homework_result::read_for(&st.db, homework.get_id(), user.get_id())
         .await?
         .is_some()
     {
         return Err(GRADED);
     }
-    let submission = HomeworkSubmissionId::composite(homework.get_id(), user.get_id());
-    let file =
-        service::homework_file::read_for(&st.db, &HomeworkFileId::from_key(&fid), &submission)
+    let submission =
+        service::homework_submission::read_for(&st.db, homework.get_id(), user.get_id())
             .await?
             .ok_or(AppError::NotFound)?;
+    let file = service::homework_file::read_for(
+        &st.db,
+        &HomeworkFileId::from_key(&fid),
+        submission.get_id(),
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
     let blob = file.get_file().to_string();
     // The delete's own transaction re-stamps the submission's "last touched"
     // clock (the late flag) as its freeze gate, so a refused delete moves
@@ -923,12 +926,11 @@ async fn grade_homework(
     Path(id): Path<String>,
     Json(req): Json<GradeHomework>,
 ) -> Result<Json<HomeworkResultResponse>, AppError> {
-    // The grading gates and the writer lease of [`HOMEWORK_LOCK`] live in
-    // [`service::homework_result::grade`]: a grade is what freezes a
-    // submission, so it must not interleave with the read side's
-    // gate-through-write submission edits — and the homework is re-read under
-    // the lease there, which keeps a homework delete (a fellow writer) from
-    // letting the upsert resurrect a result row under a vanished homework.
+    // The grading gates live in [`service::homework_result::grade`]; the
+    // grade transaction locks the homework row across the freeze stamp, which
+    // orders it against every student-side write — and keeps a homework
+    // delete from letting the upsert resurrect a result row under a vanished
+    // homework (the vanished row answers 404).
     let (homework, course) = homework_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &teacher) {
         return Err(AppError::Forbidden(
@@ -974,9 +976,9 @@ async fn remove_homework_result(
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    // The writer lease of [`HOMEWORK_LOCK`] is [`service::homework_result::ungrade`]'s
-    // — removing the grade is what unfreezes the submission, so it must not
-    // straddle the read side's gate-through-write edits either.
+    // Removing the grade is what unfreezes the submission; the un-grade's
+    // transaction takes the homework row's lock, so it cannot straddle a
+    // student-side write either.
     let (homework, course) = homework_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
