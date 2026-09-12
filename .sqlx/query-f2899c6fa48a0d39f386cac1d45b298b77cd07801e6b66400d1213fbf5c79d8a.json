@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT retired AS \"retired!: bool\" FROM slot_ref WHERE name = $1 FOR UPDATE",
+  "query": "SELECT count AS \"count!: i64\" FROM slot_ref WHERE name = $1 FOR UPDATE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "retired!: bool",
-        "type_info": "Bool",
+        "name": "count!: i64",
+        "type_info": "Int8",
         "origin": {
           "Table": {
             "table": "slot_ref",
-            "name": "retired"
+            "name": "count"
           }
         }
       }
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "44a499ad7b793126076de9b93338b714e23625e50318163a82ae88d370ad8bf7"
+  "hash": "f2899c6fa48a0d39f386cac1d45b298b77cd07801e6b66400d1213fbf5c79d8a"
 }

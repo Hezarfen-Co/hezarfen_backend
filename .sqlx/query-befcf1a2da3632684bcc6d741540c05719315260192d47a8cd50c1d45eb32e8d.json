@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT courses AS \"courses: Vec<CourseId>\"\n           FROM class_blueprint WHERE grade = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "courses: Vec<CourseId>",
+        "type_info": "UuidArray",
+        "origin": {
+          "Table": {
+            "table": "class_blueprint",
+            "name": "courses"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "befcf1a2da3632684bcc6d741540c05719315260192d47a8cd50c1d45eb32e8d"
+}

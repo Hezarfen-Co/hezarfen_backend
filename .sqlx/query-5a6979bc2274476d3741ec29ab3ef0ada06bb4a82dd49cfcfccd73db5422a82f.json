@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count AS \"count!: i64\", retired AS \"retired!: bool\"\n           FROM kind_ref WHERE name = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "kind_ref",
+            "name": "count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "retired!: bool",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "kind_ref",
+            "name": "retired"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5a6979bc2274476d3741ec29ab3ef0ada06bb4a82dd49cfcfccd73db5422a82f"
+}
