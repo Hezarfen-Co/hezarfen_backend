@@ -34,7 +34,7 @@ impl HomeworkResultId {
 
     /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
     /// cannot take the newtype. Static `query!` binds take `self` directly.
-    pub fn uuid(&self) -> Uuid {
+    pub fn uuid(&self) -> uuid::Uuid {
         self.0
     }
 
@@ -76,6 +76,7 @@ impl HomeworkStatus {
 pub struct HomeworkResult {
     pub(crate) id: HomeworkResultId,
     pub(crate) homework: HomeworkId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: HomeworkStatus,
     pub(crate) mark: Option<Mark>,

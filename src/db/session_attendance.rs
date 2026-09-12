@@ -4,60 +4,30 @@
 //! management's, only students attend, enrollment) are
 //! [`crate::service::session_attendance`]'s to judge before calling here.
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::{
-    LESSON_COUNTED_AT_FIELD, LESSONS_ATTENDED_TOTAL_FIELD, LESSONS_HELD_TOTAL_FIELD,
-};
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
-use crate::domain::session_attendance::{
-    SessionAttendance, SessionAttendanceId, counts_as_attended,
-};
+use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Record (or overwrite) `user`'s status for the session. One row per
-/// (session, user), keyed by a deterministic composite id so this is a
-/// single atomic UPSERT — concurrent marks converge on the one row.
+/// Record (or overwrite) `user`'s status for the session. The table's
+/// primary key *is* the (session, user) pair, so the mark is a single
+/// atomic upsert — concurrent marks converge on the one row.
 ///
-/// The "session still exists" gate rides in the same transaction as the
-/// mark, the mirror of the cascade in [`crate::db::course_session::delete`]: the
-/// caller's pre-flight read sits four round trips in front of this write,
-/// so a delete landing in that gap used to leave a roll-call row on a
-/// session that was gone — and that row was *unremovable*, its only delete
-/// route 404ing on the vanished session while the attendance report went
-/// on counting it. A deleted session reads NONE, which is falsy, so the
-/// gate is written as an explicit `IS NONE` (see
-/// [`crate::domain::exam_result::ExamResult::grade`]). It reads the
-/// session's `teacher` — required on every row, so NONE means "no row" just
-/// as `id` did — because the counter below needs that teacher anyway, and
-/// one read serves both.
-///
-/// A read is not a claim, though: SurrealDB 3.2.3 conflict-checks write
-/// sets, not read sets, so that gate alone only closes the *sequential*
-/// order (delete committed, then the mark arrives). To make the two really
-/// collide, this transaction also *writes* the session row, unconditionally
-/// — the bump-and-restore of [`crate::domain::exam_answer::ExamAnswer::save`]
-/// on the one column this write already owns, [`LESSON_COUNTED_AT_FIELD`].
-/// Unconditional is the whole point: the credit branch below writes that
-/// column already, but it fires only for the first roll call of a lesson
-/// that has begun, so a future-dated sheet and every re-mark of a counted
-/// one touched nothing at all and committed happily beside
-/// `DELETE /sessions/{id}`. Re-stating the value verbatim would not do
-/// either — an `UPDATE` that leaves the document unchanged is elided and
-/// never enters the write set — hence bump first, then either stamp
-/// (credit branch) or put back exactly what was found, `NONE` included, so
-/// the row is byte-identical and the once-per-lesson rule is untouched.
-///
-/// Sound to re-send while the store answers "conflict, retry": the gate
-/// reads the record a delete writes, so the two contend by design, and the
-/// UPSERT cannot legitimately answer "already exists" — its composite id is
-/// bijective with the `session_attendance_session_user` unique tuple, so
-/// the index entry can only point at the row the id already names.
+/// The "session still exists" gate is a row lock: the transaction takes the
+/// session row `FOR NO KEY UPDATE` before anything else, so a session (or
+/// course) delete cascading beneath this mark simply waits, and a delete
+/// that got there first leaves this gate matching nothing — `404`, the
+/// mirror of [`crate::db::course_session::delete`]. The caller's
+/// pre-flight read sits several round trips in front of this write, which
+/// is exactly the gap the old code had to fake with a bump-and-restore
+/// write on the session row; the lock is the same serialization without
+/// the trick. It also freezes `starts_at` and `held_counted_at` for the
+/// transaction, so two simultaneous first marks take turns and the
+/// lesson-held credit below is stamped exactly once.
 ///
 /// Two badge counters move in this same transaction, both of them read
 /// from the store rather than taken on the caller's word:
@@ -65,27 +35,27 @@ use crate::error::AppError;
 /// - `lessons_attended_total`, on the person marked, as a *delta* rather
 ///   than an increment, because this is an upsert: a re-mark that changes
 ///   nothing must change nothing, and a teacher's correction must move it
-///   back down. `$was` is read before the upsert overwrites it (`NONE` when
-///   the pair has no row yet), so it writes only on a real crossing of the
-///   attended line, and only for a **student** — attending lessons is a
-///   student's badge, the same student-only rule enrolling and sitting an
-///   exam already carry, so a teacher marked present in their own lesson
-///   moves it in neither direction. The live `role` decides that, not the
-///   role someone held when the row was written.
+///   back down. The pair's stored status is read before the upsert
+///   overwrites it (`None` when the pair has no row yet), so it writes
+///   only on a real crossing of the attended line, and only for a
+///   **student** — attending lessons is a student's badge, the same
+///   student-only rule enrolling and sitting an exam already carry, so a
+///   teacher marked present in their own lesson moves it in neither
+///   direction. The live `role` decides that, not the role someone held
+///   when the row was written.
 /// - `lessons_held_total`, on the *session's* teacher, exactly once per
-///   session: the first roll call taken stamps
-///   [`LESSON_COUNTED_AT_FIELD`] on the lesson and every later mark sees
-///   the stamp and credits nothing. It counts lessons that actually
-///   happened — scheduling one and cancelling it earns nothing, which is
-///   why the credit does not live in `crate::db::course_session::create`. Two
-///   simultaneous first marks both write the lesson row, so the store's own
-///   conflict detection (and `transaction_with_retry` behind it) is what
-///   keeps the stamp from being set twice.
+///   session: the first roll call taken stamps `held_counted_at` on the
+///   lesson and every later mark sees the stamp and credits nothing. It
+///   counts lessons that actually happened — scheduling one and
+///   cancelling it earns nothing, which is why the credit does not live
+///   in `crate::db::course_session::create`. Two simultaneous first
+///   marks serialize on the session row's lock, so the stamp cannot be
+///   set twice.
 ///
 ///   "Actually happened" is a clock reading, not a request count: the
 ///   credit waits for the lesson's own `starts_at` to arrive. Roll call is
-///   deliberately *not* time-gated — a teacher may open the sheet early and
-///   is never refused — so without this a teacher could schedule two
+///   deliberately *not* time-gated — a teacher may open the sheet early
+///   and is never refused — so without this a teacher could schedule two
 ///   hundred lessons for next week, mark one student in each, and hold two
 ///   hundred lessons this afternoon. Because the stamp is written only on
 ///   the branch that credits, a sheet opened early and touched again after
@@ -100,9 +70,6 @@ use crate::error::AppError;
 ///   credited — a student's real lessons eaten by someone else's farm. It
 ///   is also nobody's self-service: only a teacher can mark a student, so
 ///   the counter cannot be moved by the person it decorates.
-///
-/// Both are floored/guarded rather than trusting the column to exist: a row
-/// written before these columns carries none of them.
 //
 // corner-cut: that asymmetry leaves a teacher able to inflate a *student's*
 // attendance with future-dated lessons. Closing it needs the credit stamped
@@ -117,76 +84,94 @@ pub async fn mark(
     status: AttendanceStatus,
     marked_by: &UserId,
 ) -> Result<SessionAttendance, AppError> {
-    let attended = counts_as_attended(&status);
+    let attended = crate::domain::session_attendance::counts_as_attended(&status);
     let delta: i64 = if attended { 1 } else { -1 };
-    let attendance = SessionAttendance {
-        id: SessionAttendanceId::composite(session.get_id(), user),
-        session: session.get_id().clone(),
-        course: session.get_course().clone(),
-        user: user.clone(),
-        status,
-        marked_by: marked_by.clone(),
-    };
-    let (mut written, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $teacher = (SELECT VALUE teacher FROM ONLY $sess);
-             IF $teacher IS NONE {{ THROW 'session_missing' }};
-             LET $counted = (SELECT VALUE {LESSON_COUNTED_AT_FIELD} FROM ONLY $sess);
-             LET $begun = ((SELECT VALUE starts_at FROM ONLY $sess) <= $stamp);
-             LET $student = ((SELECT VALUE role FROM ONLY $usr) = 'student');
-             LET $was = ((SELECT VALUE status FROM ONLY $id) IN ['present', 'late']);
-             LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
-             IF $student AND $was != $now {{
-                 UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} =
-                     math::max([({LESSONS_ATTENDED_TOTAL_FIELD} ?? 0) + $delta, 0])
-             }};
-             UPDATE $sess SET {LESSON_COUNTED_AT_FIELD} = ({LESSON_COUNTED_AT_FIELD} ?? 0) + 1;
-             IF ($counted IS NONE) AND $begun {{
-                 UPDATE $sess SET {LESSON_COUNTED_AT_FIELD} = $stamp;
-                 UPDATE $teacher SET {LESSONS_HELD_TOTAL_FIELD} =
-                     ({LESSONS_HELD_TOTAL_FIELD} ?? 0) + 1
-             }} ELSE {{
-                 UPDATE $sess SET {LESSON_COUNTED_AT_FIELD} = $counted
-             }};
-             RETURN $after;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            // `$session` is SurrealDB's own protected variable (the auth
-            // session): binding that name errors the whole query.
-            ("sess".into(), session.get_id().record().into_value()),
-            ("id".into(), attendance.id.record().into_value()),
-            ("usr".into(), user.record().into_value()),
-            ("now".into(), attended.into_value()),
-            ("delta".into(), delta.into_value()),
-            ("stamp".into(), Timestamp::now().into_value()),
-            ("row".into(), attendance.into_value()),
-        ],
-        &["session_missing"],
-    )
-    .await?;
-    // An aborted transaction errors every slot and only the THROW's own
-    // slot names the marker, so a refusal is read by marker while a lost
-    // round was already re-sent — never reported as a 500.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("session_missing"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`,
-    // so its slot follows the statement count instead of a hand-kept one.
-    let slot = written.num_statements().saturating_sub(2);
-    written
-        .take::<Vec<SessionAttendance>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to mark session attendance".into()))
+    let now = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        // The gate and the serialization point: a live session row, locked
+        // against the delete cascade and every rival mark.
+        let sess = sqlx::query!(
+            r#"SELECT teacher, starts_at, held_counted_at
+               FROM course_session WHERE id = $1 FOR NO KEY UPDATE"#,
+            session.id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(sess) = sess else {
+            return Err(AppError::NotFound);
+        };
+        // The pair's stored status — the pre-image the attended delta is
+        // computed off.
+        let was = sqlx::query!(
+            r#"SELECT status FROM session_attendance
+               WHERE session = $1 AND app_user = $2"#,
+            session.id,
+            user,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.status);
+        // The live role of the person marked (a gone user row marks as
+        // non-student — no badge to move; the service gate has already
+        // refused a vanished target before this write ran).
+        let is_student = sqlx::query!(
+            r#"SELECT role = 'student' AS "is_student" FROM app_user WHERE id = $1"#,
+            user,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.is_student)
+        .unwrap_or(false);
+        let row = sqlx::query_as!(
+            SessionAttendance,
+            r#"INSERT INTO session_attendance (session, app_user, course, status, marked_by)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (session, app_user) DO UPDATE
+                 SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by
+               RETURNING session, app_user AS "user", course, status, marked_by"#,
+            session.id,
+            user,
+            session.course,
+            status,
+            marked_by,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        // The attended badge: student-only, and only on a real crossing.
+        let was_attended = was
+            .as_deref()
+            .is_some_and(|was| was == "present" || was == "late");
+        if is_student && was_attended != attended {
+            sqlx::query!(
+                r#"UPDATE app_user
+                     SET lessons_attended_total = GREATEST(lessons_attended_total + $2, 0)
+                   WHERE id = $1"#,
+                user,
+                delta,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        // The held badge: once per lesson, and only once the lesson began.
+        if sess.held_counted_at.is_none() && sess.starts_at <= now.as_millis() {
+            sqlx::query!(
+                r#"UPDATE course_session SET held_counted_at = $2 WHERE id = $1"#,
+                session.id,
+                now.as_millis(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!(
+                r#"UPDATE app_user SET lessons_held_total = lessons_held_total + 1
+                   WHERE id = $1"#,
+                sess.teacher,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(row)
+    })
+    .await
 }
 
 pub async fn list_for_session(
@@ -195,10 +180,16 @@ pub async fn list_for_session(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<SessionAttendance>, i64), AppError> {
-    PagedList::new("session_attendance WHERE session = $s", "ORDER BY id DESC")
-        .bind("s", session.record())
-        .run(limit, offset, db)
-        .await
+    // The old composite key `{session}_{user}` sorted by user within a
+    // session — its session prefix was constant — so the natural-PK
+    // columns sort the same way.
+    PagedList::new(
+        "session_attendance WHERE session = $1",
+        "ORDER BY session DESC, app_user DESC",
+    )
+    .bind(session.uuid())
+    .run::<SessionAttendance>(limit, offset, db)
+    .await
 }
 
 /// Every roll-call row ever recorded for `user` — the session half of the
@@ -209,12 +200,16 @@ pub async fn list_for_user(
     db: &Database,
     user: &UserId,
 ) -> Result<Vec<SessionAttendance>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM session_attendance WHERE user = $usr ORDER BY id DESC")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<SessionAttendance>>(0)?)
+    let rows = sqlx::query_as!(
+        SessionAttendance,
+        r#"SELECT session, app_user AS "user", course, status, marked_by
+           FROM session_attendance WHERE app_user = $1
+           ORDER BY session DESC, app_user DESC"#,
+        user,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// Clearing a row the student was counted for gives the count back, in the
@@ -229,50 +224,60 @@ pub async fn list_for_user(
 ///
 /// Student-only on the same terms as the mark, and read from the store for
 /// the same reason.
-///
-/// Sound to re-send: neither statement can answer "already exists".
-//
-// corner-cut: both ends read the *live* role, so a student promoted between
-// being marked present and having that row corrected leaves the counter one
-// high (the credit landed as a student, the refund is refused as staff).
-// Upgrade path is stamping the credit on the roll-call row itself and
-// refunding off that stamp, the way `counted_on_time` works for homework —
-// not worth a column until a promotion mid-term is a real complaint.
 pub async fn remove(
     db: &Database,
     session: &CourseSessionId,
     user: &UserId,
 ) -> Result<Option<SessionAttendance>, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $student = ((SELECT VALUE role FROM ONLY $usr) = 'student');
-             LET $gone = (DELETE session_attendance
-                 WHERE session = $s AND user = $usr RETURN BEFORE);
-             IF $student AND array::len($gone) > 0 AND $gone[0].status IN ['present', 'late'] {{
-                 UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} =
-                     math::max([({LESSONS_ATTENDED_TOTAL_FIELD} ?? 0) - 1, 0])
-             }};
-             RETURN $gone;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("s".into(), session.record().into_value()),
-            ("usr".into(), user.record().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`.
-    let slot = result.num_statements().saturating_sub(2);
-    Ok(result
-        .take::<Vec<SessionAttendance>>(slot)?
-        .into_iter()
-        .next())
+    tx_with_retry(db, false, async |tx| {
+        // The pre-image and the row's right to exist in one locked
+        // statement: the row cannot vanish (or change status) under this
+        // transaction, and `None` here is simply "nothing to remove".
+        let Some(gone) = sqlx::query_as!(
+            SessionAttendance,
+            r#"SELECT session, app_user AS "user", course, status, marked_by
+               FROM session_attendance
+               WHERE session = $1 AND app_user = $2
+               FOR UPDATE"#,
+            session,
+            user,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        if crate::domain::session_attendance::counts_as_attended(&gone.status) {
+            // Student-only, live role: the same rule the mark pays.
+            let student = sqlx::query!(
+                r#"SELECT role = 'student' AS "is_student" FROM app_user WHERE id = $1"#,
+                user,
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.is_student)
+            .unwrap_or(false);
+            if student {
+                sqlx::query!(
+                    r#"UPDATE app_user
+                         SET lessons_attended_total = GREATEST(lessons_attended_total - 1, 0)
+                       WHERE id = $1"#,
+                    user,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query!(
+            r#"DELETE FROM session_attendance WHERE session = $1 AND app_user = $2"#,
+            session,
+            user,
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(gone))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -345,7 +350,10 @@ mod tests {
     }
 
     async fn held(user: &UserId, db: &Database) -> i64 {
-        crate::db::badge::load(db, user).await.unwrap().get_lessons_held()
+        crate::db::badge::load(db, user)
+            .await
+            .unwrap()
+            .get_lessons_held()
     }
 
     /// The whole transition table in one pass: an upsert may only move the

@@ -77,7 +77,7 @@ pub async fn reverse_booking(
 /// resending the identical body after a timeout gets back the line the
 /// first attempt wrote, not a second credit — nothing on this API can edit
 /// or delete one, so a doubled credit is corrected only by a compensating
-/// line. Without one the id is a fresh ulid and two identical calls are two
+/// line. Without one the id is a fresh uuid and two identical calls are two
 /// credits, which is what a desk taking the same amount twice really means.
 pub async fn credit(
     db: &Database,

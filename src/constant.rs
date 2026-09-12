@@ -913,7 +913,6 @@ pub const FEE_PLAN_TABLE: &str = "fee_plan";
 pub const FEE_PLAN_ASSIGNMENT_TABLE: &str = "fee_plan_assignment";
 pub const PAYMENT_LEDGER_TABLE: &str = "payment_ledger";
 pub const BOARD_TABLE: &str = "board";
-pub const BOARD_STROKE_TABLE: &str = "board_stroke";
 /// One row per badge a user has earned, keyed by the pair. A table of its own
 /// rather than an array column on the user row: an `array<…>` there breaks
 /// every `PATCH` of that row, and awards are append-only facts with their own
@@ -963,8 +962,6 @@ pub const FEE_PLAN_ASSIGNMENT_COUNT_FIELD: &str = "assignment_count";
 /// `count ?? 0 = 0` parses as `count ?? (0 = 0)`, which is truthy for *every*
 /// row and would license editing a plan a family is already being billed for.
 pub const FEE_PLAN_UNASSIGNED_GUARD: &str = "(assignment_count ?? 0) = 0";
-pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
-pub const COURSE_NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// The column a *grant* claim moves and puts back, so its transaction writes
@@ -975,11 +972,6 @@ pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// column of its own — a new one would mean a migration on a SCHEMAFULL table
 /// for a value nothing ever observes.
 pub const USER_ROLE_CLAIM_FIELD: &str = CHATBOT_THREAD_COUNT_FIELD;
-/// How many boards this user created, on the user row — the same per-user shape
-/// as `CHATBOT_THREAD_COUNT_FIELD`, capped at `MAX_BOARDS_PER_CREATOR`. It is
-/// what closes the "open another board" way around the two board counters
-/// below; released when a board is deleted.
-pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
 /// The lifetime totals behind the badges, all on the user row. Not caps: each
 /// one counts something the person *did*. A counter comes down in exactly one
 /// shape, and the two cases that qualify share a reason: the account credited
@@ -1144,15 +1136,6 @@ pub const BADGES: [(&str, BadgeStat, i64); 34] = [
     ("study_streak_7", BadgeStat::StudyStreak, 7),
     ("study_streak_30", BadgeStat::StudyStreak, 30),
 ];
-/// The two stroke counters on a board row. `epoch_stroke_count` is reset to
-/// zero by a clear and capped at `MAX_EPOCH_STROKES` — a full epoch is
-/// recoverable. `total_stroke_count` is never reset and capped at
-/// `MAX_BOARD_STROKES`; reaching it stamps `closed_at`, and a closed board is
-/// read-only for good. Both are claimed in the same conditional write as the
-/// stroke row, so two people drawing at once contend on the board record rather
-/// than on a `SELECT count()` either of them can outrun.
-pub const BOARD_EPOCH_STROKE_COUNT_FIELD: &str = "epoch_stroke_count";
-pub const BOARD_TOTAL_STROKE_COUNT_FIELD: &str = "total_stroke_count";
 /// Cap 1, not N: an appointment slot holds at most one live booking, so this
 /// counter is really an "is it taken" flag kept in the shape every other cap
 /// uses (`claim`/`release`), which is what makes rejecting or cancelling a
@@ -1194,12 +1177,6 @@ pub const SUBMISSION_GRADED_FIELD: &str = "graded_by_result";
 /// The condition itself, spelled once: a submission is writable exactly while
 /// its grade stamp is absent.
 pub const SUBMISSION_OPEN_GUARD: &str = "graded_by_result = NONE";
-/// The same idea for a whiteboard, spelled once: a board accepts strokes
-/// exactly while the creator has not locked it and it has not closed itself on
-/// `MAX_BOARD_STROKES`. Every stroke write carries it, so "is this board still
-/// open" and the write it licenses are one conditional single-record write —
-/// a lock landing mid-draw beats the stroke instead of racing it.
-pub const BOARD_OPEN_GUARD: &str = "locked = false AND closed_at = NONE";
 /// A signup list has **frozen**: the event takes registrations at all *and* it
 /// started, or — for an ends_at-only event (a pure signup deadline) — that end
 /// passed. A timeless event never freezes. Matched against `$now` in millis, on

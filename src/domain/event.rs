@@ -23,7 +23,7 @@ impl EventId {
 
     /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
     /// cannot take the newtype. Static `query!` binds take `self` directly.
-    pub fn uuid(&self) -> Uuid {
+    pub fn uuid(&self) -> uuid::Uuid {
         self.0
     }
 
@@ -132,6 +132,32 @@ impl EventAudienceKind {
         match self {
             EventAudienceKind::School => "school",
             EventAudienceKind::Role => "role",
+
+/// The five audience columns as one value — the write-side bundle. The row
+/// keeps them flat; every write spells them as a unit, so a kind and its
+/// payload always land together and only the payload matching `kind` is
+/// ever non-NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAudience {
+    pub kind: EventAudienceKind,
+    pub role: Option<Role>,
+    pub course: Option<CourseId>,
+    pub class: Option<ClassGroupId>,
+    pub capacity: Option<i64>,
+}
+
+impl EventAudience {
+    /// The audience of a row read back from the store.
+    pub fn of_row(event: &Event) -> Self {
+        Self {
+            kind: event.get_audience_kind(),
+            role: event.get_audience_role(),
+            course: event.get_audience_course().copied(),
+            class: event.get_audience_class().copied(),
+            capacity: event.get_audience_capacity(),
+        }
+    }
+}
             EventAudienceKind::Course => "course",
             EventAudienceKind::Class => "class",
             EventAudienceKind::Registration => "registration",

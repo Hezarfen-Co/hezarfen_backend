@@ -20,7 +20,7 @@ impl CourseId {
 
     /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
     /// cannot take the newtype. Static `query!` binds take `self` directly.
-    pub fn uuid(&self) -> Uuid {
+    pub fn uuid(&self) -> uuid::Uuid {
         self.0
     }
 
@@ -33,14 +33,7 @@ impl CourseId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
-
-    /// The inner uuid, for binding the id through the runtime-checked
-    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
-    pub(crate) fn uuid(&self) -> uuid::Uuid {
-        self.0
-    }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct CourseTitle(String);

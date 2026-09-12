@@ -2,9 +2,8 @@
 //! submission (the graded gate plus the auto-created seat it hangs off) and
 //! the pass-through reads the download paths scope through. The blob bytes
 //! and their ordering (blob before row on upload, row before blob on delete)
-//! stay the web layer's — it owns `files_path` — but every lease holder is
-//! [`HOMEWORK_LOCK`](crate::service::homework::HOMEWORK_LOCK)'s reader side.
-//! The row writes live in [`crate::db::homework_file`].
+//! stay the web layer's — it owns `files_path`. The row writes live in
+//! [`crate::db::homework_file`].
 
 use crate::database::Database;
 use crate::db::homework_file;
@@ -18,10 +17,11 @@ use crate::error::AppError;
 
 /// The submission the file will hang off, created if absent — a photo-only
 /// homework never types text, so an upload auto-creates an empty submission
-/// to carry the file (an existing one's text is preserved). A photo-only
-/// hand-in is a hand-in: it creates the row, so it moves the counters, so it
-/// earns badges exactly as a text submit does. Refused (409) when a grade
-/// has frozen the homework.
+/// to carry the file (an existing one's text is preserved — `upsert` is
+/// called with `preserve_text`, so even a rival hand-in landing mid-request
+/// keeps its text). A photo-only hand-in is a hand-in: it creates the row,
+/// so it moves the counters, so it earns badges exactly as a text submit
+/// does. Refused (409) when a grade has frozen the homework.
 pub async fn ensure_can_attach(
     db: &Database,
     user: &User,
@@ -30,7 +30,7 @@ pub async fn ensure_can_attach(
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before adding files",
     );
-    // The common-case gate; the freeze itself rides on the writes below.
+    // The common-case gate; the freeze itself rides on the write below.
     if crate::db::homework_result::read_for(db, homework.get_id(), user.get_id())
         .await?
         .is_some()
@@ -40,17 +40,21 @@ pub async fn ensure_can_attach(
     match homework_submission::read_for(db, homework.get_id(), user.get_id()).await? {
         Some(existing) => Ok(existing),
         None => {
-            let created = homework_submission::upsert(db, homework, user.get_id(), None)
-                .await?
-                .ok_or(GRADED)?;
-            crate::service::homework::award_badges(user.get_id(), db).await;
+            let Some((created, fresh)) =
+                homework_submission::upsert(db, homework, user.get_id(), None, true).await?
+            else {
+                return Err(GRADED);
+            };
+            if fresh {
+                crate::service::homework::award_badges(user.get_id(), db).await;
+            }
             Ok(created)
         }
     }
 }
 
 /// Persist the assembled row — the seat claim and the freeze in one
-/// conditional write (see [`homework_file::insert`]). `Ok(None)` is the
+/// guarded insert (see [`homework_file::insert`]). `Ok(None)` is the
 /// freeze; the web layer keeps its own wording and unlinks the blob it wrote.
 pub async fn insert(db: &Database, file: HomeworkFile) -> Result<Option<HomeworkFile>, AppError> {
     homework_file::insert(db, file).await

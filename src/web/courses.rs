@@ -545,8 +545,8 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
-    // The workflow — archived-term gate, EXAM_LOCK and HOMEWORK_LOCK writer
-    // leases, blob-key collection, cascade — is [`service::course::delete`]'s.
+    // The workflow — archived-term gate, blob-key collection, cascade — is
+    // [`service::course::delete`]'s.
     // Blob unlinking stays here because only the web layer knows `files_path`.
     let outcome = service::course::delete(&st.db, &course).await?;
     if !outcome.deleted {

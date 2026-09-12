@@ -40,14 +40,7 @@ impl SubjectId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
-
-    /// The inner uuid, for binding the id through the runtime-checked
-    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
-    pub(crate) fn uuid(&self) -> Uuid {
-        self.0
-    }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Type)]
 #[sqlx(transparent)]
 pub struct SubjectName(String);
@@ -119,9 +112,7 @@ mod tests {
     /// burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {
-        let ids: Vec<String> = (0..500)
-            .map(|_| SubjectId::generate().key())
-            .collect();
+        let ids: Vec<String> = (0..500).map(|_| SubjectId::generate().key()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);

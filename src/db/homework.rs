@@ -1,31 +1,34 @@
-//! The `homework` table: row reads and listings, the count-and-create that
-//! pins a homework to a live subject row, the reference-counting PATCH, and
-//! the cascading delete. The PATCH's orphan guard and the audience gate live
-//! in [`crate::service::homework`].
+//! The `homework` table: row reads and listings, the subject-counter claim
+//! that pins a homework to a live subject row, the reference-counting PATCH —
+//! whose audience-narrowing orphan guard is one transaction with the write,
+//! serialized on the homework row's `FOR UPDATE` lock — and the cascading
+//! delete.
 
-use surrealdb::types::RecordId;
-
-use crate::constant::SUBJECT_HOMEWORK_COUNT_FIELD;
-use crate::database::Database;
-use crate::db::cap;
-use crate::db::field_update::FieldUpdate;
+use crate::database::{Database, tx_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+use sqlx::PgConnection;
 
 /// The answer a link to a subject that is not there gets, on create and on
-/// re-tag alike — both claims are conditional writes on the subject row, so a
-/// subject a delete already removed matches nothing and the caller says exactly
-/// what the web layer's pre-flight lookup would have.
+/// re-tag alike — the conditional claim on the subject row matches nothing,
+/// and the caller says exactly what the web layer's pre-flight lookup would
+/// have.
 fn subject_gone() -> AppError {
     AppError::Validation(ValidationError::Invalid {
         field: "subject_id",
         reason: "subject does not exist",
     })
 }
+
+/// What a stale re-tag answers. The shared PATCH builder
+/// ([`crate::db::field_update`]) carries the same refusal; the homework PATCH
+/// keeps its own copy because its orphan guard needs the row lock the generic
+/// builder cannot take.
+const STALE_MOVE: &str = "the link this update moves changed since it was read; re-read and retry";
 
 #[expect(
     clippy::too_many_arguments,
@@ -41,16 +44,14 @@ pub async fn create(
     assigned: Option<Vec<UserId>>,
     created_by: &UserId,
 ) -> Result<Homework, AppError> {
-    // The subject's reference is taken in the very transaction that writes
-    // the row — the exam question's twin
-    // ([`crate::db::exam_question`]): the subject delete
-    // is refused while this counter is non-zero, so the create and the
-    // delete contend on the subject record rather than on a cross-table
-    // count neither of them sees the other move, and a crash can no longer
-    // strand a claim that would make the subject undeletable forever. A
-    // refused claim means the subject is already gone, which is the 400 the
-    // web layer's pre-flight check answers with.
-    let counted = subject.record();
+    // The subject's reference is taken in the very statement that writes the
+    // row — the exam question's twin ([`crate::db::exam_question`]): the
+    // claim (`UPDATE subject … +1`) and the insert are one CTE, so a subject
+    // a delete already removed matches nothing and nothing is written, which
+    // is the 400 the web layer's pre-flight check answers with. The subject
+    // delete is refused while this counter is non-zero, so the two writers
+    // contend on the subject row itself, and a crash cannot strand a claim
+    // that would make the subject undeletable forever.
     let homework = Homework {
         id: HomeworkId::generate(),
         course: course.clone(),
@@ -62,46 +63,111 @@ pub async fn create(
         created_by: created_by.clone(),
         created_at: Timestamp::now(),
     };
-    let id = homework.id.record();
-    match cap::claim_and_create(
-        &counted,
-        SUBJECT_HOMEWORK_COUNT_FIELD,
-        cap::UNLIMITED,
-        &id,
-        &homework,
-        db,
+    let assigned_values = homework.assigned.clone().unwrap_or_default();
+    // The fresh v7 id cannot collide, so the pair-unique answer has no rival
+    // here; the mapping is kept for symmetry with the other claim sites.
+    let created = sqlx::query_as!(
+        Homework,
+        r#"WITH seat AS (
+               UPDATE subject SET homework_count = homework_count + 1
+               WHERE id = $1
+               RETURNING 1
+           )
+           INSERT INTO homework (id, course, subject, title, description, due_at, assigned, created_by, created_at)
+           SELECT $2, $3, $1, $4, $5, $6, $7, $8, $9 WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING id AS "id: HomeworkId",
+                     course AS "course: CourseId",
+                     subject AS "subject: SubjectId",
+                     title AS "title: HomeworkTitle",
+                     description AS "description: Option<HomeworkDescription>",
+                     due_at AS "due_at: Timestamp",
+                     CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                         AS "assigned: Option<Vec<UserId>>",
+                     created_by AS "created_by: UserId",
+                     created_at AS "created_at: Timestamp""#,
+        subject,
+        homework.id,
+        course,
+        homework.title,
+        homework.description,
+        homework.due_at,
+        assigned_values,
+        homework.created_by,
+        homework.created_at,
     )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(created),
-        cap::Claimed::Full => Err(subject_gone()),
-        cap::Claimed::Duplicate => Err(AppError::Internal("failed to create homework".into())),
-    }
+    .fetch_optional(db)
+    .await
+    .map_err(|err| {
+        if crate::database::unique_violation(&err).is_some() {
+            AppError::Internal("failed to create homework".into())
+        } else {
+            AppError::from(err)
+        }
+    })?;
+    created.ok_or_else(subject_gone)
 }
 
 pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, AppError> {
-    Ok(db.select(id.record()).await?)
+    Ok(sqlx::query_as!(
+        Homework,
+        r#"SELECT id AS "id: HomeworkId",
+                  course AS "course: CourseId",
+                  subject AS "subject: SubjectId",
+                  title AS "title: HomeworkTitle",
+                  description AS "description: Option<HomeworkDescription>",
+                  due_at AS "due_at: Timestamp",
+                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                      AS "assigned: Option<Vec<UserId>>",
+                  created_by AS "created_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework WHERE id = $1"#,
+        id
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
-/// The course's homework, newest first (ULID ids sort by creation). The web
+/// The course's homework, newest first (v7 ids sort by creation). The web
 /// layer retains only the rows a given student `student_sees`.
 pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Homework>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM homework WHERE course = $course ORDER BY id DESC")
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Homework>>(0)?)
+    Ok(sqlx::query_as!(
+        Homework,
+        r#"SELECT id AS "id: HomeworkId",
+                  course AS "course: CourseId",
+                  subject AS "subject: SubjectId",
+                  title AS "title: HomeworkTitle",
+                  description AS "description: Option<HomeworkDescription>",
+                  due_at AS "due_at: Timestamp",
+                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                      AS "assigned: Option<Vec<UserId>>",
+                  created_by AS "created_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework WHERE course = $1 ORDER BY id DESC"#,
+        course
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Every homework in the system, newest first — the manager+ view of the
 /// cross-course "my homework" list.
 pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM homework ORDER BY id DESC")
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Homework>>(0)?)
+    Ok(sqlx::query_as!(
+        Homework,
+        r#"SELECT id AS "id: HomeworkId",
+                  course AS "course: CourseId",
+                  subject AS "subject: SubjectId",
+                  title AS "title: HomeworkTitle",
+                  description AS "description: Option<HomeworkDescription>",
+                  due_at AS "due_at: Timestamp",
+                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                      AS "assigned: Option<Vec<UserId>>",
+                  created_by AS "created_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework ORDER BY id DESC"#,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Every homework of every course in `courses`, newest first (one query) —
@@ -115,51 +181,71 @@ pub async fn list_for_courses(
     if courses.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = courses.iter().map(CourseId::record).collect();
-    let mut result = db
-        .query("SELECT * FROM homework WHERE course IN $courses ORDER BY id DESC")
-        .bind(("courses", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Homework>>(0)?)
+    let ids: Vec<CourseId> = courses.to_vec();
+    Ok(sqlx::query_as!(
+        Homework,
+        r#"SELECT id AS "id: HomeworkId",
+                  course AS "course: CourseId",
+                  subject AS "subject: SubjectId",
+                  title AS "title: HomeworkTitle",
+                  description AS "description: Option<HomeworkDescription>",
+                  due_at AS "due_at: Timestamp",
+                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                      AS "assigned: Option<Vec<UserId>>",
+                  created_by AS "created_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework WHERE course = ANY($1) ORDER BY id DESC"#,
+        ids
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// The homework of `course` that `user` is meant to see — whole-course ones
 /// plus any subset that names them — newest first. Backs a student's (or an
 /// observer's) per-course homework report; mirrors
 /// [`Homework::student_sees`](crate::domain::homework::Homework::student_sees)
-/// in SurQL so the filter runs in the database.
+/// in SQL so the filter runs in the database.
 pub async fn list_for_user_in_course(
     db: &Database,
     course: &CourseId,
     user: &UserId,
 ) -> Result<Vec<Homework>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM homework
-             WHERE course = $course
-               AND (assigned = NONE OR assigned = [] OR $usr IN assigned)
-             ORDER BY id DESC",
-        )
-        .bind(("course", course.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Homework>>(0)?)
+    Ok(sqlx::query_as!(
+        Homework,
+        r#"SELECT id AS "id: HomeworkId",
+                  course AS "course: CourseId",
+                  subject AS "subject: SubjectId",
+                  title AS "title: HomeworkTitle",
+                  description AS "description: Option<HomeworkDescription>",
+                  due_at AS "due_at: Timestamp",
+                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                      AS "assigned: Option<Vec<UserId>>",
+                  created_by AS "created_by: UserId",
+                  created_at AS "created_at: Timestamp"
+           FROM homework
+           WHERE course = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
+           ORDER BY id DESC"#,
+        course,
+        user
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Re-tag, re-title, re-describe, re-schedule, or re-scope the homework.
 /// Request-scoped: every parameter is `Option`, `None` meaning the PATCH
 /// did not carry that field, so it is not written at all. Handing the
 /// snapshot's value back instead would revert a concurrent edit of that
-/// field — scoping the `SET` alone does not prevent that, the *values* must
-/// come from the request. `course`, `created_by`, and `created_at` are
-/// `READONLY` and never appear in the write.
+/// field — under the row lock below, an uncarried field keeps the value read
+/// *under that lock*, never the handler's snapshot. `course`, `created_by`,
+/// and `created_at` are readonly and never appear in the write.
 ///
-/// `description` and `assigned` are nullable columns, so they take a
-/// `NONE` (clear the description / widen back to the whole course). The web
-/// layer has already re-checked a new `due_at` against now, a new `subject`
-/// against the course, and refused a narrowing that would orphan work.
+/// `description` takes `Some(None)` to clear; `assigned` takes `Some(None)`
+/// to widen back to the whole course (stored as `'{}'`, read back as `None`).
+/// The web layer has already re-checked a new `due_at` against now, a new
+/// `subject` against the course, and — inside the transaction here — the
+/// narrowing against the work that would be orphaned by it.
 pub async fn update(
     db: &Database,
     homework: Homework,
@@ -169,75 +255,250 @@ pub async fn update(
     due_at: Option<Timestamp>,
     assigned: Option<Option<Vec<UserId>>>,
 ) -> Result<Homework, AppError> {
-    let assigned = assigned
-        .map(|subset| subset.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>()));
-    // A re-tag moves a reference: the new subject's claim and the old one's
-    // release ride the same transaction as the link write, so no crash can
-    // leave a count without its link (the subject would be undeletable
-    // forever) or a link without its count. `subject` is required, so the
-    // snapshot's value is always the CAS expectation — two PATCHes moving
-    // the same homework off the same subject would otherwise both claim
-    // their target, and the loser is refused with a 409 instead. The
-    // `.refcount` call is unconditional: the CAS is armed by the request
-    // *carrying* `subject_id`, not by a counter moving, so a PATCH that
-    // re-states the tag its snapshot showed — shifting no counter at all —
-    // is still refused when a rival moved the tag in between. A PATCH that
-    // carried no `subject_id` arms nothing and writes what it always did.
-    let (claim, release) = subject
-        .as_ref()
-        .filter(|next| **next != homework.subject)
-        .map(|next| (next.record(), homework.subject.record()))
-        .unzip();
-    FieldUpdate::new(homework.id.record())
-        .set("subject", subject.map(|subject| subject.record()))
-        .set("title", title)
-        .set("description", description)
-        .set("due_at", due_at)
-        .set("assigned", assigned)
-        .refcount(
-            SUBJECT_HOMEWORK_COUNT_FIELD,
-            "subject",
-            Some(homework.subject.record()),
-            claim,
-            release,
-            subject_gone(),
+    tx_with_retry(db, false, async |tx| {
+        // The homework row's lock. The orphan guard's reads and the write
+        // below are one transaction with it, so a submission — whose own
+        // transaction locks this very row before writing — cannot land
+        // between the check and the narrowing, orphaned by an audience change
+        // that just missed it. The lock also replaces the old CAS's row read:
+        // the re-tag check below compares the handler's snapshot against the
+        // row as it is *locked*, not as it was first read.
+        let current = sqlx::query_as!(
+            Homework,
+            r#"SELECT id AS "id: HomeworkId",
+                      course AS "course: CourseId",
+                      subject AS "subject: SubjectId",
+                      title AS "title: HomeworkTitle",
+                      description AS "description: Option<HomeworkDescription>",
+                      due_at AS "due_at: Timestamp",
+                      CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                          AS "assigned: Option<Vec<UserId>>",
+                      created_by AS "created_by: UserId",
+                      created_at AS "created_at: Timestamp"
+               FROM homework WHERE id = $1 FOR UPDATE"#,
+            homework.get_id()
         )
-        .run::<Homework>(db)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+        // The orphan guard runs on exactly the requests that re-scope the
+        // audience. An absent `assigned` writes nothing, so the stored subset
+        // is untouched and no narrowing can happen behind the guard's back.
+        if let Some(resolved) = assigned.as_ref() {
+            ensure_no_orphans(&current, resolved.as_deref(), tx).await?;
+        }
+
+        // A re-tag moves a reference: the new subject's claim and the old
+        // one's release ride the same transaction as the link write, so no
+        // crash can leave a count without its link (the subject would be
+        // undeletable forever) or a link without its count. The release goes
+        // first and the claim refuses on a gone row, so a move to a deleted
+        // subject is a rolled-back no-op — every abort takes the whole move
+        // back with it.
+        let moving = subject.as_ref().filter(|next| **next != homework.subject);
+        if let Some(next) = moving {
+            sqlx::query!(
+                "UPDATE subject SET homework_count = GREATEST(homework_count - 1, 0) WHERE id = $1",
+                current.subject
+            )
+            .execute(&mut *tx)
+            .await?;
+            let seat = sqlx::query!(
+                r#"UPDATE subject SET homework_count = homework_count + 1
+                   WHERE id = $1 RETURNING 1 AS "seat: i32""#,
+                next
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if seat.is_none() {
+                return Err(subject_gone());
+            }
+        }
+
+        // The stale-re-tag check. Armed by the request *carrying* the subject
+        // — even when it re-states the tag its snapshot showed, shifting no
+        // counter — so two PATCHes moving the same homework off the same
+        // subject cannot both claim their target: the loser's snapshot says
+        // A, the locked row says B, and the refusal is the 409 the generic
+        // PATCH builder has always answered with.
+        if subject.is_some() && current.subject != homework.subject {
+            return Err(AppError::Conflict(STALE_MOVE.to_string()));
+        }
+
+        // What the PATCH carried is written; what it did not carry keeps the
+        // value just read under the lock. Under that lock this resolved
+        // full-row write is exactly the request-scoped SET the old builder
+        // emitted — except it is one static statement instead of a runtime
+        // build.
+        let new_subject = subject.clone().unwrap_or_else(|| current.subject.clone());
+        let new_title = title.unwrap_or_else(|| current.title.clone());
+        let new_description = match description {
+            None => current.description.clone(),
+            Some(None) => None,
+            Some(Some(text)) => Some(text),
+        };
+        let new_due_at = due_at.unwrap_or(current.due_at);
+        let new_assigned = match assigned {
+            None => current.assigned.clone(),
+            // Clear = the whole course, stored as `'{}'`.
+            Some(None) => None,
+            Some(Some(subset)) => Some(subset),
+        };
+        let assigned_values = new_assigned.unwrap_or_default();
+        sqlx::query_as!(
+            Homework,
+            r#"UPDATE homework SET subject = $2, title = $3, description = $4,
+                   due_at = $5, assigned = $6
+               WHERE id = $1
+               RETURNING id AS "id: HomeworkId",
+                         course AS "course: CourseId",
+                         subject AS "subject: SubjectId",
+                         title AS "title: HomeworkTitle",
+                         description AS "description: Option<HomeworkDescription>",
+                         due_at AS "due_at: Timestamp",
+                         CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                             AS "assigned: Option<Vec<UserId>>",
+                         created_by AS "created_by: UserId",
+                         created_at AS "created_at: Timestamp""#,
+            homework.get_id(),
+            new_subject,
+            new_title,
+            new_description,
+            new_due_at,
+            assigned_values,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)
+    })
+    .await
+}
+
+/// Refuse (409) a PATCH that would narrow `homework`'s audience so a student
+/// who already submitted or was graded falls outside it — their work would be
+/// stranded. `new_assigned` is the proposed subset (`None` = whole course, in
+/// which case no one can be orphaned). The blocking students are named in the
+/// message so the teacher knows whose work to clear (or whom to keep assigned)
+/// first.
+///
+/// Runs inside the caller's transaction, under the homework row's lock, so
+/// the check and the narrowing cannot be driven through by a submission.
+async fn ensure_no_orphans(
+    homework: &Homework,
+    new_assigned: Option<&[UserId]>,
+    tx: &mut PgConnection,
+) -> Result<(), AppError> {
+    // Whole-course covers everyone — no narrowing, no orphans.
+    let Some(subset) = new_assigned else {
+        return Ok(());
+    };
+    let submitted: Vec<UserId> = sqlx::query!(
+        r#"SELECT app_user AS "user: UserId" FROM homework_submission WHERE homework = $1"#,
+        homework.get_id()
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| row.user)
+    .collect();
+    let graded: Vec<UserId> = sqlx::query!(
+        r#"SELECT app_user AS "user: UserId" FROM homework_result WHERE homework = $1"#,
+        homework.get_id()
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| row.user)
+    .collect();
+    let mut blocked: Vec<String> = Vec::new();
+    for user in submitted.iter().chain(graded.iter()) {
+        let key = user.key().to_string();
+        if !subset.contains(user) && !blocked.contains(&key) {
+            blocked.push(key);
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::ConflictOwned(format!(
+            "narrowing the assigned list would orphan existing work by {} student(s): {}",
+            blocked.len(),
+            blocked.join(", ")
+        )))
+    }
 }
 
 /// Delete the homework and cascade its submissions, their files, and its
 /// results — one transaction, so a crash can't orphan a submission under a
 /// vanished homework. The submission file *blobs* are the web layer's to
-/// unlink: it collects their names via
-/// [`crate::db::homework_file::file_keys_for_homework`]
-/// before calling this, and removes them after the rows are gone.
-pub async fn delete(db: &Database, homework: Homework) -> Result<Homework, AppError> {
-    let mut result = db
-        .query(
-            format!(
-                "BEGIN TRANSACTION;
-                 DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework = $hw);
-                 DELETE homework_submission WHERE homework = $hw;
-                 DELETE homework_result WHERE homework = $hw;
-                 LET $gone = (DELETE $hw RETURN BEFORE);
-                 FOR $sub IN ($gone.subject ?? []) {{
-                     UPDATE $sub SET {SUBJECT_HOMEWORK_COUNT_FIELD} =
-                         math::max([({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) - 1, 0])
-                 }};
-                 RETURN $gone;
-                 COMMIT TRANSACTION;"
-            ),
+/// unlink: their names are returned (collected inside the transaction,
+/// before the wipes — a file row inserted after an out-of-transaction
+/// collection would be deleted here while its key was already gone from the
+/// list, stranding the blob) and removed after the rows are gone.
+pub async fn delete(
+    db: &Database,
+    homework: Homework,
+) -> Result<(Homework, Vec<String>), AppError> {
+    tx_with_retry(db, true, async |tx| {
+        let blob_keys: Vec<String> = sqlx::query!(
+            r#"SELECT file FROM homework_file
+               WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
+            homework.get_id()
         )
-        .bind(("hw", homework.id.record()))
+        .fetch_all(&mut *tx)
         .await?
-        .check()?;
-    // The subject's reference is given back in this same transaction, off
-    // what the delete actually removed. Read through the trailing `RETURN`,
-    // not a hand-counted slot — see [`crate::db::exam::delete`].
-    let slot = result.num_statements().saturating_sub(2);
-    let deleted: Option<Homework> = result.take::<Vec<Homework>>(slot)?.into_iter().next();
-    deleted.ok_or(AppError::NotFound)
+        .into_iter()
+        .map(|row| row.file)
+        .collect();
+        sqlx::query!(
+            r#"DELETE FROM homework_file
+               WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
+            homework.get_id()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM homework_result WHERE homework = $1",
+            homework.get_id()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM homework_submission WHERE homework = $1",
+            homework.get_id()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query_as!(
+            Homework,
+            r#"DELETE FROM homework WHERE id = $1
+               RETURNING id AS "id: HomeworkId",
+                         course AS "course: CourseId",
+                         subject AS "subject: SubjectId",
+                         title AS "title: HomeworkTitle",
+                         description AS "description: Option<HomeworkDescription>",
+                         due_at AS "due_at: Timestamp",
+                         CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
+                             AS "assigned: Option<Vec<UserId>>",
+                         created_by AS "created_by: UserId",
+                         created_at AS "created_at: Timestamp""#,
+            homework.get_id()
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        // The subject's reference is given back in this same transaction, off
+        // the row the delete actually removed.
+        sqlx::query!(
+            "UPDATE subject SET homework_count = GREATEST(homework_count - 1, 0) WHERE id = $1",
+            deleted.subject
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok((deleted, blob_keys))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -360,7 +621,10 @@ mod tests {
             "the old subject is free"
         );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
-        assert!(crate::db::subject::delete(&db, from).await.is_ok(), "no reference left");
+        assert!(
+            crate::db::subject::delete(&db, from).await.is_ok(),
+            "no reference left"
+        );
         assert!(
             crate::db::subject::delete(&db, to).await.is_err(),
             "the reference moved here refuses the delete"
