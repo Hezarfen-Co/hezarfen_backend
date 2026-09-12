@@ -237,10 +237,12 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
     Ok(())
 }
 
-/// Delete the class and give its term reference back. Nothing cascades: a
-/// class that still holds students or courses is refused outright, because
+/// Delete the class and give its term reference back. Nothing else cascades:
+/// a class that still holds students or courses is refused outright, because
 /// dropping it silently would leave the enrollments it pumped behind with
-/// nothing left to sweep them.
+/// nothing left to sweep them. An event aimed at the class keeps standing
+/// with `audience_class` cleared — the course twin's documented outcome
+/// (`db::course::delete`): the roster resolves live, so it simply reads empty.
 ///
 /// `false` = refused, nothing was written. Both counts are read off the
 /// class's own row, so the check and the delete are one conditional write on
@@ -249,6 +251,15 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// `Err(NotFound)` keeps the answer a concurrent *delete* used to get.
 pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> {
     tx_with_retry(db, false, async move |tx| {
+        // Events aimed at this class keep standing, audience cleared — the
+        // hard FK on `event.audience_class` would otherwise refuse the delete
+        // outright, and a dangling audience resolves to an empty roster.
+        sqlx::query!(
+            r#"UPDATE event SET audience_class = NULL WHERE audience_class = $1"#,
+            class.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         let gone = sqlx::query!(
             r#"DELETE FROM class_group
                WHERE id = $1

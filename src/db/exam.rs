@@ -807,14 +807,18 @@ mod tests {
     /// The racer is a mark: [`crate::db::exam_result::grade`] claims the exam's own
     /// `result_count` (and the kind's reference) before writing, so it contends
     /// with the `DELETE $ex` and with the kind_ref decrement inside the same
-    /// transaction. A round where *some* of the six grades 404 and the rest
-    /// succeed is the witness that the delete landed inside the burst: the 404
-    /// comes from `write_mark`'s existence gate, so it can only be answered by a
-    /// grade that reached the store after the row was gone, and its siblings'
-    /// success says the same burst also had grades that got there first. Stored
-    /// state cannot say this any more — the gate is what stops a mark outliving
-    /// its exam, so the sweep now finds nothing to leave behind in *every*
-    /// round, which is asserted below as a fact rather than read as a signal.
+    /// transaction. The witness that the site is genuinely raced is read per
+    /// round and asserted over the whole run — the subject twin's shape. A
+    /// grade answered 404 says the delete landed before it (`write_mark`'s
+    /// existence gate is the only thing that can answer that); a grade going
+    /// through says that grade beat the delete. Which side wins a *round* is
+    /// load luck: under a busy machine the delete lands wholly on one side of
+    /// the burst in every round (measured 0/20 same-round splits, 3 runs in 5
+    /// red, with the integration suite running concurrently), so a same-round
+    /// split must not be the gate. Stored state cannot witness the straddle —
+    /// the gate is what stops a mark outliving its exam, so the sweep now
+    /// finds nothing to leave behind in *every* round, which is asserted
+    /// below as a fact rather than read as a signal.
     ///
     /// It does not prove the retry either: measured at 0 conflicts in 100 raced
     /// rounds, and green with
@@ -830,7 +834,7 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let teacher = a_person(&db, "teacher", "teacher").await;
         let (mut delete_500, mut grade_500) = (0, 0);
-        let (mut split, mut swept) = (0, 0);
+        let (mut delete_first, mut grade_first, mut swept) = (0, 0, 0);
         let (mut last_delete, mut last_grade) = (String::new(), String::new());
         for round in 0..20 {
             let exam = published(&db).await;
@@ -895,11 +899,15 @@ mod tests {
                     _ => {}
                 }
             }
-            // Neither end of the burst: some grades beat the delete and some
-            // lost to it, so the delete landed *between* them. A round that is
-            // all-refused or all-through is one where it landed outside.
-            if (1..6).contains(&refused) {
-                split += 1;
+            // Which side won, read per round and asserted over the whole run:
+            // a round with a refused grade saw the delete land first, a round
+            // with a grade through saw a grade land first. One round can be
+            // both — that is the same-round split, welcome but not required.
+            if refused > 0 {
+                delete_first += 1;
+            }
+            if refused < 6 {
+                grade_first += 1;
             }
             if exam_result::list_for_exam(&db, exam.get_id())
                 .await
@@ -911,11 +919,13 @@ mod tests {
         }
         eprintln!(
             "Exam::delete raced: {delete_500}/20 delete 500s, {grade_500} grade 500s, \
-             {split} rounds split by the delete / {swept} swept clean"
+             {delete_first} rounds with a grade refused / {grade_first} with one through, \
+             {swept} swept clean"
         );
         assert!(
-            split > 0,
-            "the delete never landed inside the burst (0/20 rounds split)"
+            delete_first > 0 && grade_first > 0,
+            "the sweep never crossed the window ({delete_first} rounds with a grade \
+             refused / {grade_first} with one through)"
         );
         // Not a race signal, an invariant: the gate refuses a mark for an exam
         // that is gone, so no round can leave one behind for the next reader.

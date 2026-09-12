@@ -15,6 +15,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send};
 use hezarfen_backend::constant::{MAX_FEE_PLAN_ASSIGN_WRITES, MAX_LEDGER_APPLIED_LINES};
+use hezarfen_backend::database::Database;
 use hezarfen_backend::db::fee_plan;
 use hezarfen_backend::domain::fee_plan::{FeePlanName, Installment};
 use hezarfen_backend::domain::payment_ledger::LedgerAmount;
@@ -23,6 +24,7 @@ use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
 use hezarfen_backend::service::fee_plan_assignment;
 use serde_json::{Value, json};
+use sqlx::Row as _;
 
 /// A plan of `installments`, as the manager writes it.
 async fn create_plan(app: &axum::Router, mgr: &str, installments: Value) -> String {
@@ -50,6 +52,31 @@ async fn ledger(app: &axum::Router, mgr: &str, student: &str) -> Vec<Value> {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     common::items(&res.body).clone()
+}
+
+/// A real `app_user` row for the creator or assignee a domain call must
+/// name: those columns are foreign keys now, so they are rows, not
+/// fabricated ids. The username is unique, so every call for the same name
+/// shares one row, whichever call minted it. These rows never log in, so the
+/// hash is a stub.
+async fn fixture_user(db: &Database, username: &str) -> UserId {
+    sqlx::query(
+        "INSERT INTO app_user (id, username, password_hash, role) \
+         VALUES ($1, $2, 'x', 'student') ON CONFLICT DO NOTHING",
+    )
+    .bind(UserId::generate().uuid())
+    .bind(username)
+    .execute(db)
+    .await
+    .unwrap();
+    let id: uuid::Uuid = sqlx::query("SELECT id FROM app_user WHERE username = $1")
+        .bind(username)
+        .fetch_one(db)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    UserId::from_key(&id.to_string())
 }
 
 /// The `balance_minor` a statement reports must be folded from the very lines
@@ -227,7 +254,7 @@ async fn a_negative_due_date_is_refused_on_both_write_paths() {
 #[tokio::test]
 async fn editing_a_plan_deleted_since_it_was_read_is_a_404_not_a_409() {
     let (_app, db) = app_and_db().await;
-    let manager = UserId::from_key("del_mgr");
+    let manager = fixture_user(&db, "del_mgr").await;
     let one = || {
         vec![Installment::new(
             LedgerAmount::try_new(10_000).unwrap(),
@@ -272,7 +299,8 @@ async fn editing_a_plan_deleted_since_it_was_read_is_a_404_not_a_409() {
     )
     .await
     .unwrap();
-    fee_plan_assignment::assign(&db, &plan, &UserId::from_key("del_stu"), &manager)
+    let student = fixture_user(&db, "del_stu").await;
+    fee_plan_assignment::assign(&db, &plan, &student, &manager)
         .await
         .unwrap();
     let refused = fee_plan::update(
