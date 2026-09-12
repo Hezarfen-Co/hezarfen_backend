@@ -34,6 +34,12 @@ impl SubjectId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
+
+    /// The inner uuid, for binding the id through the runtime-checked
+    /// builders ([`crate::db::page::Param`]) whose values are raw uuids.
+    pub(crate) fn uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Type)]
