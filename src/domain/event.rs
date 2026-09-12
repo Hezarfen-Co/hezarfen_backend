@@ -1,3 +1,4 @@
+use uuid::Uuid;
 use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;

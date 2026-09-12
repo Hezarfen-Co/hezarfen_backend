@@ -5,7 +5,12 @@
 use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::Param;
-use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
+use crate::domain::class_group::ClassGroupId;
+use crate::domain::course::CourseId;
+use crate::domain::event::{
+    Event, EventAudience, EventAudienceKind, EventDescription, EventId, EventTitle,
+};
+use crate::domain::role::Role;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
@@ -36,8 +41,8 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
                 let row = sqlx::query!(
                     "SELECT EXISTS(SELECT 1 FROM class_member WHERE class = $1 AND app_user = $2)
                      AS present",
-                    class,
-                    user.get_id()
+                    class.uuid(),
+                    user.get_id().uuid()
                 )
                 .fetch_one(db)
                 .await?;
@@ -115,22 +120,27 @@ pub async fn create(
     // bundle guarantees only the matching payload is ever non-NULL.
     let created = query_as!(
         Event,
-        "INSERT INTO event (id, creator, title, description, audience_kind, audience_role, \
+        "INSERT INTO event (id, creator, title AS \"title: EventTitle\", description AS \"description: EventDescription\", audience_kind, audience_role, \
                             audience_course, audience_class, audience_capacity, starts_at, ends_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         RETURNING id, creator, title, description, audience_kind, audience_role, \
-                   audience_course, audience_class, audience_capacity, starts_at, ends_at",
-        EventId::generate(),
-        creator,
-        title,
-        description,
+         RETURNING id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
+                audience_kind AS \"audience_kind: EventAudienceKind\", \
+                audience_role AS \"audience_role: Role\", \
+                audience_course AS \"audience_course: CourseId\", \
+                audience_class AS \"audience_class: ClassGroupId\", \
+                audience_capacity, starts_at AS \"starts_at: Timestamp\", \
+                ends_at AS \"ends_at: Timestamp\"",
+        EventId::generate().uuid(),
+        creator.uuid(),
+        title.as_str(),
+        description.as_str(),
         audience.kind,
-        audience.role,
-        audience.course,
-        audience.class,
+        audience.role.map(|r| r.as_str().to_string()),
+        audience.course.map(|c| c.uuid()),
+        audience.class.map(|c| c.uuid()),
         audience.capacity,
-        starts_at,
-        ends_at,
+        starts_at.map(|t| t.as_millis()),
+        ends_at.map(|t| t.as_millis()),
     )
     .fetch_one(db)
     .await?;
@@ -140,10 +150,15 @@ pub async fn create(
 pub async fn read(db: &Database, id: &EventId) -> Result<Option<Event>, AppError> {
     let event = query_as!(
         Event,
-        "SELECT id, creator, title, description, audience_kind, audience_role, audience_course, \
-                audience_class, audience_capacity, starts_at, ends_at \
+        "SELECT id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
+                audience_kind AS \"audience_kind: EventAudienceKind\", \
+                audience_role AS \"audience_role: Role\", \
+                audience_course AS \"audience_course: CourseId\", \
+                audience_class AS \"audience_class: ClassGroupId\", \
+                audience_capacity, starts_at AS \"starts_at: Timestamp\", \
+                ends_at AS \"ends_at: Timestamp\" \
          FROM event WHERE id = $1",
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -153,8 +168,13 @@ pub async fn read(db: &Database, id: &EventId) -> Result<Option<Event>, AppError
 pub async fn list_all(db: &Database) -> Result<Vec<Event>, AppError> {
     let events = query_as!(
         Event,
-        "SELECT id, creator, title, description, audience_kind, audience_role, audience_course, \
-                audience_class, audience_capacity, starts_at, ends_at \
+        "SELECT id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
+                audience_kind AS \"audience_kind: EventAudienceKind\", \
+                audience_role AS \"audience_role: Role\", \
+                audience_course AS \"audience_course: CourseId\", \
+                audience_class AS \"audience_class: ClassGroupId\", \
+                audience_capacity, starts_at AS \"starts_at: Timestamp\", \
+                ends_at AS \"ends_at: Timestamp\" \
          FROM event ORDER BY id DESC",
     )
     .fetch_all(db)
@@ -240,21 +260,26 @@ pub async fn update(
 /// it lands), so a lost round re-sends instead of answering 500.
 pub async fn delete(db: &Database, event: Event) -> Result<Event, AppError> {
     tx_with_retry(db, true, async |tx| {
-        sqlx::query!("DELETE FROM attendance WHERE event = $1", event.get_id())
+        sqlx::query!("DELETE FROM attendance WHERE event = $1", event.get_id().uuid())
             .execute(&mut *tx)
             .await?;
         sqlx::query!(
             "DELETE FROM registration WHERE event = $1",
-            event.get_id()
+            event.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
         let gone = query_as!(
             Event,
             "DELETE FROM event WHERE id = $1 \
-             RETURNING id, creator, title, description, audience_kind, audience_role, \
-                       audience_course, audience_class, audience_capacity, starts_at, ends_at",
-            event.get_id()
+             RETURNING id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
+                audience_kind AS \"audience_kind: EventAudienceKind\", \
+                audience_role AS \"audience_role: Role\", \
+                audience_course AS \"audience_course: CourseId\", \
+                audience_class AS \"audience_class: ClassGroupId\", \
+                audience_capacity, starts_at AS \"starts_at: Timestamp\", \
+                ends_at AS \"ends_at: Timestamp\"",
+            event.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;

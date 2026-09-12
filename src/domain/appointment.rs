@@ -17,14 +17,15 @@
 //!   with nothing to sweep.
 //! - **No double-booked teacher window.** Two overlapping published windows
 //!   cannot both exist — the `appointment_slot` exclusion constraint refuses
-//!   the second insert at the store, which is what replaced the
-//!   [`crate::service::appointment::APPOINTMENT_LOCK`] serialization.
+//!   the second insert at the store, which is what replaced the process
+//!   lock the appointment workflows used to hold.
 //!
 //! The *single-row* invariant — a decision must be written onto the state it
 //! was validated against — is a compare-and-set
 //! ([`crate::db::appointment::save_if_unchanged`]), decided by a conditional
 //! `UPDATE`.
 
+use uuid::Uuid;
 use crate::constant::{MAX_APPOINTMENT_REASON_LEN};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
 use crate::domain::monotonic_id::next_uuid;

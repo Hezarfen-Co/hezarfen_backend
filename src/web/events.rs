@@ -13,7 +13,9 @@ use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
-use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
+use crate::domain::event::{
+    Event, EventAudience, EventAudienceKind, EventDescription, EventId, EventTitle,
+};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
@@ -83,11 +85,21 @@ impl AudienceDto {
     /// Validate the wire form into the domain audience: the role must parse,
     /// the course must exist, and a registration capacity must be positive.
     async fn into_domain(self, db: &Database) -> Result<EventAudience, AppError> {
-        match self {
-            AudienceDto::School => Ok(EventAudience::School),
-            AudienceDto::Role { role } => Ok(EventAudience::Role {
-                role: Role::try_from_str(&role)?,
-            }),
+        Ok(match self {
+            AudienceDto::School => EventAudience {
+                kind: EventAudienceKind::School,
+                role: None,
+                course: None,
+                class: None,
+                capacity: None,
+            },
+            AudienceDto::Role { role } => EventAudience {
+                kind: EventAudienceKind::Role,
+                role: Some(Role::try_from_str(&role)?),
+                course: None,
+                class: None,
+                capacity: None,
+            },
             AudienceDto::Course { course } => {
                 let course = CourseId::from_key(&course);
                 if crate::service::course::read(db, &course).await?.is_none() {
@@ -96,7 +108,13 @@ impl AudienceDto {
                         reason: "course does not exist",
                     }));
                 }
-                Ok(EventAudience::Course { course })
+                EventAudience {
+                    kind: EventAudienceKind::Course,
+                    role: None,
+                    course: Some(course),
+                    class: None,
+                    capacity: None,
+                }
             }
             AudienceDto::Class { class } => {
                 let class = ClassGroupId::from_key(&class);
@@ -109,7 +127,13 @@ impl AudienceDto {
                         reason: "class does not exist",
                     }));
                 }
-                Ok(EventAudience::Class { class })
+                EventAudience {
+                    kind: EventAudienceKind::Class,
+                    role: None,
+                    course: None,
+                    class: Some(class),
+                    capacity: None,
+                }
             }
             AudienceDto::Registration { capacity } => {
                 if capacity.is_some_and(|capacity| capacity < 1) {
@@ -118,25 +142,39 @@ impl AudienceDto {
                         reason: "capacity must be at least 1",
                     }));
                 }
-                Ok(EventAudience::Registration { capacity })
+                EventAudience {
+                    kind: EventAudienceKind::Registration,
+                    role: None,
+                    course: None,
+                    class: None,
+                    capacity,
+                }
             }
-        }
+        })
     }
 
     fn from_domain(audience: &EventAudience) -> Self {
-        match audience {
-            EventAudience::School => AudienceDto::School,
-            EventAudience::Role { role } => AudienceDto::Role {
-                role: role.as_str().to_string(),
+        match audience.kind {
+            EventAudienceKind::School => AudienceDto::School,
+            EventAudienceKind::Role => AudienceDto::Role {
+                role: audience.role.map(|role| role.as_str().to_string()).unwrap_or_default(),
             },
-            EventAudience::Course { course } => AudienceDto::Course {
-                course: course.key().to_string(),
+            EventAudienceKind::Course => AudienceDto::Course {
+                course: audience
+                    .course
+                    .as_ref()
+                    .map(|course| course.key())
+                    .unwrap_or_default(),
             },
-            EventAudience::Class { class } => AudienceDto::Class {
-                class: class.key().to_string(),
+            EventAudienceKind::Class => AudienceDto::Class {
+                class: audience
+                    .class
+                    .as_ref()
+                    .map(|class| class.key())
+                    .unwrap_or_default(),
             },
-            EventAudience::Registration { capacity } => AudienceDto::Registration {
-                capacity: *capacity,
+            EventAudienceKind::Registration => AudienceDto::Registration {
+                capacity: audience.capacity,
             },
         }
     }
@@ -208,7 +246,7 @@ impl EventResponse {
             creator: event.get_creator().key().to_string(),
             title: event.get_title().as_str().to_string(),
             description: event.get_description().as_str().to_string(),
-            audience: AudienceDto::from_domain(event.get_audience()),
+            audience: AudienceDto::from_domain(&EventAudience::of_row(event)),
             starts_at: event.get_starts_at().map(|t| t.as_millis()),
             ends_at: event.get_ends_at().map(|t| t.as_millis()),
         }
@@ -284,7 +322,13 @@ async fn create_event(
     let description = EventDescription::try_new(&req.description.unwrap_or_default())?;
     let audience = match req.audience {
         Some(audience) => audience.into_domain(&st.db).await?,
-        None => EventAudience::School,
+        None => EventAudience {
+            kind: EventAudienceKind::School,
+            role: None,
+            course: None,
+            class: None,
+            capacity: None,
+        },
     };
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
@@ -535,7 +579,7 @@ async fn mark(
 
     // Only expected attendees can be marked. The marker needn't be in the
     // audience — a teacher takes roll of a student-targeted event.
-    if !service::event::includes(&st.db, event.get_audience(), event.get_id(), &target_user).await?
+    if !service::event::includes(&st.db, &event, &target_user).await?
     {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
@@ -677,7 +721,7 @@ async fn roster(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let mut members = service::event::members(&st.db, event.get_audience(), event.get_id()).await?;
+    let mut members = service::event::members(&st.db, &event).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
     members.sort_by(|a, b| a.key().cmp(b.key()));
     let (marks, _) = crate::service::attendance::list_for_event(&st.db, &event_id, None, 0).await?;

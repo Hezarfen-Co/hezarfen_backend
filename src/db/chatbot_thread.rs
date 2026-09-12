@@ -45,15 +45,16 @@ pub async fn create_capped(
                      (SELECT max_chatbot_threads FROM settings WHERE id = 'school'),
                      $2)
              RETURNING 1)
-         INSERT INTO chatbot_thread (id, user_id, title, created_at, updated_at)
+         INSERT INTO chatbot_thread (id, user_id, title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\")
          SELECT $3, $1, $4, $5, $5
          WHERE EXISTS (SELECT 1 FROM seat)
-         RETURNING id, user_id, title, created_at, updated_at",
-        user,
+         RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
+                   created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+        user.uuid(),
         DEFAULT_MAX_CHATBOT_THREADS,
-        ChatbotThreadId::generate(),
-        title,
-        now,
+        ChatbotThreadId::generate().uuid(),
+        title.map(|t| t.as_str().to_string()),
+        now.as_millis(),
     )
     .fetch_optional(db)
     .await?
@@ -79,7 +80,7 @@ pub async fn list_for_user(
         "chatbot_thread WHERE user_id = $1",
         "ORDER BY updated_at DESC, id DESC",
     )
-    .bind(user)
+    .bind(user.uuid())
     .run(limit, offset, db)
     .await
 }
@@ -88,11 +89,11 @@ pub async fn list_for_user(
 pub async fn count_for_user(db: &Database, user: &UserId) -> Result<usize, AppError> {
     let row = sqlx::query!(
         "SELECT count(*) AS threads FROM chatbot_thread WHERE user_id = $1",
-        user
+        user.uuid()
     )
     .fetch_one(db)
     .await?;
-    Ok(row.threads.max(0) as usize)
+    Ok(row.threads.unwrap_or(0).max(0) as usize)
 }
 
 /// Read a thread only if `user` owns it — a foreign id reads as absent, so
@@ -104,7 +105,7 @@ pub async fn read_for(
 ) -> Result<Option<ChatbotThread>, AppError> {
     let thread = query_as!(
         ChatbotThread,
-        "SELECT id, user_id, title, created_at, updated_at FROM chatbot_thread WHERE id = $1",
+        "SELECT id, user_id, title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM chatbot_thread WHERE id = $1",
         id
     )
     .fetch_optional(db)
@@ -134,9 +135,10 @@ pub async fn rename(
         ChatbotThread,
         "UPDATE chatbot_thread SET title = $2, updated_at = GREATEST($3, updated_at + 1) \
          WHERE id = $1 \
-         RETURNING id, user_id, title, created_at, updated_at",
-        thread.get_id(),
-        title,
+         RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
+                   created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+        thread.get_id().uuid(),
+        title.map(|t| t.as_str().to_string()),
         Timestamp::now().as_millis(),
     )
     .fetch_optional(db)
@@ -162,15 +164,16 @@ pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThrea
         // turn still names it.
         sqlx::query!(
             "DELETE FROM chatbot_message WHERE thread_id = $1",
-            thread.get_id()
+            thread.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
         let gone = query_as!(
             ChatbotThread,
             "DELETE FROM chatbot_thread WHERE id = $1 \
-             RETURNING id, user_id, title, created_at, updated_at",
-            thread.get_id()
+             RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title, \
+                       created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+            thread.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;

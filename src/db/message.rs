@@ -26,15 +26,18 @@ pub async fn send(
         "INSERT INTO message (id, sender, recipient, subject, body, label, sent_at, read, \
                              sender_folder, recipient_folder, sender_origin, recipient_origin)
          VALUES ($1, $2, $3, $4, $5, $6, $7, false, 'sent', 'inbox', NULL, NULL)
-         RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                   sender_folder, recipient_folder, sender_origin, recipient_origin",
-        MessageId::generate(),
-        sender,
-        recipient,
-        subject,
-        body,
-        label,
-        Timestamp::now(),
+         RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+        MessageId::generate().uuid(),
+        sender.uuid(),
+        recipient.uuid(),
+        subject.as_str(),
+        body.as_str(),
+        label.map(|l| l.as_str().to_string()),
+        Timestamp::now().as_millis(),
     )
     .fetch_one(db)
     .await?;
@@ -99,10 +102,13 @@ pub async fn read_for(
 ) -> Result<Option<Message>, AppError> {
     let message = query_as!(
         Message,
-        "SELECT id, sender, recipient, subject, body, label, sent_at, read, \
-                sender_folder, recipient_folder, sender_origin, recipient_origin \
+        "SELECT id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                subject, body, label AS \"label: MessageLabel\", \
+                sent_at AS \"sent_at: Timestamp\", read, \
+                sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\" \
          FROM message WHERE id = $1",
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -118,8 +124,11 @@ pub async fn set_read(db: &Database, message: Message, read: bool) -> Result<Mes
     let updated = query_as!(
         Message,
         "UPDATE message SET read = $1 WHERE id = $2 \
-         RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                   sender_folder, recipient_folder, sender_origin, recipient_origin",
+         RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
         read,
         message.get_id(),
     )
@@ -159,11 +168,14 @@ pub async fn move_to(
         query_as!(
             Message,
             "UPDATE message SET sender_folder = $1, sender_origin = $2 WHERE id = $3 \
-             RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                       sender_folder, recipient_folder, sender_origin, recipient_origin",
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
             folder.as_str(),
             origin,
-            message.get_id(),
+            message.get_id().uuid(),
         )
         .fetch_optional(db)
         .await?
@@ -171,11 +183,14 @@ pub async fn move_to(
         query_as!(
             Message,
             "UPDATE message SET recipient_folder = $1, recipient_origin = $2 WHERE id = $3 \
-             RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                       sender_folder, recipient_folder, sender_origin, recipient_origin",
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
             folder.as_str(),
             origin,
-            message.get_id(),
+            message.get_id().uuid(),
         )
         .fetch_optional(db)
         .await?
@@ -195,9 +210,12 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
             Message,
             "UPDATE message SET sender_folder = 'deleted', sender_origin = NULL \
              WHERE id = $1 AND sender_folder = 'trash' \
-             RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                       sender_folder, recipient_folder, sender_origin, recipient_origin",
-            message.get_id(),
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            message.get_id().uuid(),
         )
         .fetch_optional(db)
         .await?
@@ -206,9 +224,12 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
             Message,
             "UPDATE message SET recipient_folder = 'deleted', recipient_origin = NULL \
              WHERE id = $1 AND recipient_folder = 'trash' \
-             RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                       sender_folder, recipient_folder, sender_origin, recipient_origin",
-            message.get_id(),
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            message.get_id().uuid(),
         )
         .fetch_optional(db)
         .await?
@@ -222,9 +243,12 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
         query_as!(
             Message,
             "DELETE FROM message WHERE id = $1 \
-             RETURNING id, sender, recipient, subject, body, label, sent_at, read, \
-                       sender_folder, recipient_folder, sender_origin, recipient_origin",
-            after.get_id(),
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            after.get_id().uuid(),
         )
         .fetch_optional(db)
         .await?;

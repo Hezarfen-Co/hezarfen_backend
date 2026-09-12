@@ -4,7 +4,7 @@
 //! [`crate::service::registration`].
 
 use crate::database::{Database, tx_with_retry, unique_violation};
-use crate::db::cap::{self, Claimed};
+use crate::db::cap::Claimed;
 use crate::domain::event::EventId;
 use crate::domain::registration::Registration;
 use crate::domain::user::UserId;
@@ -19,11 +19,13 @@ pub async fn read_for_user(
 ) -> Result<Option<Registration>, AppError> {
     let seat = query_as!(
         Registration,
-        "SELECT event, app_user, registered_by FROM registration
+        "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                registered_by AS \"registered_by: UserId\" \
+         FROM registration
          WHERE event = $1 AND app_user = $2
          LIMIT 1",
-        event,
-        user
+        event.uuid(),
+        user.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -33,10 +35,12 @@ pub async fn read_for_user(
 pub async fn list_for_event(db: &Database, event: &EventId) -> Result<Vec<Registration>, AppError> {
     let seats = query_as!(
         Registration,
-        "SELECT event, app_user, registered_by FROM registration
+        "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                registered_by AS \"registered_by: UserId\" \
+         FROM registration
          WHERE event = $1
          ORDER BY event DESC, app_user DESC",
-        event
+        event.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -76,10 +80,10 @@ pub async fn claim_seat(
          INSERT INTO registration (event, app_user, registered_by)
          SELECT $1, $2, $3
          WHERE EXISTS (SELECT 1 FROM seat) AND EXISTS (SELECT 1 FROM person)
-         RETURNING event, app_user, registered_by",
-        event,
-        user,
-        registered_by
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\"",
+        event.uuid(),
+        user.uuid(),
+        registered_by.uuid()
     )
     .fetch_optional(db)
     .await
@@ -103,9 +107,9 @@ pub async fn remove(
         let gone = query_as!(
             Registration,
             "DELETE FROM registration WHERE event = $1 AND app_user = $2
-             RETURNING event, app_user, registered_by",
-            event,
-            user
+             RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\"",
+            event.uuid(),
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -113,7 +117,7 @@ pub async fn remove(
             sqlx::query!(
                 "UPDATE event SET registration_count = GREATEST(registration_count - 1, 0)
                  WHERE id = $1",
-                event
+                event.uuid()
             )
             .execute(&mut *tx)
             .await?;

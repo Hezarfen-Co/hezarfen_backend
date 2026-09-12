@@ -13,7 +13,7 @@ use crate::constant::MAX_ERROR_CODE_LEN;
 use crate::database::Database;
 use crate::db::page::PagedList;
 use crate::domain::chatbot_message::{
-    ChatContent, ChatbotMessage, ChatbotMessageId, MessageStatus,
+    ChatContent, ChatbotMessage, ChatbotMessageId, MessageRole, MessageStatus,
 };
 use crate::domain::chatbot_thread::ChatbotThreadId;
 use crate::domain::timestamp::Timestamp;
@@ -46,19 +46,22 @@ async fn insert(db: &Database, message: ChatbotMessage) -> Result<ChatbotMessage
                                       truncated, error_code, created_at, completed_at)
          SELECT $3, $1, $4, $5, $6, $7, $8, $9, $10, $11
          WHERE EXISTS (SELECT 1 FROM touch)
-         RETURNING id, thread_id, user_id, role, content, status, truncated, error_code, \
-                   created_at, completed_at",
-        message.get_thread_id(),
+         RETURNING id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                   user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                   status AS \"status: MessageStatus\", truncated, \
+                   error_code AS \"error_code: String\", \
+                   created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\"",
+        message.get_thread_id().uuid(),
         Timestamp::now().as_millis(),
-        message.get_id(),
-        &message.user_id,
-        message.role,
+        message.get_id().uuid(),
+        message.user_id.uuid(),
+        message.role.as_str(),
         message.content.as_str(),
-        message.status,
+        message.status.as_str(),
         message.truncated,
         message.error_code,
-        message.created_at,
-        message.completed_at,
+        message.created_at.as_millis(),
+        message.completed_at.map(|t| t.as_millis()),
     )
     .fetch_optional(db)
     .await?;
@@ -129,7 +132,7 @@ pub async fn list_for_thread(
         "chatbot_message WHERE thread_id = $1",
         "ORDER BY created_at ASC, id ASC",
     )
-    .bind(thread)
+    .bind(thread.uuid())
     .run::<ChatbotMessage>(limit, offset, db)
     .await?;
     Ok((
@@ -148,11 +151,14 @@ pub async fn list_tail(
 ) -> Result<Vec<ChatbotMessage>, AppError> {
     let mut messages: Vec<ChatbotMessage> = query_as!(
         ChatbotMessage,
-        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
-                created_at, completed_at \
+        "SELECT id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                status AS \"status: MessageStatus\", truncated, \
+                error_code AS \"error_code: String\", \
+                created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\" \
          FROM chatbot_message WHERE thread_id = $1 \
          ORDER BY created_at DESC, id DESC LIMIT $2",
-        thread,
+        thread.uuid(),
         limit as i64
     )
     .fetch_all(db)
@@ -174,12 +180,15 @@ pub async fn list_settled_tail(
 ) -> Result<Vec<ChatbotMessage>, AppError> {
     let mut messages: Vec<ChatbotMessage> = query_as!(
         ChatbotMessage,
-        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
-                created_at, completed_at \
+        "SELECT id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                status AS \"status: MessageStatus\", truncated, \
+                error_code AS \"error_code: String\", \
+                created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\" \
          FROM chatbot_message WHERE thread_id = $1 \
            AND status = 'complete' AND content <> '' \
          ORDER BY created_at DESC, id DESC LIMIT $2",
-        thread,
+        thread.uuid(),
         limit as i64
     )
     .fetch_all(db)
@@ -202,10 +211,13 @@ pub async fn prompt_of(
 ) -> Result<Option<ChatbotMessage>, AppError> {
     let message = query_as!(
         ChatbotMessage,
-        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
-                created_at, completed_at \
+        "SELECT id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                status AS \"status: MessageStatus\", truncated, \
+                error_code AS \"error_code: String\", \
+                created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\" \
          FROM chatbot_message WHERE id = $1",
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -220,10 +232,13 @@ pub async fn read_for(
 ) -> Result<Option<ChatbotMessage>, AppError> {
     let message = query_as!(
         ChatbotMessage,
-        "SELECT id, thread_id, user_id, role, content, status, truncated, error_code, \
-                created_at, completed_at \
+        "SELECT id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                status AS \"status: MessageStatus\", truncated, \
+                error_code AS \"error_code: String\", \
+                created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\" \
          FROM chatbot_message WHERE id = $1",
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -273,11 +288,14 @@ async fn settle(
         "UPDATE chatbot_message SET content = $2, status = $3, truncated = $4, \
              error_code = $5, completed_at = $6 \
          WHERE id = $1 AND status = 'pending' \
-         RETURNING id, thread_id, user_id, role, content, status, truncated, error_code, \
-                   created_at, completed_at",
-        id,
+         RETURNING id AS \"id: ChatbotMessageId\", thread_id AS \"thread_id: ChatbotThreadId\", \
+                   user_id AS \"user_id: UserId\", role AS \"role: MessageRole\", content AS \"content: ChatContent\", \
+                   status AS \"status: MessageStatus\", truncated, \
+                   error_code AS \"error_code: String\", \
+                   created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\"",
+        id.uuid(),
         text.map(|t| t.as_str().to_string()).unwrap_or_default(),
-        status,
+        status.as_str(),
         truncated,
         error_code.map(|code| code.chars().take(MAX_ERROR_CODE_LEN).collect::<String>()),
         Timestamp::now().as_millis(),

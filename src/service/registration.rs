@@ -4,9 +4,10 @@
 //! claim-on-the-event-row.
 
 use crate::database::Database;
+use crate::db::cap::Claimed;
 use crate::db::registration;
 use crate::domain::event::EventId;
-use crate::domain::registration::{Registration, RegistrationId};
+use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -46,18 +47,18 @@ pub async fn register(
         .ok_or(AppError::NotFound)?
         .registration_capacity()?;
     match registration::claim_seat(db, event, user, registered_by).await? {
-        cap::Claimed::Made(created) => Ok(created),
+        Claimed::Made(created) => Ok(created),
         // A concurrent placement of the same pair got there first: hand its
         // row over, the same no-op the early return above would have made,
         // and with no seat spent either way.
-        cap::Claimed::Duplicate => registration::read_for_user(db, event, user)
+        Claimed::Duplicate => registration::read_for_user(db, event, user)
             .await?
             .ok_or_else(|| AppError::Internal("failed to register user".into())),
         // Full, the event was deleted between the read and the claim, or
         // the holder fell to parent while this ran — the conditional writes
         // match nothing (or throw) either way, and only this path pays for
         // the reads that tell them apart.
-        cap::Claimed::Full => match crate::db::event::read(db, event).await? {
+        Claimed::Full => match crate::db::event::read(db, event).await? {
             None => Err(AppError::NotFound),
             Some(_) => match crate::db::user::read(db, user).await? {
                 Some(held) if held.get_role() == Role::Parent => Err(AppError::Forbidden(

@@ -7,7 +7,6 @@ use crate::database::{Database, foreign_key_violation};
 use crate::db::page::PagedList;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::EventId;
-use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use sqlx::query_as;
@@ -32,11 +31,12 @@ pub async fn mark(
         "INSERT INTO attendance (event, app_user, status, marked_by)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
-         RETURNING event, app_user, status, marked_by",
-        event,
-        user,
-        status,
-        marked_by
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                  status, marked_by AS \"marked_by: UserId\"",
+        event.uuid(),
+        user.uuid(),
+        status.as_str(),
+        marked_by.uuid()
     )
     .fetch_one(db)
     .await
@@ -62,7 +62,7 @@ pub async fn list_for_event(
         "attendance WHERE event = $1",
         "ORDER BY event DESC, app_user DESC",
     )
-    .bind(event)
+    .bind(event.uuid())
     .run(limit, offset, db)
     .await
 }
@@ -72,10 +72,13 @@ pub async fn list_for_event(
 pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<Attendance>, AppError> {
     let rows = query_as!(
         Attendance,
-        "SELECT event, app_user, status, marked_by FROM attendance
+        "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                status AS \"status: AttendanceStatus\", \
+                marked_by AS \"marked_by: UserId\" \
+         FROM attendance
          WHERE app_user = $1
          ORDER BY event DESC, app_user DESC",
-        user
+        user.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -90,9 +93,11 @@ pub async fn remove(
     let gone = query_as!(
         Attendance,
         "DELETE FROM attendance WHERE event = $1 AND app_user = $2
-         RETURNING event, app_user, status, marked_by",
-        event,
-        user
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                  status AS \"status: AttendanceStatus\", \
+                  marked_by AS \"marked_by: UserId\"",
+        event.uuid(),
+        user.uuid()
     )
     .fetch_optional(db)
     .await?;

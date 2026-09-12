@@ -22,10 +22,11 @@ pub async fn link(
         "INSERT INTO parent_link (parent, student, linked_by)
          VALUES ($1, $2, $3)
          ON CONFLICT (parent, student) DO UPDATE SET linked_by = $3
-         RETURNING parent, student, linked_by",
-        parent,
-        student,
-        linked_by
+         RETURNING parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                  linked_by AS \"linked_by: UserId\"",
+        parent.uuid(),
+        student.uuid(),
+        linked_by.uuid()
     )
     .fetch_one(db)
     .await?;
@@ -38,8 +39,8 @@ pub async fn link(
 pub async fn exists(db: &Database, parent: &UserId, student: &UserId) -> Result<bool, AppError> {
     let row = sqlx::query!(
         "SELECT EXISTS(SELECT 1 FROM parent_link WHERE parent = $1 AND student = $2) AS present",
-        parent,
-        student
+        parent.uuid(),
+        student.uuid()
     )
     .fetch_one(db)
     .await?;
@@ -52,9 +53,11 @@ pub async fn exists(db: &Database, parent: &UserId, student: &UserId) -> Result<
 pub async fn list_for_parent(db: &Database, parent: &UserId) -> Result<Vec<ParentLink>, AppError> {
     let links = query_as!(
         ParentLink,
-        "SELECT parent, student, linked_by FROM parent_link WHERE parent = $1
+        "SELECT parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                linked_by AS \"linked_by: UserId\" \
+         FROM parent_link WHERE parent = $1
          ORDER BY student DESC",
-        parent
+        parent.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -69,9 +72,10 @@ pub async fn remove(
     let gone = query_as!(
         ParentLink,
         "DELETE FROM parent_link WHERE parent = $1 AND student = $2
-         RETURNING parent, student, linked_by",
-        parent,
-        student
+         RETURNING parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                  linked_by AS \"linked_by: UserId\"",
+        parent.uuid(),
+        student.uuid()
     )
     .fetch_optional(db)
     .await?;

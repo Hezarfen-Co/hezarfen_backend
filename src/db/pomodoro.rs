@@ -48,10 +48,12 @@ pub async fn start(
                  RETURNING 1)
              INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
              SELECT $2, $1, $3, NULL, NULL, $4
-             RETURNING id, app_user, started_at, finished_at, counted, label",
-            user,
-            id,
-            started_at,
+             RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
+                       started_at AS \"started_at: Timestamp\", \
+                       finished_at AS \"finished_at: Timestamp\", counted, label",
+            user.uuid(),
+            id.uuid(),
+            started_at.as_millis(),
             label
         )
         .fetch_one(db)
@@ -76,8 +78,8 @@ pub async fn start(
 ///
 /// The open row is taken by a guarded `DELETE … WHERE finished_at IS NULL
 /// RETURNING` — of two racing finishes exactly one receives the row, and
-/// the other is refused (`no pomodoro session running`), the old THROW now
-/// an ordinary early return. The user row carries every counter family
+/// the other is refused (`no pomodoro session running`), the old abort
+/// marker now an ordinary early return. The user row carries every counter family
 /// this decision moves, so the transaction takes it `FOR NO KEY UPDATE`,
 /// decides in Rust, and writes once: no interleaving can tear the streak
 /// pair, and a rival finish is serialized on the row lock instead of
@@ -129,8 +131,8 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
         let open = sqlx::query!(
             "DELETE FROM pomodoro_session
              WHERE app_user = $1 AND finished_at IS NULL
-             RETURNING started_at, label",
-            user
+             RETURNING started_at AS \"started_at: Timestamp\", label",
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -148,7 +150,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
                     study_streak_longest \
              FROM app_user WHERE id = $1 \
              FOR NO KEY UPDATE",
-            user
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -179,7 +181,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
                         study_streak_current = $5, study_streak_last_day = $4, \
                         study_streak_longest = GREATEST(study_streak_longest, $5) \
                  WHERE id = $1",
-                user,
+                user.uuid(),
                 ms,
                 counted_today + 1,
                 day,
@@ -191,7 +193,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
             sqlx::query!(
                 "UPDATE app_user SET pomodoro_counted_today = 0, pomodoro_counted_day = $2 \
                  WHERE id = $1",
-                user,
+                user.uuid(),
                 day
             )
             .execute(&mut *tx)
@@ -202,11 +204,13 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
             PomodoroSession,
             "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
              VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, app_user, started_at, finished_at, counted, label",
-            PomodoroSessionId::generate(),
-            user,
-            open.started_at,
-            Some(end),
+             RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
+                       started_at AS \"started_at: Timestamp\", \
+                       finished_at AS \"finished_at: Timestamp\", counted, label",
+            PomodoroSessionId::generate().uuid(),
+            user.uuid(),
+            open.started_at.as_millis(),
+            Some(end.as_millis()),
             Some(counted),
             open.label,
         )
@@ -232,10 +236,12 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
 pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<PomodoroSession>, AppError> {
     let sessions = query_as!(
         PomodoroSession,
-        "SELECT id, app_user, started_at, finished_at, counted, label \
+        "SELECT id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
+                started_at AS \"started_at: Timestamp\", \
+                finished_at AS \"finished_at: Timestamp\", counted, label \
          FROM pomodoro_session WHERE app_user = $1 \
          ORDER BY started_at DESC, id DESC",
-        user
+        user.uuid()
     )
     .fetch_all(db)
     .await?;
