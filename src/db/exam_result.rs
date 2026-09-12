@@ -402,6 +402,7 @@ mod tests {
         let teacher = UserId::from_key(TEACHER);
         // The exam has to be real: a mark is refused on one that isn't.
         an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
 
         // Grade sitting #1, then a retake as sitting #2 — two rows, not one.
         super::grade(
@@ -501,7 +502,8 @@ mod tests {
             .unwrap()
             .map(|row| row.try_get::<i64, _>(0).unwrap())
             .unwrap_or(0);
-        let exam_count = sqlx::query("SELECT COALESCE(sum(result_count), 0) FROM exam")
+        let exam_count =
+            sqlx::query("SELECT COALESCE(sum(result_count), 0)::bigint FROM exam")
             .fetch_one(db)
             .await
             .unwrap()
@@ -579,6 +581,7 @@ mod tests {
         let (db, _leases) = init_test_db().await;
         let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1c4");
         an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
 
         grade(&db, &exam, 1, 40, "midterm").await.unwrap();
         assert_eq!(counters(&db, "midterm").await, (1, 1));

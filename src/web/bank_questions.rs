@@ -948,10 +948,19 @@ mod tests {
     async fn demoted_owner_loses_their_own_template() {
         let (db, _leases) = init_test_db().await;
         let owner = user("ogretmen", Role::Teacher, &db).await;
+        // The subject is a foreign key: a real row, via the course fixture.
+        let subject = crate::db::subject::create(
+            &db,
+            &crate::db::course::a_test_course(&db).await,
+            crate::domain::subject::SubjectName::try_new("matematik").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
         let question = bank_question::create(
             &db,
             owner.get_id().clone(),
-            SubjectId::from_key("019732e3-7b00-7000-8000-00000000a2b3"),
+            subject.get_id().clone(),
             QuestionText::try_new("2 + 2 = ?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),

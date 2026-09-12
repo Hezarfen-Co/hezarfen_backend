@@ -1087,8 +1087,10 @@ mod tests {
     #[tokio::test]
     async fn the_statement_rolls_each_charge_up_from_its_own_lines() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let manager =
+            crate::db::class_member::tests::fixture_user(&db, "stmt-manager").await;
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "stmt-student").await;
         let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;
         let plan = service::fee_plan::create(
             &db,

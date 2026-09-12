@@ -201,6 +201,43 @@ pub async fn delete_if_unchanged(
     Ok(deleted.rows_affected() > 0)
 }
 
+/// [`delete_if_unchanged`] inside the caller's transaction — the blueprint
+/// delete rides the row lock its claim took, so the sourced links are swept
+/// while the window the claim opened is still closed.
+pub(crate) async fn delete_if_unchanged_in(
+    tx: &mut sqlx::PgConnection,
+    id: &ClassBlueprintId,
+    held: &[CourseId],
+) -> Result<bool, AppError> {
+    let deleted = sqlx::query!(
+        r#"DELETE FROM class_blueprint WHERE grade = $1 AND courses = $2"#,
+        id as _,
+        held as _
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+/// The stored course list of one blueprint, read `FOR UPDATE` — the claim
+/// the delete holds across its sweep, so a sourced attach (whose own
+/// transaction takes `FOR KEY SHARE` on this row before inserting) either
+/// commits before the claim and is swept, or waits past it and finds no
+/// row. `None` when the blueprint is gone.
+pub(crate) async fn held_courses_for_update(
+    tx: &mut sqlx::PgConnection,
+    id: &ClassBlueprintId,
+) -> Result<Option<Vec<CourseId>>, AppError> {
+    let row = sqlx::query!(
+        r#"SELECT courses AS "courses: Vec<CourseId>"
+           FROM class_blueprint WHERE grade = $1 FOR UPDATE"#,
+        id as _
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(row.map(|row| row.courses))
+}
+
 /// Every `class_course` row held by any of `classes`, projected down to the
 /// pair — the read [`crate::service::class_blueprint::status`] diffs the
 /// template against.

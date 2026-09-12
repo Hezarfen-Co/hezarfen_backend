@@ -300,11 +300,16 @@ mod tests {
     /// A published menu on a fresh in-memory database, plus a student. Dated
     /// well ahead on purpose: a menu whose day has passed refuses every
     /// booking, so a date the calendar overtakes would fail this whole module.
-    async fn menu(capacity: Option<i64>) -> (Database, MenuId) {
+    async fn menu(capacity: Option<i64>) -> (Database, MenuId, crate::database::TestDatabases) {
         menu_on("2099-09-14", capacity).await
     }
 
-    async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
+    // The lease rides with the pool: dropping it here would drop the database
+    // out from under the test that is about to run.
+    async fn menu_on(
+        date: &str,
+        capacity: Option<i64>,
+    ) -> (Database, MenuId, crate::database::TestDatabases) {
         let (db, _leases) = init_test_db().await;
         // The menu's creator is a foreign key now: a real `app_user` row.
         let creator = UserId::generate();
@@ -313,7 +318,7 @@ mod tests {
              VALUES ($1, $2, 'x', 'teacher')",
         )
         .bind(creator.uuid())
-        .bind(format!("menu-fixture-{}", &creator.key()[..8]))
+        .bind(format!("menu-fixture-{}", &creator.key()[30..]))
         .execute(&db)
         .await
         .unwrap();
@@ -327,7 +332,7 @@ mod tests {
         )
         .await
         .unwrap();
-        (db, menu.get_id().clone())
+        (db, menu.get_id().clone(), _leases)
     }
 
     /// The stored counter, absent reading as zero — the number the cap's
@@ -366,8 +371,9 @@ mod tests {
     /// seat that was already returned (which would open the cap by one forever).
     #[tokio::test]
     async fn the_seat_counter_follows_the_seats_it_guards() {
-        let (db, menu) = menu(Some(1)).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(Some(1)).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
 
         let booking = book(&db, &menu, &ali, &ali, &open).await.unwrap();
@@ -398,8 +404,8 @@ mod tests {
     /// in the `WHERE` rather than in a read the delete then trusts.
     #[tokio::test]
     async fn a_held_seat_refuses_the_menu_delete() {
-        let (db, id) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, id, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         let booking = book(&db, &id, &ali, &ali, &MealCutoff::default())
             .await
             .unwrap();
@@ -419,8 +425,9 @@ mod tests {
     /// never re-read from the menu.
     #[tokio::test]
     async fn a_seat_keeps_the_price_it_was_taken_at() {
-        let (db, menu) = menu(None).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
 
@@ -451,8 +458,9 @@ mod tests {
     /// single-process interleaving (and no in-memory engine) can stage.
     #[tokio::test]
     async fn a_lost_flip_refunds_only_the_attempt_it_released() {
-        let (db, menu) = menu(None).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
 
@@ -504,8 +512,8 @@ mod tests {
     /// and mint no ledger line, with the shipped defaults in force.
     #[tokio::test]
     async fn a_past_day_takes_no_seat_and_writes_no_charge() {
-        let (db, menu) = menu_on("2020-01-06", None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on("2020-01-06", None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         add_dish(&menu, 4550, &db).await;
 
         assert!(matches!(
@@ -527,8 +535,8 @@ mod tests {
     /// with the cutoff knob set *and* unset.
     #[tokio::test]
     async fn todays_menu_still_books_without_a_serving_hour() {
-        let (db, menu) = menu_on(&today(), None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on(&today(), None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         book(&db, &menu, &ali, &ali, &cutoff(Some(60), None))
             .await
             .expect("an unset serving hour is an unenforced cutoff");
@@ -540,8 +548,8 @@ mod tests {
     /// cutoff. The guard binds `book` alone.
     #[tokio::test]
     async fn a_past_day_still_gives_the_seat_and_the_money_back() {
-        let (db, menu) = menu_on("2020-01-06", None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on("2020-01-06", None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         add_dish(&menu, 4550, &db).await;
         // The seat this student is holding was taken while the day was still
         // ahead — the shape the create-side check cannot reach. A test cannot

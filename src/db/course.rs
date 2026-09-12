@@ -581,7 +581,7 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
          VALUES ($1, $2, 'x', 'teacher')",
     )
     .bind(creator.uuid())
-    .bind(format!("course-fixture-{}", &creator.key()[..8]))
+    .bind(format!("course-fixture-{}", &creator.key()[30..]))
     .execute(db)
     .await
     .unwrap();
@@ -721,7 +721,7 @@ mod tests {
              VALUES ($1, $2, 'x', $3)",
         )
         .bind(user.uuid())
-        .bind(format!("{label}-{}", &user.key()[..8]))
+        .bind(format!("{label}-{}", &user.key()[30..]))
         .bind(role)
         .execute(db)
         .await
@@ -859,9 +859,9 @@ mod tests {
             .unwrap()
     }
 
-    /// How many rows `sql` selects ids for.
-    async fn rows(sql: &str, db: &Database) -> usize {
-        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+    /// How many rows a table holds (the table name is a fixture literal).
+    async fn rows(table: &str, db: &Database) -> usize {
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
             .fetch_one(db)
             .await
             .unwrap()
@@ -901,12 +901,12 @@ mod tests {
         .expect_err("a term that is gone must not be linkable");
         assert!(error.to_string().contains("term does not exist"));
         assert_eq!(
-            rows("SELECT VALUE id FROM course", &db).await,
+            rows("course", &db).await,
             0,
             "a refused create may write no row"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM term", &db).await,
+            rows("term", &db).await,
             0,
             "…and least of all a count on a term it just brought back"
         );
@@ -1148,7 +1148,7 @@ mod tests {
             "the release must roll back with the abort"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM term", &db).await,
+            rows("term", &db).await,
             1,
             "the dead term must not be resurrected by the claim"
         );

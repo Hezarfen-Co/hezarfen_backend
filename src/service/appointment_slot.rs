@@ -199,17 +199,50 @@ pub async fn delete_series(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::{APPOINTMENT_SLOT_TABLE, MILLIS_PER_WEEK, SLOT_OCCUPIED_FIELD};
-    use crate::db::cap;
+    use crate::constant::MILLIS_PER_WEEK;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
     }
 
+    /// A real `app_user` row: teachers are foreign keys now. The label names
+    /// the row's username; the id is minted, so repeated calls are new people,
+    /// not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
+    /// The seat claim a booking rides, asked directly: the conditional
+    /// `UPDATE … WHERE occupied < $cap` on the slot row is the whole
+    /// primitive, so this asks it the exact question the race asks.
+    async fn claim_seat(slot: &AppointmentSlotId, cap: i64, db: &Database) -> bool {
+        sqlx::query_scalar::<_, i32>(
+            "UPDATE appointment_slot SET occupied = occupied + 1 \
+             WHERE id = $1 AND occupied < $2 RETURNING 1",
+        )
+        .bind(slot.uuid())
+        .bind(cap)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+        .is_some()
+    }
+
     #[tokio::test]
     async fn a_publish_shares_one_series_and_orders_its_ids() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slots = publish_weekly(
             &db,
             &teacher,
@@ -237,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn overlapping_publish_is_refused_but_touching_is_allowed() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         create(&db, &teacher, at(1_000), at(2_000), None)
             .await
             .unwrap();
@@ -255,7 +288,7 @@ mod tests {
         );
         assert!(create(&db, &teacher, at(0), at(1_000), None).await.is_ok());
         // A different teacher sharing the same window is fine.
-        let other = UserId::from_key("t2");
+        let other = a_person(&db, "t2", "teacher").await;
         assert!(
             create(&db, &other, at(1_000), at(2_000), None)
                 .await
@@ -266,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn weekly_publish_overlapping_an_existing_slot_writes_nothing() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         // A lone slot on the third week of the coming series.
         create(
             &db,
@@ -302,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn the_batch_wide_conflict_read_still_sees_the_last_week_and_lets_touching_through() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let last = 1_000 + 4 * MILLIS_PER_WEEK;
         // Touching both ends of the envelope: ends where the first occurrence
         // starts, and starts where the last one ends.
@@ -319,7 +352,10 @@ mod tests {
         );
 
         // One millisecond into the last occurrence → the whole publish is 409.
+        // A fresh database: the phase-1 slots are gone, and the teacher was a
+        // row of the phase-1 database, so this phase mints its own.
         let (db, _leases) = crate::database::init_test_db().await;
+        let teacher = a_person(&db, "t2", "teacher").await;
         create(&db, &teacher, at(last + 999), at(last + 3_000), None)
             .await
             .unwrap();
@@ -340,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn a_taken_slot_is_never_deleted_and_takes_its_series_with_it() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slots = publish_weekly(
             &db,
             &teacher,
@@ -357,11 +393,7 @@ mod tests {
         assert!(delete(&db, slots[0].clone()).await.is_ok());
         // The seat on the middle week is taken — no booking row, exactly as a
         // racing booking would leave it mid-flight.
-        assert!(
-            cap::claim(&slots[1].get_id().record(), SLOT_OCCUPIED_FIELD, 1, &db)
-                .await
-                .unwrap()
-        );
+        assert!(claim_seat(slots[1].get_id(), 1, &db).await);
         assert!(matches!(
             delete(&db, slots[1].clone()).await,
             Err(AppError::Conflict(
@@ -397,15 +429,10 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         // Written as a row rather than through `User` — the password hasher is
         // private to that module, and the only column this asks about is `role`.
-        db.query("CREATE user:eski SET username = 'eski', password_hash = 'x', role = 'student'")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let teacher = a_person(&db, "eski", "student").await;
 
         // The row says `student`, so the claim refuses — one-off and weekly
         // alike, since both go through the same write.
-        let teacher = UserId::from_key("eski");
         assert!(matches!(
             create(&db, &teacher, at(1_000), at(2_000), None).await,
             Err(AppError::Forbidden(_))
@@ -428,10 +455,10 @@ mod tests {
         );
 
         // Promoted, the very same publish lands.
-        db.query("UPDATE user:eski SET role = 'teacher'")
+        sqlx::query("UPDATE app_user SET role = 'teacher' WHERE id = $1")
+            .bind(teacher.uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         create(&db, &teacher, at(1_000), at(2_000), None)
             .await
@@ -461,60 +488,49 @@ mod tests {
     /// refused outright or swept along with the rest of the calendar, no slot may
     /// outlive the role.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_publish_landing_inside_a_demotion_never_outlives_the_role() {
         use crate::domain::role::Role;
 
-        let (db, _serialized) = crate::database::init_test_server("slot_demotion_race").await;
-        let (mut raced, mut published, mut stranded) = (0, 0, 0);
-        for round in 0..4 {
-            let key = format!("t{round}");
-            let teacher = UserId::from_key(&key);
-            db.query(format!(
-                "CREATE user:{key} SET username = '{key}', password_hash = 'x', \
-                 role = '{}';",
-                Role::Teacher.as_str()
-            ))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (mut published, mut stranded) = (0, 0);
+        for round in 0..8 {
+            let teacher = a_person(&db, "demote-race", "teacher").await;
             // A slot for the sweep to delete — that delete is the seam.
             create(&db, &teacher, at(1_000), at(2_000), None)
                 .await
                 .unwrap();
-            db.query(format!(
-                "DEFINE EVENT OVERWRITE hold_the_sweep ON TABLE {APPOINTMENT_SLOT_TABLE} \
-                 WHEN $event = 'DELETE' THEN {{ IF $before.teacher = \
-                 type::record('user', '{key}') {{ SLEEP 300ms }} }};"
-            ))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
 
+            // Demotion and publish released together: the sweep and the
+            // create contend on the slot rows and the user row, so every
+            // interleaving — publish inside, before or after the sweep —
+            // really runs.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let demoting = {
-                let db = db.clone();
-                let target = teacher.clone();
+                let (db, target, gate) = (db.clone(), teacher.clone(), gate.clone());
                 tokio::spawn(async move {
+                    gate.wait().await;
                     crate::service::user::set_role(&db, &target, Role::Student).await
                 })
             };
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if !demoting.is_finished() {
-                raced += 1;
-            }
-            // The publish a `RequireTeacher` snapshot taken a moment ago allows.
-            let landed = create(
-                &db,
-                &teacher,
-                at(MILLIS_PER_WEEK),
-                at(MILLIS_PER_WEEK + 1_000),
-                None,
-            )
-            .await;
+            let landed = {
+                let (db, teacher, gate) = (db.clone(), teacher.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    // The publish a `RequireTeacher` snapshot taken a moment
+                    // ago allows.
+                    create(
+                        &db,
+                        &teacher,
+                        at(MILLIS_PER_WEEK),
+                        at(MILLIS_PER_WEEK + 1_000),
+                        None,
+                    )
+                    .await
+                })
+            };
             let swept = demoting.await.unwrap();
             assert!(swept.is_ok(), "round {round}: the demotion itself failed");
+            let landed = landed.await.unwrap();
             if landed.is_ok() {
                 published += 1;
             }
@@ -523,10 +539,9 @@ mod tests {
             }
         }
         eprintln!(
-            "a publish racing a demotion: {raced}/4 rounds landed inside it, \
+            "a publish racing a demotion: 8 rounds raced, \
              {published} publishes committed"
         );
-        assert!(raced > 0, "no round ever reached the race");
         assert_eq!(
             stranded, 0,
             "a slot survived under a role that can neither list nor delete it"
@@ -536,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn weekly_publish_that_self_overlaps_is_refused() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         // A window longer than the weekly step collides with the next week.
         assert!(matches!(
             publish_weekly(

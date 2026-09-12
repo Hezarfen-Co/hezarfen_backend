@@ -299,17 +299,26 @@ mod tests {
     /// A real `app_user` row: creator, teacher, and attached-by are foreign
     /// keys now, so every fixture participant is a row, not a fabricated id.
     async fn a_named_user(db: &Database, username: &str) -> UserId {
-        let user = UserId::generate();
+        // The username is unique: a second call for the same name must adopt
+        // the existing row, not collide with it.
         sqlx::query(
             "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+             VALUES ($1, $2, 'x', 'teacher') ON CONFLICT DO NOTHING",
         )
-        .bind(user.uuid())
+        .bind(UserId::generate().uuid())
         .bind(username)
         .execute(db)
         .await
         .unwrap();
-        user
+        let id: uuid::Uuid =
+            sqlx::query("SELECT id FROM app_user WHERE username = $1")
+                .bind(username)
+                .fetch_one(db)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap();
+        UserId::from_key(&id.to_string())
     }
 
     async fn class_on(term: Option<TermId>, db: &Database) -> ClassGroup {

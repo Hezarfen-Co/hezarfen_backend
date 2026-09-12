@@ -445,6 +445,16 @@ mod tests {
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
         let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+        // The creator is a foreign key now: a real `app_user` row under the
+        // fixture's fixed key.
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'acdc-fixture', 'x') ON CONFLICT DO NOTHING",
+        )
+        .bind(creator.uuid())
+        .execute(db)
+        .await
+        .unwrap();
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
@@ -523,6 +533,8 @@ mod tests {
 
     /// The student's lifetime sitting count, absent reading as zero.
     async fn sat_total(user: &UserId, db: &Database) -> i64 {
+        use sqlx::Row as _;
+
         sqlx::query("SELECT exam_sat_total FROM app_user WHERE id = $1")
             .bind(user.uuid())
             .fetch_one(db)

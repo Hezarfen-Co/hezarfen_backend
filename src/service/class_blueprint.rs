@@ -177,25 +177,44 @@ pub async fn set_courses(
 /// asked for — and telling the two apart needs a revision column on the
 /// row, which nothing else here would use.
 pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppError> {
-    if !class_blueprint::delete_if_unchanged(db, &blueprint.id, blueprint.courses.clone()).await? {
-        // Matched nothing: the row is gone, or its list moved since this
-        // caller read it. Only this path pays for the read that tells
-        // them apart.
-        return match read(db, &blueprint.id).await? {
-            Some(_) => Err(AppError::Conflict(
-                "this blueprint changed since you read it — re-read and retry",
-            )),
-            None => Err(AppError::NotFound),
-        };
+    // The claim, the sweep and the delete are one transaction — the shape
+    // Postgres demands and the doc above argues for. The old order (delete
+    // the row on the pool, then sweep) cannot work against an enforcing
+    // foreign key: the delete statement itself is refused the instant a
+    // sourced link it has not swept yet exists, and a link committing
+    // between the row lock's release and the sweep re-arms the same
+    // refusal. Holding the claim across the sweep closes the window: an
+    // attach in flight waits behind it and finds no row; an attach that
+    // committed first is in the set the sweep reads.
+    let mut tx = db.begin().await?;
+    let Some(stored) = class_blueprint::held_courses_for_update(&mut tx, &blueprint.id).await?
+    else {
+        // Gone before we claimed it.
+        return Err(AppError::NotFound);
+    };
+    if stored != blueprint.courses {
+        // The list moved since this caller read it: a 409, not a silent
+        // detach of somebody else's additions.
+        return Err(AppError::Conflict(
+            "this blueprint changed since you read it — re-read and retry",
+        ));
     }
-    // The row set is read after the delete, and the delete itself is what
-    // serializes it against the attaches: a sourced attach holds a `FOR KEY
-    // SHARE` on the blueprint row across its transaction, so its row lands
-    // before this delete (and is in the set this read then sees) or finds the
-    // row gone and writes nothing at all. No attach can commit a row this
-    // read did not see, and none that starts afterwards writes one.
+    // The sweep runs on its own bounded transactions while this transaction
+    // holds the claim: it touches no `class_blueprint` rows, so it cannot
+    // deadlock against the lock it runs under.
     let doomed = class_blueprint::sourced_links(db, &blueprint.id, &[]).await?;
-    class_blueprint::drop_links(db, &blueprint.id, doomed).await
+    class_blueprint::drop_links(db, &blueprint.id, doomed).await?;
+    if !class_blueprint::delete_if_unchanged_in(&mut tx, &blueprint.id, &blueprint.courses)
+        .await?
+    {
+        // The row was locked, matched at the claim, and vanished anyway:
+        // nothing does that but a bug.
+        return Err(AppError::Internal(
+            "the claimed blueprint row did not survive its own lock".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Attach every course in this blueprint to `class`, skipping — never
@@ -386,7 +405,7 @@ mod tests {
     async fn a_section(name: &str, db: &Database) -> ClassGroup {
         class_group::create(
             db,
-            &UserId::from_key("manager"),
+            &fixture_user(db, "manager").await,
             ClassName::try_new(name).unwrap(),
             Some(ClassBlueprint::grade_key("9").unwrap()),
             None,

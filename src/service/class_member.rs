@@ -216,9 +216,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The whole record id, not just the key: a caller reading the 409 must
-        // not have to guess which table the name came from.
-        let named = format!("{}:{}", crate::constant::COURSE_TABLE, full.key());
+        // The refusal names the course that had no seat. Postgres ids are
+        // bare uuids (no record-id prefix to inherit), so the message is
+        // matched on the course's own key.
+        let named = full.key().to_string();
         let refused = add(&db, &class, &student, &manager).await;
         assert!(
             matches!(refused, Err(AppError::ConflictCoded { code, ref message })

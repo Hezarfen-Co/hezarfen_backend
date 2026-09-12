@@ -158,7 +158,8 @@ mod tests {
     #[tokio::test]
     async fn delete_returns_the_attachment_rows_it_removed() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator = crate::domain::user::UserId::generate();
+        let creator =
+            crate::db::class_member::tests::fixture_user(&db, "course-note-author").await;
         let course = crate::db::course::create(
             &db,
             &creator,

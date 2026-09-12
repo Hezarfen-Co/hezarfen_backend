@@ -10,7 +10,7 @@
 //! [`crate::service::appointment_slot`] remain for their precise refusal
 //! texts; the constraint is the authority a racing publish answers to.
 
-use crate::database::{Database, tx_with_retry, unique_violation};
+use crate::database::{Database, exclusion_violation, tx_with_retry, unique_violation};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotNote, SlotSeries};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -96,7 +96,12 @@ pub async fn insert_claimed(
                 Ok(row) => saved.push(row),
                 // A teacher cannot publish two overlapping windows: the
                 // exclusion constraint, answering the caller's overlap 409.
-                Err(err) if unique_violation(&err) == Some("appointment_slot_teacher_span") => {
+                // An EXCLUDE constraint answers 23P01 (exclusion), not the
+                // 23505 a UNIQUE would — the overlap 409 rides this code.
+                Err(err)
+                    if unique_violation(&err) == Some("appointment_slot_teacher_span")
+                        || exclusion_violation(&err) == Some("appointment_slot_teacher_span") =>
+                {
                     return Err(overlap_refusal.take().unwrap_or_else(|| {
                         AppError::Internal("overlap refusal re-raised".into())
                     }));

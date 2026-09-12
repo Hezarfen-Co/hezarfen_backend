@@ -300,7 +300,7 @@ mod tests {
              VALUES ($1, $2, 'x', 'teacher')",
         )
         .bind(user.uuid())
-        .bind(format!("{label}-{}", &user.key()[..8]))
+        .bind(format!("{label}-{}", &user.key()[30..]))
         .execute(db)
         .await
         .unwrap();
@@ -394,8 +394,9 @@ mod tests {
                 Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
             );
             // Test-side copy of the sweep predicate in `service::user::set_role`
-            // (src/db/user.rs): frozen == the demotion sweep would leave the row.
-            let sql = !sqlx::query_scalar::<_, bool>(
+            // (src/db/user.rs): true == frozen, i.e. the demotion sweep would
+            // leave the signup rows exactly as they stand.
+            let sql = sqlx::query_scalar::<_, bool>(
                 "SELECT audience_kind = 'registration' \
                  AND COALESCE(starts_at, ends_at) IS NOT NULL \
                  AND COALESCE(starts_at, ends_at) <= $2 \

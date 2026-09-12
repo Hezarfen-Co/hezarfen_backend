@@ -312,7 +312,7 @@ mod tests {
         let user = UserId::generate();
         sqlx::query("INSERT INTO app_user (id, username, password_hash, role) VALUES ($1, $2, 'x', 'student')")
             .bind(user.uuid())
-            .bind(format!("s-{}", &user.key()[..8]))
+            .bind(format!("s-{}", &user.key()[30..]))
             .execute(db)
             .await
             .unwrap();
@@ -324,7 +324,7 @@ mod tests {
         let user = UserId::generate();
         sqlx::query("INSERT INTO app_user (id, username, password_hash, role) VALUES ($1, $2, 'x', 'teacher')")
             .bind(user.uuid())
-            .bind(format!("t-{}", &user.key()[..8]))
+            .bind(format!("t-{}", &user.key()[30..]))
             .execute(db)
             .await
             .unwrap();
@@ -343,6 +343,8 @@ mod tests {
     /// The counter as *stored* — the only witness that the seat and the row
     /// moved together, since every other read counts the rows themselves.
     async fn stored_count(submission: &HomeworkSubmissionId, db: &Database) -> i64 {
+        use sqlx::Row as _;
+
         sqlx::query("SELECT file_count FROM homework_submission WHERE id = $1")
             .bind(submission.uuid())
             .fetch_one(db)
@@ -458,7 +460,7 @@ mod tests {
             &user,
             HomeworkStatus::try_new("done").unwrap(),
             None,
-            &UserId::from_key("019732e3-7b00-7000-8000-00000000acdc"),
+            &a_teacher(&db).await,
         )
         .await
         .unwrap();

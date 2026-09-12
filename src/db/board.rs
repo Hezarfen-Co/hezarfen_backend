@@ -332,7 +332,8 @@ mod tests {
     #[tokio::test]
     async fn field_scoped_writes_return_the_row_and_a_gone_board_refuses() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator = UserId::generate();
+        let creator =
+            crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
         let board = create(
             &db,
             &creator,
@@ -363,7 +364,8 @@ mod tests {
     #[tokio::test]
     async fn the_cap_refuses_and_delete_releases_the_seat() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator = UserId::generate();
+        let creator =
+            crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
         for index in 0..MAX_BOARDS_PER_CREATOR {
             create(
                 &db,

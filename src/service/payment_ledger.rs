@@ -330,8 +330,11 @@ mod tests {
         use crate::db::fee_plan;
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let manager =
+            crate::db::class_member::tests::fixture_user(db, "ledger-manager")
+                .await;
+        let student =
+            crate::db::class_member::tests::fixture_user(db, "ledger-student").await;
         let plan = fee_plan::create(
             db,
             FeePlanName::try_new("Yearly").unwrap(),
@@ -402,7 +405,7 @@ mod tests {
             student: charge.student.clone(),
             kind: PaymentLedgerKind::Credit,
             amount_minor: LedgerAmount::try_new(1).unwrap(),
-            source: Some(charge.id.record()),
+            source: Some(charge.id.key().to_owned()),
             due_at: None,
             method: None,
             note: None,
@@ -441,7 +444,10 @@ mod tests {
         let credit_line = pay(100).await.unwrap();
         // Still fully paid: a second payment has no room.
         assert!(
-            matches!(pay(100).await, Err(AppError::Conflict(_))),
+            matches!(
+                pay(100).await,
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+            ),
             "a charge paid in full may not be paid twice"
         );
 
@@ -468,7 +474,10 @@ mod tests {
         assert_eq!(balance_of(&db, &student).await.unwrap(), 0);
 
         // And the room is gone again, so the cap still bites after all that.
-        assert!(matches!(pay(1).await, Err(AppError::Conflict(_))));
+        assert!(matches!(
+            pay(1).await,
+            Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+        ));
     }
 
     /// The other half of the fold: reversing a refund un-does the money going
@@ -513,7 +522,7 @@ mod tests {
                     &manager
                 )
                 .await,
-                Err(AppError::Conflict(_))
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
             ),
             "the refund was undone, so the charge is paid in full again"
         );
@@ -529,8 +538,11 @@ mod tests {
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
         let (db, _leases) = crate::database::init_test_db().await;
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let manager =
+            crate::db::class_member::tests::fixture_user(&db, "ledger-manager")
+                .await;
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "ledger-student").await;
         let plan = fee_plan::create(
             &db,
             FeePlanName::try_new("Yearly").unwrap(),
@@ -564,7 +576,10 @@ mod tests {
         };
         let first = paid(6_000).await.unwrap();
         assert!(
-            matches!(paid(5_000).await, Err(AppError::Conflict(_))),
+            matches!(
+                paid(5_000).await,
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+            ),
             "6 000 + 5 000 overshoots a 10 000 charge"
         );
         paid(4_000).await.expect("the exact remainder is allowed");
@@ -584,7 +599,7 @@ mod tests {
         };
         assert!(matches!(
             refund_amount(6_001).await,
-            Err(AppError::Conflict(_))
+            Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
         ));
         refund_amount(6_000).await.unwrap();
         assert_eq!(

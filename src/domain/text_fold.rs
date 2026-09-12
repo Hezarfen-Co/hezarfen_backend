@@ -100,8 +100,12 @@ mod tests {
             "one replace() per rule"
         );
         // The base is PostgreSQL's locale-invariant lower(), applied before
-        // any letter folding, over the exact column named.
-        assert!(sql.starts_with(&format!("lower({})", "name")));
+        // any letter folding, over the exact column named — every rule wraps
+        // a `replace()` around it, so the base sits innermost.
+        assert!(
+            sql.contains(&format!("lower({})", "name")),
+            "the fold must be lower() of the column, wrapped in replaces: {sql}"
+        );
     }
 
     /// The expression folds a sample exactly like the Rust side does: same
@@ -118,7 +122,7 @@ mod tests {
                     && sql.contains(&format!("'{from}', '{to}'")),
                 "rule {from} -> {to} missing from the emitted expression"
             );
-            assert_eq!(search_fold(&from.to_string()), to);
+            assert_eq!(search_fold(&from.to_string()), *to);
         }
     }
 

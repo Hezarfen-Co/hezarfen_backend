@@ -267,8 +267,8 @@ mod tests {
     #[tokio::test]
     async fn inbox_is_newest_first_within_a_millisecond() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let sender = UserId::from_key("a");
-        let recipient = UserId::from_key("b");
+        let sender = crate::db::class_member::tests::fixture_user(&db, "gonderen").await;
+        let recipient = crate::db::class_member::tests::fixture_user(&db, "alici").await;
         let mut sent = Vec::new();
         for i in 0..25 {
             let message = send(

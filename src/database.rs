@@ -200,6 +200,19 @@ async fn migrator(set: &str) -> Result<Migrator, AppError> {
 /// newly minted school at create — then sweep the chatbot turns the previous
 /// process owed an answer. Idempotent: an already-migrated database runs only
 /// the sweep.
+/// Apply the control schema (schools, builders, the shared rate-limit
+/// window) to a control database. Idempotent: an already-migrated database
+/// runs nothing. The boot path folds this into [`boot_control`]; suites that
+/// re-boot an existing control database call it directly.
+pub async fn migrate_control(pool: &PgPool) -> Result<(), AppError> {
+    migrator("control")
+        .await?
+        .run(pool)
+        .await
+        .map_err(|err| AppError::from(sqlx::Error::from(err)))?;
+    Ok(())
+}
+
 pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     migrator("school")
         .await?
@@ -270,6 +283,18 @@ pub(crate) fn is_duplicate_database(err: &sqlx::Error) -> bool {
 pub fn unique_violation(err: &sqlx::Error) -> Option<&str> {
     let db = err.as_database_error()?;
     if db.code().as_deref() == Some("23505") {
+        db.constraint()
+    } else {
+        None
+    }
+}
+
+/// The violated `EXCLUDE` constraint's name, when `err` is an exclusion
+/// violation (`23P01`) — the SQLSTATE an exclusion constraint raises, as
+/// distinct from a plain `UNIQUE` (`23505`).
+pub fn exclusion_violation(err: &sqlx::Error) -> Option<&str> {
+    let db = err.as_database_error()?;
+    if db.code().as_deref() == Some("23P01") {
         db.constraint()
     } else {
         None

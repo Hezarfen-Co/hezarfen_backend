@@ -409,10 +409,25 @@ mod tests {
             None,
             due_at,
             None,
-            &UserId::from_key("teacher"),
+            &a_teacher(db).await,
         )
         .await
         .unwrap()
+    }
+
+    /// A real `app_user` teacher row: graders are foreign keys too.
+    async fn a_teacher(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(user.uuid())
+        .bind(format!("t-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
     }
 
     /// A deadline no test run can reach, so a submission is unambiguously on
@@ -548,7 +563,7 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
-        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+        let teacher = a_teacher(&db).await;
         let graded = |value| {
             let text = SubmissionText::try_new(value).unwrap();
             upsert(&db, &homework, &user, Some(text), false)

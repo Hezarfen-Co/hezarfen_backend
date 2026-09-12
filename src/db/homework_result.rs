@@ -321,7 +321,7 @@ mod tests {
             None,
             Timestamp::from_millis(1),
             None,
-            &UserId::from_key("teacher"),
+            &a_teacher(db).await,
         )
         .await
         .unwrap()
@@ -329,12 +329,42 @@ mod tests {
         .clone()
     }
 
+    /// A real `app_user` teacher row: graders are foreign keys too.
+    async fn a_teacher(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(user.uuid())
+        .bind(format!("t-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
+    /// A real `app_user` student row: graded users are foreign keys too.
+    async fn a_student(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'student')",
+        )
+        .bind(user.uuid())
+        .bind(format!("s-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     #[tokio::test]
     async fn grade_upserts_one_row_per_pair_and_remove_unfreezes() {
         let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
-        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+        let user = a_student(&db).await;
+        let teacher = a_teacher(&db).await;
 
         let first = grade(
             &db,
@@ -374,25 +404,8 @@ mod tests {
     async fn a_first_grade_credits_the_grader_and_a_regrade_does_not() {
         let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
-        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
-        // `UPDATE` writes nothing to a user row that does not exist.
-        sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(teacher.uuid())
-        .execute(&db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 'ali', 'x', 'student') ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user.uuid())
-        .execute(&db)
-        .await
-        .unwrap();
+        let user = a_student(&db).await;
+        let teacher = a_teacher(&db).await;
 
         for status in ["incomplete", "done"] {
             grade(
@@ -421,24 +434,8 @@ mod tests {
     async fn ungrading_gives_the_grader_credit_back() {
         let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(&db).await;
-        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000aaaa");
-        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
-        sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(teacher.uuid())
-        .execute(&db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 'ali', 'x', 'student') ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(user.uuid())
-        .execute(&db)
-        .await
-        .unwrap();
+        let user = a_student(&db).await;
+        let teacher = a_teacher(&db).await;
 
         for _ in 0..3 {
             grade(
@@ -465,6 +462,8 @@ mod tests {
     }
     /// The grader's badge counter, re-read out of the store.
     async fn marks_given(user: &UserId, db: &Database) -> i64 {
+        use sqlx::Row as _;
+
         sqlx::query("SELECT marks_given_total FROM app_user WHERE id = $1")
             .bind(user.uuid())
             .fetch_one(db)

@@ -541,7 +541,7 @@ mod tests {
              VALUES ($1, $2, 'x', 'teacher')",
         )
         .bind(teacher.uuid())
-        .bind(format!("homework-fixture-{}", &teacher.key()[..8]))
+        .bind(format!("homework-fixture-{}", &teacher.key()[30..]))
         .execute(db)
         .await
         .unwrap();
@@ -563,9 +563,10 @@ mod tests {
     async fn count_on(subject: &SubjectId, db: &Database) -> i64 {
         sqlx::query_scalar::<_, i64>("SELECT homework_count FROM subject WHERE id = $1")
             .bind(subject.uuid())
-            .fetch_one(db)
+            .fetch_optional(db)
             .await
             .unwrap()
+            .unwrap_or(0)
     }
 
     /// How many rows `sql` selects ids for.

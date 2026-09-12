@@ -184,7 +184,8 @@ mod tests {
     async fn a_hand_placed_row_survives_the_detach() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student = UserId::from_key("student");
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         crate::db::enrollment::enroll(&db, &algebra, &student, &manager)
@@ -222,7 +223,8 @@ mod tests {
     async fn a_detach_sweeps_the_rows_it_pumped() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student = UserId::from_key("student");
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         class_member::add(&db, &class, &student, &manager)
@@ -251,7 +253,8 @@ mod tests {
     async fn a_detach_hands_a_shared_row_to_the_class_that_still_claims_it() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student = UserId::from_key("student");
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "student").await;
         let algebra = a_course("algebra", None, &db).await;
         let first = a_class("9-A", &db).await;
         let second = a_class("club", &db).await;
@@ -299,7 +302,8 @@ mod tests {
     async fn a_member_removal_hands_a_shared_row_over_too() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student = UserId::from_key("student");
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "student").await;
         let algebra = a_course("algebra", None, &db).await;
         let first = a_class("9-A", &db).await;
         let second = a_class("club", &db).await;
@@ -333,20 +337,25 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
-        let absent = "SELECT VALUE id FROM course WHERE enrollment_count = NONE";
+        // The course's own counter: fresh means 0 (the Postgres column is
+        // NOT NULL DEFAULT 0), and the claim's bump must be restored, not
+        // left dangling at 1 with an empty roster behind it.
+        let count = || {
+            sqlx::query_scalar::<_, i64>("SELECT enrollment_count FROM course WHERE id = $1")
+                .bind(algebra.uuid())
+        };
         assert_eq!(
-            rows(absent, &db).await,
-            1,
+            count().fetch_one(&db).await.unwrap(),
+            0,
             "a fresh course carries no count"
         );
 
-        attach(&db, &class, &algebra, &UserId::from_key("manager"))
-            .await
-            .unwrap();
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        attach(&db, &class, &algebra, &manager).await.unwrap();
         assert_eq!(
-            rows(absent, &db).await,
-            1,
-            "the claim's bump must be restored to absent, not to 0"
+            count().fetch_one(&db).await.unwrap(),
+            0,
+            "the claim's bump must be restored, not left dangling"
         );
     }
 

@@ -620,8 +620,10 @@ mod tests {
             school_db_name(control, &slug("ata-koleji")),
             "hezarfen_control_school_ata_koleji"
         );
-        for a in ["a", "a-b", "ab", "a1b", "1a", "x-y-z"] {
-            for b in ["a", "a-b", "ab", "a1b", "1a", "x-y-z"] {
+        // Slugs are at least two characters, so the shortest pair stands in
+        // for the old single-letter probe.
+        for a in ["ab", "a-b", "abc", "a1b", "1a", "x-y-z"] {
+            for b in ["ab", "a-b", "abc", "a1b", "1a", "x-y-z"] {
                 if a != b {
                     assert_ne!(
                         school_db_name(control, &slug(a)),

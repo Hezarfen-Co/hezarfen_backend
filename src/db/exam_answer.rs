@@ -328,25 +328,60 @@ mod tests {
         .await
         .unwrap();
         let stored = async |db: &Database| -> Option<i64> {
-            sqlx::query_scalar::<_, i64>("SELECT result_count FROM exam WHERE id = $1")
+            sqlx::query_scalar::<_, Option<i64>>("SELECT result_count FROM exam WHERE id = $1")
                 .bind(exam.get_id().uuid())
                 .fetch_optional(db)
                 .await
                 .unwrap()
                 .flatten()
         };
-        let question = choice_question(exam.get_id(), 10, 1);
+        // The question is a foreign key: a real row, so the choice ids the
+        // answer names exist in the store too.
+        let spec = QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(
+                ["a", "b", "c"]
+                    .iter()
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
+                    .collect(),
+            ),
+            Some("b".into()),
+            &[],
+        )
+        .unwrap();
+        let subject = crate::db::subject::create(
+            &db,
+            &crate::db::course::a_test_course(&db).await,
+            crate::domain::subject::SubjectName::try_new("sorular").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        let question = crate::db::exam_question::create(
+            &db,
+            exam.get_id(),
+            subject.get_id().clone(),
+            crate::domain::exam_question::QuestionText::try_new("pick one").unwrap(),
+            crate::domain::exam_question::QuestionPoints::try_new(10).unwrap(),
+            spec,
+        )
+        .await
+        .unwrap();
         let pick = choice_id(&question, 1).as_str().to_string();
 
-        // A fresh exam carries no counter at all, and must still not after a save.
-        assert_eq!(stored(&db).await, None, "the fixture must start absent");
+        // A fresh exam's counter is zero (the column is NOT NULL DEFAULT 0),
+        // and a save must still not move it.
+        assert_eq!(stored(&db).await, Some(0), "the fixture starts at zero");
         save(&db, &question, &student(), 1, Some(pick.clone()), None)
             .await
             .unwrap();
         assert_eq!(
             stored(&db).await,
-            None,
-            "the touch left the counter set — the backfill keys on NONE"
+            Some(0),
+            "the touch left the counter alone"
         );
 
         // …and a counter that marks have moved is put back at its own value.

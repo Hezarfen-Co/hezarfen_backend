@@ -235,14 +235,6 @@ pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, App
 /// The name still referenced (`count > 0`) is the caller's removal refusal,
 /// byte for byte the old 409.
 async fn retire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
-    let was = sqlx::query!(
-        r#"SELECT retired AS "retired!: bool" FROM kind_ref WHERE name = $1 FOR UPDATE"#,
-        name
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .map(|row| row.retired)
-    .unwrap_or(false);
     let landed = sqlx::query!(
         r#"INSERT INTO kind_ref (name, count, retired) VALUES ($1, 0, TRUE)
            ON CONFLICT (name) DO UPDATE SET retired = TRUE
@@ -253,27 +245,39 @@ async fn retire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
     .fetch_optional(&mut *tx)
     .await?
     .is_some();
-    match (landed, was) {
-        // Still in use, and not already retired: the removal is refused.
-        (false, false) => Err(AppError::ConflictOwned(format!(
-            "exams of kind '{name}' are already graded — the kind cannot be removed"
-        ))),
-        // Flipped, or already retired by the rival that decided the same
-        // removal: nothing to do — the transaction decides whether it stands.
-        _ => Ok(()),
+    if landed {
+        // Flipped by this call: nothing to do — the transaction decides
+        // whether the retirement stands.
+        return Ok(());
     }
+    // The upsert's `WHERE` refused the flip. Under READ COMMITTED the row it
+    // conflicted with may have committed *after* this transaction's first
+    // snapshot, so the settled state is read here rather than carried over:
+    // still in use (`count > 0`) is the removal refusal, byte for byte the
+    // old 409; already retired (with nothing referencing it) is a rival
+    // having decided the same removal — success, same as a fresh flip.
+    let row = sqlx::query!(
+        r#"SELECT count AS "count!: i64", retired AS "retired!: bool"
+           FROM kind_ref WHERE name = $1 FOR UPDATE"#,
+        name
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if row.count > 0 {
+        return Err(AppError::ConflictOwned(format!(
+            "exams of kind '{name}' are already graded — the kind cannot be removed"
+        )));
+    }
+    let _ = row.retired;
+    Ok(())
 }
 
 /// [`retire_kind`] against the meal-slot counters.
 async fn retire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppError> {
-    let was = sqlx::query!(
-        r#"SELECT retired AS "retired!: bool" FROM slot_ref WHERE name = $1 FOR UPDATE"#,
-        name
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .map(|row| row.retired)
-    .unwrap_or(false);
+    // Same shape as [`retire_kind`]: the settled row is read *after* the
+    // refused flip, never carried over from this transaction's first
+    // snapshot — a rival's retirement may have committed in between, and
+    // that is success, not a refusal.
     let landed = sqlx::query!(
         r#"INSERT INTO slot_ref (name, count, retired) VALUES ($1, 0, TRUE)
            ON CONFLICT (name) DO UPDATE SET retired = TRUE
@@ -284,12 +288,21 @@ async fn retire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
     .fetch_optional(&mut *tx)
     .await?
     .is_some();
-    match (landed, was) {
-        (false, false) => Err(AppError::ConflictOwned(format!(
-            "menus are already published for the '{name}' slot — it cannot be removed"
-        ))),
-        _ => Ok(()),
+    if landed {
+        return Ok(());
     }
+    let row = sqlx::query!(
+        r#"SELECT count AS "count!: i64" FROM slot_ref WHERE name = $1 FOR UPDATE"#,
+        name
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if row.count > 0 {
+        return Err(AppError::ConflictOwned(format!(
+            "menus are already published for the '{name}' slot — it cannot be removed"
+        )));
+    }
+    Ok(())
 }
 
 /// Put an exam kind back in service, inside the caller's transaction. One
@@ -357,9 +370,11 @@ mod tests {
     /// The `retired` bit as the store holds it, `None` when no counter row was
     /// ever written — read back, never inferred from a return value.
     async fn ref_bit(db: &Database, table: &str, name: &str) -> Option<bool> {
-        let row = sqlx::query(&format!(
+        use sqlx::Row as _;
+
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT retired FROM {table} WHERE name = $1"
-        ))
+        )))
         .bind(name)
         .fetch_optional(db)
         .await
@@ -600,8 +615,12 @@ mod tests {
             async move { apply(&db, &without).await.map(|_| ()) }
         });
         while !rival.is_finished() {
-            let (kinds, _) = stored(&db).await;
+            // The bit is read BEFORE the list: a `true` bit proves the edit's
+            // commit already landed, so the list read that follows cannot
+            // predate it. The other order races the commit between the two
+            // probes and "sees" a split that never existed.
             let retired = kind_bit(&db, "midterm").await;
+            let (kinds, _) = stored(&db).await;
             if retired == Some(true) {
                 assert!(
                     !kinds.contains(&"midterm".to_string()),

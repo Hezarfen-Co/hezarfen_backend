@@ -382,11 +382,16 @@ mod tests {
     /// A published menu on a fresh in-memory database, plus a student. Dated
     /// well ahead on purpose: a menu whose day has passed refuses every
     /// booking, so a date the calendar overtakes would fail this whole module.
-    async fn menu(capacity: Option<i64>) -> (Database, MenuId) {
+    async fn menu(capacity: Option<i64>) -> (Database, MenuId, crate::database::TestDatabases) {
         menu_on("2099-09-14", capacity).await
     }
 
-    async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
+    // The lease rides with the pool: dropping it here would drop the database
+    // out from under the test that is about to run.
+    async fn menu_on(
+        date: &str,
+        capacity: Option<i64>,
+    ) -> (Database, MenuId, crate::database::TestDatabases) {
         let (db, _leases) = init_test_db().await;
         // The menu's creator is a foreign key now: a real `app_user` row.
         let creator = UserId::generate();
@@ -395,7 +400,7 @@ mod tests {
              VALUES ($1, $2, 'x', 'teacher')",
         )
         .bind(creator.uuid())
-        .bind(format!("menu-fixture-{}", &creator.key()[..8]))
+        .bind(format!("menu-fixture-{}", &creator.key()[30..]))
         .execute(&db)
         .await
         .unwrap();
@@ -409,7 +414,7 @@ mod tests {
         )
         .await
         .unwrap();
-        (db, menu.get_id().clone())
+        (db, menu.get_id().clone(), _leases)
     }
 
     /// The stored counter, absent reading as zero — the number the cap's
@@ -448,8 +453,8 @@ mod tests {
     /// driven by hand because no single-process interleaving can produce it.
     #[tokio::test]
     async fn a_seat_cannot_be_claimed_at_a_revision_the_menu_has_left() {
-        let (db, menu) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         let seen = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
         // A dish lands: the price a booking read a moment ago is now stale.
         add_dish(&menu, 1_000, &db).await;
@@ -501,7 +506,7 @@ mod tests {
     /// a revision no in-flight booking is still holding.
     #[tokio::test]
     async fn every_menu_write_that_moves_the_price_moves_the_revision() {
-        let (db, id) = menu(None).await;
+        let (db, id, _leases) = menu(None).await;
         let mut seen = 0;
         let mut moved = async |db: &Database| {
             let now = menu::read(db, &id).await.unwrap().unwrap().get_version();
@@ -545,8 +550,9 @@ mod tests {
     /// burning the new attempt's own reversal id for good.
     #[tokio::test]
     async fn a_cancel_cannot_release_an_attempt_it_never_read() {
-        let (db, menu) = menu(Some(1)).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(Some(1)).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
 
@@ -596,8 +602,8 @@ mod tests {
     /// the API.
     #[tokio::test]
     async fn the_seat_cannot_be_freed_without_its_refund() {
-        let (db, menu) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
         let booked = meal_booking::book(&db, &menu, &ali, &ali, &open)
@@ -634,8 +640,8 @@ mod tests {
     /// with the `(booking, attempt)` reversal id burnt for good.
     #[tokio::test]
     async fn the_seat_cannot_be_claimed_without_its_charge() {
-        let (db, menu) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         add_dish(&menu, 1_000, &db).await;
         let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
         let seen = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
@@ -683,8 +689,8 @@ mod tests {
     /// — the branch the reversal's conditional statement adds.
     #[tokio::test]
     async fn a_seat_that_was_never_billed_frees_without_a_line() {
-        let (db, menu) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         let booked = meal_booking::book(&db, &menu, &ali, &ali, &MealCutoff::default())
             .await
             .unwrap();

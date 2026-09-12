@@ -246,11 +246,53 @@ mod tests {
         .collect()
     }
 
+    /// A real question row on `exam`: images are FK children of their
+    /// question, so a minted id is refused outright.
+    async fn a_question(db: &Database, exam: &ExamId) -> ExamQuestionId {
+        use crate::domain::exam_question::{QuestionPoints, QuestionText};
+        use crate::domain::subject::{SubjectDescription, SubjectName};
+        let spec = QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(
+                ["a", "b", "c"]
+                    .iter()
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
+                    .collect(),
+            ),
+            Some("a".into()),
+            &[],
+        )
+        .unwrap();
+        let subject = crate::db::subject::create(
+            db,
+            &crate::db::course::a_test_course(db).await,
+            SubjectName::try_new("pictures").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::db::exam_question::create(
+            db,
+            exam,
+            subject.get_id().clone(),
+            QuestionText::try_new("pick one").unwrap(),
+            QuestionPoints::try_new(1).unwrap(),
+            spec,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
         let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
 
         let (first, retired) = upsert(&db, QuestionImage::new(&exam, &question, None, png(), 3))
@@ -295,7 +337,7 @@ mod tests {
     async fn only_the_dropped_options_lose_their_pictures() {
         let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
         upsert(&db, QuestionImage::new(&exam, &question, None, png(), 1))
             .await
@@ -337,7 +379,7 @@ mod tests {
     async fn an_empty_keep_set_clears_every_option_picture_but_not_the_illustration() {
         let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
         upsert(&db, QuestionImage::new(&exam, &question, None, png(), 1))
             .await
@@ -367,7 +409,7 @@ mod tests {
         let exam_b = exam_row(&db).await;
         upsert(
             &db,
-            QuestionImage::new(&exam_a, &ExamQuestionId::generate(), None, png(), 1),
+            QuestionImage::new(&exam_a, &a_question(&db, &exam_a).await, None, png(), 1),
         )
         .await
         .unwrap();

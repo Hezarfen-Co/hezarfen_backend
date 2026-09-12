@@ -130,7 +130,11 @@ pub async fn update(
 /// session-row lock makes a mark and this delete take turns — a mark
 /// committing after this cascade cannot name a session that is gone.
 pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSession, AppError> {
-    tx_with_retry(db, false, async move |tx| {
+    // Cascade mode: a roll-call row written *after* the sweep's snapshot (a
+    // mark racing the delete) still references the session when the session
+    // row goes, and that 23503 means "a racing writer is mid-flight" — the
+    // re-send sweeps the settled rows and succeeds.
+    tx_with_retry(db, true, async move |tx| {
         // Roll-call rows first: the session row's own FK would refuse the
         // delete while they exist. An empty first sweep is fine — the
         // session may simply have had none.
@@ -158,7 +162,6 @@ pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSessi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::COURSE_SESSION_TABLE;
 
     /// A lesson must not outlive the course it is a lesson of: an orphan 404s
     /// forever through `session_with_course` — unreadable, unpatchable,
@@ -181,7 +184,7 @@ mod tests {
                      VALUES ($1, $2, 'x', 'teacher')",
                 )
                 .bind(creator.uuid())
-                .bind(format!("session-race-{}", &creator.key()[..8]))
+                .bind(format!("session-race-{}", &creator.key()[30..]))
                 .execute(&db)
                 .await
                 .unwrap();
@@ -197,6 +200,6 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("session", make).await;
+        crate::db::course::assert_no_child_outlives_a_course_delete("course_session", make).await;
     }
 }
