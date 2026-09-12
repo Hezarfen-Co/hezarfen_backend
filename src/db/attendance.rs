@@ -1,41 +1,24 @@
-//! The `attendance` table: event roll call. Every write is a single
-//! transaction whose gates ride inside it (the event-existence proof), so
-//! the whole module is the persistence half; the workflow that decides it
-//! lives in [`crate::service::attendance`].
+//! The `attendance` table: event roll call. Every write is one guarded
+//! statement whose gates ride inside it, so the whole module is the
+//! persistence half; the workflow that decides it lives in
+//! [`crate::service::attendance`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::REGISTRATION_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, foreign_key_violation};
 use crate::db::page::PagedList;
-use crate::domain::attendance::{Attendance, AttendanceId, AttendanceStatus};
+use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::query_as;
 
-/// Record (or overwrite) `user`'s status for `event`. One row per (event,
-/// user), keyed by a deterministic composite id so this is a single atomic
-/// UPSERT — concurrent marks for the same pair can no longer both insert and
-/// collide on the unique index (a 500); they converge on the one row.
+/// Record (or overwrite) `user`'s status for `event`. The pair is the
+/// table's primary key, so this is a single atomic upsert — concurrent
+/// marks for the same pair converge on the one row instead of racing.
 ///
-/// The event's existence is proved *inside* the write, the twin of the gate
-/// in [`crate::db::session_attendance::mark`]: the handler's event read sits
-/// several round trips in front of this, so a bare upsert left a mark on an
-/// event [`crate::domain::event::Event`]'s cascade
-/// (`DELETE attendance WHERE event = $ev`) had already swept — counted
-/// forever in `GET /attendance/{user}` on an event no page shows. Reading
-/// the event here would not have closed it either: SurrealDB 3.2.3
-/// conflict-checks write sets, not read sets, so the proof has to *move* a
-/// value on the event row. It is the bump-and-restore of
-/// [`crate::domain::exam_answer::ExamAnswer::save`], on the counter the
-/// event already carries: matching nothing is the existence gate, writing
-/// the key the delete removes is the collision, and the restore is by
-/// captured value (`NONE` included) so no seat is spent or freed.
-///
-/// Admissible for [`transaction_with_retry`]: no statement can answer
-/// "already exists" — the `UPSERT`'s composite id is bijective with the
-/// `attendance_event_user` unique tuple, so it resolves onto the row it
-/// names instead of colliding with it.
+/// The event's existence is proved by the foreign key itself: a mark naming
+/// an event whose row is gone is refused `23503`, mapped to the same 404 the
+/// old existence-proof transaction produced. No bump-and-restore trick, no
+/// retry loop — one statement decides.
 pub async fn mark(
     db: &Database,
     event: &EventId,
@@ -43,52 +26,28 @@ pub async fn mark(
     status: AttendanceStatus,
     marked_by: &UserId,
 ) -> Result<Attendance, AppError> {
-    let attendance = Attendance {
-        id: AttendanceId::composite(event, user),
-        event: event.clone(),
-        user: user.clone(),
-        status,
-        marked_by: marked_by.clone(),
-    };
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was = (SELECT VALUE {REGISTRATION_COUNT_FIELD} FROM ONLY $ev);
-             LET $alive = (UPDATE $ev SET {REGISTRATION_COUNT_FIELD} =
-                 ({REGISTRATION_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($alive) = 0 {{ THROW 'event_missing' }};
-             UPDATE $ev SET {REGISTRATION_COUNT_FIELD} = $was;
-             LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
-             RETURN $after;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("ev".into(), event.record().into_value()),
-            ("id".into(), attendance.id.record().into_value()),
-            ("row".into(), attendance.into_value()),
-        ],
-        &["event_missing"],
+    match query_as!(
+        Attendance,
+        "INSERT INTO attendance (event, app_user, status, marked_by)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                  status, marked_by AS \"marked_by: UserId\"",
+        event.uuid(),
+        user.uuid(),
+        status.as_str(),
+        marked_by.uuid()
     )
-    .await?;
-    // An aborted transaction errors every slot and only the THROW's own
-    // slot names the marker.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("event_missing"))
+    .fetch_one(db)
+    .await
     {
-        return Err(AppError::NotFound);
+        Ok(row) => Ok(row),
+        // The event row is gone: exactly today's "no such event" refusal.
+        // (The other foreign keys name users the routes already authenticated;
+        // a violation there stays a database error, as before.)
+        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
     }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`.
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<Attendance>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to mark attendance".into()))
 }
 
 pub async fn list_for_event(
@@ -97,21 +56,33 @@ pub async fn list_for_event(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Attendance>, i64), AppError> {
-    PagedList::new("attendance WHERE event = $ev", "ORDER BY id DESC")
-        .bind("ev", event.record())
-        .run(limit, offset, db)
-        .await
+    // The composite key's text form ordered the old listing; on the natural
+    // key that order is (event, then user).
+    PagedList::new(
+        "attendance WHERE event = $1",
+        "ORDER BY event DESC, app_user DESC",
+    )
+    .bind(event.uuid())
+    .run(limit, offset, db)
+    .await
 }
 
 /// Every event-attendance row recorded for `user` — the events half of the
 /// attendance report.
 pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<Attendance>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM attendance WHERE user = $usr ORDER BY id DESC")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Attendance>>(0)?)
+    let rows = query_as!(
+        Attendance,
+        "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                status AS \"status: AttendanceStatus\", \
+                marked_by AS \"marked_by: UserId\" \
+         FROM attendance
+         WHERE app_user = $1
+         ORDER BY event DESC, app_user DESC",
+        user.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 pub async fn remove(
@@ -119,13 +90,18 @@ pub async fn remove(
     event: &EventId,
     user: &UserId,
 ) -> Result<Option<Attendance>, AppError> {
-    let mut result = db
-        .query("DELETE attendance WHERE event = $ev AND user = $usr RETURN BEFORE")
-        .bind(("ev", event.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Attendance>>(0)?.into_iter().next())
+    let gone = query_as!(
+        Attendance,
+        "DELETE FROM attendance WHERE event = $1 AND app_user = $2
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                  status AS \"status: AttendanceStatus\", \
+                  marked_by AS \"marked_by: UserId\"",
+        event.uuid(),
+        user.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(gone)
 }
 
 #[cfg(test)]

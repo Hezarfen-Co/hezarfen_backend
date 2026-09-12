@@ -15,10 +15,11 @@
 //! outrun. Two overlapping windows of one teacher cannot both be published:
 //! the `appointment_slot` span exclusion constraint refuses the second
 //! insert, which is what replaced the
-//! [`crate::service::appointment::APPOINTMENT_LOCK`]. The reads and writes
+//! the old process lock the appointment workflows used to hold. The reads and writes
 //! live in [`crate::db::appointment_slot`]; the publish and delete workflows
 //! in [`crate::service::appointment_slot`].
 
+use uuid::Uuid;
 use crate::constant::{
     MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
 };

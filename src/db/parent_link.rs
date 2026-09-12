@@ -1,12 +1,13 @@
-//! The `parent_link` table: the composite-id upsert, the existence probe,
+//! The `parent_link` table: the composite-PK upsert, the existence probe,
 //! the per-parent listing, and the delete. The *decisions* over these rows
 //! — who may be tied, and which reads a live link grants — live in
 //! [`crate::service::parent_link`].
 
 use crate::database::Database;
-use crate::domain::parent_link::{ParentLink, ParentLinkId};
+use crate::domain::parent_link::ParentLink;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::query_as;
 
 pub async fn link(
     db: &Database,
@@ -14,34 +15,53 @@ pub async fn link(
     student: &UserId,
     linked_by: &UserId,
 ) -> Result<ParentLink, AppError> {
-    let link = ParentLink {
-        id: ParentLinkId::composite(parent, student),
-        parent: parent.clone(),
-        student: student.clone(),
-        linked_by: linked_by.clone(),
-    };
-    let saved: Option<ParentLink> = db.upsert(link.id.record()).content(link).await?;
-    saved.ok_or_else(|| AppError::Internal("failed to link student to parent".into()))
+    // The pair is the primary key, so the upsert is one atomic statement —
+    // no find-then-insert race to lose, and a re-link restamps `linked_by`.
+    let link = query_as!(
+        ParentLink,
+        "INSERT INTO parent_link (parent, student, linked_by)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (parent, student) DO UPDATE SET linked_by = $3
+         RETURNING parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                  linked_by AS \"linked_by: UserId\"",
+        parent.uuid(),
+        student.uuid(),
+        linked_by.uuid()
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(link)
 }
 
 /// True iff a link row exists for the (parent, student) pair — the storage
 /// half of the grant. The live half (the student side still holding the
 /// role) is [`crate::service::parent_link::links_live`].
 pub async fn exists(db: &Database, parent: &UserId, student: &UserId) -> Result<bool, AppError> {
-    let found: Option<ParentLink> = db
-        .select(ParentLinkId::composite(parent, student).record())
-        .await?;
-    Ok(found.is_some())
+    let row = sqlx::query!(
+        "SELECT EXISTS(SELECT 1 FROM parent_link WHERE parent = $1 AND student = $2) AS present",
+        parent.uuid(),
+        student.uuid()
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.present)
 }
 
-/// Every student `parent` observes, newest link first.
+/// Every student `parent` observes. The composite key's text form ordered
+/// the old listing, which for one parent means the student ids — the same
+/// order on the natural key.
 pub async fn list_for_parent(db: &Database, parent: &UserId) -> Result<Vec<ParentLink>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM parent_link WHERE parent = $parent ORDER BY id DESC")
-        .bind(("parent", parent.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ParentLink>>(0)?)
+    let links = query_as!(
+        ParentLink,
+        "SELECT parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                linked_by AS \"linked_by: UserId\" \
+         FROM parent_link WHERE parent = $1
+         ORDER BY student DESC",
+        parent.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(links)
 }
 
 pub async fn remove(
@@ -49,11 +69,15 @@ pub async fn remove(
     parent: &UserId,
     student: &UserId,
 ) -> Result<Option<ParentLink>, AppError> {
-    let mut result = db
-        .query("DELETE parent_link WHERE parent = $parent AND student = $student RETURN BEFORE")
-        .bind(("parent", parent.record()))
-        .bind(("student", student.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ParentLink>>(0)?.into_iter().next())
+    let gone = query_as!(
+        ParentLink,
+        "DELETE FROM parent_link WHERE parent = $1 AND student = $2
+         RETURNING parent AS \"parent: UserId\", student AS \"student: UserId\", \
+                  linked_by AS \"linked_by: UserId\"",
+        parent.uuid(),
+        student.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(gone)
 }

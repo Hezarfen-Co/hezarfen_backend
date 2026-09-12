@@ -1,12 +1,14 @@
 //! Slot publishing and withdrawal: the one-off and weekly publishes, the
 //! single and series deletes, and the reads the web layer renders the
-//! calendar from. Row reads, listings, the overlap probes, the role-claimed
-//! INSERT, and the guarded delete live in [`crate::db::appointment_slot`].
+//! calendar from. Row reads, listings, the role-claimed INSERT, and the
+//! guarded delete live in [`crate::db::appointment_slot`].
 //!
-//! Publishing holds [`APPOINTMENT_LOCK`] from the conflict check through the
-//! write — the same lock the booking path takes — so a concurrent publish or
-//! booking cannot slip a colliding window in between the check and the
-//! insert.
+//! There is no lock anymore. Overlap — a colliding publish slipping in
+//! between a check and its write — is the `appointment_slot_teacher_span`
+//! exclusion constraint: the store refuses the second window, so a racing
+//! publish answers to the database, not to this process. The pre-insert
+//! reads below stay for their precise refusal texts; the constraint is the
+//! authority.
 
 use crate::database::Database;
 use crate::db::appointment_slot;
@@ -15,8 +17,6 @@ use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotNo
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-use super::appointment::APPOINTMENT_LOCK;
 
 /// The row, for callers that only inspect it — the web layer's gates read
 /// through here.
@@ -52,7 +52,9 @@ pub async fn list_for_series(
     appointment_slot::list_for_series(db, series).await
 }
 
-/// Publish one slot.
+/// Publish one slot. Overlap is the exclusion constraint's call: a window
+/// colliding with one the teacher already holds refuses the insert (23505)
+/// with the same 409 the pre-check used to answer.
 pub async fn create(
     db: &Database,
     teacher: &UserId,
@@ -61,14 +63,6 @@ pub async fn create(
     note: Option<SlotNote>,
 ) -> Result<AppointmentSlot, AppError> {
     AppointmentSlot::check_window(starts_at, ends_at)?;
-    // Check-then-insert under the lock so a concurrent publish or booking
-    // can't slip a colliding window in between.
-    let _guard = APPOINTMENT_LOCK.lock().await;
-    if appointment_slot::conflicts_existing(db, teacher, starts_at, ends_at).await? {
-        return Err(AppError::ConflictOwned(
-            "this time overlaps a slot you have already published".into(),
-        ));
-    }
     appointment_slot::insert_claimed(
         db,
         teacher,
@@ -81,6 +75,9 @@ pub async fn create(
             series: None,
             created_at: Timestamp::now(),
         }],
+        AppError::ConflictOwned(
+            "this time overlaps a slot you have already published".into(),
+        ),
     )
     .await?
     .into_iter()
@@ -102,11 +99,13 @@ pub async fn publish_weekly(
 ) -> Result<Vec<AppointmentSlot>, AppError> {
     let windows = AppointmentSlot::weekly_windows(starts_at, ends_at, until)?;
     // Validate the whole batch before writing a single row: all-or-nothing,
-    // so a mid-series collision never leaves stray weeks behind. Held under
-    // the lock from the check through the write, matching `create`.
-    let _guard = APPOINTMENT_LOCK.lock().await;
-    // (a) against the slots already in the database. `weekly_windows` walks
-    // forward, so the first and last occurrence bound every one of them.
+    // so a mid-series collision never leaves stray weeks behind.
+    //
+    // (a) against the slots already in the database — one envelope-wide
+    // read, so the first and last occurrence bound every one of them. The
+    // exclusion constraint would refuse a colliding insert anyway; this
+    // read is what keeps the refusal's *words* precise ("a repeated slot
+    // overlaps one you have already published") ahead of the write.
     let (first, last) = (windows[0], windows[windows.len() - 1]);
     let published = appointment_slot::windows_in_span(db, teacher, first.0, last.1).await?;
     for (i, &(w_start, w_end)) in windows.iter().enumerate() {
@@ -143,13 +142,20 @@ pub async fn publish_weekly(
             created_at: now,
         })
         .collect();
-    // One `INSERT`, therefore all-or-nothing: SurrealDB rolls the whole
-    // publish back on any error. The row-by-row loop this replaces did not
-    // — a database error at week 7 of 10 answered 500 with six stray weeks
-    // already published, a half-series nobody asked for. It is also a single
-    // round trip, so the lock is held for two queries whatever the
-    // occurrence count, instead of 1 + N (up to 52) sequential ones.
-    let mut created = appointment_slot::insert_claimed(db, teacher, rows).await?;
+    // One transaction, therefore all-or-nothing: the row-by-row loop this
+    // replaces did not — a database error at week 7 of 10 answered 500 with
+    // six stray weeks already published. A racing publish that slips past
+    // the read above answers to the exclusion constraint with the batch's
+    // own overlap refusal.
+    let mut created = appointment_slot::insert_claimed(
+        db,
+        teacher,
+        rows,
+        AppError::ConflictOwned(
+            "a repeated slot overlaps one you have already published".into(),
+        ),
+    )
+    .await?;
     if created.len() != windows.len() {
         return Err(AppError::Internal(format!(
             "published {} of {} appointment slots",
@@ -159,7 +165,7 @@ pub async fn publish_weekly(
     }
     // `INSERT` makes no promise about the order it echoes rows back in, and
     // the response is rendered as the published calendar.
-    created.sort_by_key(|slot| slot.starts_at.as_millis());
+    created.sort_by_key(|slot| slot.get_starts_at().as_millis());
     Ok(created)
 }
 
@@ -186,11 +192,10 @@ pub async fn delete_series(
     if slots.is_empty() {
         return Err(AppError::NotFound);
     }
-    let ids: Vec<AppointmentSlotId> = slots.iter().map(|slot| slot.id.clone()).collect();
+    let ids: Vec<AppointmentSlotId> = slots.iter().map(|slot| slot.get_id().clone()).collect();
     appointment_slot::delete_free(db, &ids).await?;
     Ok(slots)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

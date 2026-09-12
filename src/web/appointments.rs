@@ -179,7 +179,10 @@ impl AppointmentResponse {
         let window = slot.map(|slot| appointment.window(slot));
         Self {
             id: appointment.get_id().key().to_string(),
-            slot: appointment.get_slot().key().to_string(),
+            // A settled booking whose slot was withdrawn renders without a
+            // window and without a slot id — the dangling reference the old
+            // store permitted, now an explicit NULL.
+            slot: appointment.get_slot().map(|slot| slot.key()).unwrap_or_default(),
             teacher: slot.map(|slot| PersonRef::resolve(people, slot.get_teacher())),
             requester: PersonRef::resolve(people, appointment.get_requester()),
             status: appointment.get_status().as_str().to_string(),
@@ -216,7 +219,12 @@ async fn appointment_responses(
 ) -> Result<Vec<AppointmentResponse>, AppError> {
     let mut slots = Vec::with_capacity(rows.len());
     for row in rows {
-        slots.push(service::appointment_slot::read(db, row.get_slot()).await?);
+        let slot = match row.get_slot() {
+            Some(slot_id) => service::appointment_slot::read(db, slot_id).await?,
+            // A settled booking whose slot was withdrawn: no window.
+            None => None,
+        };
+        slots.push(slot);
     }
     // Collected eagerly rather than as a lazy iterator: a borrowing closure
     // held across the `person_map` await makes the handler's future
@@ -277,7 +285,8 @@ async fn for_decision(
     let appointment = service::appointment::read(db, id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let slot = service::appointment_slot::read(db, appointment.get_slot())
+    let slot_id = appointment.get_slot().ok_or(AppError::NotFound)?;
+    let slot = service::appointment_slot::read(db, slot_id)
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&slot, user) {

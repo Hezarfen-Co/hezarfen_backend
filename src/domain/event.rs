@@ -1,3 +1,4 @@
+use uuid::Uuid;
 use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
@@ -161,6 +162,32 @@ impl EventAudience {
             EventAudienceKind::Course => "course",
             EventAudienceKind::Class => "class",
             EventAudienceKind::Registration => "registration",
+        }
+    }
+}
+
+/// The five audience columns as one value — the write-side bundle. The row
+/// keeps them flat; every write spells them as a unit, so a kind and its
+/// payload always land together and only the payload matching `kind` is
+/// ever non-NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAudience {
+    pub kind: EventAudienceKind,
+    pub role: Option<Role>,
+    pub course: Option<CourseId>,
+    pub class: Option<ClassGroupId>,
+    pub capacity: Option<i64>,
+}
+
+impl EventAudience {
+    /// The audience of a row read back from the store.
+    pub fn of_row(event: &Event) -> Self {
+        Self {
+            kind: event.get_audience_kind(),
+            role: event.get_audience_role(),
+            course: event.get_audience_course().copied(),
+            class: event.get_audience_class().copied(),
+            capacity: event.get_audience_capacity(),
         }
     }
 }

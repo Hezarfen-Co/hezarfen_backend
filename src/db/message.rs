@@ -4,13 +4,14 @@
 //! [`crate::domain::message`].
 
 use crate::database::Database;
-use crate::db::page::PagedList;
+use crate::db::page::{PagedList, Param};
 use crate::domain::message::{
     Folder, Message, MessageBody, MessageId, MessageLabel, MessageSubject,
 };
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::query_as;
 
 pub async fn send(
     db: &Database,
@@ -20,30 +21,40 @@ pub async fn send(
     body: MessageBody,
     label: Option<MessageLabel>,
 ) -> Result<Message, AppError> {
-    let message = Message {
-        id: MessageId::generate(),
-        sender: sender.clone(),
-        recipient: recipient.clone(),
-        subject,
-        body,
-        label,
-        sent_at: Timestamp::now(),
-        read: false,
-        sender_folder: Folder::Sent,
-        recipient_folder: Folder::Inbox,
-        sender_origin: None,
-        recipient_origin: None,
-    };
-    let created: Option<Message> = db.create(message.id.record()).content(message).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create message".into()))
+    let message = query_as!(
+        Message,
+        "INSERT INTO message (id, sender, recipient, subject, body, label, sent_at, read, \
+                             sender_folder, recipient_folder, sender_origin, recipient_origin)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, false, 'sent', 'inbox', NULL, NULL)
+         RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+        MessageId::generate().uuid(),
+        sender.uuid(),
+        recipient.uuid(),
+        subject.as_str(),
+        body.as_str(),
+        label.map(|l| l.as_str().to_string()),
+        Timestamp::now().as_millis(),
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(message)
 }
 
 /// One folder view for `user`, newest first. `inbox` is recipient-side,
 /// `sent` is sender-side, and `archive`/`trash` are each the union of both
 /// sides' filed copies (either party may archive or trash their own copy).
 /// `read` narrows to that flag state (`false` on the inbox is the unread
-/// view; on `sent`, receipts pending) — the folder condition is
-/// parenthesized because `archive`'s and `trash`'s are ORs.
+/// view; on `sent`, receipts pending).
+///
+/// The folder predicates are the four closed shapes the domain's folder
+/// vocabulary admits, spelled as one `WHERE` each — the same shapes the old
+/// dynamic string assembled, minus the interpolation. They ride the
+/// [`PagedList`] builder (the paged-list exemption), so the page and its
+/// count always see the same predicate.
 pub async fn list_folder(
     db: &Database,
     user: &UserId,
@@ -52,32 +63,34 @@ pub async fn list_folder(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Message>, i64), AppError> {
-    let condition = match folder {
-        Folder::Sent => "sender = $usr AND sender_folder = 'sent'",
+    let home_arm = folder == Folder::Inbox;
+    let mut from = match folder {
+        Folder::Sent => "message WHERE sender = $1 AND sender_folder = 'sent'".to_string(),
         Folder::Archive => {
-            "(recipient = $usr AND recipient_folder = 'archive') \
-             OR (sender = $usr AND sender_folder = 'archive')"
+            "message WHERE (recipient = $1 AND recipient_folder = 'archive') \
+             OR (sender = $1 AND sender_folder = 'archive')"
+                .to_string()
         }
         Folder::Trash => {
-            "(recipient = $usr AND recipient_folder = 'trash') \
-             OR (sender = $usr AND sender_folder = 'trash')"
+            "message WHERE (recipient = $1 AND recipient_folder = 'trash') \
+             OR (sender = $1 AND sender_folder = 'trash')"
+                .to_string()
         }
-        _ => "recipient = $usr AND recipient_folder = $folder",
+        _ => "message WHERE recipient = $1 AND recipient_folder = $2".to_string(),
     };
-    let read_clause = if read.is_some() {
-        " AND read = $read"
-    } else {
-        ""
-    };
-    PagedList::new(
-        format!("message WHERE ({condition}){read_clause}"),
-        "ORDER BY id DESC",
-    )
-    .bind("usr", user.record())
-    .bind("folder", folder.as_str().to_string())
-    .bind("read", read.unwrap_or_default())
-    .run(limit, offset, db)
-    .await
+    // The `read` filter binds after whichever placeholders the folder shape
+    // spent (`$1` is always the user; the home-folder arm spends `$2`).
+    if read.is_some() {
+        from.push_str(&format!(" AND read = ${}", if home_arm { 3 } else { 2 }));
+    }
+    let mut builder = PagedList::new(from, "ORDER BY id DESC").bind(user);
+    if home_arm {
+        builder = builder.bind(folder.as_str().to_string());
+    }
+    if let Some(read) = read {
+        builder = builder.bind(Param::Bool(read));
+    }
+    builder.run(limit, offset, db).await
 }
 
 /// Read a message only if `user` is its sender or recipient and their
@@ -87,7 +100,18 @@ pub async fn read_for(
     id: &MessageId,
     user: &UserId,
 ) -> Result<Option<Message>, AppError> {
-    let message: Option<Message> = db.select(id.record()).await?;
+    let message = query_as!(
+        Message,
+        "SELECT id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                subject, body, label AS \"label: MessageLabel\", \
+                sent_at AS \"sent_at: Timestamp\", read, \
+                sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\" \
+         FROM message WHERE id = $1",
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
     Ok(message.filter(|message| {
         (&message.sender == user || &message.recipient == user)
             && message.folder_of(user) != Folder::Deleted
@@ -97,17 +121,20 @@ pub async fn read_for(
 /// Flip the recipient's read flag. Field-scoped write: the sender may be
 /// filing their side concurrently, and a whole-row save would clobber it.
 pub async fn set_read(db: &Database, message: Message, read: bool) -> Result<Message, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET read = $read RETURN AFTER")
-        .bind(("id", message.id.record()))
-        .bind(("read", read))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<Message>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let updated = query_as!(
+        Message,
+        "UPDATE message SET read = $1 WHERE id = $2 \
+         RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+        read,
+        message.get_id(),
+    )
+    .fetch_optional(db)
+    .await?;
+    updated.ok_or(AppError::NotFound)
 }
 
 /// File `user`'s side into `folder` (already validated against that
@@ -128,31 +155,47 @@ pub async fn move_to(
     folder: Folder,
 ) -> Result<Message, AppError> {
     let current = message.folder_of(user);
-    let (field, origin_field) = if message.is_sender(user) {
-        ("sender_folder", "sender_origin")
-    } else {
-        ("recipient_folder", "recipient_origin")
-    };
     let origin = match folder {
         _ if !folder.is_filed() => None,
         _ if current == folder => message.origin_of(user),
         _ if current.is_restore_target() => Some(current),
         _ => None,
     };
-    let mut result = db
-        .query(format!(
-            "UPDATE $id SET {field} = $folder, {origin_field} = $origin RETURN AFTER"
-        ))
-        .bind(("id", message.id.record()))
-        .bind(("folder", folder.as_str().to_string()))
-        .bind(("origin", origin.map(|origin| origin.as_str().to_string())))
+    let origin = origin.map(|origin| origin.as_str().to_string());
+    // One static statement per side: the field pair written is the caller's
+    // own, so the sender can never clobber the recipient's filing flags.
+    let updated = if message.is_sender(user) {
+        query_as!(
+            Message,
+            "UPDATE message SET sender_folder = $1, sender_origin = $2 WHERE id = $3 \
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            folder.as_str(),
+            origin,
+            message.get_id().uuid(),
+        )
+        .fetch_optional(db)
         .await?
-        .check()?;
-    result
-        .take::<Vec<Message>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    } else {
+        query_as!(
+            Message,
+            "UPDATE message SET recipient_folder = $1, recipient_origin = $2 WHERE id = $3 \
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            folder.as_str(),
+            origin,
+            message.get_id().uuid(),
+        )
+        .fetch_optional(db)
+        .await?
+    };
+    updated.ok_or(AppError::NotFound)
 }
 
 /// Permanently drop `user`'s side — only if that side currently sits in
@@ -162,28 +205,53 @@ pub async fn move_to(
 /// post-write row, so two concurrent deletes can't leak an all-deleted
 /// row.
 pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Result<(), AppError> {
-    let (field, origin_field) = if message.is_sender(user) {
-        ("sender_folder", "sender_origin")
-    } else {
-        ("recipient_folder", "recipient_origin")
-    };
-    let mut result = db
-        .query(format!(
-            "UPDATE $id SET {field} = $deleted, {origin_field} = NONE \
-             WHERE {field} = $trash RETURN AFTER"
-        ))
-        .bind(("id", message.id.record()))
-        .bind(("deleted", Folder::Deleted.as_str().to_string()))
-        .bind(("trash", Folder::Trash.as_str().to_string()))
+    let after = if message.is_sender(user) {
+        query_as!(
+            Message,
+            "UPDATE message SET sender_folder = 'deleted', sender_origin = NULL \
+             WHERE id = $1 AND sender_folder = 'trash' \
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            message.get_id().uuid(),
+        )
+        .fetch_optional(db)
         .await?
-        .check()?;
-    let Some(after) = result.take::<Vec<Message>>(0)?.into_iter().next() else {
+    } else {
+        query_as!(
+            Message,
+            "UPDATE message SET recipient_folder = 'deleted', recipient_origin = NULL \
+             WHERE id = $1 AND recipient_folder = 'trash' \
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            message.get_id().uuid(),
+        )
+        .fetch_optional(db)
+        .await?
+    };
+    let Some(after) = after else {
         return Err(AppError::Conflict(
             "only messages in the trash can be permanently deleted",
         ));
     };
     if after.sender_folder == Folder::Deleted && after.recipient_folder == Folder::Deleted {
-        let _: Option<Message> = db.delete(after.id.record()).await?;
+        query_as!(
+            Message,
+            "DELETE FROM message WHERE id = $1 \
+             RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
+                   subject, body, label AS \"label: MessageLabel\", \
+                   sent_at AS \"sent_at: Timestamp\", read, \
+                   sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
+                   sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+            after.get_id().uuid(),
+        )
+        .fetch_optional(db)
+        .await?;
     }
     Ok(())
 }
