@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET board_count = GREATEST(board_count - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8f7488327a6a753a5fb7bc91dfbb45b2962663a1dac37246656f6c3795692d4b"
+}

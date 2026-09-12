@@ -1,0 +1,172 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id AS \"id: AppointmentId\", a.slot AS \"slot: AppointmentSlotId\", a.requester AS \"requester: UserId\", a.status AS \"status: AppointmentStatus\", a.reason AS \"reason: AppointmentReason\", a.proposed_starts_at AS \"proposed_starts_at: Timestamp\", a.proposed_ends_at AS \"proposed_ends_at: Timestamp\", a.proposed_by AS \"proposed_by: UserId\", a.decided_by AS \"decided_by: UserId\", a.cancelled_by AS \"cancelled_by: UserId\", a.cancel_reason AS \"cancel_reason: AppointmentReason\", a.reject_reason AS \"reject_reason: AppointmentReason\", a.created_at AS \"created_at: Timestamp\" FROM appointment a JOIN appointment_slot s ON a.slot = s.id WHERE s.teacher = $1 ORDER BY a.id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AppointmentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot: AppointmentSlotId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "requester: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "requester"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: AppointmentStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "proposed_starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "proposed_ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "proposed_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "decided_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "decided_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "cancelled_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "cancelled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "cancel_reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "cancel_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "reject_reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "reject_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "251e102e71394bb03fbfa82e5dd64f8039dca4a04a6e626b64de6ce135defd1e"
+}

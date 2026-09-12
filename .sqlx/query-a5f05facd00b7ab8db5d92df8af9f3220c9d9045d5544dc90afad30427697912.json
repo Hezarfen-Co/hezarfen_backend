@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT mark AS \"mark: Mark\" FROM exam_result\n               WHERE exam = $1 AND app_user = $2 AND seq = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mark: Mark",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "mark"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a5f05facd00b7ab8db5d92df8af9f3220c9d9045d5544dc90afad30427697912"
+}

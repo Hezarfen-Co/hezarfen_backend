@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET chatbot_thread_count = GREATEST(chatbot_thread_count - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c6b667c58afdae0c982d3f3027a8bb996318b1518870c052bf65d35a4d37f596"
+}

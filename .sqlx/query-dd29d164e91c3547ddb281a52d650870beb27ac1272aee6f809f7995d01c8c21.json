@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT epoch_stroke_count AS \"epoch_count: i64\",\n                  total_stroke_count AS \"total_count: i64\"\n           FROM board WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch_count: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "epoch_stroke_count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "total_count: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "total_stroke_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "dd29d164e91c3547ddb281a52d650870beb27ac1272aee6f809f7995d01c8c21"
+}

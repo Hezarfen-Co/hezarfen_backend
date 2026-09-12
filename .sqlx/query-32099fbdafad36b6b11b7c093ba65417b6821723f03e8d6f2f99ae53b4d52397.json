@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM registration r\n                   WHERE r.app_user = $1\n                     AND NOT EXISTS (SELECT 1 FROM event e WHERE e.id = r.event)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "32099fbdafad36b6b11b7c093ba65417b6821723f03e8d6f2f99ae53b4d52397"
+}

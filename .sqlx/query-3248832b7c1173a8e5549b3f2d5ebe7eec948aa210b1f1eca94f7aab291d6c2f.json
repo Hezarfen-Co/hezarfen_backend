@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO bank_question_image\n                   (bank_question, slot, file, content_type, size)\n               VALUES ($1, $2, $3, $4, $5)\n               ON CONFLICT (bank_question, slot) DO UPDATE\n               SET file = $3, content_type = $4, size = $5\n               RETURNING bank_question AS \"bank_question: BankQuestionId\",\n                   slot AS \"slot: ChoiceId\", file,\n                   content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_question: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "bank_question"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3248832b7c1173a8e5549b3f2d5ebe7eec948aa210b1f1eca94f7aab291d6c2f"
+}

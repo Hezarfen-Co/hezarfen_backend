@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT app_user AS \"user: UserId\" FROM homework_submission WHERE homework = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_submission",
+            "name": "app_user"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2379e1760d12f9a30c2d45ffbb0972a5982be1a7b94a5b78cb613566f13a3c7b"
+}

@@ -1,0 +1,114 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"\n         FROM meal_booking WHERE student = ANY($1::uuid[])\n         ORDER BY created_at DESC, menu DESC\n         LIMIT $2 OFFSET $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "menu: MenuId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "menu"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "booked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "booked_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: MealBookingStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "attempt",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "price_minor: LedgerAmount",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "price_minor"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "cancelled_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "cancelled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "2a9b5ca2602259c0575a32019a00f221f2841aa9be02f2cd443b9a90b62272b9"
+}

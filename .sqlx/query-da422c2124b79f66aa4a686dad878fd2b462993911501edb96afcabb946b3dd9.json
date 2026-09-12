@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS held FROM meal_booking\n             WHERE menu = $1 AND student = $2 AND status = 'booked'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "held",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "da422c2124b79f66aa4a686dad878fd2b462993911501edb96afcabb946b3dd9"
+}

@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind AS \"kind!: PaymentLedgerKind\", COALESCE(sum(amount_minor), 0)::bigint AS \"total!: i64\", count(*)::bigint AS \"lines!: i64\" FROM payment_ledger WHERE student = $1 GROUP BY kind",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind!: PaymentLedgerKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "total!: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "lines!: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "622f7056862f7fabc8e9877eac0e54808a774922c6babbf92ffa1f9bf1e21deb"
+}

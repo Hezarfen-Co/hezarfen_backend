@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM course_note_file WHERE course_note IN (\n                 SELECT id FROM course_note WHERE course = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "021c574552b42b634f9d873b64c801474c2db1fbd3afac41ecbc3a16e6d9d5ad"
+}

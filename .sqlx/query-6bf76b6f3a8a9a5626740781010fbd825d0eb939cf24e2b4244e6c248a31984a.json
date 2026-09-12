@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT draft AS \"draft: bool\" FROM exam WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft: bool",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "draft"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6bf76b6f3a8a9a5626740781010fbd825d0eb939cf24e2b4244e6c248a31984a"
+}

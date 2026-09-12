@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE note SET file_count = GREATEST(file_count - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4c0ab8e1c8549939d11a8246026900f447aa8906f4ba8d0c9f6a5b618a5dbb45"
+}

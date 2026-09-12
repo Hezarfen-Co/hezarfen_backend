@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT bank_question AS \"bank_question: BankQuestionId\",\n               slot AS \"slot: ChoiceId\", file,\n               content_type AS \"content_type: FileContentType\", size\n           FROM bank_question_image\n           WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_question: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "bank_question"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "20efe131f739cfbfec681bdc68907a8ee40ab8efaec0477265a89c8ed9808efa"
+}

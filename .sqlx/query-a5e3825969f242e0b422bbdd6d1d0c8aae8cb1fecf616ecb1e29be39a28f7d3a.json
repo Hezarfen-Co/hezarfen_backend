@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat,\n                          EXISTS(SELECT 1 FROM exam_result WHERE exam = $1) AS graded",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sat",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "graded",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a5e3825969f242e0b422bbdd6d1d0c8aae8cb1fecf616ecb1e29be39a28f7d3a"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n                       DELETE FROM registration r\n                       USING event e\n                       WHERE r.event = e.id\n                         AND r.app_user = $1\n                         AND NOT (e.audience_kind = 'registration'\n                                  AND COALESCE(e.starts_at, e.ends_at) IS NOT NULL\n                                  AND COALESCE(e.starts_at, e.ends_at) <= $2)\n                       RETURNING r.event AS event_id\n                   )\n                   UPDATE event\n                   SET registration_count = GREATEST(registration_count - 1, 0)\n                   WHERE id IN (SELECT gone.event_id FROM gone)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fdc26f5a7d0aad315f93be051ddfaa464760ec85812237f373653f96b4e62a35"
+}

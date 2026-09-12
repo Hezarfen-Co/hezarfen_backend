@@ -1,0 +1,162 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE message SET recipient_folder = $1, recipient_origin = $2 WHERE id = $3 RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", sent_at AS \"sent_at: Timestamp\", read, sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: MessageId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "sender: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "sender"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "recipient: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "recipient"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "subject: MessageSubject",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "body: MessageBody",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "label: MessageLabel",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "label"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "sent_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "sent_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "read",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "read"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "sender_folder: Folder",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "sender_folder"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "recipient_folder: Folder",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "recipient_folder"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "sender_origin: Folder",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "sender_origin"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "recipient_origin: Folder",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "recipient_origin"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "c5f24fb1f8694273692ef20a5e0ffb28f43130483c0c58beaa8ca3ce65250633"
+}

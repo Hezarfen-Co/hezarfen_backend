@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n                       DELETE FROM enrollment WHERE app_user = $1 RETURNING course\n                   )\n                   UPDATE course\n                   SET enrollment_count = GREATEST(enrollment_count - 1, 0)\n                   WHERE id IN (SELECT gone.course FROM gone)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b2a05e29db69841f2a0d727e5b0f820722a33a939b88e40956092dbc20af9947"
+}

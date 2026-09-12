@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n               UPDATE note SET file_count = file_count + 1\n               WHERE id = $1 AND file_count < $2\n               RETURNING 1)\n           INSERT INTO note_file (id, note, name, content_type, size)\n           SELECT $3, $1, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)\n           RETURNING id AS \"id: NoteFileId\", note AS \"note: NoteId\", name AS \"name: FileName\",\n               content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: NoteFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "note: NoteId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: FileName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "28ac96e52ae7a40ab37ec48f01aa60087da1bb1475f8cee2624831ff327974ba"
+}

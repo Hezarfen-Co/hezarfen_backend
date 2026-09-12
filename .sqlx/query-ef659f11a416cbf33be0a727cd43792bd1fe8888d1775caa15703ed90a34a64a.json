@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_group SET teacher = NULL WHERE teacher = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ef659f11a416cbf33be0a727cd43792bd1fe8888d1775caa15703ed90a34a64a"
+}

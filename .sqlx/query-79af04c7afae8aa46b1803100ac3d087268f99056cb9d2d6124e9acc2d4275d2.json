@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT result_count AS \"result_count: i64\" FROM exam WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "result_count: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "result_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "79af04c7afae8aa46b1803100ac3d087268f99056cb9d2d6124e9acc2d4275d2"
+}

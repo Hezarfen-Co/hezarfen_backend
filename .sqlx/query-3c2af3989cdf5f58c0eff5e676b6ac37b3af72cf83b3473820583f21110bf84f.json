@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM exam_attempt WHERE exam = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c2af3989cdf5f58c0eff5e676b6ac37b3af72cf83b3473820583f21110bf84f"
+}

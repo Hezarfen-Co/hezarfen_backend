@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM menu_dish WHERE menu = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "751b87aa1ac9be11e79b7c7d5691f495292fb357bc5567fa7a840aa432646080"
+}

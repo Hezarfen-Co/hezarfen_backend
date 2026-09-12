@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sat",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1e60ed28ab760cf47e604fa57dd4b2936b7c9b70815c2d8c724a950317364f23"
+}

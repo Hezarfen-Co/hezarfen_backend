@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cm.class AS \"class: uuid::Uuid\"\n               FROM class_member cm\n               JOIN class_course cc ON cc.class = cm.class AND cc.course = $1\n               WHERE cm.app_user = $2 AND cm.class <> $3\n               ORDER BY cm.class\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_member",
+            "name": "class"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0efbc9fb8e602d2decf3f88b9755835dbd832c36b42d09d1c5313716065bf8d5"
+}

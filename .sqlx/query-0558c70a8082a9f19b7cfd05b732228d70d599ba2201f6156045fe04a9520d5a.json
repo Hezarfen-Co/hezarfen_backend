@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE homework_submission SET file_count = GREATEST(file_count - 1, 0)\n                     WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0558c70a8082a9f19b7cfd05b732228d70d599ba2201f6156045fe04a9520d5a"
+}

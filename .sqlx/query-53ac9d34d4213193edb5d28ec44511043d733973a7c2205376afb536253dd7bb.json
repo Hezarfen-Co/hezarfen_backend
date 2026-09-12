@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE subject SET homework_count = homework_count + 1\n                   WHERE id = $1 RETURNING 1 AS \"seat: i32\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seat: i32",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "53ac9d34d4213193edb5d28ec44511043d733973a7c2205376afb536253dd7bb"
+}

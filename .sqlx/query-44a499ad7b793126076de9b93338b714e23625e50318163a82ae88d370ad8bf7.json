@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT retired AS \"retired!: bool\" FROM slot_ref WHERE name = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retired!: bool",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "slot_ref",
+            "name": "retired"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "44a499ad7b793126076de9b93338b714e23625e50318163a82ae88d370ad8bf7"
+}

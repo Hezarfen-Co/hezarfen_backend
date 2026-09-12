@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM bank_question_image\n           WHERE bank_question = $1\n             AND slot IS NOT NULL\n             AND NOT (slot = ANY($2))\n           RETURNING bank_question AS \"bank_question: BankQuestionId\",\n               slot AS \"slot: ChoiceId\", file,\n               content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bank_question: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "bank_question"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b3855defcf8c099b5f648f1fe1c97ded2de5948d699a9bcf03a82bd358f6f9db"
+}

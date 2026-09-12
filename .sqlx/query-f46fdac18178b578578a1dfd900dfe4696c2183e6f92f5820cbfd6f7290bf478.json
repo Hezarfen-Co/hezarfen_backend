@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\" FROM registration\n         WHERE event = $1\n         ORDER BY event DESC, app_user DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "event"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "registered_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "registered_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f46fdac18178b578578a1dfd900dfe4696c2183e6f92f5820cbfd6f7290bf478"
+}

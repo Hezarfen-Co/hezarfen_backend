@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM parent_link WHERE parent = $1 AND student = $2\n         RETURNING parent AS \"parent: UserId\", student AS \"student: UserId\", linked_by AS \"linked_by: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "parent: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "parent"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "linked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "linked_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4745ae76440f5178f51df7908f65bc689db88618933ff3cdef80f211264f31a7"
+}

@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: MealLedgerId\", student AS \"student: UserId\", kind AS \"kind: MealLedgerKind\", amount_minor AS \"amount_minor: LedgerAmount\", source, method AS \"method: LedgerMethod\", note AS \"note: LedgerNote\", recorded_by AS \"recorded_by: UserId\", created_at AS \"created_at: Timestamp\"\n         FROM meal_ledger WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: MealLedgerId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: MealLedgerKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "amount_minor: LedgerAmount",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "amount_minor"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "method: LedgerMethod",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "method"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "note: LedgerNote",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "recorded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "recorded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "be64fedd1690be37f5cef2ff647498fb4d7d14ca45c7e1b11baac65080890b90"
+}

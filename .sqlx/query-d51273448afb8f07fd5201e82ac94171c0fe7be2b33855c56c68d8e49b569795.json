@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT badge,\n                  earned_at AS \"earned_at!: Timestamp\"\n           FROM badge_award\n           WHERE app_user = $1 AND badge = ANY($2)\n           ORDER BY earned_at ASC, badge ASC\n           LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "badge",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "badge_award",
+            "name": "badge"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "earned_at!: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "badge_award",
+            "name": "earned_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "d51273448afb8f07fd5201e82ac94171c0fe7be2b33855c56c68d8e49b569795"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM appointment a\n             USING appointment_slot s\n             WHERE a.slot = s.id AND s.id = ANY($1) AND s.occupied < 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a23e1e3bf0e170fb23bf382b48e698b07ecc8891e905983cc686900e4afac21f"
+}

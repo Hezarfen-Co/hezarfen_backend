@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE kind_ref SET count = kind_ref.count + 1\n                   WHERE name = $1 AND retired = false\n                   RETURNING 1 AS n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9cd7caea34422e1c926b130c13003e3f771b5512c1d5c91fc15d979a454a526a"
+}

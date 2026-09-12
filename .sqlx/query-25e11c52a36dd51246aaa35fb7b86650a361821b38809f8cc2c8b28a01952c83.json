@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_blueprint SET courses = array_remove(courses, $1)\n               WHERE $1 = ANY(courses)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "25e11c52a36dd51246aaa35fb7b86650a361821b38809f8cc2c8b28a01952c83"
+}

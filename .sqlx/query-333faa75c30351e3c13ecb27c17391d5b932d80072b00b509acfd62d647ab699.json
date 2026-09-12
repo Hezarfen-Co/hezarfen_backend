@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO fee_plan (id, name, installments, created_by, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id AS \"id: FeePlanId\", name AS \"name: FeePlanName\", installments AS \"installments: sqlx::types::Json<Vec<Installment>>\", created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: FeePlanId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "fee_plan",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name: FeePlanName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "fee_plan",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "installments: sqlx::types::Json<Vec<Installment>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "fee_plan",
+            "name": "installments"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "fee_plan",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fee_plan",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "333faa75c30351e3c13ecb27c17391d5b932d80072b00b509acfd62d647ab699"
+}

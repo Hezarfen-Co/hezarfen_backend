@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE slot_ref SET count = GREATEST(count - 1, 0) WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "211b40e7acdf39db7c7e00edf3b00530e46a20d5529593ffc4b79391cf4e3c00"
+}

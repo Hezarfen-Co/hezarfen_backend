@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT teacher, starts_at, held_counted_at\n               FROM course_session WHERE id = $1 FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "teacher",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "teacher"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "starts_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "held_counted_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "held_counted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ed431273905ea5ea4710edb670f5274c786c08651ad2d3f5c8ee4f24591ab62f"
+}

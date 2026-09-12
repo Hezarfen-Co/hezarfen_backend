@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM subject WHERE id = $1\n               RETURNING id AS \"id: SubjectId\",\n                     course AS \"course: CourseId\",\n                     name AS \"name: SubjectName\",\n                     description AS \"description: SubjectDescription\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: SubjectName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description: SubjectDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "description"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "40061f26e162f1a8abb36a2952725cb9bf5d0df7b654d650a8ad447b8720c393"
+}

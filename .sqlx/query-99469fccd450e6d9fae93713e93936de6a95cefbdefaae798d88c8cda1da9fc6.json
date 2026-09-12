@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rag_output WHERE $1 = ANY(sources)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99469fccd450e6d9fae93713e93936de6a95cefbdefaae798d88c8cda1da9fc6"
+}

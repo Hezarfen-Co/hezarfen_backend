@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_blueprint SET courses = $2\n               WHERE grade = $1 AND courses = $3\n               RETURNING grade AS \"grade: ClassGrade\", creator AS \"creator: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "grade: ClassGrade",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_blueprint",
+            "name": "grade"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_blueprint",
+            "name": "creator"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "UuidArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5faf6a7b5f0ae1ff707c72f2a8985e65d83dcd7a4cad37c752908c361a460d86"
+}

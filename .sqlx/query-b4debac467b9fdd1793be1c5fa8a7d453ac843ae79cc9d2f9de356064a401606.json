@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM appointment_slot WHERE teacher = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4debac467b9fdd1793be1c5fa8a7d453ac843ae79cc9d2f9de356064a401606"
+}

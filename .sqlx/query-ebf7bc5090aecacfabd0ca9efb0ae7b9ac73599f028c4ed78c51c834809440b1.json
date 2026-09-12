@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO exam_answer (exam, question, app_user, selected, text, updated_at, seq)\n           VALUES ($1, $2, $3, $4, $5, $6, $7)\n           ON CONFLICT (question, app_user, seq) DO UPDATE\n               SET selected = EXCLUDED.selected, text = EXCLUDED.text,\n                   updated_at = EXCLUDED.updated_at\n           RETURNING exam AS \"exam: ExamId\", question AS \"question: ExamQuestionId\",\n                     app_user AS \"user: UserId\", seq,\n                     selected AS \"selected: ChoiceId\",\n                     text AS \"text: AnswerText\",\n                     updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "question: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "selected: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "selected"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "text: AnswerText",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_answer",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "ebf7bc5090aecacfabd0ca9efb0ae7b9ac73599f028c4ed78c51c834809440b1"
+}

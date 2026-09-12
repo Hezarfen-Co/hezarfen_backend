@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE kind_ref k\n                 SET count = GREATEST(k.count - s.n, 0)\n                 FROM (SELECT e.kind, count(*) AS n FROM exam_result r\n                        JOIN exam e ON r.exam = e.id\n                        WHERE r.exam = ANY($1) GROUP BY e.kind) s\n                WHERE k.name = s.kind",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bbdea4fc1c294d8aff18288094153f6dc55cec1672a5761cd31cb1ea48d94423"
+}

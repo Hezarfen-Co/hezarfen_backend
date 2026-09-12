@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM bank_question WHERE id = $1\n               RETURNING id AS \"id: BankQuestionId\", owner AS \"owner: UserId\",\n                     subject AS \"subject: SubjectId\",\n                     text AS \"text: QuestionText\", kind AS \"kind: QuestionKind\",\n                     points AS \"points: QuestionPoints\",\n                     choices AS \"choices: Json<Vec<Choice>>\",\n                     correct AS \"correct: ChoiceId\",\n                     source_exam AS \"source_exam: ExamId\",\n                     visibility AS \"visibility: BankVisibility\",\n                     created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "text: QuestionText",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: QuestionKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "points: QuestionPoints",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "points"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "choices: Json<Vec<Choice>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "choices"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "correct: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "correct"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "source_exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "source_exam"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "visibility: BankVisibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "82a818956bc4b141a8c3ac528be44a62b2b9ed1048168ed0f8257f2076a02cc9"
+}

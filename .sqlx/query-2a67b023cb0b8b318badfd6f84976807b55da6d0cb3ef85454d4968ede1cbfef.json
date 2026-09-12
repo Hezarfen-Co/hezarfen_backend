@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE menu SET seats_booked = GREATEST(seats_booked - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2a67b023cb0b8b318badfd6f84976807b55da6d0cb3ef85454d4968ede1cbfef"
+}

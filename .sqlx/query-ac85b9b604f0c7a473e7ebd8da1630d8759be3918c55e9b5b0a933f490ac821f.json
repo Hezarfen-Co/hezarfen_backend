@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ac85b9b604f0c7a473e7ebd8da1630d8759be3918c55e9b5b0a933f490ac821f"
+}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE enrollment SET source = $1 WHERE course = $2 AND app_user = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4f4dacffc966e98307ddf8667527398fe83ee865aa6199dbc7d807d5f1094bf7"
+}

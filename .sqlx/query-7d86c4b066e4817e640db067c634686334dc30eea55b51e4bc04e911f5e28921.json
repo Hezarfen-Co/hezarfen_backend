@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM attendance WHERE event = $1 AND app_user = $2\n         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "event"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status: AttendanceStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "marked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "marked_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7d86c4b066e4817e640db067c634686334dc30eea55b51e4bc04e911f5e28921"
+}

@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO attendance (event, app_user, status, marked_by)\n         VALUES ($1, $2, $3, $4)\n         ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4\n         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "event"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status: AttendanceStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "marked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "attendance",
+            "name": "marked_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2a620228d66fce9990a0b490f42955fa98e8199049288827f24080db9578e212"
+}

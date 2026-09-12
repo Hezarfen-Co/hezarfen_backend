@@ -1,0 +1,157 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO settings (id, exam_kinds, attendance_statuses, grade_bands,\n                                 max_file_bytes, chatbot_history_turns,\n                                 max_chatbot_message_len, max_chatbot_threads,\n                                 meal_slots, dietary_tags, meal_cancel_cutoff_minutes)\n           VALUES ('school', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n           ON CONFLICT (id) DO UPDATE SET\n               exam_kinds = EXCLUDED.exam_kinds,\n               attendance_statuses = EXCLUDED.attendance_statuses,\n               grade_bands = EXCLUDED.grade_bands,\n               max_file_bytes = EXCLUDED.max_file_bytes,\n               chatbot_history_turns = EXCLUDED.chatbot_history_turns,\n               max_chatbot_message_len = EXCLUDED.max_chatbot_message_len,\n               max_chatbot_threads = EXCLUDED.max_chatbot_threads,\n               meal_slots = EXCLUDED.meal_slots,\n               dietary_tags = EXCLUDED.dietary_tags,\n               meal_cancel_cutoff_minutes = EXCLUDED.meal_cancel_cutoff_minutes\n           RETURNING id,\n                     exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                     attendance_statuses,\n                     grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                     max_file_bytes,\n                     chatbot_history_turns,\n                     max_chatbot_message_len,\n                     max_chatbot_threads,\n                     meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                     dietary_tags,\n                     meal_cancel_cutoff_minutes",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "exam_kinds: Json<Vec<ExamKindDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "exam_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attendance_statuses",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "attendance_statuses"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "grade_bands: Json<Vec<GradeBand>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "grade_bands"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "max_file_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_file_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "chatbot_history_turns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "chatbot_history_turns"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_chatbot_message_len",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_message_len"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "max_chatbot_threads",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_threads"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "meal_slots: Json<Vec<MealSlotDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_slots"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "dietary_tags",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "dietary_tags"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "meal_cancel_cutoff_minutes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_cancel_cutoff_minutes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Jsonb",
+        "TextArray",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "2cf8cd6b4d75c5ca5d5f3a7c7ac6c6042438242e59b6c5b5c220117579cc575d"
+}

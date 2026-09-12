@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"\n         FROM menu_dish WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: MenuDishId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "menu: MenuId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "menu"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: DishName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description: DishDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "price_minor: DishPrice",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "price_minor"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tags: DishTags",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "menu_dish",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "42ec2891956481a4fb70b81cc230621f4481f2fc57e10e3680043fb83c850c66"
+}

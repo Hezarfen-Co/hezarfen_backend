@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE subject SET exam_question_count =\n                       GREATEST(exam_question_count - 1, 0)\n                   WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "10a0f594d16e6afa01a6987db0de616f9e506e15be780134d7adf32db5d1e135"
+}

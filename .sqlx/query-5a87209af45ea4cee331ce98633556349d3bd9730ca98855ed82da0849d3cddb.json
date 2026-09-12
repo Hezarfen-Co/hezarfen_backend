@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM exam_question WHERE id = $1\n               RETURNING id AS \"id: ExamQuestionId\", exam AS \"exam: ExamId\",\n                         subject AS \"subject: SubjectId\", text AS \"text: QuestionText\",\n                         kind AS \"kind: QuestionKind\", points AS \"points: QuestionPoints\",\n                         choices AS \"choices: Json<Vec<Choice>>\",\n                         correct AS \"correct: ChoiceId\",\n                         from_bank AS \"from_bank: BankQuestionId\",\n                         banked_as AS \"banked_as: BankQuestionId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "text: QuestionText",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: QuestionKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "points: QuestionPoints",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "points"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "choices: Json<Vec<Choice>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "choices"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "correct: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "correct"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "from_bank: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "from_bank"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "banked_as: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "banked_as"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5a87209af45ea4cee331ce98633556349d3bd9730ca98855ed82da0849d3cddb"
+}

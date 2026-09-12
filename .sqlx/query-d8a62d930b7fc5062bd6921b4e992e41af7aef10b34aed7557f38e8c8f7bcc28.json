@@ -1,0 +1,116 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: BoardStrokeId\", board AS \"board: BoardId\",\n               author AS \"author: UserId\", kind, payload, count, epoch,\n               created_at AS \"created_at: Timestamp\"\n               FROM board_stroke\n               WHERE board = $1 AND epoch = $2 AND kind = $3 AND id > $4\n               ORDER BY id LIMIT $5",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BoardStrokeId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "board: BoardId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "board"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "author: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "author"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "payload",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "epoch",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board_stroke",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d8a62d930b7fc5062bd6921b4e992e41af7aef10b34aed7557f38e8c8f7bcc28"
+}

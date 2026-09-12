@@ -1,0 +1,119 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO meal_booking\n                         (menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at)\n                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n                     ON CONFLICT (menu, student) DO NOTHING\n                     RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "menu: MenuId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "menu"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "booked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "booked_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: MealBookingStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "attempt",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "price_minor: LedgerAmount",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "price_minor"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "cancelled_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "cancelled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_booking",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "a722e40be21d8773f4507c6cd17ad336108e1c02fcfcc495b518ebf63a6d95ad"
+}

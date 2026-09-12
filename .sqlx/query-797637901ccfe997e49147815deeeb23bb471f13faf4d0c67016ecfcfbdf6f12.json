@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO answer_image (exam, question, app_user, file, content_type, size, seq)\n           VALUES ($1, $2, $3, $4, $5, $6, $7)\n           ON CONFLICT (question, app_user, seq) DO UPDATE\n               SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,\n                   size = EXCLUDED.size\n           RETURNING exam AS \"exam: ExamId\", question AS \"question: ExamQuestionId\",\n                     app_user AS \"user: UserId\", seq, file,\n                     content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "question: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "797637901ccfe997e49147815deeeb23bb471f13faf4d0c67016ecfcfbdf6f12"
+}

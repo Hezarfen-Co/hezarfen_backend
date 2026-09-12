@@ -1,0 +1,93 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO question_image (exam, question, slot, file, content_type, size)\n           VALUES ($1, $2, $3, $4, $5, $6)\n           ON CONFLICT (question, slot) DO UPDATE\n               SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,\n                   size = EXCLUDED.size\n           RETURNING exam AS \"exam: ExamId\", question AS \"question: ExamQuestionId\",\n                     slot AS \"slot: ChoiceId\", file,\n                     content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "question: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "slot: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c4284a048dc8755ef03d0483efd993af676dce43276645df6faf1abf65e00802"
+}

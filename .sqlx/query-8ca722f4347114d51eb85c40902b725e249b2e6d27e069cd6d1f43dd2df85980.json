@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT file FROM answer_image\n           WHERE question = $1 AND app_user = $2 AND seq = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8ca722f4347114d51eb85c40902b725e249b2e6d27e069cd6d1f43dd2df85980"
+}

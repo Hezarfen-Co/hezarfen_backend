@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n               UPDATE homework_submission SET file_count = file_count + 1\n               WHERE id = $2 AND file_count < $1 AND graded_by_result IS NULL\n               RETURNING 1\n           )\n           INSERT INTO homework_file (id, submission, name, content_type, size, file, created_at)\n           SELECT $3, $2, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM seat)\n           RETURNING id AS \"id: HomeworkFileId\",\n                     submission AS \"submission: HomeworkSubmissionId\",\n                     name AS \"name: FileName\",\n                     content_type AS \"content_type: FileContentType\",\n                     size,\n                     file,\n                     created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HomeworkFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "submission: HomeworkSubmissionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "submission"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: FileName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d52e2ed81c1fea69867f5a6172b3acd33522e4968880820bb7ace814d9d3bda4"
+}

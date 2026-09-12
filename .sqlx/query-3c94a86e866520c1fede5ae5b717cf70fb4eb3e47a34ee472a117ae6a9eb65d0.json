@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: ExamId\" FROM exam WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3c94a86e866520c1fede5ae5b717cf70fb4eb3e47a34ee472a117ae6a9eb65d0"
+}

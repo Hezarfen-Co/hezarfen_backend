@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT exam_question_count, homework_count\n               FROM subject WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam_question_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "exam_question_count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "homework_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "homework_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "417a950dd450554b612f3886f53e1e578a36b98e339c4d95aa552a8b85562299"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM exam_answer WHERE exam = $1 AND app_user = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e03e07ce6e69657824685e497c1ad7c340f319b46ed9ff9688864b277409892"
+}

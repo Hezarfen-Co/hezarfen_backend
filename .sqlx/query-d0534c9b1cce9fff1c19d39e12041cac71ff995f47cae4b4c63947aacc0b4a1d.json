@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pomodoro_counted_today, pomodoro_counted_day, pomodoro_finished_total, pomodoro_focus_ms_total, study_streak_current, study_streak_last_day, study_streak_longest FROM app_user WHERE id = $1 FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pomodoro_counted_today",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "pomodoro_counted_today"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "pomodoro_counted_day",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "pomodoro_counted_day"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "pomodoro_finished_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "pomodoro_finished_total"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "pomodoro_focus_ms_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "pomodoro_focus_ms_total"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "study_streak_current",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "study_streak_current"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "study_streak_last_day",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "study_streak_last_day"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "study_streak_longest",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "study_streak_longest"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d0534c9b1cce9fff1c19d39e12041cac71ff995f47cae4b4c63947aacc0b4a1d"
+}

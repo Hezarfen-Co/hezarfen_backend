@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n                   DELETE FROM exam_result\n                   WHERE exam = $1 AND app_user = $2\n                   RETURNING mark, graded_by, seq)\n               SELECT seq, mark AS \"mark: Mark\", graded_by AS \"graded_by: UserId\"\n               FROM gone ORDER BY seq ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mark: Mark",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "mark"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "graded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "graded_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b06a5c711922b7374fbfd6e9f503ea67fb315319ee7d33a15b12aa1da296aa98"
+}

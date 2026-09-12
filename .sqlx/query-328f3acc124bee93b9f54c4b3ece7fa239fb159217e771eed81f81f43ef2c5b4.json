@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n               UPDATE app_user SET exam_sat_total = app_user.exam_sat_total + $4\n               WHERE id = $2\n               RETURNING 1)\n           INSERT INTO exam_attempt (exam, app_user, seq, started_at, finished_at, left_at)\n           SELECT $1, $2, $3, $5, NULL, NULL WHERE EXISTS (SELECT 1 FROM seat)\n           RETURNING exam AS \"exam: ExamId\", app_user AS \"user: UserId\", seq,\n                     started_at AS \"started_at: Timestamp\",\n                     finished_at AS \"finished_at: Timestamp\",\n                     left_at AS \"left_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "started_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "finished_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "left_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_attempt",
+            "name": "left_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "328f3acc124bee93b9f54c4b3ece7fa239fb159217e771eed81f81f43ef2c5b4"
+}

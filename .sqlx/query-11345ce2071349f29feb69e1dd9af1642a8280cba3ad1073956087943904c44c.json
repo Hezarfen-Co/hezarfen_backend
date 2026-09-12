@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH detached AS (\n                 DELETE FROM class_course WHERE course = $1 RETURNING class)\n               UPDATE class_group g\n                  SET class_course_count = GREATEST(g.class_course_count - 1, 0)\n                 FROM detached WHERE g.id = detached.class",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "11345ce2071349f29feb69e1dd9af1642a8280cba3ad1073956087943904c44c"
+}

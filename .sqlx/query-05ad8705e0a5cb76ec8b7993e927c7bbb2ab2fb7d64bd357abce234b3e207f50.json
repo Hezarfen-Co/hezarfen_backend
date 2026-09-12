@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM session_attendance WHERE session = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "05ad8705e0a5cb76ec8b7993e927c7bbb2ab2fb7d64bd357abce234b3e207f50"
+}

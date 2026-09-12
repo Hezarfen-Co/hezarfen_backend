@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind AS \"kind: crate::domain::meal_ledger::MealLedgerKind\",\n                  CAST(sum(amount_minor) AS BIGINT) AS \"total!\"\n           FROM meal_ledger WHERE student = $1 GROUP BY kind",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind: crate::domain::meal_ledger::MealLedgerKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_ledger",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "total!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "bece98a363d6483f3507035c38da7b3a13fb1b81f9aede4a7fc03a74897f352e"
+}

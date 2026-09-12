@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM registration WHERE event = $1 AND app_user = $2\n             RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "event"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "registered_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "registered_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "40dd8aad8d2755a7a51929630410eb040b08cf23f4702f6e8e9011aaee276db0"
+}

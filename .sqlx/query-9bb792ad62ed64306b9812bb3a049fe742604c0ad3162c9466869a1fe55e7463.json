@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE term SET archived_at = $2\n           WHERE id = $1 AND archived_at IS NULL\n           RETURNING id AS \"id: TermId\", name AS \"name: TermName\",\n                     starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at: Timestamp\",\n                     archived_at AS \"archived_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TermId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "term",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name: TermName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "term",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "term",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "term",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "archived_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "term",
+            "name": "archived_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9bb792ad62ed64306b9812bb3a049fe742604c0ad3162c9466869a1fe55e7463"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rag_output WHERE course_note = $1 AND id < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c6245840a419ab6cb18bff1592e53710a3b38f70410617dddb261be4c35795b3"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user\n               SET avatar_file = NULL, avatar_content_type = NULL, avatar_size = NULL\n               WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7fa8bb0d339b1928bd6cba6e9af2b349249a22170886948b94de3aa57bf7eff4"
+}

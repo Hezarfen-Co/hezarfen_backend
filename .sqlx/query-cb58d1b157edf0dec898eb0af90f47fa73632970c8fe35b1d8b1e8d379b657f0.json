@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM appointment_slot WHERE id = ANY($1) AND occupied < 1 RETURNING id AS \"id: AppointmentSlotId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AppointmentSlotId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment_slot",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cb58d1b157edf0dec898eb0af90f47fa73632970c8fe35b1d8b1e8d379b657f0"
+}
