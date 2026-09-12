@@ -5,7 +5,7 @@
 
 use crate::constant::{CLASS_GROUP_TABLE, TERM_CLASS_COUNT_FIELD};
 use crate::database::{Database, tx_with_retry};
-use crate::db::field_update::FieldUpdate;
+use crate::db::field_update::{FieldUpdate, Refcount};
 use crate::db::page::PagedList;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
 use crate::domain::term::{self, TermId};
@@ -168,15 +168,15 @@ pub async fn update(
             "teacher",
             teacher.map(|teacher| teacher.map(|teacher| teacher.uuid())),
         )
-        .refcount(
-            "term",
-            TERM_CLASS_COUNT_FIELD,
-            "term",
+        .refcount(Refcount {
+            counter_table: "term",
+            counter_field: TERM_CLASS_COUNT_FIELD,
+            link: "term",
             expected,
-            claim.map(|term| term.uuid()),
-            release.map(|term| term.uuid()),
-            term::gone_error(),
-        )
+            claim: claim.map(|term| term.uuid()),
+            release: release.map(|term| term.uuid()),
+            refused: term::gone_error(),
+        })
         .run::<ClassGroup>(db)
         .await
 }
@@ -416,8 +416,8 @@ mod tests {
 
         let bare = class_of(None, &db).await;
         assert_eq!(teacher_of(bare.get_id(), &db).await, None);
-        let held = class_of(Some(ada.clone()), &db).await;
-        assert_eq!(teacher_of(held.get_id(), &db).await, Some(ada.clone()));
+        let held = class_of(Some(ada), &db).await;
+        assert_eq!(teacher_of(held.get_id(), &db).await, Some(ada));
 
         // A name-only PATCH must not re-state the teacher out of its snapshot.
         let renamed = update(
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(renamed.get_name().as_str(), "9-B");
         assert_eq!(teacher_of(renamed.get_id(), &db).await, Some(ada));
 
-        let moved = update(&db, renamed, None, None, None, Some(Some(boole.clone())))
+        let moved = update(&db, renamed, None, None, None, Some(Some(boole)))
             .await
             .unwrap();
         assert_eq!(teacher_of(moved.get_id(), &db).await, Some(boole));
@@ -473,9 +473,9 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let ada = a_named_user(&db, "ada").await;
         let boole = a_named_user(&db, "boole").await;
-        let first = class_of(Some(ada.clone()), &db).await;
-        let second = class_of(Some(ada.clone()), &db).await;
-        let other = class_of(Some(boole.clone()), &db).await;
+        let first = class_of(Some(ada), &db).await;
+        let second = class_of(Some(ada), &db).await;
+        let other = class_of(Some(boole), &db).await;
         let none = class_of(None, &db).await;
 
         unassign_everywhere(&db, &ada).await.unwrap();
@@ -503,8 +503,8 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term(&db).await;
 
-        let linked = class_on(Some(term.get_id().clone()), &db).await;
-        let patched = class_on(Some(term.get_id().clone()), &db).await;
+        let linked = class_on(Some(*term.get_id()), &db).await;
+        let patched = class_on(Some(*term.get_id()), &db).await;
         assert_eq!(
             one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
             2,
@@ -543,7 +543,7 @@ mod tests {
         for field in ["class_member_count", "class_course_count"] {
             let (db, _leases) = crate::database::init_test_db().await;
             let term = a_term(&db).await;
-            let class = class_on(Some(term.get_id().clone()), &db).await;
+            let class = class_on(Some(*term.get_id()), &db).await;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE class_group SET {field} = 1 WHERE id = $1"
             )))
@@ -594,7 +594,7 @@ mod tests {
     async fn a_refused_create_writes_neither_row_nor_count() {
         let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term(&db).await;
-        let id = term.get_id().clone();
+        let id = *term.get_id();
         assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
@@ -637,9 +637,9 @@ mod tests {
             crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
                 .await
                 .unwrap();
-        let dead_id = dead.get_id().clone();
+        let dead_id = *dead.get_id();
         assert!(crate::db::term::delete(&db, dead).await.unwrap());
-        let class = class_on(Some(from.get_id().clone()), &db).await;
+        let class = class_on(Some(*from.get_id()), &db).await;
 
         let error = update(
             &db,
@@ -666,7 +666,7 @@ mod tests {
             class,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -701,14 +701,14 @@ mod tests {
             crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
                 .await
                 .unwrap();
-        let class = class_on(Some(from.get_id().clone()), &db).await;
+        let class = class_on(Some(*from.get_id()), &db).await;
         let stale = class.clone();
         update(
             &db,
             class,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -721,7 +721,7 @@ mod tests {
             stale.clone(),
             None,
             None,
-            Some(Some(other.get_id().clone())),
+            Some(Some(*other.get_id())),
             None,
         )
         .await
@@ -733,7 +733,7 @@ mod tests {
             stale.clone(),
             None,
             None,
-            Some(Some(from.get_id().clone())),
+            Some(Some(*from.get_id())),
             None,
         )
         .await
@@ -752,7 +752,7 @@ mod tests {
             stored,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await

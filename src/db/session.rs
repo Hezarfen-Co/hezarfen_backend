@@ -17,7 +17,7 @@ pub async fn create(db: &Database, user: &UserId) -> Result<Session, AppError> {
         Session,
         r#"INSERT INTO user_session (id, app_user, token, expires_at)
            VALUES ($1, $2, $3, $4)
-           RETURNING id AS "id: SessionId",
+           RETURNING
                      app_user AS "user: UserId",
                      token AS "token: SessionToken",
                      expires_at AS "expires_at: Timestamp""#,
@@ -34,7 +34,7 @@ pub async fn create(db: &Database, user: &UserId) -> Result<Session, AppError> {
 pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<Session>, AppError> {
     let session = sqlx::query_as!(
         Session,
-        r#"SELECT id AS "id: SessionId",
+        r#"SELECT
                   app_user AS "user: UserId",
                   token AS "token: SessionToken",
                   expires_at AS "expires_at: Timestamp"

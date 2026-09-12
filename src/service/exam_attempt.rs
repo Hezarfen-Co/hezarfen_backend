@@ -28,8 +28,6 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-#[cfg(test)]
-use crate::constant::EXAM_SAT_TOTAL_FIELD;
 
 /// Rejects sitting an exam that can't be sat. A draft is a `404`, not a
 /// `409` — sitting is a student act, drafts are invisible to students, and a
@@ -179,7 +177,7 @@ pub async fn start(
     };
     let attempt = ExamAttempt {
         exam: exam.get_id().clone(),
-        user: user.clone(),
+        user: *user,
         seq: next_seq,
         started_at: Timestamp::now(),
         finished_at: None,
@@ -502,7 +500,7 @@ mod tests {
         let question = crate::db::exam_question::create(
             db,
             exam.get_id(),
-            subject.get_id().clone(),
+            *subject.get_id(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
@@ -520,7 +518,7 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        crate::db::user::create(
+        *crate::db::user::create(
             db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
             hash,
@@ -528,7 +526,6 @@ mod tests {
         .await
         .unwrap()
         .get_id()
-        .clone()
     }
 
     /// The student's lifetime sitting count, absent reading as zero.

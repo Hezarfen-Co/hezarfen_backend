@@ -590,7 +590,7 @@ async fn list_results(
     let rows = paginate(&results, limit, offset);
     let people = person_map(
         rows.iter()
-            .flat_map(|r| [r.get_user().clone(), r.get_graded_by().clone()]),
+            .flat_map(|r| [*r.get_user(), *r.get_graded_by()]),
         &st.db,
     )
     .await?;
@@ -624,7 +624,7 @@ async fn my_result(
         .await?
         .ok_or(AppError::NotFound)?;
     let people = person_map(
-        [result.get_user().clone(), result.get_graded_by().clone()],
+        [*result.get_user(), *result.get_graded_by()],
         &st.db,
     )
     .await?;

@@ -37,7 +37,7 @@ impl AnswerImageId {
     pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
         Self {
             question: question.clone(),
-            user: user.clone(),
+            user: *user,
             seq,
         }
     }
@@ -87,7 +87,7 @@ impl AnswerImage {
         Self {
             exam: exam.clone(),
             question: question.clone(),
-            user: user.clone(),
+            user: *user,
             seq,
             file: uuid::Uuid::new_v4().to_string(),
             content_type,

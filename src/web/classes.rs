@@ -188,7 +188,7 @@ struct CreateClassResponse {
 /// must also be left out of the response.
 fn class_people(class: &ClassGroup, with_creator: bool) -> impl Iterator<Item = UserId> + '_ {
     with_creator
-        .then(|| class.get_creator().clone())
+        .then(|| *class.get_creator())
         .into_iter()
         .chain(class.get_teacher().cloned())
 }
@@ -363,7 +363,7 @@ async fn create_class(
         name,
         grade,
         term,
-        teacher.as_ref().map(|t| t.get_id().clone()),
+        teacher.as_ref().map(|t| *t.get_id()),
     )
     .await?;
     // The row is written; a demotion that raced this request's role check swept
@@ -578,14 +578,14 @@ async fn update_class(
 
     let assigned = teacher
         .as_ref()
-        .and_then(|teacher| teacher.as_ref().map(|teacher| teacher.get_id().clone()));
+        .and_then(|teacher| teacher.as_ref().map(|teacher| *teacher.get_id()));
     let updated = class_group::update(
         &st.db,
         class,
         name,
         grade,
         term,
-        teacher.map(|teacher| teacher.map(|teacher| teacher.get_id().clone())),
+        teacher.map(|teacher| teacher.map(|teacher| *teacher.get_id())),
     )
     .await?;
     // Only when this request named a teacher: a PATCH that left the column
@@ -801,7 +801,7 @@ async fn list_members(
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
-            .flat_map(|row| [row.get_user().clone(), row.get_added_by().clone()]),
+            .flat_map(|row| [*row.get_user(), *row.get_added_by()]),
         &st.db,
     )
     .await?;
@@ -927,7 +927,7 @@ async fn list_class_courses(
     let (limit, offset) = page.resolve()?;
     let class = class_or_404(&id, &st.db).await?;
     let (rows, total) = class_course::list_for_class(&st.db, class.get_id(), limit, offset).await?;
-    let people = person_map(rows.iter().map(|row| row.get_attached_by().clone()), &st.db).await?;
+    let people = person_map(rows.iter().map(|row| *row.get_attached_by()), &st.db).await?;
     let items = rows
         .iter()
         .map(|row| ClassCourseResponse::new(row, &people))
@@ -1179,7 +1179,7 @@ async fn blueprint_body(
     pumped: &Pumped,
     db: &Database,
 ) -> Result<BlueprintPumpResponse, AppError> {
-    let people = person_map([blueprint.get_creator().clone()], db).await?;
+    let people = person_map([*blueprint.get_creator()], db).await?;
     Ok(BlueprintPumpResponse {
         blueprint: BlueprintResponse::new(blueprint, &people),
         matched: pumped.matched,
@@ -1251,7 +1251,7 @@ async fn list_blueprints(
     let people = person_map(
         blueprints
             .iter()
-            .map(|blueprint| blueprint.get_creator().clone()),
+            .map(|blueprint| *blueprint.get_creator()),
         &st.db,
     )
     .await?;
@@ -1282,7 +1282,7 @@ async fn get_blueprint(
     Path(grade): Path<String>,
 ) -> Result<Json<BlueprintResponse>, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
-    let people = person_map([blueprint.get_creator().clone()], &st.db).await?;
+    let people = person_map([*blueprint.get_creator()], &st.db).await?;
     Ok(Json(BlueprintResponse::new(&blueprint, &people)))
 }
 
@@ -1540,8 +1540,8 @@ mod tests {
             teacher_or_none(Some(teacher.get_id().key().as_str()), &db)
                 .await
                 .unwrap()
-                .map(|found| found.get_id().clone()),
-            Some(teacher.get_id().clone()),
+                .map(|found| *found.get_id()),
+            Some(*teacher.get_id()),
             "a teacher account is the one thing that resolves"
         );
     }

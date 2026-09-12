@@ -359,7 +359,7 @@ pub async fn remove(
             {
                 *n += 1;
             } else {
-                per_grader.push((row.graded_by.clone(), 1));
+                per_grader.push((row.graded_by, 1));
             }
         }
         for (grader, n) in &per_grader {
@@ -378,7 +378,7 @@ pub async fn remove(
         // removed and what the latest standing was.
         let first = gone.into_iter().next().map(|row| ExamResult {
             exam: exam.clone(),
-            user: user.clone(),
+            user,
             seq: row.seq,
             mark: row.mark,
             graded_by: row.graded_by,

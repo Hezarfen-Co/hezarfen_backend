@@ -447,7 +447,7 @@ mod tests {
         let question = crate::db::exam_question::create(
             db,
             exam.get_id(),
-            subject.get_id().clone(),
+            *subject.get_id(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
@@ -465,7 +465,7 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        crate::db::user::create(
+        *crate::db::user::create(
             db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
             hash,
@@ -473,7 +473,6 @@ mod tests {
         .await
         .unwrap()
         .get_id()
-        .clone()
     }
 
     #[tokio::test]

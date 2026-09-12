@@ -303,7 +303,7 @@ mod tests {
         let student = a_person(&db, "student", "student").await;
         let ghost = Enrollment {
             course: course.clone(),
-            user: student.clone(),
+            user: student,
             enrolled_by: a_person(&db, "mgr", "manager").await,
             source: Some(class),
         };

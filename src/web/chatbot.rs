@@ -755,7 +755,7 @@ async fn stream_message(
     let (tx, rx) = mpsc::channel(REPLY_CHUNKS + 2);
     let (message_id, user_id, db) = (
         ChatbotMessageId::from_key(&mid),
-        user.get_id().clone(),
+        *user.get_id(),
         st.db.clone(),
     );
     tokio::spawn(async move {

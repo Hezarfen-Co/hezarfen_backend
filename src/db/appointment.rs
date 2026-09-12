@@ -16,10 +16,6 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 use sqlx::{query, query_as, PgConnection, Postgres};
 
-/// The appointment row's columns, in [`Appointment`]'s field order.
-const COLS: &str = "id, slot, requester, status, reason, proposed_starts_at, proposed_ends_at, \
-                    proposed_by, decided_by, cancelled_by, cancel_reason, reject_reason, created_at";
-
 /// Is `[starts_at, ends_at)` already taken for either party? Both sides are
 /// checked: a teacher can't be in two meetings at once, and neither can a
 /// requester (a parent with two children's teachers, say).

@@ -22213,7 +22213,7 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
     .await
     .expect("read the booking")
     .expect("the booking exists");
-    let student = booking.get_student().clone();
+    let student = *booking.get_student();
     assert_eq!(
         meal_ledger::balance_of(&db, &student).await.unwrap(),
         -1000,

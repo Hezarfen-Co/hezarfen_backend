@@ -226,7 +226,8 @@ pub(crate) async fn claim_and_place(
                 // No row (or a rival moved it past this attempt): place a
                 // fresh one. A rival that landed first answers `Duplicate`
                 // — nothing here overwrites its row.
-                let inserted = sqlx::query_as!(
+                
+                sqlx::query_as!(
                     MealBooking,
                     "INSERT INTO meal_booking
                          (menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at)
@@ -243,8 +244,7 @@ pub(crate) async fn claim_and_place(
                     created_at,
                 )
                 .fetch_optional(&mut *tx)
-                .await?;
-                inserted
+                .await?
             }
         };
         let Some(placed) = placed else {
@@ -476,7 +476,7 @@ mod tests {
         add_dish(&menu, 1_000, &db).await;
         let row = MealBooking {
             menu: menu.clone(),
-            student: ali.clone(),
+            student: ali,
             booked_by: ali,
             status: MealBookingStatus::Booked,
             attempt: 1,
@@ -663,8 +663,8 @@ mod tests {
         let seen = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
         let row = MealBooking {
             menu: menu.clone(),
-            student: ali.clone(),
-            booked_by: ali.clone(),
+            student: ali,
+            booked_by: ali,
             status: MealBookingStatus::Booked,
             attempt: 1,
             price_minor: price,

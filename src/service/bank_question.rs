@@ -111,7 +111,7 @@ pub async fn update(
         // Omitted keeps the stored subject — which may already be `None`, cleared
         // by that subject's delete.
         let subject = match &patch.subject {
-            Some(subject) => Some(subject.clone()),
+            Some(subject) => Some(*subject),
             None => question.get_subject().cloned(),
         };
         let text = patch

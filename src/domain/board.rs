@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn participants_are_deduplicated_and_bounded() {
         let one = user("0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f");
-        assert_eq!(checked_participants(vec![one.clone(), one]).unwrap().len(), 1);
+        assert_eq!(checked_participants(vec![one, one]).unwrap().len(), 1);
         // One over the ceiling is refused; each key must be a distinct
         // *parseable* UUID, or the parser would collapse them all to nil.
         let many = (0..=MAX_BOARD_PARTICIPANTS)

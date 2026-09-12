@@ -682,7 +682,7 @@ mod tests {
                 })
             };
             let marked = {
-                let (db, teacher, gate) = (db.clone(), teacher.clone(), gate);
+                let (db, teacher, gate) = (db.clone(), teacher, gate);
                 let student = a_student(&format!("s{round}"), &db).await;
                 tokio::spawn(async move {
                     gate.wait().await;

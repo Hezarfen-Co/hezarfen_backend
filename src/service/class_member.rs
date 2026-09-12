@@ -365,7 +365,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let student = account.get_id().clone();
+        let student = *account.get_id();
         let first = a_class("9-A", &db).await;
         let second = a_class("club", &db).await;
         let algebra = a_course("algebra", None, &db).await;

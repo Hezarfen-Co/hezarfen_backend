@@ -403,7 +403,7 @@ mod tests {
                 ClassName::try_new("9-A").unwrap(),
                 None,
                 None,
-                Some(teacher.get_id().clone()),
+                Some(*teacher.get_id()),
             )
             .await
             .unwrap();
@@ -456,8 +456,8 @@ mod tests {
         assert_eq!(
             stored(class.get_id(), course.get_id(), &db).await,
             (
-                Some(teacher.get_id().clone()),
-                vec![teacher.get_id().clone()]
+                Some(*teacher.get_id()),
+                vec![*teacher.get_id()]
             ),
             "nothing may be undone while the bar still holds"
         );

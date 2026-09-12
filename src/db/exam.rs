@@ -865,7 +865,7 @@ mod tests {
             let marks: Vec<_> = (0..6)
                 .map(|seat| {
                     let (id, db, kind) = (exam.get_id().clone(), db.clone(), kind.clone());
-                    let (student, teacher) = (students[seat].clone(), teacher.clone());
+                    let (student, teacher) = (students[seat], teacher);
                     tokio::spawn(async move {
                         exam_result::grade(
                             &db,
@@ -978,7 +978,7 @@ mod tests {
         crate::db::exam_question::create(
             db,
             exam.get_id(),
-            subject.get_id().clone(),
+            *subject.get_id(),
             QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
@@ -1029,7 +1029,7 @@ mod tests {
             };
             let child = {
                 let (db, question, student, pick, gate) =
-                    (db.clone(), question.clone(), student.clone(), pick, gate);
+                    (db.clone(), question.clone(), student, pick, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     exam_answer::save(&db, &question, &student, 1, Some(pick), None).await
@@ -1098,7 +1098,7 @@ mod tests {
                 })
             };
             let child = {
-                let (db, exam_id, on, gate) = (db.clone(), id.clone(), subject.get_id().clone(), gate);
+                let (db, exam_id, on, gate) = (db.clone(), id.clone(), *subject.get_id(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     let spec = QuestionSpec::try_new(
@@ -1197,7 +1197,7 @@ mod tests {
             };
             let child = {
                 let (db, exam_id, on, student, gate) =
-                    (db.clone(), id.clone(), question.get_id().clone(), student.clone(), gate);
+                    (db.clone(), id.clone(), question.get_id().clone(), student, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     let image = AnswerImage::new(

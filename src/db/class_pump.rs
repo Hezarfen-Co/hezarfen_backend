@@ -143,18 +143,6 @@ pub(crate) enum Axis {
 }
 
 impl Axis {
-    /// The class counter this axis's link rows are counted on. Taken off the
-    /// axis rather than passed in beside it, because the two are one fact and a
-    /// call site that paired the member axis with the course counter would
-    /// compile, pass every test — both are `&'static str` — and desync the
-    /// class delete guard forever.
-    fn counter(self) -> &'static str {
-        match self {
-            Axis::Member => "class_member_count",
-            Axis::Course => "class_course_count",
-        }
-    }
-
     /// How many link rows this axis's counter may reach.
     ///
     /// This is what makes the pair loop in [`add_member`]/[`attach_course`]
@@ -444,7 +432,6 @@ pub(crate) async fn add_member(
             class: class.clone(),
             user,
             added_by: by,
-            added_at: Some(added_at),
         }))
     })
     .await;
@@ -539,7 +526,6 @@ pub(crate) async fn attach_course(
             course: course.clone(),
             attached_by: by,
             source: source.clone(),
-            attached_at: Some(attached_at),
         }))
     })
     .await;
@@ -906,7 +892,7 @@ async fn release(
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use crate::db::class_member::tests::{a_class, counter, fixture_user, rows};
     use crate::domain::class_group::ClassGroupId;
     use crate::error::AppError;

@@ -17,7 +17,7 @@ impl EnrollmentId {
     pub fn composite(course: &CourseId, user: &UserId) -> Self {
         Self {
             course: course.clone(),
-            user: user.clone(),
+            user: *user,
         }
     }
 

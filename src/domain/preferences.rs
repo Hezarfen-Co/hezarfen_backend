@@ -207,17 +207,17 @@ mod tests {
         let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for theme in THEMES {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&theme, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&theme, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), theme.as_str());
         }
         for language in LANGUAGES {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&language, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&language, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), language.as_str());
         }
         let color = PaletteColor::try_from_str("#fefae0").unwrap();
         buf.clear();
-        sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&color, &mut buf);
+        let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&color, &mut buf).unwrap();
         assert_eq!(std::str::from_utf8(&buf).unwrap(), "#fefae0");
     }
 }

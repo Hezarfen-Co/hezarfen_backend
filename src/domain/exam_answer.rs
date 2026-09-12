@@ -24,7 +24,7 @@ impl ExamAnswerId {
     pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
         Self {
             question: question.clone(),
-            user: user.clone(),
+            user: *user,
             seq,
         }
     }
@@ -180,7 +180,7 @@ mod tests {
         ExamAnswer {
             exam: question.get_exam().clone(),
             question: question.get_id().clone(),
-            user: user.clone(),
+            user: *user,
             seq: 1,
             text: selected
                 .is_none()

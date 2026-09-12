@@ -77,7 +77,7 @@ struct SessionAttendanceResponse {
 impl SessionAttendanceResponse {
     fn new(attendance: &SessionAttendance, people: &HashMap<String, PersonRef>) -> Self {
         Self {
-            id: SessionAttendanceId::composite(attendance.get_session(), &attendance.get_user()).key(),
+            id: SessionAttendanceId::composite(attendance.get_session(), attendance.get_user()).key(),
             session: attendance.get_session().key().to_string(),
             course: attendance.get_course().key().to_string(),
             user: PersonRef::resolve(people, attendance.get_user()),
@@ -145,7 +145,7 @@ async fn get_session(
             "only enrolled users, the session teacher, the course's teachers, or a manager/admin can view this session",
         ));
     }
-    let people = person_map([session.get_teacher().clone()], &st.db).await?;
+    let people = person_map([*session.get_teacher()], &st.db).await?;
     Ok(Json(SessionResponse::new(&session, &people)))
 }
 
@@ -199,10 +199,9 @@ async fn update_session(
         .transpose()?;
     let teacher = match req.teacher_id {
         Some(ref key) => Some(
-            service::course_session::resolve_session_teacher(Some(key), &user, &st.db)
+            *service::course_session::resolve_session_teacher(Some(key), &user, &st.db)
                 .await?
-                .get_id()
-                .clone(),
+                .get_id(),
         ),
         None => None,
     };
@@ -217,7 +216,7 @@ async fn update_session(
     let updated =
         service::course_session::update(&st.db, session, teacher, topic, starts_at, ends_at)
             .await?;
-    let people = person_map([updated.get_teacher().clone()], &st.db).await?;
+    let people = person_map([*updated.get_teacher()], &st.db).await?;
     Ok(Json(SessionResponse::new(&updated, &people)))
 }
 
@@ -338,7 +337,7 @@ async fn list_roll_call(
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
-            .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
+            .flat_map(|a| [*a.get_user(), *a.get_marked_by()]),
         &st.db,
     )
     .await?;

@@ -55,12 +55,12 @@ pub async fn create(
     let homework = Homework {
         id: HomeworkId::generate(),
         course: course.clone(),
-        subject: subject.clone(),
+        subject: *subject,
         title,
         description,
         due_at,
         assigned,
-        created_by: created_by.clone(),
+        created_by: *created_by,
         created_at: Timestamp::now(),
     };
     let assigned_values: Vec<uuid::Uuid> = homework
@@ -337,7 +337,7 @@ pub async fn update(
         // full-row write is exactly the request-scoped SET the old builder
         // emitted — except it is one static statement instead of a runtime
         // build.
-        let new_subject = subject.clone().unwrap_or_else(|| current.subject.clone());
+        let new_subject = subject.unwrap_or(current.subject);
         let new_title = title.clone().unwrap_or_else(|| current.title.clone());
         let new_description = match description.clone() {
             None => current.description.clone(),
@@ -587,7 +587,7 @@ mod tests {
     async fn a_refused_create_writes_neither_row_nor_count() {
         let (db, _leases) = crate::database::init_test_db().await;
         let subject = a_subject("algebra", &db).await;
-        let id = subject.get_id().clone();
+        let id = *subject.get_id();
         crate::db::subject::delete(&db, subject).await.unwrap();
 
         let error = create(
@@ -628,7 +628,7 @@ mod tests {
         let moved = update(
             &db,
             homework,
-            Some(to.get_id().clone()),
+            Some(*to.get_id()),
             None,
             None,
             None,
@@ -661,14 +661,14 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let from = a_subject("algebra", &db).await;
         let dead = a_subject("geometry", &db).await;
-        let gone = dead.get_id().clone();
+        let gone = *dead.get_id();
         crate::db::subject::delete(&db, dead).await.unwrap();
         let homework = homework_on(from.get_id(), &db).await;
 
         let error = update(
             &db,
             homework.clone(),
-            Some(gone.clone()),
+            Some(gone),
             None,
             None,
             None,
@@ -710,7 +710,7 @@ mod tests {
         update(
             &db,
             homework,
-            Some(to.get_id().clone()),
+            Some(*to.get_id()),
             None,
             None,
             None,
@@ -722,7 +722,7 @@ mod tests {
         let error = update(
             &db,
             stale.clone(),
-            Some(other.get_id().clone()),
+            Some(*other.get_id()),
             None,
             None,
             None,
@@ -763,7 +763,7 @@ mod tests {
         update(
             &db,
             homework,
-            Some(to.get_id().clone()),
+            Some(*to.get_id()),
             None,
             None,
             None,
@@ -775,7 +775,7 @@ mod tests {
         let error = update(
             &db,
             stale.clone(),
-            Some(from.get_id().clone()),
+            Some(*from.get_id()),
             None,
             None,
             None,
@@ -806,7 +806,7 @@ mod tests {
         let same = update(
             &db,
             fresh,
-            Some(to.get_id().clone()),
+            Some(*to.get_id()),
             None,
             None,
             None,

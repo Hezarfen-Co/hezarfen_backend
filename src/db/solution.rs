@@ -280,7 +280,7 @@ mod tests {
     /// so a minted id nothing wrote is a 404.
     async fn question_row(db: &Database) -> PoolQuestionId {
         let asker = a_person(db, "asker").await;
-        crate::db::pool_question::insert(
+        *crate::db::pool_question::insert(
             db,
             PoolQuestion::new(
                 &asker,
@@ -291,7 +291,6 @@ mod tests {
         .await
         .unwrap()
         .get_id()
-        .clone()
     }
 
     #[tokio::test]
@@ -474,7 +473,7 @@ mod tests {
             }
         }
 
-        let counts = counts_for(&db, &[two.clone(), one.clone(), none.clone()])
+        let counts = counts_for(&db, &[two, one, none])
             .await
             .unwrap();
         assert_eq!(counts.get(two.key().as_str()), Some(&2));

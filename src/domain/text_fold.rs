@@ -118,11 +118,11 @@ mod tests {
         let sql = search_fold_sql("name");
         for (from, to) in TEXT_FOLD_REPLACEMENTS {
             assert!(
-                sql.contains(&format!("replace("))
+                sql.contains(&"replace(".to_string())
                     && sql.contains(&format!("'{from}', '{to}'")),
                 "rule {from} -> {to} missing from the emitted expression"
             );
-            assert_eq!(search_fold(&from.to_string()), *to);
+            assert_eq!(search_fold(from), *to);
         }
     }
 

@@ -443,11 +443,9 @@ impl Tenants {
         )))
         .execute(&self.control)
         .await
-        {
-            if !is_duplicate_database(&err) {
+            && !is_duplicate_database(&err) {
                 return Err(err.into());
             }
-        }
         let pool = school_pool(&self.base, &db_name).await?;
         let migrated = migrate_school(&pool).await;
         if migrated.is_err() {

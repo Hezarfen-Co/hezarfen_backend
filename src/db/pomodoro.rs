@@ -437,7 +437,7 @@ mod tests {
         for round in 1..=20 {
             let racers: Vec<_> = (0..4)
                 .map(|_| {
-                    let (user, db) = (user.clone(), db.clone());
+                    let (user, db) = (user, db.clone());
                     tokio::spawn(async move {
                         // Aged past the minimum, so whichever racer wins the
                         // open row closes a stint that *counts* — a fresh

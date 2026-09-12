@@ -152,8 +152,8 @@ pub async fn approve(
         )
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some(question) = &approved {
-            if question.asker != approver {
+        if let Some(question) = &approved
+            && question.asker != approver {
                 // The counter columns are NOT NULL DEFAULT 0 — the old
                 // absent-reads-as-zero coalesce is gone with the schema.
                 sqlx::query!(
@@ -171,7 +171,6 @@ pub async fn approve(
                 .execute(&mut *tx)
                 .await?;
             }
-        }
         Ok(approved)
     })
     .await
@@ -586,20 +585,20 @@ mod tests {
             let asker = a_user(&db).await;
             let helper = a_user(&db).await;
             let q = insert(&db, question(&asker)).await.unwrap();
-            let id = q.get_id().clone();
+            let id = *q.get_id();
 
             // Delete and offer released together: both write the question row,
             // so Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, id, gate) = (db.clone(), id.clone(), gate.clone());
+                let (db, id, gate) = (db.clone(), id, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     delete(&db, &id).await
                 })
             };
             let child = {
-                let (db, id, helper, gate) = (db.clone(), id.clone(), helper.clone(), gate);
+                let (db, id, helper, gate) = (db.clone(), id, helper, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     crate::db::solution::insert(

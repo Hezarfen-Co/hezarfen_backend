@@ -277,7 +277,7 @@ mod tests {
         crate::db::exam_question::create(
             db,
             exam,
-            subject.get_id().clone(),
+            *subject.get_id(),
             QuestionText::try_new("pick one").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec,

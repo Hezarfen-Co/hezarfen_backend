@@ -50,7 +50,6 @@ impl SessionToken {
 /// Fields are crate-visible: [`crate::db::session`] mints the rows on login.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Session {
-    pub(crate) id: SessionId,
     #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) token: SessionToken,

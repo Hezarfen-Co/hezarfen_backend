@@ -28,7 +28,6 @@ use common::{
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::{Value, json};
-use sqlx::Row as _;
 
 /// A due date comfortably clear of the 60s past-scheduling grace.
 fn far_future() -> i64 {

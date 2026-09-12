@@ -80,7 +80,7 @@ pub async fn create(
         id: ClassBlueprintId::for_grade(&grade),
         grade: grade.clone(),
         courses: courses.clone(),
-        creator: creator.clone(),
+        creator: *creator,
     };
     let creator = *creator;
     tx_with_retry(db, false, async move |tx| {

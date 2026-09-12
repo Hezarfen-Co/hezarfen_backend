@@ -51,7 +51,7 @@ pub async fn resolve(db: &Database, id: Option<&str>) -> Result<Option<TermId>, 
     if resolved.is_archived() {
         return Err(archived_error());
     }
-    Ok(Some(resolved.get_id().clone()))
+    Ok(Some(*resolved.get_id()))
 }
 
 /// Refuse when the named term is archived. A missing row is `Ok(())`: a

@@ -176,7 +176,7 @@ mod tests {
         let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for role in [Role::Ai, Role::Parent, Role::Student, Role::Teacher, Role::Manager, Role::Admin] {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&role, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&role, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), role.as_str());
         }
     }

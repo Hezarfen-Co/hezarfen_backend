@@ -73,10 +73,8 @@ impl Builder {
 /// are the same 64 hex chars.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BuilderSession {
-    pub(crate) id: Uuid,
     pub(crate) builder: BuilderId,
     pub(crate) token: SessionToken,
-    pub(crate) created_at: Timestamp,
     pub(crate) expires_at: Timestamp,
 }
 

@@ -241,7 +241,7 @@ pub struct CourseResponse {
 /// assigned to run it. Feed this into `person_map` so the response can resolve
 /// all of them — a name the map is missing renders as an unknown person.
 pub fn course_people(course: &Course) -> impl Iterator<Item = UserId> + '_ {
-    std::iter::once(course.get_creator().clone()).chain(course.get_teachers().iter().cloned())
+    std::iter::once(*course.get_creator()).chain(course.get_teachers().iter().cloned())
 }
 
 impl CourseResponse {

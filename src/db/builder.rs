@@ -68,10 +68,9 @@ pub async fn create_session(
         BuilderSession,
         r#"INSERT INTO builder_session (id, builder, token, created_at, expires_at)
            VALUES ($1, $2, $3, $4, $5)
-           RETURNING id,
+           RETURNING
                      builder AS "builder: BuilderId",
                      token AS "token: SessionToken",
-                     created_at AS "created_at: Timestamp",
                      expires_at AS "expires_at: Timestamp""#,
         crate::domain::monotonic_id::next_uuid(),
         builder.uuid(),
@@ -87,10 +86,9 @@ pub async fn create_session(
 pub async fn find_by_token(db: &Database, token: &str) -> Result<Option<BuilderSession>, AppError> {
     let session = sqlx::query_as!(
         BuilderSession,
-        r#"SELECT id,
+        r#"SELECT
                   builder AS "builder: BuilderId",
                   token AS "token: SessionToken",
-                  created_at AS "created_at: Timestamp",
                   expires_at AS "expires_at: Timestamp"
            FROM builder_session WHERE token = $1"#,
         token

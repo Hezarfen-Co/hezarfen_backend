@@ -108,7 +108,7 @@ impl PoolQuestion {
     pub fn new(asker: &UserId, title: PoolQuestionTitle, body: PoolQuestionBody) -> Self {
         Self {
             id: PoolQuestionId::generate(),
-            asker: asker.clone(),
+            asker: *asker,
             title,
             body,
             status: STATUS_PENDING.to_string(),

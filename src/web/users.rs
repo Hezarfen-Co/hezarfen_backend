@@ -539,7 +539,7 @@ async fn students_page(
     let links = crate::service::parent_link::list_for_parent(db, parent).await?;
     let ids: Vec<UserId> = links
         .iter()
-        .map(|link| link.get_student().clone())
+        .map(|link| *link.get_student())
         .collect();
     let mut students = crate::service::user::list_by_ids(db, &ids).await?;
     // The link row alone is not the grant, exactly as [`ensure_can_observe`]

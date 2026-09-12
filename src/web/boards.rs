@@ -640,7 +640,7 @@ impl InviteSource {
                         .await?
                         .0
                         .iter()
-                        .map(|member| member.get_user().clone())
+                        .map(|member| *member.get_user())
                         .collect(),
                 )
             }
@@ -661,7 +661,7 @@ impl InviteSource {
                         .await?
                         .0
                         .iter()
-                        .map(|enrollment| enrollment.get_user().clone())
+                        .map(|enrollment| *enrollment.get_user())
                         .collect(),
                 )
             }

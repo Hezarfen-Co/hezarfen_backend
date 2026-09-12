@@ -40,7 +40,7 @@ impl ExamResultId {
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
         Self {
             exam: exam.clone(),
-            user: user.clone(),
+            user: *user,
             seq,
         }
     }
@@ -163,9 +163,9 @@ mod tests {
         };
 
         let got = latest_per_pair(vec![
-            row(user.clone(), 1, 60),
-            row(other.clone(), 1, 70),
-            row(user.clone(), 2, 85), // retake outranks the seq-1 mark
+            row(user, 1, 60),
+            row(other, 1, 70),
+            row(user, 2, 85), // retake outranks the seq-1 mark
             row(other, 3, 40),        // third sitting of the second pair
         ]);
         assert_eq!(got.len(), 2);

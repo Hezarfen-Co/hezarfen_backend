@@ -424,7 +424,7 @@ mod tests {
         let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for status in [MealBookingStatus::Booked, MealBookingStatus::Cancelled] {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&status, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&status, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), status.as_str());
         }
     }

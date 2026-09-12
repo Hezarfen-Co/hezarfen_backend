@@ -203,7 +203,7 @@ async fn against(
             }
             return Ok(existing);
         }
-        let taken = payment_ledger::applied_to(&mut *tx, &target.id.key(), target.kind).await?;
+        let taken = payment_ledger::applied_to(&mut *tx, target.id.key(), target.kind).await?;
         if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
             // The fold cannot say *why* the room is gone: a reversal is a
             // child of the line it undoes and folds in at `+amount` exactly
@@ -228,7 +228,7 @@ async fn against(
             &mut *tx,
             PaymentLedger {
                 id: keyed.clone().unwrap_or_else(PaymentLedgerId::generate),
-                student: target.student.clone(),
+                student: target.student,
                 kind,
                 amount_minor,
                 source: Some(target.id.key().to_string()),
@@ -285,7 +285,7 @@ pub async fn reversal(
             &mut *tx,
             PaymentLedger {
                 id: PaymentLedgerId::for_reversal(line.get_id()),
-                student: line.student.clone(),
+                student: line.student,
                 kind: PaymentLedgerKind::Reversal,
                 amount_minor: line.amount_minor,
                 source: Some(line.id.key().to_string()),
@@ -402,14 +402,14 @@ mod tests {
         // is a 500, never that other line handed back as this one.
         let intruder = PaymentLedger {
             id: charge.get_id().clone(),
-            student: charge.student.clone(),
+            student: charge.student,
             kind: PaymentLedgerKind::Credit,
             amount_minor: LedgerAmount::try_new(1).unwrap(),
             source: Some(charge.id.key().to_owned()),
             due_at: None,
             method: None,
             note: None,
-            recorded_by: manager.clone(),
+            recorded_by: manager,
             created_at: Timestamp::now(),
         };
         assert!(

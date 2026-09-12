@@ -264,8 +264,8 @@ mod tests {
         let recipient = UserId::from_key("018f1a00-0000-7000-8000-000000000002");
         let message = Message {
             id: MessageId::generate(),
-            sender: sender.clone(),
-            recipient: recipient.clone(),
+            sender,
+            recipient,
             subject: MessageSubject::try_new("s").unwrap(),
             body: MessageBody::try_new("").unwrap(),
             label: None,
@@ -310,7 +310,7 @@ mod tests {
             Folder::Deleted,
         ] {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&folder, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&folder, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), folder.as_str());
         }
     }

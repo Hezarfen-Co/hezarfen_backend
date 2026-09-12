@@ -31,7 +31,7 @@ pub struct DietaryProfileId {
 impl DietaryProfileId {
     pub fn of(student: &UserId) -> Self {
         Self {
-            student: student.clone(),
+            student: *student,
         }
     }
 

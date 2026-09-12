@@ -67,14 +67,14 @@ pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppErr
             .await?
             .0
             .iter()
-            .map(|user| user.get_id().clone())
+            .map(|user| *user.get_id())
             .collect()),
         crate::domain::event::EventAudienceKind::Role => {
             match event.get_audience_role() {
                 Some(role) => Ok(crate::db::user::list_by_role(db, role)
                     .await?
                     .iter()
-                    .map(|user| user.get_id().clone())
+                    .map(|user| *user.get_id())
                     .collect()),
                 None => Ok(Vec::new()),
             }
@@ -84,7 +84,7 @@ pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppErr
                 .await?
                 .0
                 .iter()
-                .map(|enrollment| enrollment.get_user().clone())
+                .map(|enrollment| *enrollment.get_user())
                 .collect()),
             None => Ok(Vec::new()),
         },
@@ -93,7 +93,7 @@ pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppErr
                 .await?
                 .0
                 .iter()
-                .map(|member| member.get_user().clone())
+                .map(|member| *member.get_user())
                 .collect()),
             None => Ok(Vec::new()),
         },
@@ -101,7 +101,7 @@ pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppErr
             Ok(crate::db::registration::list_for_event(db, event.get_id())
                 .await?
                 .iter()
-                .map(|registration| registration.get_user().clone())
+                .map(|registration| *registration.get_user())
                 .collect())
         }
     }

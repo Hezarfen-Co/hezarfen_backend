@@ -93,7 +93,6 @@ const ROOM: &str = "exam room";
 /// stamp can never erase a join's clear of a marker it did not make. The
 /// join's clear lands milliseconds after the door's read-only rejoin
 /// check, which no HTTP caller can observe.
-
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -147,7 +146,7 @@ pub async fn attempt_ws(
     check_rejoin(&exam, &attempt)?;
     crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
 
-    let user_id = user.get_id().clone();
+    let user_id = *user.get_id();
     Ok(ws.on_upgrade(move |socket| room(socket, st, slug, exam, attempt, user_id)))
 }
 

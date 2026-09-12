@@ -19,7 +19,7 @@ impl ExamAttemptId {
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
         Self {
             exam: exam.clone(),
-            user: user.clone(),
+            user: *user,
             seq,
         }
     }

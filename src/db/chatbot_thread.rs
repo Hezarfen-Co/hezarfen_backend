@@ -409,7 +409,7 @@ mod tests {
                 })
             };
             let turn = {
-                let (id, db, user, gate) = (id.clone(), db.clone(), user.clone(), gate);
+                let (id, db, user, gate) = (id.clone(), db.clone(), user, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     chatbot_message::append_user(

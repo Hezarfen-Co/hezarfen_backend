@@ -17,7 +17,7 @@ impl AttendanceId {
     pub fn composite(event: &EventId, user: &UserId) -> Self {
         Self {
             event: event.clone(),
-            user: user.clone(),
+            user: *user,
         }
     }
 

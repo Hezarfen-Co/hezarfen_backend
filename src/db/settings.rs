@@ -11,7 +11,7 @@ use crate::error::AppError;
 pub async fn load(db: &Database) -> Result<Settings, AppError> {
     let settings = sqlx::query_as!(
         Settings,
-        r#"SELECT id,
+        r#"SELECT
                   exam_kinds AS "exam_kinds: Json<Vec<ExamKindDef>>",
                   attendance_statuses,
                   grade_bands AS "grade_bands: Json<Vec<GradeBand>>",
@@ -62,7 +62,7 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
                meal_slots = EXCLUDED.meal_slots,
                dietary_tags = EXCLUDED.dietary_tags,
                meal_cancel_cutoff_minutes = EXCLUDED.meal_cancel_cutoff_minutes
-           RETURNING id,
+           RETURNING
                      exam_kinds AS "exam_kinds: Json<Vec<ExamKindDef>>",
                      attendance_statuses,
                      grade_bands AS "grade_bands: Json<Vec<GradeBand>>",
@@ -172,7 +172,7 @@ where
              AND settings.meal_slots                 IS NOT DISTINCT FROM $18
              AND settings.dietary_tags               IS NOT DISTINCT FROM $19
              AND settings.meal_cancel_cutoff_minutes IS NOT DISTINCT FROM $20
-           RETURNING id,
+           RETURNING
                      exam_kinds AS "exam_kinds: Json<Vec<ExamKindDef>>",
                      attendance_statuses,
                      grade_bands AS "grade_bands: Json<Vec<GradeBand>>",

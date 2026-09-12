@@ -46,7 +46,6 @@ fn listed_kinds(body: &Value) -> Vec<String> {
 /// A graded student, an exam of `kind`, and the manager's cookie.
 struct School {
     app: axum::Router,
-    db: hezarfen_backend::database::Database,
     boss: String,
     course: String,
     exam: String,
@@ -72,7 +71,6 @@ async fn school_with_kinds(names: &[&str]) -> School {
     let exam = create_exam(&app, &boss, &course, "Midterm", names[0]).await;
     School {
         app,
-        db,
         boss,
         course,
         exam,

@@ -363,7 +363,7 @@ mod tests {
         let question = crate::db::exam_question::create(
             &db,
             exam.get_id(),
-            subject.get_id().clone(),
+            *subject.get_id(),
             crate::domain::exam_question::QuestionText::try_new("pick one").unwrap(),
             crate::domain::exam_question::QuestionPoints::try_new(10).unwrap(),
             spec,

@@ -77,8 +77,8 @@ impl Solution {
     pub fn new(question: &PoolQuestionId, author: &UserId, body: SolutionBody) -> Self {
         Self {
             id: SolutionId::generate(),
-            question: question.clone(),
-            author: author.clone(),
+            question: *question,
+            author: *author,
             body,
             offered_at: Timestamp::now(),
             image_file: None,

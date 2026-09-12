@@ -140,7 +140,7 @@ pub async fn board_ws(
         return Err(AppError::NotFound);
     }
     let board_id = board.get_id().clone();
-    let user_id = user.get_id().clone();
+    let user_id = *user.get_id();
     Ok(ws.on_upgrade(move |socket| room(socket, st, slug, board_id, user_id)))
 }
 
@@ -690,12 +690,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let mate_id = mate.get_id().clone();
+        let mate_id = *mate.get_id();
         let board = board::create(
             &db,
             creator.get_id(),
             BoardTitle::try_new("Tahta").unwrap(),
-            vec![mate_id.clone()],
+            vec![mate_id],
         )
         .await
         .unwrap();

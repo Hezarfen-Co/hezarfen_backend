@@ -135,14 +135,14 @@ pub async fn charge_for_installment(
         exe,
         PaymentLedger {
             id: PaymentLedgerId::for_installment(&assignment.get_id(), n),
-            student: assignment.get_student().clone(),
+            student: *assignment.get_student(),
             kind: PaymentLedgerKind::Charge,
             amount_minor: installment.get_amount_minor(),
             source: Some(assignment.get_id().key()),
             due_at: Some(installment.get_due_at()),
             method: None,
             note: None,
-            recorded_by: recorded_by.clone(),
+            recorded_by: *recorded_by,
             created_at: Timestamp::now(),
         },
     )

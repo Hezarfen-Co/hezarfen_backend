@@ -376,7 +376,7 @@ pub(crate) async fn live_snapshot(
         entry.0 += 1;
         entry.1 = entry.1.max(answer.get_updated_at().as_millis());
     }
-    let people = person_map(roster.iter().map(|e| e.get_user().clone()), db).await?;
+    let people = person_map(roster.iter().map(|e| *e.get_user()), db).await?;
 
     // Once the window closes the door is shut for good (starting answers
     // 409), so "hasn't started" hardens into "was absent". Open exams have
@@ -761,7 +761,7 @@ pub(crate) async fn answer_sheet(
         .map(|question| (question.get_id().key(), question))
         .collect();
     let (earned, possible) = auto_score(&questions, &answers);
-    let people = person_map([target.clone()], db).await?;
+    let people = person_map([*target], db).await?;
     Ok(AttemptAnswersResponse {
         exam: exam.get_id().key().to_string(),
         user: PersonRef::resolve(&people, target),

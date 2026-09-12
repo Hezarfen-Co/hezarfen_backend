@@ -182,14 +182,14 @@ mod tests {
             description: None,
             due_at: Timestamp::from_millis(1),
             assigned,
-            created_by: a.clone(),
+            created_by: a,
             created_at: Timestamp::from_millis(1),
         };
         // Whole course: NULL or empty list means everyone sees it.
         assert!(with(None).student_sees(&a));
         assert!(with(Some(vec![])).student_sees(&b));
         // Subset: only the named students.
-        assert!(with(Some(vec![a.clone()])).student_sees(&a));
-        assert!(!with(Some(vec![a.clone()])).student_sees(&b));
+        assert!(with(Some(vec![a])).student_sees(&a));
+        assert!(!with(Some(vec![a])).student_sees(&b));
     }
 }

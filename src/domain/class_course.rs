@@ -10,7 +10,6 @@
 use crate::domain::class_blueprint::ClassBlueprintId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
-use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
 /// The identity of one (class, course) pair. Not a row column: the table's
@@ -49,11 +48,6 @@ pub struct ClassCourse {
     /// row carrying the key is a blueprint's to take back, so a hand-attached
     /// course survives every blueprint sweep.
     pub(crate) source: Option<ClassBlueprintId>,
-    /// When it was attached, and the *only* thing "newest first" can mean
-    /// here: the row's primary key is the (class, course) pair, so ordering
-    /// falls to this stamp (or the attached course's id). Optional because
-    /// rows written before this column carry no stamp.
-    pub(crate) attached_at: Option<Timestamp>,
 }
 
 impl ClassCourse {

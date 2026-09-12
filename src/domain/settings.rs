@@ -23,7 +23,7 @@ use crate::constant::{
     MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES,
     MAX_MEAL_SERVING_MINUTE, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
     MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN,
-    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, SETTINGS_KEY,
+    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
 };
 use crate::domain::text_fold;
 use crate::error::ValidationError;
@@ -196,7 +196,6 @@ impl GradeBand {
 /// binds them directly in the compare-and-set guard.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Settings {
-    pub(crate) id: String,
     pub(crate) exam_kinds: Json<Vec<ExamKindDef>>,
     pub(crate) attendance_statuses: Vec<String>,
     pub(crate) grade_bands: Json<Vec<GradeBand>>,
@@ -238,16 +237,10 @@ pub struct SettingsParams {
 }
 
 impl Settings {
-    /// The singleton row's key (`settings.id` is `TEXT PRIMARY KEY`).
-    pub(crate) fn record_id() -> String {
-        SETTINGS_KEY.to_string()
-    }
-
     /// The out-of-the-box policy — mirrors the constants that were previously
     /// hard-coded, so a school that never touches `/settings` sees no change.
     pub fn defaults() -> Self {
         Self {
-            id: Self::record_id(),
             exam_kinds: Json(
                 DEFAULT_EXAM_KINDS
                     .map(|(name, weight)| ExamKindDef {
@@ -400,7 +393,6 @@ impl Settings {
         }
 
         Ok(Self {
-            id: Self::record_id(),
             exam_kinds: Json(exam_kinds),
             attendance_statuses,
             grade_bands: Json(grade_bands),

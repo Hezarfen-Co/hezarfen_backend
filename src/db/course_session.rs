@@ -25,7 +25,7 @@ pub async fn create(
     let session = CourseSession {
         id: CourseSessionId::generate(),
         course: course.clone(),
-        teacher: teacher.clone(),
+        teacher: *teacher,
         topic,
         starts_at,
         ends_at,

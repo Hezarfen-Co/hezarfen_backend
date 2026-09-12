@@ -153,7 +153,7 @@ async fn plan_responses(
     plans: &[FeePlan],
     db: &Database,
 ) -> Result<Vec<FeePlanResponse>, AppError> {
-    let people = person_map(plans.iter().map(|plan| plan.get_created_by().clone()), db).await?;
+    let people = person_map(plans.iter().map(|plan| *plan.get_created_by()), db).await?;
     Ok(plans
         .iter()
         .map(|plan| FeePlanResponse::new(plan, &people))
@@ -457,7 +457,7 @@ async fn list_plan_assignments(
         service::fee_plan_assignment::list_for_plan(&st.db, plan.get_id(), limit, offset).await?;
     let people = person_map(
         rows.iter()
-            .flat_map(|row| [row.get_student().clone(), row.get_assigned_by().clone()]),
+            .flat_map(|row| [*row.get_student(), *row.get_assigned_by()]),
         &st.db,
     )
     .await?;
@@ -523,7 +523,7 @@ async fn line_responses(
     let people = person_map(
         lines
             .iter()
-            .flat_map(|line| [line.get_student().clone(), line.get_recorded_by().clone()]),
+            .flat_map(|line| [*line.get_student(), *line.get_recorded_by()]),
         db,
     )
     .await?;
@@ -948,7 +948,7 @@ async fn statement_response(
         })
         .collect();
 
-    let people = person_map(std::iter::once(student.clone()), db).await?;
+    let people = person_map(std::iter::once(*student), db).await?;
     Ok(Json(StatementResponse {
         student: PersonRef::resolve(&people, student),
         entries: Page::new(entries, total, limit, offset),
@@ -1026,7 +1026,7 @@ async fn balance_response(
     student: &UserId,
     db: &Database,
 ) -> Result<Json<PaymentBalanceResponse>, AppError> {
-    let people = person_map(std::iter::once(student.clone()), db).await?;
+    let people = person_map(std::iter::once(*student), db).await?;
     Ok(Json(PaymentBalanceResponse {
         student: PersonRef::resolve(&people, student),
         balance_minor: service::payment_ledger::balance_of(db, student).await?,

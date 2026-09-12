@@ -194,7 +194,7 @@ mod tests {
                 })
             };
             let marked = {
-                let (db, id, marker, gate) = (db.clone(), id.clone(), marker.clone(), gate);
+                let (db, id, marker, gate) = (db.clone(), id.clone(), marker, gate);
                 let student = a_person(&db, "student").await;
                 let status = AttendanceStatus::try_new("present", &allowed).unwrap();
                 tokio::spawn(async move {

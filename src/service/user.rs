@@ -243,7 +243,7 @@ mod tests {
             &db,
             creator.get_id(),
             BoardTitle::try_new("Geometri").unwrap(),
-            vec![guest.get_id().clone()],
+            vec![*guest.get_id()],
         )
         .await
         .unwrap();
@@ -283,12 +283,12 @@ mod tests {
             &db,
             creator.get_id(),
             BoardTitle::try_new("Geometri").unwrap(),
-            vec![guest.get_id().clone()],
+            vec![*guest.get_id()],
         )
         .await
         .unwrap();
         let mark = |epoch| {
-            let (id, author, db) = (board.get_id().clone(), guest.get_id().clone(), db.clone());
+            let (id, author, db) = (board.get_id().clone(), *guest.get_id(), db.clone());
             async move { crate::db::board_stroke::append(&db, &id, &author, "{\"p\":[1]}", epoch).await }
         };
         mark(0).await.unwrap();
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(stored.get_closed_at(), Some(stamp));
         assert_eq!(
             stored.get_participants(),
-            [guest.get_id().clone()],
+            [*guest.get_id()],
             "closing must not empty the roster it did not touch"
         );
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
         let soon = |offset| Timestamp::from_millis(Timestamp::now().as_millis() + offset);
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
         let slot = |owner: &User, offset: i64, db: Database| {
-            let owner = owner.get_id().clone();
+            let owner = *owner.get_id();
             async move {
                 crate::service::appointment_slot::create(
                     &db,

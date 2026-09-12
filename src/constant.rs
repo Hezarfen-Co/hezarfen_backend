@@ -785,10 +785,6 @@ pub const BANK_VISIBILITY_SCHOOL: &str = "school";
 
 // --- fixed keys and literals -------------------------------------------
 
-/// The settings singleton's fixed key: one school per deployment, one settings
-/// row.
-pub const SETTINGS_KEY: &str = "school";
-
 /// A fixed password whose hash is the login decoy (see
 /// [`crate::domain::user::PasswordHash::verify_decoy`]). Not a secret — it
 /// never matches a real account.

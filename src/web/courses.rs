@@ -273,7 +273,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
         }
     }
     // Both sources come newest-first; re-sort so the merged list is too.
-    courses.sort_by(|a, b| b.get_id().key().cmp(&a.get_id().key()));
+    courses.sort_by_key(|course| std::cmp::Reverse(course.get_id().key()));
     Ok(courses)
 }
 
@@ -692,7 +692,7 @@ async fn enroll(
     let target = UserId::from_key(&req.user_id);
     let enrollment =
         service::enrollment::enroll(&st.db, course.get_id(), &target, user.get_id()).await?;
-    let people = person_map([target, user.get_id().clone()], &st.db).await?;
+    let people = person_map([target, *user.get_id()], &st.db).await?;
     Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
 }
 
@@ -735,7 +735,7 @@ async fn list_roster(
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
-            .flat_map(|e| [e.get_user().clone(), e.get_enrolled_by().clone()]),
+            .flat_map(|e| [*e.get_user(), *e.get_enrolled_by()]),
         &st.db,
     )
     .await?;
@@ -1271,7 +1271,7 @@ async fn list_course_sessions(
     let (rows, total) =
         service::course_session::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     // Join teachers onto the page alone — the lookup shrinks with the window.
-    let people = person_map(rows.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
+    let people = person_map(rows.iter().map(|s| *s.get_teacher()), &st.db).await?;
     let items = rows
         .iter()
         .map(|s| SessionResponse::new(s, &people))

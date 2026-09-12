@@ -8,7 +8,6 @@
 //! composite id.
 
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
 /// The identity of one (class, user) pair. Not a row column: the table's
@@ -25,7 +24,7 @@ impl ClassMemberId {
     pub fn composite(class: &ClassGroupId, user: &UserId) -> Self {
         Self {
             class: class.clone(),
-            user: user.clone(),
+            user: *user,
         }
     }
 
@@ -44,11 +43,6 @@ pub struct ClassMember {
     #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) added_by: UserId,
-    /// When they were added, and the *only* thing "newest first" can mean
-    /// here: the row's primary key is the (class, user) pair, so ordering
-    /// falls to this stamp. Optional because rows written before this column
-    /// carry no stamp.
-    pub(crate) added_at: Option<Timestamp>,
 }
 
 impl ClassMember {

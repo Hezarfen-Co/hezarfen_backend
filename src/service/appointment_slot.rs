@@ -68,7 +68,7 @@ pub async fn create(
         teacher,
         vec![AppointmentSlot {
             id: AppointmentSlotId::generate(),
-            teacher: teacher.clone(),
+            teacher: *teacher,
             starts_at,
             ends_at,
             note,
@@ -134,7 +134,7 @@ pub async fn publish_weekly(
         .iter()
         .map(|&(starts_at, ends_at)| AppointmentSlot {
             id: AppointmentSlotId::generate(),
-            teacher: teacher.clone(),
+            teacher: *teacher,
             starts_at,
             ends_at,
             note: note.clone(),
@@ -506,14 +506,14 @@ mod tests {
             // really runs.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let demoting = {
-                let (db, target, gate) = (db.clone(), teacher.clone(), gate.clone());
+                let (db, target, gate) = (db.clone(), teacher, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     crate::service::user::set_role(&db, &target, Role::Student).await
                 })
             };
             let landed = {
-                let (db, teacher, gate) = (db.clone(), teacher.clone(), gate);
+                let (db, teacher, gate) = (db.clone(), teacher, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     // The publish a `RequireTeacher` snapshot taken a moment

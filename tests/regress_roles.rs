@@ -13,7 +13,6 @@ use common::{app_and_db, id_of, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::json;
-use sqlx::Row as _;
 
 /// One counter, re-read out of the store — never off a response body. `sql`
 /// is a whole scalar query.

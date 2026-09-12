@@ -91,7 +91,7 @@ pub async fn resolve_participants(
         .await?
         .iter()
         .filter(|found| found.get_role().at_least(Role::Student))
-        .map(|found| found.get_id().clone())
+        .map(|found| *found.get_id())
         .collect();
     let mut users = Vec::with_capacity(wanted.len());
     for user in wanted {
@@ -140,7 +140,7 @@ pub async fn invite(db: &Database, board: &Board, invited: Vec<UserId>) -> Resul
         if candidate.get_id() == board.get_creator() || roster.contains(candidate.get_id()) {
             continue;
         }
-        add.push(candidate.get_id().clone());
+        add.push(*candidate.get_id());
     }
 
     // Unchanged rosters still write and still fan out: the alternative is a
@@ -220,7 +220,7 @@ pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     /// The security boundary of the gates this module owns, in one test: an
     /// outsider is told the board does not exist, an insider without rights is

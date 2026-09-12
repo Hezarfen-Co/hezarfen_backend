@@ -444,7 +444,7 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        crate::db::user::create(
+        *crate::db::user::create(
             db,
             crate::domain::user::Username::try_new(username).unwrap(),
             hash,
@@ -452,7 +452,6 @@ mod tests {
         .await
         .unwrap()
         .get_id()
-        .clone()
     }
 
     /// Move the stored deadline the way a teacher's PATCH does, leaving the

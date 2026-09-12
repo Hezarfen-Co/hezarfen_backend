@@ -18,7 +18,7 @@ pub async fn create(
 ) -> Result<Board, AppError> {
     let board = Board {
         id: BoardId::generate(),
-        creator: creator.clone(),
+        creator: *creator,
         title,
         participants: checked_participants(participants)?,
         locked: false,

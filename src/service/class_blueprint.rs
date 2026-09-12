@@ -615,8 +615,8 @@ mod tests {
             })
         };
         let pumping = {
-            let (db, class, algebra, manager, gate) =
-                (db.clone(), class.clone(), algebra.clone(), manager.clone(), gate);
+            let (db, class, _algebra, manager, gate) =
+                (db.clone(), class.clone(), algebra.clone(), manager, gate);
             tokio::spawn(async move {
                 gate.wait().await;
                 apply_to(&db, &blueprint, &class, &manager).await
@@ -714,7 +714,7 @@ mod tests {
             let (db, class, manager, gate, blueprint) = (
                 db.clone(),
                 classes[2].clone(),
-                manager.clone(),
+                manager,
                 gate.clone(),
                 blueprint.clone(),
             );

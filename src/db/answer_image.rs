@@ -271,7 +271,7 @@ mod tests {
         crate::db::exam_question::create(
             db,
             exam,
-            subject.get_id().clone(),
+            *subject.get_id(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             crate::domain::exam_question::QuestionPoints::try_new(1).unwrap(),
             spec,

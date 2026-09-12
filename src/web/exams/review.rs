@@ -161,7 +161,7 @@ pub(crate) async fn student_marks_history(
     let people = person_map(
         results
             .iter()
-            .flat_map(|r| [r.get_user().clone(), r.get_graded_by().clone()]),
+            .flat_map(|r| [*r.get_user(), *r.get_graded_by()]),
         &st.db,
     )
     .await?;
@@ -305,7 +305,7 @@ pub(crate) async fn review_attempts(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<i64>>, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
-    let target = user.get_id().clone();
+    let target = *user.get_id();
     let mut seqs =
         crate::service::exam_answer::list_seqs_for_user(&st.db, exam.get_id(), &target).await?;
     for result in

@@ -331,7 +331,7 @@ mod tests {
     async fn an_edit_racing_an_assign_leaves_the_plan_and_the_money_agreeing() {
         let (db, _leases) = crate::database::init_test_db().await;
         let mut reached = 0;
-        for round in 0..20 {
+        for _round in 0..20 {
             let manager = a_person(&db, "mgr", "manager").await;
             let student = a_person(&db, "stu", "student").await;
             let plan = a_plan(
@@ -360,7 +360,7 @@ mod tests {
             };
             let assign = {
                 let (db, plan, manager, student) =
-                    (db.clone(), plan.clone(), manager.clone(), student.clone());
+                    (db.clone(), plan.clone(), manager, student);
                 tokio::spawn(async move { assign(&db, &plan, &student, &manager).await })
             };
             let (edit, assign) = (edit.await.unwrap(), assign.await.unwrap());
@@ -462,7 +462,7 @@ mod tests {
             };
             let assign = {
                 let (db, plan, manager, student) =
-                    (db.clone(), plan.clone(), manager.clone(), student.clone());
+                    (db.clone(), plan.clone(), manager, student);
                 tokio::spawn(async move {
                     if hold_back_the_assign {
                         tokio::time::sleep(head_start).await;

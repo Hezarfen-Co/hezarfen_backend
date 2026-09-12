@@ -5,7 +5,7 @@
 use crate::constant::COURSE_TABLE;
 use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::cap;
-use crate::db::field_update::FieldUpdate;
+use crate::db::field_update::{FieldUpdate, Refcount};
 use crate::db::page::PagedList;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::term::{self, TermId};
@@ -220,15 +220,15 @@ pub async fn update(
             term.map(|term| crate::db::page::Param::OptUuid(term.map(|term| term.uuid()))),
         )
         .set("capacity", capacity.map(crate::db::page::Param::OptI64))
-        .refcount(
-            "term",
-            "course_count",
-            "term",
-            course.term.as_ref().map(|term| term.uuid()),
-            claim.map(|term| term.uuid()),
-            release.map(|term| term.uuid()),
-            term::gone_error(),
-        )
+        .refcount(Refcount {
+            counter_table: "term",
+            counter_field: "course_count",
+            link: "term",
+            expected: course.term.as_ref().map(|term| term.uuid()),
+            claim: claim.map(|term| term.uuid()),
+            release: release.map(|term| term.uuid()),
+            refused: term::gone_error(),
+        })
         .run::<Course>(db)
         .await
 }
@@ -801,8 +801,8 @@ mod tests {
                 .await
                 .unwrap();
 
-        let linked = course_on(Some(term.get_id().clone()), &db).await;
-        let patched = course_on(Some(term.get_id().clone()), &db).await;
+        let linked = course_on(Some(*term.get_id()), &db).await;
+        let patched = course_on(Some(*term.get_id()), &db).await;
         assert!(
             !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "two linked courses must refuse the delete"
@@ -885,7 +885,7 @@ mod tests {
     async fn a_refused_create_writes_neither_row_nor_count() {
         let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term("2026", &db).await;
-        let id = term.get_id().clone();
+        let id = *term.get_id();
         assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
@@ -919,7 +919,7 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
-        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let course = course_on(Some(*from.get_id()), &db).await;
         assert_eq!(count_on(from.get_id(), &db).await, 1);
 
         let moved = update(
@@ -928,7 +928,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -957,7 +957,7 @@ mod tests {
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
         let other = a_term("2028", &db).await;
-        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let course = course_on(Some(*from.get_id()), &db).await;
         let stale = course.clone();
         update(
             &db,
@@ -965,7 +965,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -977,7 +977,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(other.get_id().clone())),
+            Some(Some(*other.get_id())),
             None,
         )
         .await
@@ -1006,7 +1006,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -1017,7 +1017,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(other.get_id().clone())),
+            Some(Some(*other.get_id())),
             None,
         )
         .await
@@ -1047,7 +1047,7 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let to = a_term("2027", &db).await;
-        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let course = course_on(Some(*from.get_id()), &db).await;
         let stale = course.clone();
         update(
             &db,
@@ -1055,7 +1055,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -1067,7 +1067,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(from.get_id().clone())),
+            Some(Some(*from.get_id())),
             None,
         )
         .await
@@ -1098,7 +1098,7 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(to.get_id().clone())),
+            Some(Some(*to.get_id())),
             None,
         )
         .await
@@ -1118,9 +1118,9 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let from = a_term("2026", &db).await;
         let dead = a_term("2027", &db).await;
-        let dead_id = dead.get_id().clone();
+        let dead_id = *dead.get_id();
         assert!(crate::db::term::delete(&db, dead).await.unwrap());
-        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let course = course_on(Some(*from.get_id()), &db).await;
 
         let error = update(
             &db,
@@ -1211,8 +1211,8 @@ mod tests {
             };
             let joins: Vec<_> = (0..6)
                 .map(|seat| {
-                    let (id, db, mgr) = (course.get_id().clone(), db.clone(), mgr.clone());
-                    let student = students[seat].clone();
+                    let (id, db, mgr) = (course.get_id().clone(), db.clone(), mgr);
+                    let student = students[seat];
                     tokio::spawn(async move {
                         crate::db::enrollment::enroll(&db, &id, &student, &mgr).await
                     })

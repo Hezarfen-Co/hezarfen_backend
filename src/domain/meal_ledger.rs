@@ -294,13 +294,13 @@ impl MealLedger {
                 booking.get_attempt(),
                 MealLedgerKind::Charge,
             ),
-            student: booking.get_student().clone(),
+            student: *booking.get_student(),
             kind: MealLedgerKind::Charge,
             amount_minor: amount,
             source: Some(booking.id().key()),
             method: None,
             note: None,
-            recorded_by: recorded_by.clone(),
+            recorded_by: *recorded_by,
             created_at: Timestamp::now(),
         })
     }
@@ -330,13 +330,13 @@ impl MealLedger {
                 booking.get_attempt(),
                 MealLedgerKind::Reversal,
             ),
-            student: booking.get_student().clone(),
+            student: *booking.get_student(),
             kind: MealLedgerKind::Reversal,
             amount_minor: amount,
             source: Some(charge.key().to_string()),
             method: None,
             note: None,
-            recorded_by: recorded_by.clone(),
+            recorded_by: *recorded_by,
             created_at: Timestamp::now(),
         };
         Some((charge, line))
@@ -360,7 +360,7 @@ mod tests {
             MealLedgerKind::Reversal,
         ] {
             buf.clear();
-            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&kind, &mut buf);
+            let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&kind, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), kind.as_str());
         }
     }

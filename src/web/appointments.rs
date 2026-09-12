@@ -231,8 +231,8 @@ async fn appointment_responses(
     // higher-ranked, which axum then refuses as not `Send` enough.
     let mut ids = Vec::with_capacity(rows.len() * 2);
     for (row, slot) in rows.iter().zip(&slots) {
-        ids.push(row.get_requester().clone());
-        ids.extend(slot.as_ref().map(|slot| slot.get_teacher().clone()));
+        ids.push(*row.get_requester());
+        ids.extend(slot.as_ref().map(|slot| *slot.get_teacher()));
         ids.extend(row.get_proposed_by().cloned());
         ids.extend(row.get_decided_by().cloned());
         ids.extend(row.get_cancelled_by().cloned());

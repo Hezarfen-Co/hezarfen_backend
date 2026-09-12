@@ -32,7 +32,7 @@ impl FeePlanAssignmentId {
     pub fn composite(plan: &FeePlanId, student: &UserId) -> Self {
         Self {
             plan: plan.clone(),
-            student: student.clone(),
+            student: *student,
         }
     }
 

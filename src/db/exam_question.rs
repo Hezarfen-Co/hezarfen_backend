@@ -258,7 +258,7 @@ pub async fn update(
     // subject its own stale snapshot held, sent while a rival's move
     // already landed, writes that stale subject straight back over the
     // winner — a revert with the counters left pointing at the move.
-    let retag = (subject != question.subject).then(|| (subject, question.subject.clone()));
+    let retag = (subject != question.subject).then_some((subject, question.subject));
     tx_with_retry(db, false, async move |conn| {
         // Freeze first, as always: it outranks every caller gate, and a
         // frozen exam answers the same 409 the pre-flight check gave.
@@ -498,7 +498,7 @@ mod tests {
 
         async fn a_question(exam: &Exam, on: &SubjectId, db: &Database) -> ExamQuestion {
             let (text, points, spec) = body();
-            create(db, exam.get_id(), on.clone(), text, points, spec)
+            create(db, exam.get_id(), *on, text, points, spec)
                 .await
                 .unwrap()
         }
@@ -509,7 +509,7 @@ mod tests {
             db: &Database,
         ) -> Result<ExamQuestion, AppError> {
             let (text, points, spec) = body();
-            update(db, question, to.clone(), text, points, spec).await
+            update(db, question, *to, text, points, spec).await
         }
 
         /// The stored `exam_question_count` on one subject, absent = zero.
@@ -540,7 +540,7 @@ mod tests {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let (from, to) = (a_subject(&db).await, a_subject(&db).await);
-            let (from, to) = (from.get_id().clone(), to.get_id().clone());
+            let (from, to) = (*from.get_id(), *to.get_id());
             let question = a_question(&exam, &from, &db).await;
             assert_eq!(count_on(&from, &db).await, 1);
 
@@ -564,7 +564,7 @@ mod tests {
                 .unwrap();
 
             let (text, points, spec) = body();
-            let error = create(&db, exam.get_id(), to.clone(), text, points, spec)
+            let error = create(&db, exam.get_id(), to, text, points, spec)
                 .await
                 .expect_err("a started exam takes no new questions");
             assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
@@ -585,7 +585,7 @@ mod tests {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let subject = a_subject(&db).await;
-            let id = subject.get_id().clone();
+            let id = *subject.get_id();
             crate::db::subject::delete(&db, subject).await.unwrap();
 
             let (text, points, spec) = body();
@@ -610,7 +610,7 @@ mod tests {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
             let (from, to) = (a_subject(&db).await, a_subject(&db).await);
-            let (from, to) = (from.get_id().clone(), to.get_id().clone());
+            let (from, to) = (*from.get_id(), *to.get_id());
             let question = a_question(&exam, &from, &db).await;
 
             let after = moved(question, &to, &db).await.unwrap();
@@ -623,9 +623,9 @@ mod tests {
         async fn a_move_to_a_dead_subject_leaves_everything_untouched() {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
-            let from = a_subject(&db).await.get_id().clone();
+            let from = *a_subject(&db).await.get_id();
             let dead = a_subject(&db).await;
-            let gone = dead.get_id().clone();
+            let gone = *dead.get_id();
             crate::db::subject::delete(&db, dead).await.unwrap();
             let question = a_question(&exam, &from, &db).await;
 
@@ -658,9 +658,9 @@ mod tests {
         async fn a_stale_mover_is_refused_and_claims_nothing() {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
-            let from = a_subject(&db).await.get_id().clone();
-            let to = a_subject(&db).await.get_id().clone();
-            let other = a_subject(&db).await.get_id().clone();
+            let from = *a_subject(&db).await.get_id();
+            let to = *a_subject(&db).await.get_id();
+            let other = *a_subject(&db).await.get_id();
             let question = a_question(&exam, &from, &db).await;
             let stale = question.clone();
 
@@ -694,8 +694,8 @@ mod tests {
         async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
-            let from = a_subject(&db).await.get_id().clone();
-            let to = a_subject(&db).await.get_id().clone();
+            let from = *a_subject(&db).await.get_id();
+            let to = *a_subject(&db).await.get_id();
             let question = a_question(&exam, &from, &db).await;
             let stale = question.clone();
 
@@ -724,14 +724,14 @@ mod tests {
         async fn a_no_op_re_state_still_lands() {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
-            let on = a_subject(&db).await.get_id().clone();
+            let on = *a_subject(&db).await.get_id();
             let question = a_question(&exam, &on, &db).await;
 
             let (_, points, spec) = body();
             let after = update(
                 &db,
                 question,
-                on.clone(),
+                on,
                 QuestionText::try_new("4 + 4?").unwrap(),
                 points,
                 spec,
@@ -749,8 +749,8 @@ mod tests {
         async fn a_move_of_a_deleted_question_is_still_a_404() {
             let (db, _leases) = init_test_db().await;
             let exam = an_exam(&db).await;
-            let from = a_subject(&db).await.get_id().clone();
-            let to = a_subject(&db).await.get_id().clone();
+            let from = *a_subject(&db).await.get_id();
+            let to = *a_subject(&db).await.get_id();
             let question = a_question(&exam, &from, &db).await;
             delete(&db, question.clone()).await.unwrap();
 

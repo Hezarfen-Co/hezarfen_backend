@@ -87,7 +87,7 @@ pub async fn book(
     let appointment_row = Appointment {
         id: AppointmentId::generate(),
         slot: Some(slot.clone()),
-        requester: requester.clone(),
+        requester: *requester,
         status: AppointmentStatus::Pending,
         reason,
         proposed_starts_at: None,
@@ -264,7 +264,7 @@ pub async fn reject(
         let expected = appointment::read_pending(db, id).await?;
         let mut rejected = expected.clone();
         rejected.status = AppointmentStatus::Rejected;
-        rejected.decided_by = Some(decided_by.clone());
+        rejected.decided_by = Some(*decided_by);
         rejected.reject_reason = reason.clone();
         if let Some(saved) = appointment::save_if_unchanged(db, &expected, rejected).await? {
             return Ok(saved);
@@ -303,7 +303,7 @@ pub async fn cancel(
         }
         let mut cancelled = expected.clone();
         cancelled.status = AppointmentStatus::Cancelled;
-        cancelled.cancelled_by = Some(cancelled_by.clone());
+        cancelled.cancelled_by = Some(*cancelled_by);
         cancelled.cancel_reason = reason.clone();
         if let Some(saved) = appointment::save_if_unchanged(db, &expected, cancelled).await? {
             return Ok(saved);
@@ -352,7 +352,7 @@ pub async fn propose(
         proposed.decided_by = None;
         proposed.proposed_starts_at = Some(starts_at);
         proposed.proposed_ends_at = Some(ends_at);
-        proposed.proposed_by = Some(proposed_by.clone());
+        proposed.proposed_by = Some(*proposed_by);
         if let Some(saved) = appointment::save_if_unchanged(db, &expected, proposed).await? {
             return Ok(saved);
         }
@@ -594,7 +594,7 @@ mod tests {
 
         let mut late = stale.clone();
         late.status = AppointmentStatus::Approved;
-        late.decided_by = Some(teacher.clone());
+        late.decided_by = Some(teacher);
         assert!(
             appointment::save_if_unchanged(&db, &stale, late)
                 .await
@@ -617,7 +617,7 @@ mod tests {
         // stands, does land — a miss is a retry signal, not a wall.
         let mut fresh = after.clone();
         fresh.status = AppointmentStatus::Approved;
-        fresh.decided_by = Some(teacher.clone());
+        fresh.decided_by = Some(teacher);
         let saved = appointment::save_if_unchanged(&db, &after, fresh)
             .await
             .unwrap()

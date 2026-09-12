@@ -464,7 +464,7 @@ async fn create_question(
         &[],
     )?;
     let question =
-        bank_question::create(&st.db, user.get_id().clone(), subject, text, points, spec).await?;
+        bank_question::create(&st.db, *user.get_id(), subject, text, points, spec).await?;
     Ok((
         StatusCode::CREATED,
         Json(BankQuestionResponse::new(&question, &[])),
@@ -504,7 +504,7 @@ async fn list_questions(
     let (limit, offset) = page.resolve()?;
     let subject = filter.subject.as_deref().map(SubjectId::from_key);
     let owner = filter.owner.as_deref().map(|owner| match owner {
-        "me" => user.get_id().clone(),
+        "me" => *user.get_id(),
         id => UserId::from_key(id),
     });
     // Same newtype the PATCH validates against, so an unknown shelf is the same
@@ -517,7 +517,7 @@ async fn list_questions(
     // The visibility gate is one of those SQL filters, never a post-filter over
     // the page: `total` counts what the caller may see, so paging can't hand
     // back short pages full of holes where someone else's private templates sat.
-    let viewer = (!user.get_role().at_least(Role::Admin)).then(|| user.get_id().clone());
+    let viewer = (!user.get_role().at_least(Role::Admin)).then(|| *user.get_id());
     // Filters, order, and window are all SQL — `total` comes from a count over
     // the same WHERE, so a client can page past the first window.
     let (questions, total) = bank_question::list(
@@ -554,7 +554,7 @@ async fn list_questions(
                 )
             })
             .collect();
-    let people = person_map(questions.iter().map(|q| q.get_owner().clone()), &st.db).await?;
+    let people = person_map(questions.iter().map(|q| *q.get_owner()), &st.db).await?;
 
     let empty: Vec<BankQuestionImage> = Vec::new();
     let items = questions
@@ -959,8 +959,8 @@ mod tests {
         .unwrap();
         let question = bank_question::create(
             &db,
-            owner.get_id().clone(),
-            subject.get_id().clone(),
+            *owner.get_id(),
+            *subject.get_id(),
             QuestionText::try_new("2 + 2 = ?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),

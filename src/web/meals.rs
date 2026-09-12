@@ -205,7 +205,7 @@ async fn menu_responses(
 ) -> Result<Vec<MenuResponse>, AppError> {
     let ids: Vec<MenuId> = menus.iter().map(|menu| menu.get_id().clone()).collect();
     let dishes = service::menu::list_dishes_for_menus(db, &ids).await?;
-    let people = person_map(menus.iter().map(|menu| menu.get_created_by().clone()), db).await?;
+    let people = person_map(menus.iter().map(|menu| *menu.get_created_by()), db).await?;
     let viewer_tags = service::dietary_profile::tags_of(db, viewer).await?;
     Ok(menus
         .iter()
@@ -220,7 +220,7 @@ async fn one_menu(
     db: &Database,
 ) -> Result<Json<MenuResponse>, AppError> {
     let dishes = service::menu::list_dishes(db, menu.get_id()).await?;
-    let people = person_map([menu.get_created_by().clone()], db).await?;
+    let people = person_map([*menu.get_created_by()], db).await?;
     let viewer_tags = service::dietary_profile::tags_of(db, viewer).await?;
     Ok(Json(MenuResponse::new(
         menu,
@@ -573,8 +573,8 @@ async fn profile_response(
 ) -> Result<Json<DietaryProfileResponse>, AppError> {
     let profile = service::dietary_profile::read(db, student).await?;
     let people = person_map(
-        std::iter::once(student.clone())
-            .chain(profile.as_ref().map(|row| row.get_updated_by().clone())),
+        std::iter::once(*student)
+            .chain(profile.as_ref().map(|row| *row.get_updated_by())),
         db,
     )
     .await?;
@@ -745,8 +745,8 @@ async fn booking_responses(
     let people = person_map(
         bookings.iter().flat_map(|booking| {
             [
-                booking.get_student().clone(),
-                booking.get_booked_by().clone(),
+                *booking.get_student(),
+                *booking.get_booked_by(),
             ]
         }),
         db,
@@ -786,7 +786,7 @@ async fn booking_target(
             Some(id) if id != caller.get_id().key() => Err(AppError::Forbidden(
                 "a student books meals only for themselves",
             )),
-            _ => Ok(caller.get_id().clone()),
+            _ => Ok(*caller.get_id()),
         },
         Role::Parent => {
             let target = UserId::from_key(student_id.ok_or(AppError::Validation(
@@ -889,13 +889,13 @@ async fn my_bookings(
     let (limit, offset) = page.resolve()?;
     // Own seats always; a parent's children only while the link is live — the
     // booking row's `booked_by` is history, never a standing read grant.
-    let mut students = vec![user.get_id().clone()];
+    let mut students = vec![*user.get_id()];
     if user.get_role() == Role::Parent {
         students.extend(
             crate::service::parent_link::list_for_parent(&st.db, user.get_id())
                 .await?
                 .iter()
-                .map(|link| link.get_student().clone()),
+                .map(|link| *link.get_student()),
         );
     }
     let (rows, total) =
@@ -1065,7 +1065,7 @@ struct MealAttendanceResponse {
 impl MealAttendanceResponse {
     fn new(row: &MealAttendance, people: &std::collections::HashMap<String, PersonRef>) -> Self {
         Self {
-            id: MealAttendanceId::composite(row.get_menu(), &row.get_student()).key(),
+            id: MealAttendanceId::composite(row.get_menu(), row.get_student()).key(),
             menu_id: row.get_menu().key().to_string(),
             student: PersonRef::resolve(people, row.get_student()),
             status: row.get_status().as_str().to_string(),
@@ -1082,7 +1082,7 @@ async fn attendance_responses(
 ) -> Result<Vec<MealAttendanceResponse>, AppError> {
     let people = person_map(
         rows.iter()
-            .flat_map(|row| [row.get_student().clone(), row.get_marked_by().clone()]),
+            .flat_map(|row| [*row.get_student(), *row.get_marked_by()]),
         db,
     )
     .await?;
@@ -1286,7 +1286,7 @@ async fn ledger_responses(
     let people = person_map(
         lines
             .iter()
-            .flat_map(|line| [line.get_student().clone(), line.get_recorded_by().clone()]),
+            .flat_map(|line| [*line.get_student(), *line.get_recorded_by()]),
         db,
     )
     .await?;
@@ -1301,7 +1301,7 @@ async fn balance_response(
     student: &UserId,
     db: &Database,
 ) -> Result<Json<BalanceResponse>, AppError> {
-    let people = person_map(std::iter::once(student.clone()), db).await?;
+    let people = person_map(std::iter::once(*student), db).await?;
     Ok(Json(BalanceResponse {
         student: PersonRef::resolve(&people, student),
         balance_minor: service::meal_ledger::balance_of(db, student).await?,

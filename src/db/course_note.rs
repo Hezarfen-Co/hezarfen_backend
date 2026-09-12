@@ -22,7 +22,7 @@ pub async fn create(
     let note = CourseNote {
         id: CourseNoteId::generate(),
         course: course.clone(),
-        author: author.clone(),
+        author: *author,
         title,
         content,
     };

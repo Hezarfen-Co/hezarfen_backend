@@ -152,13 +152,6 @@ mod tests {
         count
     }
 
-    fn stats(homework_submitted: i64) -> BadgeStats {
-        BadgeStats {
-            homework_submitted,
-            ..Default::default()
-        }
-    }
-
     #[tokio::test]
     async fn load_defaults_every_counter_to_zero() {
         let (db, _leases) = init_test_db().await;

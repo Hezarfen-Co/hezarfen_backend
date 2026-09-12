@@ -9,13 +9,6 @@ use crate::domain::profile::ProfileStats;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The aggregate row of [`load`].
-#[derive(Debug)]
-struct PomodoroTotals {
-    sessions: i64,
-    focus_ms: i64,
-}
-
 /// One round trip, and only one: `courses` and `classes` arrive from the
 /// caller, which already holds them as the `total` of the paged class and
 /// course readers it ran for the profile's own blocks — re-counting them

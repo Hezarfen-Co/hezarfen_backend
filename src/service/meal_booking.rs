@@ -123,8 +123,8 @@ pub async fn book(
         let price = meal_ledger::price_snapshot(db, menu).await?;
         let fresh_row = MealBooking {
             menu: menu.clone(),
-            student: student.clone(),
-            booked_by: booked_by.clone(),
+            student: *student,
+            booked_by: *booked_by,
             status: MealBookingStatus::Booked,
             attempt,
             price_minor: price,
@@ -559,8 +559,8 @@ mod tests {
         let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
         let row = MealBooking {
             menu: menu.clone(),
-            student: ali.clone(),
-            booked_by: ali.clone(),
+            student: ali,
+            booked_by: ali,
             status: MealBookingStatus::Booked,
             attempt: 1,
             price_minor: price,

@@ -138,7 +138,7 @@ impl NoteFile {
     pub fn new(note: &NoteId, name: FileName, content_type: FileContentType, size: i64) -> Self {
         Self {
             id: NoteFileId::generate(),
-            note: note.clone(),
+            note: *note,
             name,
             content_type,
             size,

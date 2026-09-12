@@ -312,7 +312,7 @@ mod tests {
             };
             let makes: Vec<_> = (0..6)
                 .map(|_| {
-                    let (id, db, teacher) = (term.get_id().clone(), db.clone(), teacher.clone());
+                    let (id, db, teacher) = (*term.get_id(), db.clone(), teacher);
                     let head_start = if separated {
                         std::time::Duration::from_millis(2)
                     } else {

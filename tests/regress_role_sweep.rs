@@ -138,7 +138,7 @@ async fn demote_in_the_window(
     db: &Database,
 ) -> tokio::task::JoinHandle<()> {
     let handle = {
-        let (student, db) = (student.clone(), db.clone());
+        let (student, db) = (*student, db.clone());
         tokio::spawn(async move { demote(&student, to, &db).await })
     };
     // race-window staging — do not convert to poll

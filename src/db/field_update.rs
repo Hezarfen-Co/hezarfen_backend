@@ -59,17 +59,19 @@ fn mark(kind: &'static str) -> AppError {
     AppError::Internal(kind.to_owned())
 }
 
-/// `(counter table, counter field, link column, expected link, claim, release,
-/// refusal)`.
-type Refcount = (
-    &'static str,
-    &'static str,
-    &'static str,
-    Option<Uuid>,
-    Option<Uuid>,
-    Option<Uuid>,
-    AppError,
-);
+/// The counter move [`FieldUpdate::refcount`] arms: the table and field that
+/// count the link, the column carrying it, the link value the handler's
+/// snapshot read, the claim/release pair, and the caller's answer when the
+/// claimed counter row is gone.
+pub(crate) struct Refcount {
+    pub(crate) counter_table: &'static str,
+    pub(crate) counter_field: &'static str,
+    pub(crate) link: &'static str,
+    pub(crate) expected: Option<Uuid>,
+    pub(crate) claim: Option<Uuid>,
+    pub(crate) release: Option<Uuid>,
+    pub(crate) refused: AppError,
+}
 
 pub(crate) struct FieldUpdate {
     /// The row's own table — an in-crate constant, never user input.
@@ -80,10 +82,7 @@ pub(crate) struct FieldUpdate {
     sets: Vec<(&'static str, Param)>,
     /// `(low, high, refusal)` for [`FieldUpdate::ordered`].
     ordered: Option<(&'static str, &'static str, AppError)>,
-    /// `(condition, refusal)` for [`FieldUpdate::guard`].
-    guard: Option<(&'static str, AppError)>,
-    /// `(counter table, counter field, link column, expected link, claim,
-    /// release, refusal)` for [`FieldUpdate::refcount`].
+    /// The armed counter move, from [`FieldUpdate::refcount`].
     refcount: Option<Refcount>,
 }
 
@@ -95,7 +94,6 @@ impl FieldUpdate {
             id,
             sets: Vec::new(),
             ordered: None,
-            guard: None,
             refcount: None,
         }
     }
@@ -132,23 +130,6 @@ impl FieldUpdate {
         refused: AppError,
     ) -> Self {
         self.ordered = Some((low, high, refused));
-        self
-    }
-
-    /// Refuse the write unless `condition` — a predicate on this same row —
-    /// still holds at write time. The [`FieldUpdate::ordered`] guard for a
-    /// precondition that is not about a range: a handler that read "nothing
-    /// references this yet" re-asks the database at the instant it writes, so
-    /// a reference landing in between refuses the edit instead of being
-    /// edited out from under. `condition` is always an in-crate SQL literal,
-    /// never user input.
-    ///
-    /// A request that carries no field at all emits no `UPDATE`, so it is not
-    /// refused: it writes nothing, and reading the row back is a truthful
-    /// answer to a PATCH that asked for no change.
-    #[must_use]
-    pub(crate) fn guard(mut self, condition: &'static str, refused: AppError) -> Self {
-        self.guard = Some((condition, refused));
         self
     }
 
@@ -190,25 +171,8 @@ impl FieldUpdate {
     /// and leaving the reverted-to term linked at zero (deletable while
     /// linked). Gating the CAS on the counters is what let that through.
     #[must_use]
-    pub(crate) fn refcount(
-        mut self,
-        counter_table: &'static str,
-        counter_field: &'static str,
-        link: &'static str,
-        expected: Option<Uuid>,
-        claim: Option<Uuid>,
-        release: Option<Uuid>,
-        refused: AppError,
-    ) -> Self {
-        self.refcount = Some((
-            counter_table,
-            counter_field,
-            link,
-            expected,
-            claim,
-            release,
-            refused,
-        ));
+    pub(crate) fn refcount(mut self, refcount: Refcount) -> Self {
+        self.refcount = Some(refcount);
         self
     }
 
@@ -223,7 +187,7 @@ impl FieldUpdate {
         // read and so shifts nothing. Decided here rather than in `refcount`
         // so the builder's call order cannot silently disarm it — `run` is
         // always last.
-        let moved = self.refcount.take().filter(|rc| self.is_set(rc.2));
+        let moved = self.refcount.take().filter(|rc| self.is_set(rc.link));
         if self.sets.is_empty() {
             let row: Option<T> = sqlx::query_as(AssertSqlSafe(format!(
                 "SELECT * FROM {} WHERE id = $1",
@@ -270,33 +234,21 @@ impl FieldUpdate {
             }
             _ => (None, None),
         };
-        let (extra, extra_refused) = match self.guard.take() {
-            Some((condition, err)) => (Some(condition.to_owned()), Some(err)),
-            None => (None, None),
-        };
-        // No caller sets both, so the refusal is whichever one is there.
-        refused = refused.or(extra_refused);
         // A PATCH that does not carry the link at all writes the same
         // unguarded `UPDATE` it always did — it re-states nothing and races
         // nobody. The CAS is `IS NOT DISTINCT FROM`, so an absent link
         // (bound `None`) still compares truthfully.
         let mut expected_at: Option<usize> = None;
         let cas = moved.as_ref().map(|rc| {
-            binds.push(Param::OptUuid(rc.3));
+            binds.push(Param::OptUuid(rc.expected));
             expected_at = Some(binds.len());
-            format!("{} IS NOT DISTINCT FROM ${}", rc.2, binds.len())
+            format!("{} IS NOT DISTINCT FROM ${}", rc.link, binds.len())
         });
-        // The caller's own guards, kept apart from the CAS: the probe below
-        // has to ask "did *only* the link move?", and a probe that ignores
-        // them answers "the link moved" to a write its `.guard()` refused
-        // outright.
-        let own = ordered
-            .iter()
-            .chain(extra.iter())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let conditions: Vec<String> = ordered.into_iter().chain(extra).chain(cas).collect();
+        // The ordered guard is kept apart from the CAS: the probe below has
+        // to ask "did *only* the link move?", and a probe that ignores it
+        // answers "the link moved" to a write the guard refused outright.
+        let own = ordered.iter().cloned().collect::<Vec<_>>().join(" AND ");
+        let conditions: Vec<String> = ordered.into_iter().chain(cas).collect();
         let guard_sql = if conditions.is_empty() {
             String::new()
         } else {
@@ -320,7 +272,7 @@ impl FieldUpdate {
                     "SELECT 1 FROM {} WHERE id = ${id_at} AND {still_mine}{} \
                      IS DISTINCT FROM ${} LIMIT 1",
                     self.table,
-                    rc.2,
+                    rc.link,
                     expected_at.expect("the CAS arms with its link"),
                 );
                 run_with_refcount(db, update, probe, binds, rc).await?
@@ -384,7 +336,7 @@ async fn run_with_refcount(
     // lifted from an async fn's *pattern parameter* poisons the higher-ranked
     // `AsyncFnMut`/`Send` evaluation of any closure that captures it
     // ("`Send` would have to be implemented for `&'0 str`, for any lifetime").
-    let (counter_table, counter_field, _link, _expected, claim, release, refused) = refcount;
+    let Refcount { counter_table, counter_field, claim, release, refused, .. } = refcount;
     // Owned into the closure: a captured `&str` — even `'static` — drags the
     // async closure's arg lifetime off the higher-ranked one `tx_with_retry`
     // needs ("AsyncFnMut is not general enough" at the route registration).
@@ -403,8 +355,7 @@ async fn run_with_refcount(
             update.clone(),
             probe.clone(),
             binds.clone(),
-            &counter_table,
-            &counter_field,
+            (&counter_table, &counter_field),
             claim,
             release,
         )
@@ -427,17 +378,16 @@ async fn run_with_refcount(
 /// One attempt of [`run_with_refcount`]'s transaction: the release, the
 /// claim, the guarded row write, and — on an empty write — the probe that
 /// tells a stale link apart from a row that is simply gone.
-#[allow(clippy::too_many_arguments)]
 async fn run_refcount_tx(
     tx: &mut PgConnection,
     update: String,
     probe: String,
     binds: Vec<Param>,
-    counter_table: &str,
-    counter_field: &str,
+    counter: (&str, &str),
     claim: Option<Uuid>,
     release: Option<Uuid>,
 ) -> Result<Vec<PgRow>, AppError> {
+    let (counter_table, counter_field) = counter;
     if let Some(release) = release {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE {counter_table} \

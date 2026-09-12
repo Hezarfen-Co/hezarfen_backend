@@ -325,7 +325,7 @@ pub(crate) async fn update_question(
         Some(ref subject_id) => {
             service::subject::in_course(&st.db, subject_id, course.get_id()).await?
         }
-        None => question.get_subject().clone(),
+        None => *question.get_subject(),
     };
     let text = match req.text {
         Some(ref text) => QuestionText::try_new(text)?,
@@ -655,7 +655,7 @@ pub(crate) async fn question_refresh_from_bank(
 
     // The question's own subject stays: it is checked against the exam's
     // course, and the template's is origin metadata from anywhere in school.
-    let subject = question.get_subject().clone();
+    let subject = *question.get_subject();
     // `spec()` hands over the template's stored choices *with their ids* rather
     // than re-minting any — the same funnel `question_from_bank` uses.
     let updated = exam_question::update(
@@ -751,8 +751,8 @@ pub(crate) async fn question_to_bank(
     // question's fields plus the origin exam it was saved off.
     let template = bank_question::create_from_exam(
         &st.db,
-        user.get_id().clone(),
-        question.get_subject().clone(),
+        *user.get_id(),
+        *question.get_subject(),
         question.get_text().clone(),
         question.get_points(),
         question.spec(),

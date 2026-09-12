@@ -566,7 +566,7 @@ async fn mark(
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = match req.user_id {
         Some(ref key) => UserId::from_key(key),
-        None => user.get_id().clone(),
+        None => *user.get_id(),
     };
 
     // Target user must exist.
@@ -628,7 +628,7 @@ async fn list_attendance(
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
-            .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
+            .flat_map(|a| [*a.get_user(), *a.get_marked_by()]),
         &st.db,
     )
     .await?;
@@ -723,7 +723,7 @@ async fn roster(
 
     let mut members = service::event::members(&st.db, &event).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
-    members.sort_by(|a, b| a.key().cmp(&b.key()));
+    members.sort_by_key(|a| a.key());
     let (marks, _) = crate::service::attendance::list_for_event(&st.db, &event_id, None, 0).await?;
     let by_user: HashMap<String, &Attendance> = marks
         .iter()
@@ -737,7 +737,7 @@ async fn roster(
     let ids = window.iter().cloned().chain(window.iter().filter_map(|m| {
         by_user
             .get(m.key().as_str())
-            .map(|attendance| attendance.get_marked_by().clone())
+            .map(|attendance| *attendance.get_marked_by())
     }));
     let people = person_map(ids, &st.db).await?;
     let items = window
@@ -813,7 +813,7 @@ async fn register(
 
     let target = match req.user_id {
         Some(ref key) => UserId::from_key(key),
-        None => user.get_id().clone(),
+        None => *user.get_id(),
     };
     let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
@@ -835,8 +835,8 @@ async fn register(
     // the {target, caller} pair may not contain.
     let people = person_map(
         [
-            registration.get_user().clone(),
-            registration.get_registered_by().clone(),
+            *registration.get_user(),
+            *registration.get_registered_by(),
         ],
         &st.db,
     )

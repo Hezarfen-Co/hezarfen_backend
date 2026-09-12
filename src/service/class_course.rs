@@ -411,7 +411,7 @@ mod tests {
             };
             let child = {
                 let (db, class, algebra, manager, gate) =
-                    (db.clone(), class.clone(), algebra.clone(), manager.clone(), gate);
+                    (db.clone(), class.clone(), algebra.clone(), manager, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     attach(&db, &class, &algebra, &manager).await

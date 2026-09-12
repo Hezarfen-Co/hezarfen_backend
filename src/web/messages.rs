@@ -115,8 +115,8 @@ async fn load_people(messages: &[Message], db: &Database) -> Result<People, AppE
         .iter()
         .flat_map(|message| {
             [
-                message.get_sender().clone(),
-                message.get_recipient().clone(),
+                *message.get_sender(),
+                *message.get_recipient(),
             ]
         })
         .filter(|id| seen.insert(id.key().to_string()))

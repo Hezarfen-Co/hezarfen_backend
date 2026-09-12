@@ -17,7 +17,7 @@ pub async fn create(
 ) -> Result<Note, AppError> {
     let note = Note {
         id: NoteId::generate(),
-        user: owner.clone(),
+        user: *owner,
         title,
         content,
     };

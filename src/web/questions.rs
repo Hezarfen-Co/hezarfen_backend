@@ -221,12 +221,12 @@ async fn question_responses(
     st: &AppState,
 ) -> Result<Vec<PoolQuestionResponse>, AppError> {
     let ids = questions.iter().flat_map(|question| {
-        std::iter::once(question.get_asker().clone()).chain(question.get_approved_by().cloned())
+        std::iter::once(*question.get_asker()).chain(question.get_approved_by().cloned())
     });
     let people = person_map(ids, &st.db).await?;
     let question_ids: Vec<PoolQuestionId> = questions
         .iter()
-        .map(|question| question.get_id().clone())
+        .map(|question| *question.get_id())
         .collect();
     let counts = solution::counts_for(&st.db, &question_ids).await?;
     Ok(questions
@@ -644,7 +644,7 @@ async fn offer_solution(
         Solution::new(question.get_id(), user.get_id(), body),
     )
     .await?;
-    let people = person_map([user.get_id().clone()], &st.db).await?;
+    let people = person_map([*user.get_id()], &st.db).await?;
     Ok((
         StatusCode::CREATED,
         Json(SolutionResponse::new(&solution, &people)),
@@ -679,7 +679,7 @@ async fn list_solutions(
     let (solutions, total) = solution::list_for(&st.db, question.get_id(), limit, offset).await?;
     let slice = solutions.as_slice();
     let people = person_map(
-        slice.iter().map(|solution| solution.get_author().clone()),
+        slice.iter().map(|solution| *solution.get_author()),
         &st.db,
     )
     .await?;
@@ -763,7 +763,7 @@ async fn edit_solution(
     let updated = solution::set_body(&st.db, solution.get_id(), &body)
         .await?
         .ok_or(AppError::NotFound)?;
-    let people = person_map([user.get_id().clone()], &st.db).await?;
+    let people = person_map([*user.get_id()], &st.db).await?;
     Ok(Json(SolutionResponse::new(&updated, &people)))
 }
 

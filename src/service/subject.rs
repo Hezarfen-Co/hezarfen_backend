@@ -70,7 +70,7 @@ pub async fn in_course(db: &Database, id: &str, course: &CourseId) -> Result<Sub
             reason: "subject belongs to a different course",
         }));
     }
-    Ok(subject.get_id().clone())
+    Ok(*subject.get_id())
 }
 
 /// Turn a request-supplied subject id into a validated reference, checking only
@@ -85,5 +85,5 @@ pub async fn must_exist(db: &Database, id: &str) -> Result<SubjectId, AppError> 
                 field: "subject_id",
                 reason: "subject does not exist",
             }))?;
-    Ok(subject.get_id().clone())
+    Ok(*subject.get_id())
 }

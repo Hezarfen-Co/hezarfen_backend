@@ -84,7 +84,7 @@ pub async fn append_user(
         ChatbotMessage {
             id: ChatbotMessageId::generate(),
             thread_id: thread.clone(),
-            user_id: user.clone(),
+            user_id: *user,
             role: crate::domain::chatbot_message::MessageRole::User,
             content,
             status: MessageStatus::Complete,
@@ -109,7 +109,7 @@ pub async fn append_pending_assistant(
         ChatbotMessage {
             id: ChatbotMessageId::generate(),
             thread_id: thread.clone(),
-            user_id: user.clone(),
+            user_id: *user,
             role: crate::domain::chatbot_message::MessageRole::Assistant,
             content: ChatContent::empty(),
             status: MessageStatus::Pending,

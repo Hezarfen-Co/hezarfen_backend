@@ -410,7 +410,7 @@ mod tests {
     /// A real subject row: a template's subject reference is a foreign key
     /// too (and the subject needs a real course under it).
     async fn a_subject(db: &Database) -> SubjectId {
-        crate::db::subject::create(
+        *crate::db::subject::create(
             db,
             &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
@@ -419,7 +419,6 @@ mod tests {
         .await
         .unwrap()
         .get_id()
-        .clone()
     }
 
     fn spec() -> QuestionSpec {
@@ -477,7 +476,7 @@ mod tests {
         let other = a_person(&db, "other").await;
         let private = create(
             &db,
-            owner.clone(),
+            owner,
             a_subject(&db).await,
             QuestionText::try_new("secret").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
@@ -487,7 +486,7 @@ mod tests {
         .unwrap();
         let published = create(
             &db,
-            owner.clone(),
+            owner,
             a_subject(&db).await,
             QuestionText::try_new("shared").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
@@ -590,14 +589,14 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let owner = a_person(&db, "owner").await;
         let other = a_person(&db, "other").await;
-        async fn mine<'a>(
+        async fn mine(
             db: &Database,
             owner: &UserId,
             text: &str,
         ) -> Result<BankQuestion, AppError> {
             create(
                 db,
-                owner.clone(),
+                *owner,
                 a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
@@ -671,14 +670,14 @@ mod tests {
         // compiler now checks the way the old constant asserted.
         let (db, _leases) = crate::database::init_test_db().await;
         let owner = a_person(&db, "owner").await;
-        async fn template<'a>(
+        async fn template(
             db: &Database,
             owner: &UserId,
             text: &str,
         ) -> Result<BankQuestion, AppError> {
             create(
                 db,
-                owner.clone(),
+                *owner,
                 a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
@@ -714,7 +713,7 @@ mod tests {
             crate::db::exam_question::create_from_bank(
                 db,
                 exam,
-                subject.clone(),
+                *subject,
                 source.get_text().clone(),
                 source.get_points(),
                 source.spec(),
@@ -731,7 +730,7 @@ mod tests {
         crate::db::exam_question::create(
             &db,
             &exam,
-            subject.get_id().clone(),
+            *subject.get_id(),
             QuestionText::try_new("mine").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -789,7 +788,7 @@ mod tests {
         for i in 0..5 {
             create(
                 &db,
-                owner.clone(),
+                owner,
                 a_subject(&db).await,
                 QuestionText::try_new(&format!("question {i}")).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),

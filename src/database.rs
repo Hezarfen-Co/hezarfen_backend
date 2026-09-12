@@ -255,11 +255,9 @@ async fn ensure_template(
     )))
     .execute(control)
     .await
-    {
-        if !is_duplicate_database(&err) {
+        && !is_duplicate_database(&err) {
             return Err(err.into());
         }
-    }
     // One migrator connection, made and closed: the template is never served.
     let pool = pool_options(1)
         .connect_with(base.clone().database(name))
@@ -685,19 +683,16 @@ async fn ensure_test_template(maintenance: &PgPool, base: &PgConnectOptions) -> 
         .await
         .map(|(count,)| count > 0)
         .unwrap_or_else(|err| panic!("probe for the school template {name}: {err}"));
-    if !exists {
-        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
+    if !exists
+        && let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
             "CREATE DATABASE",
             &name,
         )))
         .execute(&mut *session)
         .await
-        {
-            if !is_duplicate_database(&err) {
+            && !is_duplicate_database(&err) {
                 panic!("create the school template {name}: {err}");
             }
-        }
-    }
     let pool = pool_options(1)
         .connect_with(base.clone().database(&name))
         .await
