@@ -1,13 +1,23 @@
-//! The `payment_ledger` table: the append-only `CREATE`s and the reads the
-//! balance and the statement fold. Nothing here ever `UPDATE`s or `DELETE`s a
-//! row — a mistake is corrected by appending the opposing line. The lock that
-//! serializes the money arithmetic around these calls lives in
-//! [`crate::service::payment_ledger`].
+//! The `payment_ledger` table: the append-only `INSERT`s and the reads the
+//! balance and the over-payment cap fold. Nothing here ever `UPDATE`s or
+//! `DELETE`s a row — a mistake is corrected by appending the opposing line.
+//! The row locks that serialize the money arithmetic around these calls are
+//! taken by the workflows in [`crate::service::payment_ledger`]
+//! ([`lock_for_cap`]).
+//!
+//! The ledger row's `id` is a derived TEXT primary key, so Postgres itself is
+//! the uniqueness check: a duplicate insert of the same key is the
+//! "already billed" answer, surfaced here as
+//! `INSERT … ON CONFLICT (id) DO NOTHING` plus a read-back of the row that
+//! won. That is what makes every deterministic id (see
+//! [`PaymentLedgerId::for_installment`] and friends) an idempotence key —
+//! replaying the same append is a no-op, never a second line and never an
+//! edit of the first, however the concurrent writers interleave.
 
-use surrealdb::types::{AlreadyExistsError, SurrealValue};
+use sqlx::PgExecutor;
 
-use crate::constant::{CAS_UPDATE_RETRIES, PAYMENT_LEDGER_TABLE};
-use crate::database::{Database, lost_the_race};
+use crate::constant::MAX_LEDGER_APPLIED_LINES;
+use crate::database::Database;
 use crate::db::page::PagedList;
 use crate::domain::fee_plan::Installment;
 use crate::domain::fee_plan_assignment::FeePlanAssignment;
@@ -16,73 +26,86 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Did this `CREATE` fail *only* because the row is already there? Matched on
-/// the SDK's typed `AlreadyExists`/`Record` detail — never on the message text
-/// and never on "any database error", because swallowing a real fault in money
-/// code would be far worse than the 500 it saves.
-fn is_duplicate_record(error: &surrealdb::Error) -> bool {
-    matches!(
-        error.already_exists_details(),
-        Some(AlreadyExistsError::Record { .. })
-    )
-}
-
-/// The only writer: one `CREATE`, no update path anywhere in this module.
+/// The only writer: one `INSERT`, no update path anywhere in this module.
 ///
 /// A line whose id already exists is left exactly as it is — the row wins,
-/// the write is dropped. That is what makes a deterministic id (see
-/// [`PaymentLedgerId::for_installment`]) an idempotence key: replaying the
-/// same append is a no-op, never a second line and never an edit of the
-/// first. The point read is on the id itself, so unlike a scan it cannot
-/// miss a row a concurrent writer just made — but it is only a fast path.
-/// The guarantee is `CREATE`'s own: on an existing id it *errors* and
-/// leaves the row untouched, so the writer that lost the race reads back
-/// the winner's line instead of failing the request with a 500.
+/// the write is dropped, and the winner's line is read back in the *same
+/// statement* (`ON CONFLICT (id) DO NOTHING`, and the `UNION ALL` arm answers
+/// with the stored row when the insert was skipped). Unlike a scan, the point
+/// read on the id cannot miss a row a concurrent writer just committed: an
+/// insert that races an identical id waits on the unique index until the
+/// other transaction settles, then takes the read-back arm.
 ///
-/// A *write conflict* is the same race decided one layer down — two appends
-/// of one id arriving together are no longer serialized by a process-wide
-/// lock, so the store aborts one as retryable instead of answering it
-/// "already exists". Both are read back the same way, and a conflict that
-/// turns out to have written nothing is simply tried again; no path here
-/// can write a second line, since the id is the key.
-///
-/// Both read-backs check the stored line is the *kind* that was being
-/// appended. Handing a caller someone else's row is only safe while every
-/// id shape is unambiguous (see [`PaymentLedgerId::for_request`]); if a
-/// future marker or a widened key charset ever let two shapes meet, this is
-/// the check that turns silently-wrong money into a 500 instead. It should
-/// be unreachable, and it is cheap enough to keep it that way.
-pub(crate) async fn append(db: &Database, row: PaymentLedger) -> Result<PaymentLedger, AppError> {
-    let same_kind = |existing: PaymentLedger| {
-        if existing.kind == row.kind {
-            Ok(existing)
-        } else {
-            Err(AppError::Internal(
-                "a ledger id resolved to a line of another kind".into(),
-            ))
-        }
-    };
-    if let Some(existing) = read(db, &row.id).await? {
-        return same_kind(existing);
+/// The read-back also checks the stored line is the *kind* that was being
+/// appended. Handing a caller someone else's row is only safe while every id
+/// shape is unambiguous (see [`PaymentLedgerId::for_request`]); if a future
+/// marker or a widened key charset ever let two shapes meet, this is the
+/// check that turns silently-wrong money into a 500 instead. It should be
+/// unreachable, and it is cheap enough to keep it that way.
+pub(crate) async fn append(
+    exe: impl PgExecutor<'_>,
+    row: PaymentLedger,
+) -> Result<PaymentLedger, AppError> {
+    let created = sqlx::query_as!(
+        PaymentLedger,
+        r#"WITH ins AS (
+               INSERT INTO payment_ledger
+                   (id, student, kind, amount_minor, source, due_at, method, note,
+                    recorded_by, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               ON CONFLICT (id) DO NOTHING
+               RETURNING id, student, kind, amount_minor, source, due_at, method, note,
+                         recorded_by, created_at)
+           SELECT id AS "id!", student AS "student!",
+                  kind AS "kind!: PaymentLedgerKind",
+                  amount_minor AS "amount_minor!", source, due_at, method, note,
+                  recorded_by AS "recorded_by!", created_at AS "created_at!"
+           FROM ins
+           UNION ALL
+           SELECT id AS "id!", student AS "student!",
+                  kind AS "kind!: PaymentLedgerKind",
+                  amount_minor AS "amount_minor!", source, due_at, method, note,
+                  recorded_by AS "recorded_by!", created_at AS "created_at!"
+           FROM payment_ledger
+           WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM ins)"#,
+        row.id,
+        row.student,
+        row.kind,
+        row.amount_minor,
+        row.source,
+        row.due_at,
+        row.method,
+        row.note,
+        row.recorded_by,
+        row.created_at,
+    )
+    .fetch_optional(exe)
+    .await?;
+    match created {
+        Some(line) if line.kind == row.kind => Ok(line),
+        Some(_) => Err(AppError::Internal(
+            "a ledger id resolved to a line of another kind".into(),
+        )),
+        // Unreachable: the statement either inserts or reads back the row
+        // with that very id.
+        None => Err(AppError::Internal("failed to write the ledger line".into())),
     }
-    let id = row.id.clone();
-    for _ in 0..CAS_UPDATE_RETRIES {
-        match db.create(id.record()).content(row.clone()).await {
-            Ok(Some(created)) => return Ok(created),
-            Ok(None) => break,
-            Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
-                if let Some(existing) = read(db, &id).await? {
-                    return same_kind(existing);
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(AppError::Internal("failed to write the ledger line".into()))
 }
 
-pub async fn read(db: &Database, id: &PaymentLedgerId) -> Result<Option<PaymentLedger>, AppError> {
-    Ok(db.select(id.record()).await?)
+pub async fn read(
+    exe: impl PgExecutor<'_>,
+    id: &PaymentLedgerId,
+) -> Result<Option<PaymentLedger>, AppError> {
+    sqlx::query_as!(
+        PaymentLedger,
+        "SELECT id, student, kind, amount_minor, source, due_at, method, note, \
+                recorded_by, created_at \
+         FROM payment_ledger WHERE id = $1",
+        id,
+    )
+    .fetch_optional(exe)
+    .await
+    .map_err(Into::into)
 }
 
 /// Bill installment `n` (1-based) of `assignment`, at the amount and due
@@ -93,20 +116,20 @@ pub async fn read(db: &Database, id: &PaymentLedgerId) -> Result<Option<PaymentL
 /// assign writes nothing and an assignment whose charges landed only in
 /// part self-heals on the next assign of the same pair.
 pub async fn charge_for_installment(
-    db: &Database,
+    exe: impl PgExecutor<'_>,
     assignment: &FeePlanAssignment,
     n: usize,
     installment: &Installment,
     recorded_by: &UserId,
 ) -> Result<PaymentLedger, AppError> {
     append(
-        db,
+        exe,
         PaymentLedger {
             id: PaymentLedgerId::for_installment(assignment.get_id(), n),
             student: assignment.get_student().clone(),
             kind: PaymentLedgerKind::Charge,
             amount_minor: installment.get_amount_minor(),
-            source: Some(assignment.get_id().record()),
+            source: Some(assignment.get_id().key()),
             due_at: Some(installment.get_due_at()),
             method: None,
             note: None,
@@ -125,35 +148,22 @@ pub async fn list_for_student(
     offset: i64,
 ) -> Result<(Vec<PaymentLedger>, i64), AppError> {
     PagedList::new(
-        "payment_ledger WHERE student = $student",
+        "payment_ledger WHERE student = $1",
         "ORDER BY created_at DESC, id DESC",
     )
-    .bind("student", student.record())
+    .bind(student.uuid())
     .run(limit, offset, db)
     .await
 }
 
-/// Every line pointing at `source`: a charge's payments (and its reversal),
-/// a credit's refunds. Feeds the over-payment cap and, later, the statement
-/// rollup. Oldest first — this is a history, not a page.
-pub async fn list_for_source(
-    db: &Database,
-    source: &PaymentLedgerId,
-) -> Result<Vec<PaymentLedger>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM payment_ledger WHERE source = $source ORDER BY created_at, id")
-        .bind(("source", source.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<PaymentLedger>>(0)?)
-}
-
-/// One kind's whole sum, as the `GROUP BY` in [`balance_of`]
-/// hands it back — at most four rows, never the lines behind them.
-#[derive(Debug, SurrealValue)]
-struct KindTotal {
+/// One kind's fold, as [`balance_of`] and [`applied_to`] read it off the
+/// `GROUP BY` — at most four rows, never the lines behind them.
+struct KindFold {
     kind: PaymentLedgerKind,
     total: i64,
+    /// Lines behind the fold. [`balance_of`] never looks at it; [`applied_to`]
+    /// enforces the applied-lines ceiling with it.
+    lines: i64,
 }
 
 /// The derived balance: `credits + reversals - charges - refunds`, in minor
@@ -161,12 +171,7 @@ struct KindTotal {
 ///
 /// **The sum is taken per kind by the database** and only the four totals
 /// come back, so a balance read costs the same whether the ledger holds
-/// four lines or forty thousand. It used to decode and fold every row, and
-/// a fee ledger grows by design rather than only under abuse: one
-/// assignment appends a charge *per installment* per student (up to
-/// [`MAX_FEE_PLAN_ASSIGN_WRITES`](crate::constant::MAX_FEE_PLAN_ASSIGN_WRITES)
-/// in a single request), and every one of those rows was decoded again by
-/// every later `GET /payments/balance/*`.
+/// four lines or forty thousand.
 ///
 /// **The signs stay here**, applied by the same
 /// `PaymentLedgerKind::sign` the documented formula is spelled in —
@@ -179,18 +184,114 @@ struct KindTotal {
 /// running total was the third option and is a counter that can drift — a
 /// bug class this repo closes, not one it opens.
 pub async fn balance_of(db: &Database, student: &UserId) -> Result<i64, AppError> {
-    let totals: Vec<KindTotal> = db
-        .query(format!(
-            "SELECT kind, math::sum(amount_minor) AS total \
-             FROM {PAYMENT_LEDGER_TABLE} WHERE student = $student GROUP BY kind"
-        ))
-        .bind(("student", student.record()))
-        .await?
-        .check()?
-        .take(0)?;
+    let totals = sqlx::query_as!(
+        KindFold,
+        "SELECT kind AS \"kind!: PaymentLedgerKind\", \
+                COALESCE(sum(amount_minor), 0)::bigint AS \"total!: i64\", \
+                count(*)::bigint AS \"lines!: i64\" \
+         FROM payment_ledger WHERE student = $1 GROUP BY kind",
+        student,
+    )
+    .fetch_all(db)
+    .await?;
     Ok(PaymentLedger::fold_balance(
         totals.into_iter().map(|row| (row.kind, row.total)),
     ))
+}
+
+/// Lock the **ancestor chain** of `id` (`FOR UPDATE`, the line first, then
+/// its target, and so on up to a charge). Every write that moves the money
+/// arithmetic of a subtree takes this walk in its transaction, so writers to
+/// one subtree all contend on its **root's** row lock: a payment folding a
+/// charge's subtree cannot land between a refund's fold and its append
+/// deeper down. That is the whole guarantee the over-payment cap rests on —
+/// it replaces a process-wide mutex with the rows the money lives on.
+///
+/// Lock order is *deepest first*: a writer always wants the next ancestor,
+/// never the reverse, and an ancestor is never a descendant, so no two
+/// walks can cycle — no deadlock, nothing for the retry loop to unwind.
+/// The chain is at most three rows (charge ← credit ← refund; a reversal
+/// points at a charge or a refund), and a charge's `source` names a
+/// fee-plan assignment rather than a ledger row, which is where the walk
+/// stops.
+pub(crate) async fn lock_for_cap(
+    exe: &mut sqlx::PgConnection,
+    id: &PaymentLedgerId,
+) -> Result<(), AppError> {
+    let mut next = Some(id.clone());
+    while let Some(key) = next {
+        let row = sqlx::query!(
+            r#"SELECT kind AS "kind: PaymentLedgerKind", source
+               FROM payment_ledger WHERE id = $1 FOR UPDATE"#,
+            key,
+        )
+        .fetch_optional(&mut *exe)
+        .await?;
+        next = match row {
+            // Keep walking while the row points at another *ledger* row.
+            Some(row) if row.kind != PaymentLedgerKind::Charge => {
+                row.source.map(PaymentLedgerId::from_key)
+            }
+            // A charge's source is an assignment key, not a ledger row —
+            // and by then the root lock is held, which is the point.
+            _ => None,
+        };
+    }
+    Ok(())
+}
+
+/// How much of `target` is already taken up — the balance fold restricted
+/// to everything that points at it, however deep, and read the way `target`
+/// is measured. Caller holds [`lock_for_cap`] on `target`'s chain in the
+/// same transaction, so the fold and the append it authorizes cannot be
+/// separated by a competing write.
+///
+/// The whole subtree, not just the direct children, because money given
+/// back frees the room it took: a charge paid in full and then *refunded*
+/// is owed again, so it must be payable again (the fold nets to zero). The
+/// same walk answers both sides, because the signs already say what each
+/// line does — a credit adds under a charge, its refund takes that back,
+/// and a reversal of that refund puts it back once more. `-target.sign()`
+/// is what flips the reading for a credit, whose room is measured in the
+/// refunds against it. The recursive CTE replaces the old
+/// one-query-per-child walk; the signs still fold in Rust, by
+/// [`PaymentLedger::fold_balance`](crate::domain::payment_ledger::PaymentLedger::fold_balance).
+///
+/// **The ceiling stays.** Past [`MAX_LEDGER_APPLIED_LINES`] lines the fold
+/// refuses — the count is what is refused, never the money already
+/// recorded, so a line that is *already* over the ceiling still reads,
+/// still refunds through its own children, and is still reversible. Only a
+/// fresh line applied to *it* is turned away.
+pub(crate) async fn applied_to(
+    exe: &mut sqlx::PgConnection,
+    target_key: &str,
+    target_kind: PaymentLedgerKind,
+) -> Result<i64, AppError> {
+    let folds = sqlx::query_as!(
+        KindFold,
+        r#"WITH RECURSIVE applied(id, kind, amount_minor) AS (
+               SELECT id, kind, amount_minor FROM payment_ledger WHERE source = $1
+               UNION ALL
+               SELECT l.id, l.kind, l.amount_minor
+               FROM payment_ledger l JOIN applied a ON l.source = a.id
+           )
+           SELECT kind AS "kind!: PaymentLedgerKind",
+                  COALESCE(sum(amount_minor), 0)::bigint AS "total!: i64",
+                  count(*)::bigint AS "lines!: i64"
+           FROM applied GROUP BY kind"#,
+        target_key,
+    )
+    .fetch_all(exe)
+    .await?;
+    let lines: i64 = folds.iter().map(|fold| fold.lines).sum();
+    if lines as usize >= MAX_LEDGER_APPLIED_LINES {
+        return Err(AppError::Conflict(
+            "this line already carries the most lines that may be applied to it; \
+             record the rest against another",
+        ));
+    }
+    let total = PaymentLedger::fold_balance(folds.into_iter().map(|fold| (fold.kind, fold.total)));
+    Ok(total * -target_kind.sign())
 }
 
 #[cfg(test)]

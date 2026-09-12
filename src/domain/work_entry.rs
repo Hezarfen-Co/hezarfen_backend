@@ -3,6 +3,7 @@ use uuid::Uuid;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
+use crate::error::{AppError, ValidationError};
 
 /// Typed work-entry row id. A UUIDv7 minted by the process-wide monotonic
 /// generator, so `id` order is mint order.
@@ -76,4 +77,14 @@ impl WorkEntry {
     pub fn is_open(&self) -> bool {
         self.check_out.is_none()
     }
+}
+
+/// The one ordering refusal both the web handler's pre-flight and the db
+/// layer's write-time guard owe for a corrected stint: the correction must
+/// still order as *stored* — check-out at or after check-in.
+pub(crate) fn out_before_in_error() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "check_out",
+        reason: "must be at or after check_in",
+    })
 }
