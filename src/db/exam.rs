@@ -490,7 +490,7 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
          VALUES ($1, $2, 'x', 'teacher')",
     )
     .bind(creator.uuid())
-    .bind(format!("exam-fixture-{}", &creator.key()[..8]))
+    .bind(format!("exam-fixture-{}", &creator.key()[30..]))
     .execute(db)
     .await
     .unwrap();
@@ -548,7 +548,7 @@ mod tests {
                      VALUES ($1, $2, 'x', 'teacher')",
                 )
                 .bind(creator.uuid())
-                .bind(format!("orphan-race-{}", &creator.key()[..8]))
+                .bind(format!("orphan-race-{}", &creator.key()[30..]))
                 .execute(&db)
                 .await
                 .unwrap();
@@ -582,7 +582,7 @@ mod tests {
              VALUES ($1, $2, 'x', $3)",
         )
         .bind(user.uuid())
-        .bind(format!("{label}-{}", &user.key()[..8]))
+        .bind(format!("{label}-{}", &user.key()[30..]))
         .bind(role)
         .execute(db)
         .await
@@ -879,7 +879,7 @@ mod tests {
             let drop_it = drop_it.await.unwrap();
             if matches!(drop_it, Err(AppError::Db(_))) {
                 delete_500 += 1;
-                last_delete = format!("{:?}", drop_it.as_ref().unwrap_err());
+                last_delete = format!("{:?}", drop_it.as_ref().err());
             }
             let mut refused = 0;
             for mark in marks {
@@ -1090,6 +1090,7 @@ mod tests {
             let child = {
                 let (db, exam_id, on, gate) = (db.clone(), id.clone(), subject.get_id().clone(), gate);
                 tokio::spawn(async move {
+                    gate.wait().await;
                     let spec = QuestionSpec::try_new(
                         QuestionKind::try_new("choice").unwrap(),
                         Some(vec![
@@ -1188,6 +1189,7 @@ mod tests {
                 let (db, exam_id, on, student, gate) =
                     (db.clone(), id.clone(), question.get_id().clone(), student.clone(), gate);
                 tokio::spawn(async move {
+                    gate.wait().await;
                     let image = AnswerImage::new(
                         &exam_id,
                         &on,
@@ -1254,6 +1256,7 @@ mod tests {
             let child = {
                 let (db, exam_id, on, gate) = (db.clone(), id.clone(), question.get_id().clone(), gate);
                 tokio::spawn(async move {
+                    gate.wait().await;
                     let image = QuestionImage::new(
                         &exam_id,
                         &on,

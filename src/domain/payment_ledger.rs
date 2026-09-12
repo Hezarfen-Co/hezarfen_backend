@@ -354,8 +354,8 @@ mod tests {
     fn a_request_key_is_scoped_by_its_target_and_its_kind() {
         const PLAN: &str = "018f1a00-0000-7000-8000-000000000001";
         const STU: &str = "018f1a00-0000-7000-8000-000000000002";
-        let charge = PaymentLedgerId::from_key(format!("{PLAN}_{STU}_c1"));
-        let other = PaymentLedgerId::from_key(format!("{PLAN}_{STU}_c2"));
+        let charge = PaymentLedgerId::from_key(&format!("{PLAN}_{STU}_c1"));
+        let other = PaymentLedgerId::from_key(&format!("{PLAN}_{STU}_c2"));
         let key = PaymentRequestKey::try_new("receipt-114").unwrap();
         let credit = PaymentLedgerId::for_request(&charge, "k", &key);
 

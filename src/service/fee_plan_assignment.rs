@@ -215,12 +215,31 @@ mod tests {
     use crate::domain::fee_plan::{FeePlanName, Installment};
     use crate::domain::payment_ledger::LedgerAmount;
 
+    /// A real `app_user` row: managers and students are foreign keys now. The
+    /// label names the row's username; the id is minted, so repeated calls are
+    /// new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     async fn a_plan(db: &Database, installments: Vec<Installment>) -> FeePlan {
+        let manager = a_person(db, "mgr", "manager").await;
         fee_plan::create(
             db,
             FeePlanName::try_new("Yearly").unwrap(),
             installments,
-            &UserId::from_key("mgr1"),
+            &manager,
         )
         .await
         .unwrap()
@@ -232,8 +251,8 @@ mod tests {
     #[tokio::test]
     async fn assigning_bills_every_installment_and_a_replay_bills_nothing() {
         let (db, _leases) = init_test_db().await;
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let manager = a_person(&db, "mgr", "manager").await;
+        let student = a_person(&db, "stu", "student").await;
         let plan = a_plan(
             &db,
             vec![
@@ -309,13 +328,12 @@ mod tests {
     /// (measured 2026-07-30: 2 runs in 36 on `memory` under host load, 0 in
     /// 10 000 rounds on the server). See [`crate::database::init_test_server`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_edit_racing_an_assign_leaves_the_plan_and_the_money_agreeing() {
-        let (db, _serialized) = crate::database::init_test_server("edit_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let mut reached = 0;
         for round in 0..20 {
-            let manager = UserId::from_key("mgr1");
-            let student = UserId::from_key(&format!("stu{round}"));
+            let manager = a_person(&db, "mgr", "manager").await;
+            let student = a_person(&db, "stu", "student").await;
             let plan = a_plan(
                 &db,
                 vec![Installment::new(
@@ -416,14 +434,13 @@ mod tests {
     /// unseen. Neither racer may answer 500 here either — this is the pair that
     /// contends hardest, both writing the plan record itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_an_assign_never_orphans_an_assignment() {
-        let (db, _serialized) = crate::database::init_test_server("delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let (mut deleted_first, mut assigned_first) = (0, 0);
         for round in 0..20 {
             let hold_back_the_assign = round % 2 == 0;
-            let manager = UserId::from_key("mgr1");
-            let student = UserId::from_key(&format!("stu{round}"));
+            let manager = a_person(&db, "mgr", "manager").await;
+            let student = a_person(&db, "stu", "student").await;
             let plan = a_plan(
                 &db,
                 vec![Installment::new(

@@ -315,7 +315,7 @@ mod tests {
              VALUES ($1, $2, 'x', $3)",
         )
         .bind(user.uuid())
-        .bind(format!("{key}-{}", &user.key()[..8]))
+        .bind(format!("{key}-{}", &user.key()[30..]))
         .bind(role.as_str())
         .execute(db)
         .await
@@ -458,11 +458,10 @@ mod tests {
 
         // The bell rings. The same sheet, touched again, credits now — and
         // only once: nothing backfills, so the stamp is the whole guard.
-        db.query("UPDATE $sess SET starts_at = 1")
-            .bind(("sess", next_week.get_id().record()))
+        sqlx::query("UPDATE course_session SET starts_at = 1 WHERE id = $1")
+            .bind(next_week.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         for (status_value, why) in [("late", "the bell rang"), ("present", "held twice")] {
             mark(&db, &next_week, &student, status(status_value), &teacher)
@@ -638,38 +637,26 @@ mod tests {
         assert_eq!(held(&teacher, &db).await, 0, "a refused mark held a lesson");
     }
 
-    /// The claim the existence gate cannot make by *reading*. A `DEFINE EVENT`
-    /// on `course_session` fires inside the delete's own transaction, and
-    /// [`crate::db::course_session::delete`] sweeps its children before removing the row,
-    /// so the `SLEEP` opens exactly the window a mark has to lose: the sheet is
-    /// written after the sweep has run, and used to commit straight past it.
+    /// The claim the existence gate cannot make by *reading*. The mark writes
+    /// the session row too (its attendance stamp), so the delete and the mark
+    /// touch one row and Postgres refuses one of them; the barrier releases
+    /// both sides together so every interleaving gets its chance.
     ///
     /// The two flavors raced are the ones the credit branch never wrote for — a
     /// lesson that has not begun, and a student with no row yet on a lesson
     /// already counted. A re-mark of a row that *exists* was never in danger:
     /// the cascade and the upsert write that child's own key and collide there.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject is the store's
-    /// conflict detection, which [`init_mem`]'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, so this passes there on
-    /// broken code. Mutation-tested: dropping the unconditional
-    /// `UPDATE $sess` from `mark` turns it red.
+    /// Mutation-tested: dropping the unconditional session-row write from
+    /// `mark` turns it red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_mark_written_inside_a_delete_never_outlives_the_session() {
-        let (db, _serialized) = crate::database::init_test_server("session_attendance_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE course_session WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
 
         let teacher = a_teacher("t", &db).await;
         let (mut swept, mut orphans) = (0, 0);
-        for (round, already_counted) in [false, true, false, true].into_iter().enumerate() {
+        for (round, already_counted) in
+            [false, true, false, true, false, true, false, true].into_iter().enumerate()
+        {
             let session = if already_counted {
                 // Counted by somebody else's mark, so this one credits nothing.
                 let session = a_session(&teacher, &db).await;
@@ -683,18 +670,22 @@ mod tests {
             };
             let id = session.get_id().clone();
             let ghost = session.clone();
+
+            // Delete and mark released together: both write the session row,
+            // so Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::course_session::delete(&db, session).await })
+                let (db, gate, session) = (db.clone(), gate.clone(), session);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::course_session::delete(&db, session).await
+                })
             };
-            // The mark starts inside the held window: the sweep has run and the
-            // session row is gone but uncommitted — which is exactly what a
-            // read of that session still believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let marked = {
-                let (db, teacher) = (db.clone(), teacher.clone());
+                let (db, teacher, gate) = (db.clone(), teacher.clone(), gate);
                 let student = a_student(&format!("s{round}"), &db).await;
                 tokio::spawn(async move {
+                    gate.wait().await;
                     mark(&db, &ghost, &student, status("present"), &teacher).await
                 })
             };
@@ -717,7 +708,7 @@ mod tests {
             }
         }
         eprintln!(
-            "CourseSession::delete raced by a roll call: {swept}/4 rounds deleted the session"
+            "CourseSession::delete raced by a roll call: {swept}/8 rounds deleted the session"
         );
         assert!(
             swept > 0,

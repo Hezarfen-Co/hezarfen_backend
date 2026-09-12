@@ -114,13 +114,27 @@ pub async fn delete(db: &Database, file: NoteFile) -> Result<NoteFile, AppError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::note::Note;
     use crate::domain::note::NoteContent;
     use crate::domain::note::NoteTitle;
     use crate::domain::note_file::FileContentType;
     use crate::domain::note_file::FileName;
 
+    /// A real `app_user` row: the note's owner is a foreign key now.
+    async fn a_person(db: &Database) -> crate::domain::user::UserId {
+        let user = crate::domain::user::UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("nf-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
     async fn a_note(db: &Database) -> Note {
-        let owner = crate::domain::user::UserId::generate();
+        // The note's owner is a foreign key now: a real `app_user` row.
+        let owner = a_person(db).await;
         crate::db::note::create(
             db,
             &owner,

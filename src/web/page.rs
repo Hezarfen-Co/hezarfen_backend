@@ -198,8 +198,8 @@ mod tests {
         fn ends_at_ms(&self) -> Option<i64> {
             self.2
         }
-        fn order_key(&self) -> &str {
-            self.0
+        fn order_key(&self) -> String {
+            self.0.to_owned()
         }
     }
 

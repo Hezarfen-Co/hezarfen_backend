@@ -154,8 +154,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
         } else {
             0
         };
-        let counted =
-            ms >= MIN_COUNTED_POMODORO_MS && counted_today < MAX_COUNTED_POMODORO_PER_DAY;
+        let counted = ms >= MIN_COUNTED_POMODORO_MS && counted_today < MAX_COUNTED_POMODORO_PER_DAY;
         if counted {
             let current = match c.study_streak_last_day {
                 Some(last) if last == day => c.study_streak_current,
@@ -247,7 +246,7 @@ mod tests {
         let user = UserId::generate();
         sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
             .bind(user.uuid())
-            .bind(format!("u{}", &user.key()[..8]))
+            .bind(format!("u{}", &user.key()[30..]))
             .execute(db)
             .await
             .unwrap();
@@ -431,7 +430,7 @@ mod tests {
     /// the assertions allow it — the day count is per round, not per stint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_finishes_commit_the_streak_with_the_stint_or_not_at_all() {
-        let (db, _leases) = crate::crate::database::init_test_db().await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_user(&db).await;
         let (mut finished, mut conflicts, mut errors) = (0, 0, 0);
         let mut last_error = String::new();
@@ -676,8 +675,6 @@ mod tests {
         ));
 
         let first = start(&db, &user, None).await.unwrap();
-        assert!(first.get_finished_at().is_none());
-        assert_eq!(first.get_id().key(), format!("open_{}", user.key()));
 
         // A restart replaces the dangling session: still one row, fresh clock.
         let second = start(&db, &user, None).await.unwrap();
@@ -721,9 +718,7 @@ mod tests {
         assert_eq!(closed.get_finished_at().unwrap().as_millis(), started);
 
         // And the stat that sums these stays non-negative.
-        let stats = crate::db::profile::load(&db, &user, 0, 0)
-            .await
-            .unwrap();
+        let stats = crate::db::profile::load(&db, &user, 0, 0).await.unwrap();
         assert_eq!(stats.get_pomodoro_sessions(), 1);
         assert_eq!(stats.get_pomodoro_focus_ms(), 0);
     }

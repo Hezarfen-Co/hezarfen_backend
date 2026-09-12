@@ -112,7 +112,6 @@ mod tests {
     use super::{create_session, delete_by_token, find_by_token, find_by_username};
     use crate::domain::user::{Password, Username};
     use crate::service::builder;
-    use crate::tenant::Tenants;
 
     #[tokio::test]
     async fn a_builder_session_round_trips_and_deletes() {

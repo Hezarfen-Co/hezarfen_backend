@@ -190,17 +190,28 @@ mod tests {
     }
 
     /// A real template row: an image write moves its `points` inside its own
-    /// transaction, so a minted id nothing ever wrote is refused.
+    /// transaction, so a minted id nothing ever wrote is refused. The owner is
+    /// a foreign key now, so its fixture row is real too.
     async fn a_template(db: &Database) -> BankQuestionId {
         let id = BankQuestionId::generate();
-        db.query(
-            "CREATE $b SET owner = user:u, text = 'soru', kind = 'text', points = 5,
-             visibility = 'private', created_at = 1",
+        let owner = crate::domain::user::UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
         )
-        .bind(("b", id.record()))
+        .bind(owner.uuid())
+        .bind(format!("bqi-owner-{}", &owner.key()[30..]))
+        .execute(db)
         .await
-        .unwrap()
-        .check()
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bank_question (id, owner, text, kind, points, visibility, created_at) \
+             VALUES ($1, $2, 'soru', 'text', 5, 'private', 1)",
+        )
+        .bind(id.uuid())
+        .bind(owner.uuid())
+        .execute(db)
+        .await
         .unwrap();
         id
     }
@@ -316,46 +327,36 @@ mod tests {
     /// from, so an image that committed inside the window and is *not* in it is
     /// a blob stranded on disk.
     ///
-    /// The window is opened by the schema, not by a lucky interleaving: a
-    /// `DEFINE EVENT` on `bank_question` fires inside the delete's own
-    /// transaction the instant the row goes.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both and answers `Ok` to each, so this passes there on broken
-    /// code.
+    /// The upload writes the template row too (its `points`), so the two
+    /// transactions touch one row and Postgres refuses one of them; the
+    /// barrier releases both sides together so every interleaving gets its
+    /// chance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_image_written_inside_a_delete_window_never_outlives_its_template() {
-        let (db, _serialized) = crate::database::init_test_server("bank_image_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE bank_question WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
 
         let (mut swept, mut orphans, mut stranded) = (0, 0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let question = a_template(&db).await;
             let template = crate::db::bank_question::read(&db, &question)
                 .await
                 .unwrap()
                 .unwrap();
 
+            // Delete and upload released together: both write the template row,
+            // so Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::bank_question::delete(&db, template).await })
-            };
-            // The upload starts inside the held window — the template row is
-            // gone but uncommitted, which is exactly what the handler's
-            // ownership read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let child = {
-                let (db, question) = (db.clone(), question.clone());
+                let (db, gate, template) = (db.clone(), gate.clone(), template);
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::bank_question::delete(&db, template).await
+                })
+            };
+            let child = {
+                let (db, question, gate) = (db.clone(), question.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     upsert(&db, BankQuestionImage::new(&question, None, png(), 3)).await
                 })
             };
@@ -390,7 +391,7 @@ mod tests {
             }
         }
         eprintln!(
-            "bank_question::delete raced by an upload: {swept}/4 rounds deleted the template"
+            "bank_question::delete raced by an upload: {swept}/8 rounds deleted the template"
         );
         assert!(
             swept > 0,
@@ -414,33 +415,27 @@ mod tests {
     /// table holds the first write open inside its own transaction, so the
     /// second reads the slot before the first commits.
     ///
-    /// Real server, and `#[ignore]`d for it, for the reason above: the embedded
-    /// engine has no write-write conflict detection to make a loser re-read.
+    /// Both writes touch the same `(question, slot)` row, so Postgres
+    /// serializes them and the loser re-reads inside its own transaction —
+    /// the barrier releases them together so the contention is real.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn two_uploads_to_one_slot_leave_no_blob_unretired() {
-        let (db, _serialized) = crate::database::init_test_server("bank_image_replace").await;
-        db.query(
-            "DEFINE EVENT hold_the_write ON TABLE bank_question_image WHEN true \
-             THEN { SLEEP 300ms; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
 
         let mut unretired = 0;
-        for round in 0..3 {
+        for round in 0..6 {
             let question = a_template(&db).await;
             // A first picture, so both racers have an old blob to retire.
             let (original, _) = upsert(&db, BankQuestionImage::new(&question, None, png(), 1))
                 .await
                 .unwrap();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let mut writes = Vec::new();
             for size in [2, 3] {
-                let (db, question) = (db.clone(), question.clone());
+                let (db, question, gate) = (db.clone(), question.clone(), gate.clone());
                 writes.push(tokio::spawn(async move {
+                    gate.wait().await;
                     upsert(&db, BankQuestionImage::new(&question, None, png(), size)).await
                 }));
             }

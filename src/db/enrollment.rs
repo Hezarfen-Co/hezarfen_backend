@@ -251,6 +251,24 @@ pub async fn remove(
 mod tests {
     use super::*;
 
+    /// A real `app_user` row: students, teachers and managers are foreign
+    /// keys now. The label names the row's username; the id is minted, so
+    /// repeated calls are new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
 
     /// A pumped row that vanishes under the disown — a concurrent unenroll, or
     /// the sweep a role change runs — must answer the row the caller was
@@ -260,15 +278,33 @@ mod tests {
     #[tokio::test]
     async fn a_vanished_row_is_not_an_internal_error() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let class = crate::domain::class_group::ClassGroupId::from_key("9a");
-        let course = CourseId::from_key("019732e3-7b00-7000-8000-00000000dead");
-        let student = UserId::from_key("019732e3-7b00-7000-8000-00000000deae");
-        // Never written: the same store state a delete in the window leaves.
+        let class = crate::domain::class_group::ClassGroupId::generate();
+        sqlx::query("INSERT INTO class_group (id, name, creator) VALUES ($1, '9a', $2)")
+            .bind(class.uuid())
+            .bind({
+                let mgr = UserId::generate();
+                sqlx::query(
+                    "INSERT INTO app_user (id, username, password_hash, role) \
+                     VALUES ($1, 'enroll-fixture', 'x', 'manager')",
+                )
+                .bind(mgr.uuid())
+                .execute(&db)
+                .await
+                .unwrap();
+                mgr.uuid()
+            })
+            .execute(&db)
+            .await
+            .unwrap();
+        // The course and student are foreign keys now: real rows, like the
+        // class. The enrollment itself is never written — the same store state
+        // a delete in the window leaves.
+        let course = crate::db::course::a_test_course(&db).await;
+        let student = a_person(&db, "student", "student").await;
         let ghost = Enrollment {
-            id: EnrollmentId::composite(&course, &student),
             course: course.clone(),
             user: student.clone(),
-            enrolled_by: UserId::from_key("mgr"),
+            enrolled_by: a_person(&db, "mgr", "manager").await,
             source: Some(class),
         };
 
@@ -285,7 +321,7 @@ mod tests {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
 
         let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = UserId::from_key("teacher");
+        let teacher = a_person(&db, "teacher", "teacher").await;
         let course = crate::db::course::create(
             &db,
             &teacher,
@@ -297,19 +333,17 @@ mod tests {
         )
         .await
         .unwrap();
-        enroll(&db, course.get_id(), &UserId::from_key("student"), &teacher)
+        enroll(&db, course.get_id(), &a_person(&db, "student", "student").await, &teacher)
             .await
             .unwrap();
 
-        let mut result = db
-            .query("SELECT VALUE 'source' IN object::keys($this) FROM enrollment")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        let source_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM enrollment WHERE source IS NOT NULL")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(
-            result.take::<Vec<bool>>(0).unwrap(),
-            vec![false],
+            source_rows, 0,
             "a hand-placed row may carry no source key"
         );
     }

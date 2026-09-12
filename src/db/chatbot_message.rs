@@ -65,7 +65,9 @@ async fn insert(db: &Database, message: ChatbotMessage) -> Result<ChatbotMessage
     )
     .fetch_optional(db)
     .await?;
-    inserted.ok_or_else(|| AppError::Internal("failed to create chat message".into()))
+    // No row out of the conditional insert means the thread's touch matched
+    // nothing: the thread is gone, and nothing was written.
+    inserted.ok_or(AppError::NotFound)
 }
 
 /// Append the user's prompt. Nothing is awaited for it, so it is born

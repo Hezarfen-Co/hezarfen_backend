@@ -266,11 +266,22 @@ mod tests {
     /// never 500, and a course that got linked survives it. The retry is
     /// measured on [`crate::db::course::delete`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_course_create_never_answers_500() {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::UserId;
-        let (db, _serialized) = crate::database::init_test_server("term_delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The course's teacher is a foreign key now: one real row, reused by
+        // every create in every round.
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("term-race-{}", &teacher.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
         let (mut delete_500, mut create_500) = (0, 0);
         let (mut linked, mut wiped) = (0, 0);
         let (mut last_delete, mut last_create) = (String::new(), String::new());
@@ -301,7 +312,7 @@ mod tests {
             };
             let makes: Vec<_> = (0..6)
                 .map(|_| {
-                    let (id, db) = (term.get_id().clone(), db.clone());
+                    let (id, db, teacher) = (term.get_id().clone(), db.clone(), teacher.clone());
                     let head_start = if separated {
                         std::time::Duration::from_millis(2)
                     } else {
@@ -311,7 +322,7 @@ mod tests {
                         tokio::time::sleep(head_start).await;
                         crate::db::course::create(
                             &db,
-                            &UserId::from_key("teacher"),
+                            &teacher,
                             CourseTitle::try_new("algebra").unwrap(),
                             CourseDescription::try_new("").unwrap(),
                             CourseKind::course(),

@@ -399,6 +399,24 @@ mod tests {
         Timestamp::from_millis(millis)
     }
 
+    /// A real `app_user` row: teachers and students are foreign keys now. The
+    /// label names the row's username; the id is minted, so repeated calls are
+    /// new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     /// A window that has not opened yet — `book` refuses started ones.
     fn soon(offset: i64) -> Timestamp {
         at(Timestamp::now().as_millis() + offset)
@@ -407,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn window_prefers_a_proposal_over_the_slot() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let (starts_at, ends_at) = (soon(60_000), soon(120_000));
         let slot = appointment_slot::create(&db, &teacher, starts_at, ends_at, None)
             .await
@@ -415,7 +433,7 @@ mod tests {
         let mut appointment_row = book(
             &db,
             slot.get_id(),
-            &UserId::from_key("s1"),
+            &a_person(&db, "s1", "student").await,
             AppointmentReason::try_new("ödev").unwrap(),
         )
         .await
@@ -432,13 +450,13 @@ mod tests {
     #[tokio::test]
     async fn a_started_slot_cannot_be_booked() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
         let started = appointment_slot::create(&db, &teacher, soon(-30_000), soon(60_000), None)
             .await
             .unwrap();
         assert!(matches!(
-            book(&db, started.get_id(), &UserId::from_key("s1"), reason()).await,
+            book(&db, started.get_id(), &a_person(&db, "s1", "student").await, reason()).await,
             Err(AppError::Conflict("the slot has already started"))
         ));
 
@@ -446,7 +464,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            book(&db, upcoming.get_id(), &UserId::from_key("s1"), reason())
+            book(&db, upcoming.get_id(), &a_person(&db, "s1", "student").await, reason())
                 .await
                 .is_ok()
         );
@@ -457,8 +475,8 @@ mod tests {
     #[tokio::test]
     async fn a_started_proposal_cannot_be_accepted() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -545,8 +563,8 @@ mod tests {
     #[tokio::test]
     async fn a_decision_built_on_a_stale_snapshot_never_lands() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -611,14 +629,27 @@ mod tests {
     /// What the slot row itself says about being taken — the authority every
     /// gate now reads.
     async fn occupied(slot: &AppointmentSlotId, db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE (occupied ?? 0) FROM $slot")
-            .bind(("slot", slot.record()))
+        sqlx::query_scalar::<_, i64>("SELECT occupied FROM appointment_slot WHERE id = $1")
+            .bind(slot.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result.take::<Vec<i64>>(0).unwrap()[0]
+    }
+
+    /// The seat claim `book` rides, asked directly: the conditional
+    /// `UPDATE … WHERE occupied < $cap` on the slot row is the whole
+    /// primitive, so this asks it the exact question the race asks.
+    async fn claim_seat(slot: &AppointmentSlotId, cap: i64, db: &Database) -> bool {
+        sqlx::query_scalar::<_, i32>(
+            "UPDATE appointment_slot SET occupied = occupied + 1 \
+             WHERE id = $1 AND occupied < $2 RETURNING 1",
+        )
+        .bind(slot.uuid())
+        .bind(cap)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+        .is_some()
     }
 
     /// The double-book race with the lock taken out of the picture: a second
@@ -634,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn a_concurrent_claim_cannot_take_a_booked_slot() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -643,7 +674,7 @@ mod tests {
         book(
             &db,
             slot.get_id(),
-            &UserId::from_key("s1"),
+            &a_person(&db, "s1", "student").await,
             AppointmentReason::try_new("görüşme").unwrap(),
         )
         .await
@@ -651,9 +682,7 @@ mod tests {
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
 
         assert!(
-            !cap::claim(&slot.get_id().record(), SLOT_OCCUPIED_FIELD, 1, &db)
-                .await
-                .unwrap(),
+            !claim_seat(slot.get_id(), 1, &db).await,
             "the slot's seat must already be taken"
         );
         // And the racer's refusal left the stored state alone: one booking, one
@@ -675,18 +704,18 @@ mod tests {
     #[tokio::test]
     async fn a_refused_booking_moves_nothing() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        book(&db, slot.get_id(), &UserId::from_key("s1"), reason())
+        book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
             .await
             .unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
 
-        let refused = book(&db, slot.get_id(), &UserId::from_key("s2"), reason()).await;
+        let refused = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await;
         assert!(
             matches!(refused, Err(AppError::Conflict(_))),
             "the slot is taken"
@@ -712,8 +741,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_hands_the_seat_back_with_the_status() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -737,7 +766,7 @@ mod tests {
             book(
                 &db,
                 slot.get_id(),
-                &UserId::from_key("s2"),
+                &a_person(&db, "s2", "student").await,
                 AppointmentReason::try_new("görüşme").unwrap()
             )
             .await
@@ -750,17 +779,17 @@ mod tests {
     #[tokio::test]
     async fn rejecting_frees_the_slot_for_re_booking() {
         let (db, _leases) = init_test_db().await;
-        let teacher = UserId::from_key("t1");
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        let first = book(&db, slot.get_id(), &UserId::from_key("s1"), reason())
+        let first = book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
             .await
             .unwrap();
         assert!(matches!(
-            book(&db, slot.get_id(), &UserId::from_key("s2"), reason()).await,
+            book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await,
             Err(AppError::Conflict(_))
         ));
         // The live booking also blocks the slot delete.
@@ -771,7 +800,7 @@ mod tests {
 
         reject(&db, first.get_id(), &teacher, None).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
-        let second = book(&db, slot.get_id(), &UserId::from_key("s2"), reason())
+        let second = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason())
             .await
             .unwrap();
         assert_eq!(second.get_status(), AppointmentStatus::Pending);

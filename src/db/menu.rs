@@ -78,8 +78,12 @@ pub async fn create(
             Ok(row) => row,
             Err(err) => {
                 // A rival published the same meal after the pre-check: its
-                // row owns the key, and its publish is the answer.
-                if unique_violation(&err) == Some("menu_pkey") {
+                // row owns the key — or, for a legacy id a derived key can
+                // never collide with, its (date, slot) pair does — and the
+                // rival's publish is the answer either way.
+                if matches!(unique_violation(&err),
+                            Some("menu_pkey") | Some("menu_date_slot"))
+                {
                     return Err(AppError::Conflict(
                         "a menu is already published for that date and slot",
                     ));
@@ -289,8 +293,8 @@ mod tests {
     /// The one fixture person, by a fixed valid id every publish can name.
     const TEACHER: &str = "019732e3-7b00-7000-8000-00000000acdc";
 
-    async fn school() -> Database {
-        let (db, _leases) = init_test_db().await;
+    async fn school() -> (Database, crate::database::TestDatabases) {
+        let (db, leases) = init_test_db().await;
         sqlx::query(
             "INSERT INTO app_user (id, username, password_hash, role) \
              VALUES ($1, 'teacher', 'x', 'teacher')",
@@ -299,7 +303,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        db
+        (db, leases)
     }
 
     fn lunch() -> MenuSlot {
@@ -309,6 +313,8 @@ mod tests {
     /// The reference count, re-read out of the store — never off a return
     /// value, which the in-memory engine forges wins on.
     async fn refs(db: &Database) -> i64 {
+        use sqlx::Row as _;
+
         sqlx::query("SELECT count FROM slot_ref WHERE name = 'lunch'")
             .fetch_optional(db)
             .await
@@ -360,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn publishing_lands_the_menu_and_its_reference_together() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         let menu = publish("2026-08-02", &db).await.unwrap();
         assert!(read(&db, menu.get_id()).await.unwrap().is_some());
         assert_eq!(refs(&db).await, 1);
@@ -376,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retired_slot_refuses_and_writes_nothing() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         assert!(retire_lunch(&db).await);
 
         let refused = publish("2026-08-02", &db)
@@ -400,7 +406,7 @@ mod tests {
     /// gate can answer it, and its answer must cost no reference.
     #[tokio::test]
     async fn a_rival_on_the_id_answers_taken_and_counts_nothing() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         let id = MenuId::for_slot(&MenuDate::try_new("2026-08-02").unwrap(), &lunch());
         // Planted under another day, so `find` misses it exactly as it would
         // in the instant before the rival's own row was visible.
@@ -417,7 +423,7 @@ mod tests {
     /// cannot collide with, so the pre-check is the only thing that can refuse.
     #[tokio::test]
     async fn a_legacy_ulid_menu_still_answers_taken() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         plant(&MenuId::from_key("01JLEGACYMENU"), "2026-08-02", &db).await;
 
         let taken = publish("2026-08-02", &db)
@@ -435,7 +441,7 @@ mod tests {
     /// itself against actually changed.
     #[tokio::test]
     async fn the_cap_and_the_revision_move_together_or_not_at_all() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         let menu = publish("2026-08-05", &db).await.unwrap();
         let id = menu.get_id().clone();
         assert_eq!(menu.get_version(), 0);
@@ -458,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_hands_the_reference_back_in_the_same_step() {
-        let db = school().await;
+        let (db, _leases) = school().await;
         let monday = publish("2026-08-03", &db).await.unwrap();
         publish("2026-08-04", &db).await.unwrap();
         assert_eq!(refs(&db).await, 2);
@@ -511,7 +517,7 @@ mod tests {
     async fn a_child_written_inside_a_delete_never_outlives_the_menu() {
         use crate::domain::menu_dish::DishDescription;
 
-        let db = school().await;
+        let (db, _leases) = school().await;
 
         let (mut dishes, mut marks, mut swept) = (0, 0, 0);
         for round in 0..4 {

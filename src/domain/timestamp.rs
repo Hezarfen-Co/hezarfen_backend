@@ -170,9 +170,9 @@ mod tests {
     fn json_form_is_the_bare_millisecond_number() {
         assert_eq!(
             serde_json::to_value(Timestamp::from_millis(1_700_000_000_000)).unwrap(),
-            serde_json::json!(1_700_000_000_000)
+            serde_json::json!(1_700_000_000_000i64)
         );
-        let back: Timestamp = serde_json::from_value(serde_json::json!(1_700_000_000_000)).unwrap();
+        let back: Timestamp = serde_json::from_value(serde_json::json!(1_700_000_000_000i64)).unwrap();
         assert_eq!(back.as_millis(), 1_700_000_000_000);
     }
 }

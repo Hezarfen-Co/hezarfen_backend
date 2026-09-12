@@ -165,8 +165,21 @@ mod tests {
     use crate::domain::course_note_file::FileName;
     use serde_json::json;
 
+    /// A real `app_user` row: the course's creator is a foreign key now.
+    async fn a_person(db: &Database) -> crate::domain::user::UserId {
+        let user = crate::domain::user::UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("rag-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
     async fn note_of(db: &Database, title: &str) -> CourseNote {
-        let creator = crate::domain::user::UserId::generate();
+        // The course's creator is a foreign key now: a real `app_user` row.
+        let creator = a_person(db).await;
         let course = crate::db::course::create(
             db,
             &creator,
@@ -219,9 +232,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let read = read(&db, row.get_id()).await.unwrap().unwrap();
-        assert_eq!(read.get_payload(), &json!({"answer": "x"}));
-        assert_eq!(read.get_sources(), &[file.get_id().clone()]);
+        let read_back = read(&db, row.get_id()).await.unwrap().unwrap();
+        assert_eq!(read_back.get_payload(), &json!({"answer": "x"}));
+        assert_eq!(read_back.get_sources(), &[file.get_id().clone()]);
 
         delete_for_note(&db, note.get_id()).await.unwrap();
         assert!(read(&db, row.get_id()).await.unwrap().is_none());

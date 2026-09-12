@@ -394,6 +394,34 @@ mod tests {
     use super::*;
     use crate::constant::{BANK_VISIBILITY_PRIVATE, BANK_VISIBILITY_SCHOOL};
 
+    /// A real `app_user` row: template owners are foreign keys now. The id is
+    /// minted per call, so repeated calls are new people, not the same row.
+    async fn a_person(db: &Database, label: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("{label}-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
+    /// A real subject row: a template's subject reference is a foreign key
+    /// too (and the subject needs a real course under it).
+    async fn a_subject(db: &Database) -> SubjectId {
+        crate::db::subject::create(
+            db,
+            &crate::db::course::a_test_course(db).await,
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
     fn spec() -> QuestionSpec {
         use crate::domain::exam_question::{ChoiceInput, QuestionKind};
         QuestionSpec::try_new(
@@ -423,12 +451,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_without_the_field_decodes_private() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'q', 'x')")
-            .bind(owner.uuid())
-            .execute(&db)
-            .await
-            .unwrap();
+        let owner = a_person(&db, "owner").await;
         let id = BankQuestionId::generate();
         sqlx::query(
             "INSERT INTO bank_question (id, owner, text, kind, points, created_at) \
@@ -450,12 +473,12 @@ mod tests {
     #[tokio::test]
     async fn list_hides_private_templates_from_others() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
-        let other = UserId::generate();
+        let owner = a_person(&db, "owner").await;
+        let other = a_person(&db, "other").await;
         let private = create(
             &db,
             owner.clone(),
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("secret").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -465,7 +488,7 @@ mod tests {
         let published = create(
             &db,
             owner.clone(),
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("shared").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -517,11 +540,11 @@ mod tests {
     #[tokio::test]
     async fn a_merge_built_on_a_stale_snapshot_is_refused() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
+        let owner = a_person(&db, "owner").await;
         let stale = create(
             &db,
             owner,
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("first").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -565,20 +588,25 @@ mod tests {
     #[tokio::test]
     async fn visibility_filter_narrows_never_widens() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
-        let other = UserId::generate();
-        let mine = |text: &str| {
+        let owner = a_person(&db, "owner").await;
+        let other = a_person(&db, "other").await;
+        async fn mine<'a>(
+            db: &Database,
+            owner: &UserId,
+            text: &str,
+        ) -> Result<BankQuestion, AppError> {
             create(
-                &db,
+                db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
             )
-        };
-        mine("draft").await.unwrap();
-        let published = mine("shared").await.unwrap();
+            .await
+        }
+        mine(&db, &owner, "draft").await.unwrap();
+        let published = mine(&db, &owner, "shared").await.unwrap();
         let subject = published.get_subject().cloned();
         update_if_unchanged(
             &db,
@@ -642,20 +670,25 @@ mod tests {
         // static `query!` (a `GROUP BY` with no loop around it), which the
         // compiler now checks the way the old constant asserted.
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
-        let template = |text: &str| {
+        let owner = a_person(&db, "owner").await;
+        async fn template<'a>(
+            db: &Database,
+            owner: &UserId,
+            text: &str,
+        ) -> Result<BankQuestion, AppError> {
             create(
-                &db,
+                db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
             )
-        };
-        let used_twice = template("twice").await.unwrap();
-        let used_once = template("once").await.unwrap();
-        let unused = template("never").await.unwrap();
+            .await
+        }
+        let used_twice = template(&db, &owner, "twice").await.unwrap();
+        let used_once = template(&db, &owner, "once").await.unwrap();
+        let unused = template(&db, &owner, "never").await.unwrap();
 
         // Real exam rows: instantiating a template moves the exam's counter
         // (what keeps a question from outliving its exam), so a minted id
@@ -731,8 +764,8 @@ mod tests {
         for _ in 0..2 {
             create(
                 &db,
-                UserId::generate(),
-                SubjectId::generate(),
+                a_person(&db, "owner").await,
+                a_subject(&db).await,
                 QuestionText::try_new("q").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
@@ -752,12 +785,12 @@ mod tests {
     #[tokio::test]
     async fn list_pages_newest_first_and_filters_text() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let owner = UserId::generate();
+        let owner = a_person(&db, "owner").await;
         for i in 0..5 {
             create(
                 &db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(&db).await,
                 QuestionText::try_new(&format!("question {i}")).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
@@ -786,7 +819,7 @@ mod tests {
         let (none, total) = list(
             &db,
             None,
-            Some(&UserId::generate()),
+            Some(&a_person(&db, "empty").await),
             None,
             None,
             None,
@@ -805,8 +838,8 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         create(
             &db,
-            UserId::generate(),
-            SubjectId::generate(),
+            a_person(&db, "owner").await,
+            a_subject(&db).await,
             QuestionText::try_new("İSTANBUL kaç ilçeye ayrılır?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),

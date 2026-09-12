@@ -943,7 +943,13 @@ mod tests {
             creator.get_id(),
             EventTitle::try_new("Gezi").unwrap(),
             EventDescription::try_new("").unwrap(),
-            EventAudience::School,
+            EventAudience {
+                kind: EventAudienceKind::School,
+                role: None,
+                course: None,
+                class: None,
+                capacity: None,
+            },
             None,
             None,
         )

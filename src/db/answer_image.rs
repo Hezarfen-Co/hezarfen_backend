@@ -239,16 +239,55 @@ mod tests {
         crate::db::exam::published_exam(db).await.get_id().clone()
     }
 
-    fn student() -> UserId {
-        UserId::from_key("019732e3-7b00-7000-8000-00000000a11a")
+    /// A real `app_user` row under a fixed key: the sheet's owner is a
+    /// foreign key now.
+    async fn a_student(db: &Database) -> UserId {
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000a11a");
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'a11a', 'x')")
+            .bind(user.uuid())
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
+    /// A real question row on `exam`: a drawing hangs off it by foreign key.
+    async fn a_question(db: &Database, exam: &ExamId) -> ExamQuestionId {
+        let subject = crate::db::subject::create(
+            db,
+            &crate::db::course::a_test_course(db).await,
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        let spec = crate::domain::exam_question::QuestionSpec::try_new(
+            crate::domain::exam_question::QuestionKind::try_new("text").unwrap(),
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        crate::db::exam_question::create(
+            db,
+            exam,
+            subject.get_id().clone(),
+            crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
+            crate::domain::exam_question::QuestionPoints::try_new(1).unwrap(),
+            spec,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
     }
 
     #[tokio::test]
     async fn upsert_replaces_within_a_sitting_but_not_across_them() {
         let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
-        let user = student();
+        let question = a_question(&db, &exam).await;
+        let user = a_student(&db).await;
 
         let (first, retired) = upsert(&db, AnswerImage::new(&exam, &question, &user, 1, png(), 3))
             .await
@@ -287,7 +326,12 @@ mod tests {
         );
 
         // Another student's drawing for the same question/sitting is its own row.
-        let other = UserId::from_key("019732e3-7b00-7000-8000-00000000b22b");
+        let other = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'b22b', 'x')")
+            .bind(other.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
         upsert(&db, AnswerImage::new(&exam, &question, &other, 1, png(), 7))
             .await
             .unwrap();
@@ -300,13 +344,11 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let exam_a = exam_row(&db).await;
         let exam_b = exam_row(&db).await;
-        let user = student();
-        upsert(
-            &db,
-            AnswerImage::new(&exam_a, &ExamQuestionId::generate(), &user, 1, png(), 1),
-        )
-        .await
-        .unwrap();
+        let user = a_student(&db).await;
+        let question = a_question(&db, &exam_a).await;
+        upsert(&db, AnswerImage::new(&exam_a, &question, &user, 1, png(), 1))
+            .await
+            .unwrap();
         assert_eq!(
             list_for_exam_user(&db, &exam_a, &user, 1)
                 .await

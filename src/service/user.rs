@@ -431,21 +431,17 @@ mod tests {
         }
         // The seat each held died with its slot row, so nothing is pinned: no
         // live booking is left pointing at a slot that no longer exists.
-        let mut result = db
-            .query(
-                "SELECT VALUE id FROM appointment \
-                 WHERE status IN ['pending', 'approved'] AND slot.starts_at = NONE",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        assert!(
-            result
-                .take::<Vec<surrealdb::types::RecordId>>(0)
-                .unwrap()
-                .is_empty()
-        );
+        // The slot is a foreign key now, so this reads as a structural fact:
+        // no live booking may point at a slot row that is gone.
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointment a \
+             WHERE a.status IN ('pending', 'approved') \
+               AND NOT EXISTS (SELECT 1 FROM appointment_slot s WHERE s.id = a.slot)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0);
 
         // Another teacher's calendar is nobody else's business.
         assert_eq!(

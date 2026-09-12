@@ -222,8 +222,8 @@ mod tests {
         (counter, rows as usize)
     }
 
-    async fn a_user_capped_at(threads: i64) -> Database {
-        let (db, _leases) = crate::database::init_test_db().await;
+    async fn a_user_capped_at(threads: i64) -> (Database, crate::database::TestDatabases) {
+        let (db, leases) = crate::database::init_test_db().await;
         sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'u', 'x')")
             .bind(UserId::from_key(U).uuid())
             .execute(&db)
@@ -239,7 +239,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db
+        (db, leases)
     }
 
     /// The seat and the row commit together, so the counter the cap reads can
@@ -247,7 +247,7 @@ mod tests {
     /// cap advances neither.
     #[tokio::test]
     async fn a_capped_create_moves_the_counter_with_the_row() {
-        let db = a_user_capped_at(1).await;
+        let (db, _leases) = a_user_capped_at(1).await;
         let user = UserId::from_key(U);
 
         create_capped(&db, &user, None).await.expect("first thread");
@@ -268,7 +268,7 @@ mod tests {
     /// this one pins the logic, which the in-memory engine can answer.
     #[tokio::test]
     async fn a_turn_writes_its_thread_and_dies_with_it() {
-        let db = a_user_capped_at(2).await;
+        let (db, _leases) = a_user_capped_at(2).await;
         let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
         let opened = thread.get_updated_at().as_millis();
@@ -328,7 +328,7 @@ mod tests {
     async fn a_stamp_ahead_of_the_clock_still_climbs() {
         const LEAD: i64 = 1_000;
 
-        let db = a_user_capped_at(1).await;
+        let (db, _leases) = a_user_capped_at(1).await;
         let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
 
@@ -390,7 +390,9 @@ mod tests {
     /// and the invariant must hold in each.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_turn_written_inside_a_delete_never_outlives_the_thread() {
-        let db = a_user_capped_at(4).await;
+        // One thread minted per round: the cap must cover every round, since
+        // the rounds where the turn wins keep their thread (and its seat).
+        let (db, _leases) = a_user_capped_at(8).await;
 
         let user = UserId::from_key(U);
         let (mut orphans, mut swept) = (0, 0);

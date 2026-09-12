@@ -192,7 +192,6 @@ pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::SUBJECT_TABLE;
 
     /// A curriculum topic must not outlive its course: an orphan 404s through
     /// `subject_with_course`, and worse than the sibling cases,
@@ -248,12 +247,11 @@ mod tests {
     /// measured on [`crate::db::course::delete`], whose cascade is
     /// long enough to lose a round (1-2 of 20, red under the same mutation).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_question_never_answers_500() {
         use crate::domain::exam_question::{
             QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
-        let (db, _serialized) = crate::database::init_test_server("subject_delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let (mut delete_500, mut question_500) = (0, 0);
         let (mut landed, mut wiped) = (0, 0);
         let (mut last_delete, mut last_question) = (String::new(), String::new());

@@ -268,7 +268,7 @@ mod tests {
              VALUES ($1, $2, 'x')",
         )
         .bind(user.uuid())
-        .bind(format!("{label}-{}", &user.key()[..8]))
+        .bind(format!("{label}-{}", &user.key()[30..]))
         .execute(db)
         .await
         .unwrap();
@@ -357,7 +357,7 @@ mod tests {
     async fn image_set_replace_clear_report_the_replaced_blob() {
         let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::generate().to_string());
+        let author = a_person(&db, "author").await;
         let png = FileContentType::try_new("image/png").unwrap();
 
         let solution = insert(
@@ -418,7 +418,7 @@ mod tests {
     async fn set_body_edits_in_place() {
         let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::generate().to_string());
+        let author = a_person(&db, "author").await;
 
         let solution = insert(
             &db,
@@ -446,7 +446,7 @@ mod tests {
         assert!(
             set_body(
                 &db,
-                &SolutionId::from_key(&Ulid::generate().to_string()),
+                &SolutionId::from_key(&uuid::Uuid::now_v7().to_string()),
                 &SolutionBody::try_new("boş").unwrap(),
             )
             .await

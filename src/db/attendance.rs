@@ -152,7 +152,7 @@ mod tests {
                  VALUES ($1, $2, 'x', 'teacher')",
             )
             .bind(user.uuid())
-            .bind(format!("{label}-{}", &user.key()[..8]))
+            .bind(format!("{label}-{}", &user.key()[30..]))
             .execute(db)
             .await
             .unwrap();

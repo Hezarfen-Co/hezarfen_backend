@@ -1385,7 +1385,6 @@ mod tests {
             chatbot_limit: Default::default(),
             exam_presence: Default::default(),
             board_hub: Default::default(),
-            db_up: Default::default(),
             ai: None,
             metrics: crate::telemetry::Metrics::noop(),
         };

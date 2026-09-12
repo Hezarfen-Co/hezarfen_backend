@@ -173,7 +173,7 @@ mod tests {
         );
         let json = serde_json::to_value(&one).unwrap();
         assert_eq!(json["amount_minor"], serde_json::json!(12_345));
-        assert_eq!(json["due_at"], serde_json::json!(1_700_000_000_000));
+        assert_eq!(json["due_at"], serde_json::json!(1_700_000_000_000i64));
         let back: Installment = serde_json::from_value(json).unwrap();
         assert_eq!(back, one);
     }

@@ -160,12 +160,26 @@ pub async fn delete(db: &Database, file: CourseNoteFile) -> Result<CourseNoteFil
 mod tests {
     use super::*;
     use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
+    use crate::domain::course_note::CourseNote;
     use crate::domain::course_note::{CourseNoteContent, CourseNoteTitle};
     use crate::domain::course_note_file::FileContentType;
     use crate::domain::course_note_file::FileName;
 
+    /// A real `app_user` row: authors and creators are foreign keys now.
+    async fn a_person(db: &Database) -> crate::domain::user::UserId {
+        let user = crate::domain::user::UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("cnf-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
     async fn note_of(db: &Database, title: &str) -> CourseNote {
-        let creator = crate::domain::user::UserId::generate();
+        // The note's author is a foreign key now: a real `app_user` row.
+        let creator = a_person(db).await;
         let course = crate::db::course::create(
             db,
             &creator,

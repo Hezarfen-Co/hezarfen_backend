@@ -1522,7 +1522,7 @@ mod tests {
 
         for (field, id) in [
             ("gone", "0198f1a2-3b4c-7d5e-8f90-000000000001"),
-            ("student", student.get_id().key()),
+            ("student", student.get_id().key().as_str()),
         ] {
             let refused = teacher_or_none(Some(id), &db).await;
             assert!(
@@ -1537,7 +1537,7 @@ mod tests {
             );
         }
         assert_eq!(
-            teacher_or_none(Some(teacher.get_id().key()), &db)
+            teacher_or_none(Some(teacher.get_id().key().as_str()), &db)
                 .await
                 .unwrap()
                 .map(|found| found.get_id().clone()),

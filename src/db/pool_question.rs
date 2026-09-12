@@ -335,7 +335,7 @@ mod tests {
         let user = UserId::generate();
         sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
             .bind(user.uuid())
-            .bind(format!("u{}", &user.key()[..8]))
+            .bind(format!("u{}", &user.key()[30..]))
             .execute(db)
             .await
             .unwrap();
@@ -573,47 +573,35 @@ mod tests {
     /// instead, so the two transactions touch one key and the store refuses
     /// one of them.
     ///
-    /// The window is opened by the database, not by a lucky interleaving: a
-    /// `DEFINE EVENT` on `pool_question` fires *inside* the delete's own
-    /// transaction the instant the row goes, so the `SLEEP` lands exactly
-    /// between the delete and its cascade every time.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, so this passes there on
-    /// broken code.
+    /// The offer writes the question row too (its `solution_count`), so the
+    /// two transactions touch one row and Postgres refuses one of them; the
+    /// barrier releases both sides together so every interleaving gets its
+    /// chance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_solution_offered_inside_a_delete_never_outlives_its_question() {
-        let (db, _serialized) = database::init_test_server("solution_race").await;
-        // Hold the delete open for a full second after the row is gone, while
-        // its cascade still has to run.
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE pool_question WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = database::init_test_db().await;
 
         let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let asker = a_user(&db).await;
             let helper = a_user(&db).await;
             let q = insert(&db, question(&asker)).await.unwrap();
             let id = q.get_id().clone();
 
+            // Delete and offer released together: both write the question row,
+            // so Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, id) = (db.clone(), id.clone());
-                tokio::spawn(async move { delete(&db, &id).await })
-            };
-            // The offer starts inside the held window — the question row is
-            // gone but uncommitted, which is exactly what a read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let child = {
-                let (db, id) = (db.clone(), id.clone());
+                let (db, id, gate) = (db.clone(), id.clone(), gate.clone());
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    delete(&db, &id).await
+                })
+            };
+            let child = {
+                let (db, id, helper, gate) = (db.clone(), id.clone(), helper.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     crate::db::solution::insert(
                         &db,
                         Solution::new(
@@ -647,7 +635,7 @@ mod tests {
                     .len();
             }
         }
-        eprintln!("pool_question::delete raced by an offer: {swept}/4 rounds deleted the question");
+        eprintln!("pool_question::delete raced by an offer: {swept}/8 rounds deleted the question");
         assert!(
             swept > 0,
             "no round ever deleted the question, so the window was never reached"
