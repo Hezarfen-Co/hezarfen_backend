@@ -24,8 +24,8 @@ use sqlx::postgres::PgConnectOptions;
 
 use crate::constant::{MAX_SLUG_LEN, MIN_SLUG_LEN};
 use crate::database::{
-    create_database_sql, is_duplicate_database, migrate_school, school_pool, unique_violation,
-    Database,
+    Database, create_database_sql, is_duplicate_database, migrate_school, school_pool,
+    unique_violation,
 };
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
@@ -267,6 +267,10 @@ pub struct Tenants {
     /// The control database's name; every school database is
     /// [`school_db_name`] of it.
     control_db: String,
+    /// Databases a test deployment minted, adopted via
+    /// [`Tenants::new_test_adopting`]; dropped with this registry's last
+    /// handle. `None` in production, where databases outlive the process.
+    leases: Option<crate::database::TestDatabases>,
 }
 
 impl Tenants {
@@ -278,7 +282,41 @@ impl Tenants {
             cache: Arc::new(RwLock::new(HashMap::new())),
             base,
             control_db,
+            leases: None,
         }
+    }
+
+    /// Test constructor: wrap already-created databases and adopt their
+    /// [`crate::database::TestDatabases`] lease, so everything the harness
+    /// minted dies with this registry's last handle. `prewarmed` pools enter
+    /// the cache directly — for a template clone there is no re-dial to win.
+    #[doc(hidden)]
+    pub fn new_test_adopting(
+        control: Database,
+        base: PgConnectOptions,
+        control_db: String,
+        leases: crate::database::TestDatabases,
+        prewarmed: impl IntoIterator<Item = (Slug, Database)>,
+    ) -> Tenants {
+        let cache: HashMap<String, Database> = prewarmed
+            .into_iter()
+            .map(|(slug, db)| (slug.as_str().to_owned(), db))
+            .collect();
+        Tenants {
+            control,
+            cache: Arc::new(RwLock::new(cache)),
+            base,
+            control_db,
+            leases: Some(leases),
+        }
+    }
+
+    /// The databases this deployment minted, when it is a test deployment —
+    /// for a suite that wants to name what will die with it. `None` in
+    /// production.
+    #[doc(hidden)]
+    pub fn test_leases(&self) -> Option<&crate::database::TestDatabases> {
+        self.leases.as_ref()
     }
 
     /// The control database: schools, builders, the shared rate-limit window.
@@ -383,6 +421,11 @@ impl Tenants {
             cache.len()
         };
         Self::report_size(size);
+        // A test deployment's lease learns every school the deployment
+        // mints, so a school created mid-test dies with the deployment.
+        if let Some(leases) = &self.leases {
+            leases.track(&school_db_name(&self.control_db, slug));
+        }
         Ok(db)
     }
 
@@ -590,9 +633,6 @@ mod tests {
         }
         // The control database's own name is never a school's name: the
         // suffix keeps the namespaces apart.
-        assert_ne!(
-            school_db_name(control, &slug("school")),
-            control
-        );
+        assert_ne!(school_db_name(control, &slug("school")), control);
     }
 }

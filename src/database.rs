@@ -10,19 +10,24 @@
 //! Their table names are disjoint by design, which is what lets one prepare
 //! database carry the union for the compile-time `query!` checks.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
-use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, Username};
 use crate::error::AppError;
-use crate::tenant::Tenants;
+use crate::module::ModuleSet;
+use crate::tenant::{DEMO_SLUG, SchoolStatus, Slug, Tenants, school_db_name};
 
 /// The shared database handle.
 ///
@@ -84,7 +89,10 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
 /// the name every school database hangs off (`{control}_school_{slug}`).
 pub(crate) fn parse_base(cfg: &Config) -> Result<(PgConnectOptions, String), AppError> {
     let opts: PgConnectOptions = cfg.database_url.parse().map_err(|err| {
-        AppError::Internal(format!("invalid DATABASE_URL ({}): {err}", cfg.database_url))
+        AppError::Internal(format!(
+            "invalid DATABASE_URL ({}): {err}",
+            cfg.database_url
+        ))
     })?;
     let db = opts
         .get_database()
@@ -112,7 +120,10 @@ fn pool_options(max_connections: u32) -> PgPoolOptions {
 /// A pool over one school database with the school pool sizing. The schema is
 /// the caller's business — [`migrate_school`] for a mint, nothing for a
 /// re-dial of an existing school.
-pub(crate) async fn school_pool(base: &PgConnectOptions, db_name: &str) -> Result<PgPool, AppError> {
+pub(crate) async fn school_pool(
+    base: &PgConnectOptions,
+    db_name: &str,
+) -> Result<PgPool, AppError> {
     pool_options(4)
         .connect_with(base.clone().database(db_name))
         .await
@@ -225,17 +236,21 @@ async fn ensure_template(
     base: &PgConnectOptions,
     name: &str,
 ) -> Result<(), AppError> {
-    if let Err(err) =
-        sqlx::query(sqlx::AssertSqlSafe(create_database_sql("CREATE DATABASE", name)))
-            .execute(control)
-            .await
+    if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
+        "CREATE DATABASE",
+        name,
+    )))
+    .execute(control)
+    .await
     {
         if !is_duplicate_database(&err) {
             return Err(err.into());
         }
     }
     // One migrator connection, made and closed: the template is never served.
-    let pool = pool_options(1).connect_with(base.clone().database(name)).await?;
+    let pool = pool_options(1)
+        .connect_with(base.clone().database(name))
+        .await?;
     let migrated = migrate_school(&pool).await;
     pool.close().await;
     migrated
@@ -348,9 +363,9 @@ where
             Err(err) => return Err(err),
         }
     }
-    Err(last.map(AppError::Db).unwrap_or_else(|| {
-        AppError::Internal("a guarded transaction never ran".into())
-    }))
+    Err(last
+        .map(AppError::Db)
+        .unwrap_or_else(|| AppError::Internal("a guarded transaction never ran".into())))
 }
 
 fn is_retryable(err: &sqlx::Error, cascade: bool) -> bool {
@@ -392,6 +407,412 @@ fn builder_credentials(cfg: &Config) -> Result<Option<(Username, Password)>, App
     }
 }
 
+// ---- per-test databases -----------------------------------------------------
+//
+// Every test run gets a **private pair of databases** on the compose Postgres:
+// a control database and the demo school's database, both named after one
+// random suffix — `heztest_<16 hex>` and `heztest_<…>_school_demo` — so
+// nextest's parallel processes neither collide nor see each other's rows. The
+// school schema is not migrated per test: it is cloned from a shared template
+// database whose name carries a hash of `migrations/school`, so a schema edit
+// mints a fresh template exactly once and every test after that pays only a
+// cheap `CREATE DATABASE … TEMPLATE`.
+//
+// Cleanup is a lease: every database a deployment minted is recorded in a
+// [`TestDatabases`], and its `Drop` — fired when the deployment's last handle
+// dies — sends `DROP DATABASE … WITH (FORCE)`. A best-effort janitor at first
+// use per process sweeps what a crashed run left behind: only databases past
+// a minimum age are candidates, and their `DROP` carries no `WITH (FORCE)`,
+// so a live parallel test's databases (connected backends, young name) are
+// never touched.
+//
+// These functions are `pub` rather than `#[cfg(test)]` because the
+// integration tests live outside the crate, and `#[doc(hidden)]` because they
+// are not part of the API. Their SQL is runtime-checked — the query-style
+// rule exempts all test-side SQL from the macros.
+
+/// The Postgres server the test databases are minted on. The default is the
+/// compose stack's maintenance database (`.env.example` documents it).
+const TEST_DATABASE_URL_ENV: &str = "HEZARFEN_TEST_DATABASE_URL";
+const TEST_DATABASE_URL_DEFAULT: &str = "postgres://hezarfen:hezarfen@127.0.0.1:5432/postgres";
+
+/// Every test database carries this prefix; the janitor only ever drops
+/// databases it names.
+const TEST_DB_PREFIX: &str = "heztest_";
+
+/// How old a `heztest_%` database must be before the janitor will touch it.
+/// Anything younger belongs to a test in a parallel process — nextest mints
+/// them by the dozen in overlapping seconds.
+const TEST_DB_LEFTOVER_MIN_AGE_MS: i64 = 5 * 60 * 1000;
+
+/// The advisory-lock key the template's create-and-migrate critical section
+/// holds (see [`ensure_test_template`]). An arbitrary constant — it only has
+/// to be one nobody else on the server uses.
+const TEST_TEMPLATE_LOCK_KEY: i64 = 0x6865_7A74_6500_0001;
+
+/// The databases one test deployment minted, and the promise to drop them.
+///
+/// Cloning shares the lease; the `DROP` statements fire when the **last**
+/// copy drops — which is why a [`Tenants`] can carry one: the databases die
+/// exactly when the test deployment does, even though the `Router` and the
+/// test body hold separate clones of the registry.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TestDatabases(Arc<TestLease>);
+
+struct TestLease {
+    /// How to reach the maintenance database when the drops run. Dial options,
+    /// not a pool: the pools a test built belong to the test's runtime and
+    /// cannot be borrowed from the drop thread after that runtime dies — the
+    /// drop dials its own one-connection pool instead.
+    maintenance: PgConnectOptions,
+    names: Mutex<Vec<String>>,
+}
+
+impl TestDatabases {
+    fn new(maintenance: PgConnectOptions) -> Self {
+        Self(Arc::new(TestLease {
+            maintenance,
+            names: Mutex::new(Vec::new()),
+        }))
+    }
+
+    pub(crate) fn track(&self, name: &str) {
+        self.0
+            .names
+            .lock()
+            .expect("test lease names")
+            .push(name.to_owned());
+    }
+
+    /// The database names this lease still owes a drop. Diagnostics only.
+    pub fn names(&self) -> Vec<String> {
+        self.0.names.lock().expect("test lease names").clone()
+    }
+}
+
+impl std::fmt::Debug for TestDatabases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestDatabases")
+            .field("names", &self.names())
+            .finish()
+    }
+}
+
+impl Drop for TestLease {
+    fn drop(&mut self) {
+        let names = std::mem::take(&mut *self.names.lock().expect("test lease names"));
+        let maintenance = self.maintenance.clone();
+        if names.is_empty() {
+            return;
+        }
+        let run = move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test-lease drop runtime");
+            runtime.block_on(async move {
+                let Ok(maintenance) = pool_options(1).connect_with(maintenance).await else {
+                    eprintln!(
+                        "test lease: cannot reach the maintenance database to drop {names:?}"
+                    );
+                    return;
+                };
+                for name in &names {
+                    let sql =
+                        create_database_sql("DROP DATABASE IF EXISTS", name) + " WITH (FORCE)";
+                    if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(sql))
+                        .execute(&maintenance)
+                        .await
+                    {
+                        eprintln!("test lease: dropping {name} failed: {err}");
+                    }
+                }
+                maintenance.close().await;
+            });
+        };
+        // A lease usually dies inside the test's runtime (the last registry
+        // handle drops at the end of the test future), and a runtime may not
+        // be built inside another — so the drops always run on a dedicated
+        // thread. The wait is bounded: a wedged server cannot hang the test's
+        // teardown forever, and the janitor is the backstop for whatever
+        // outlives it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let (done, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    run();
+                    let _ = done.send(());
+                });
+                let _ = done_rx.recv_timeout(Duration::from_secs(10));
+            }
+            Err(_) => run(),
+        }
+    }
+}
+
+/// A complete test deployment: a fresh control database plus the demo school,
+/// whose database is cloned from the shared school template and registered in
+/// the control registry under the slug every suite names ([`DEMO_SLUG`]).
+///
+/// The databases die with the returned registry's last handle (see
+/// [`TestDatabases`]); the janitor sweeps anything a crashed run left behind.
+#[doc(hidden)]
+pub async fn init_test_tenants() -> Tenants {
+    let maintenance = maintenance_pool().await;
+    janitor(&maintenance).await;
+    let base = test_base();
+    let lease = TestDatabases::new(base.clone());
+
+    let control_db = format!("{TEST_DB_PREFIX}{}", test_suffix());
+    create_database(&maintenance, &control_db, None).await;
+    lease.track(&control_db);
+    let control = boot_control(&base.clone().database(&control_db))
+        .await
+        .unwrap_or_else(|err| panic!("migrate the test control database {control_db}: {err}"));
+
+    let template = ensure_test_template(&maintenance, &base).await;
+
+    let demo = Slug::try_new(DEMO_SLUG).expect("the demo slug");
+    let school_db = school_db_name(&control_db, &demo);
+    create_database(&maintenance, &school_db, Some(&template)).await;
+    lease.track(&school_db);
+    let school = school_pool(&base, &school_db)
+        .await
+        .unwrap_or_else(|err| panic!("dial the test demo school {school_db}: {err}"));
+
+    // The registry row, exactly as [`Tenants::create`] would write it — but
+    // without the per-school migration its `bring_up` runs, which the
+    // template clone has just replaced.
+    sqlx::query(
+        "INSERT INTO school (slug, name, status, created_at, modules)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(DEMO_SLUG)
+    .bind("Demo School")
+    .bind(SchoolStatus::Active)
+    .bind(Timestamp::now().as_millis())
+    .bind(ModuleSet::all().names())
+    .execute(&control)
+    .await
+    .expect("register the test demo school");
+
+    Tenants::new_test_adopting(
+        control,
+        base.database(&control_db),
+        control_db,
+        lease,
+        [(demo, school)],
+    )
+}
+
+/// One school database cloned from the template, for the src-side unit tests
+/// that exercise a single store with no tenancy around it. Keep the lease
+/// alive for the database's lifetime (`let (db, _leases) = …` binds it to the
+/// test's scope); dropping it early drops the database.
+#[doc(hidden)]
+pub async fn init_test_db() -> (Database, TestDatabases) {
+    let maintenance = maintenance_pool().await;
+    janitor(&maintenance).await;
+    let base = test_base();
+    let lease = TestDatabases::new(base.clone());
+    let template = ensure_test_template(&maintenance, &base).await;
+    let name = format!("{TEST_DB_PREFIX}{}", test_suffix());
+    create_database(&maintenance, &name, Some(&template)).await;
+    lease.track(&name);
+    let db = school_pool(&base, &name)
+        .await
+        .unwrap_or_else(|err| panic!("dial the test school database {name}: {err}"));
+    (db, lease)
+}
+
+/// The school template's name, and as a side effect its existence: created
+/// and migrated on first use, adopted when something else already made it.
+/// The name carries a hash of `migrations/school`, so a schema edit mints a
+/// fresh template and every process converges on the same new one.
+///
+/// Competing first uses are real: nextest mints tests in parallel processes
+/// and in parallel test threads, all overlapping on the same millisecond.
+/// One server-wide advisory lock makes the create-and-migrate a critical
+/// section — without it, two migrators interleave their DDL on the same
+/// fresh database and one dies on a duplicate table mid-flight (observed).
+/// The probe + `42P04` swallow are the belt to that brace: a template made
+/// before the lock was ever taken is adopted, not fought.
+async fn ensure_test_template(maintenance: &PgPool, base: &PgConnectOptions) -> String {
+    static ENSURED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    let name = template_name();
+    let ensured = &*ENSURED;
+    if ensured.lock().expect("template set").contains(&name) {
+        return name;
+    }
+    let mut session = maintenance
+        .acquire()
+        .await
+        .unwrap_or_else(|err| panic!("lease a maintenance connection: {err}"));
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(TEST_TEMPLATE_LOCK_KEY)
+        .execute(&mut *session)
+        .await
+        .unwrap_or_else(|err| panic!("lock the school template: {err}"));
+    let exists = sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM pg_database WHERE datname = $1")
+        .bind(&name)
+        .fetch_one(&mut *session)
+        .await
+        .map(|(count,)| count > 0)
+        .unwrap_or_else(|err| panic!("probe for the school template {name}: {err}"));
+    if !exists {
+        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
+            "CREATE DATABASE",
+            &name,
+        )))
+        .execute(&mut *session)
+        .await
+        {
+            if !is_duplicate_database(&err) {
+                panic!("create the school template {name}: {err}");
+            }
+        }
+    }
+    let pool = pool_options(1)
+        .connect_with(base.clone().database(&name))
+        .await
+        .unwrap_or_else(|err| panic!("dial the school template {name}: {err}"));
+    let migrated = migrate_school(&pool).await;
+    pool.close().await;
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(TEST_TEMPLATE_LOCK_KEY)
+        .execute(&mut *session)
+        .await
+        .unwrap_or_else(|err| panic!("unlock the school template: {err}"));
+    migrated.unwrap_or_else(|err| panic!("migrate the school template {name}: {err:?}"));
+    ensured.lock().expect("template set").insert(name.clone());
+    name
+}
+
+/// `heztest_tpl_school_<hash>` — the hash is over `migrations/school`'s file
+/// names and bytes, sorted, so any schema edit changes it.
+fn template_name() -> String {
+    let mut migrations: Vec<std::path::PathBuf> = std::fs::read_dir(migrations_path("school"))
+        .expect("read the school migrations directory")
+        .map(|entry| entry.expect("migration directory entry").path())
+        .collect();
+    migrations.sort();
+    let mut hasher = Sha256::new();
+    for path in migrations {
+        hasher.update(
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hasher.update(std::fs::read(&path).expect("read a school migration"));
+    }
+    format!(
+        "{TEST_DB_PREFIX}tpl_school_{}",
+        &hex::encode(hasher.finalize())[..8]
+    )
+}
+
+/// One sweep per process, at the first mint: `heztest_%` databases a crashed
+/// run left behind. See the section header for why a candidate must be old
+/// *and* unconnected before it is dropped.
+async fn janitor(maintenance: &PgPool) {
+    static SWEPT: LazyLock<()> = LazyLock::new(|| {});
+    LazyLock::force(&SWEPT);
+    let template = template_name();
+    let leftovers = sqlx::query_as::<_, (String,)>(
+        "SELECT datname FROM pg_database WHERE datname LIKE 'heztest\\_%' ESCAPE '\\'",
+    )
+    .fetch_all(maintenance)
+    .await
+    .unwrap_or_else(|err| panic!("list leftover test databases: {err}"));
+    for (name,) in leftovers {
+        if name == template || !sweep_candidate(&name) {
+            continue;
+        }
+        // No `WITH (FORCE)`: a database with live backends belongs to a
+        // running test in a parallel process, and the failed drop *is* the
+        // skip.
+        let _ = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
+            "DROP DATABASE IF EXISTS",
+            &name,
+        )))
+        .execute(maintenance)
+        .await;
+    }
+}
+
+/// Should this `heztest_%` database be swept? The suffix's leading eleven hex
+/// digits are the mint time in unix milliseconds; anything that cannot be
+/// read that way is either a template of an older schema hash (swept) or
+/// junk (swept too).
+fn sweep_candidate(name: &str) -> bool {
+    let Some(minted_hex) = name.get(TEST_DB_PREFIX.len()..TEST_DB_PREFIX.len() + 11) else {
+        return true;
+    };
+    match i64::from_str_radix(minted_hex, 16) {
+        Ok(minted_ms) => Timestamp::now().as_millis() - minted_ms > TEST_DB_LEFTOVER_MIN_AGE_MS,
+        Err(_) => name.starts_with(&format!("{TEST_DB_PREFIX}tpl_")),
+    }
+}
+
+/// `<11 hex of unix-ms><5 hex random>`: the mint time, so the janitor can
+/// tell a crashed run's leftovers from a parallel test's fresh databases,
+/// plus just enough randomness that two processes minting in the same
+/// millisecond never collide.
+fn test_suffix() -> String {
+    let minted_ms = Timestamp::now().as_millis() as u64;
+    format!(
+        "{minted_ms:011x}{}",
+        &Uuid::new_v4().simple().to_string()[..5]
+    )
+}
+
+/// `CREATE DATABASE` for a harness-minted name, optionally `TEMPLATE`-cloned.
+/// Both names are generated here (prefix + hex suffix), never user input —
+/// the same audit that licenses [`create_database_sql`]'s `AssertSqlSafe`
+/// callers.
+async fn create_database(maintenance: &PgPool, name: &str, template: Option<&str>) {
+    let mut sql = create_database_sql("CREATE DATABASE", name);
+    if let Some(template) = template {
+        sql.push_str(&format!(" TEMPLATE \"{}\"", template.replace('"', "\"\"")));
+    }
+    if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(maintenance)
+        .await
+    {
+        panic!("create the test database {name}: {err}");
+    }
+}
+
+/// Dial options for the test Postgres — `HEZARFEN_TEST_DATABASE_URL` or the
+/// compose default. The URL's database is the *maintenance* database the
+/// `CREATE DATABASE`s run against; the harness names every database itself.
+fn test_base() -> PgConnectOptions {
+    let url = std::env::var(TEST_DATABASE_URL_ENV)
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| TEST_DATABASE_URL_DEFAULT.to_owned());
+    url.parse().unwrap_or_else(|err| {
+        panic!("{TEST_DATABASE_URL_ENV}={url:?} is not a Postgres URL: {err}")
+    })
+}
+
+/// A small pool over the maintenance database: the janitor's listing and
+/// every `CREATE DATABASE` (DDL — not usable inside a transaction) go
+/// through it, and each lease keeps a clone for its drops.
+async fn maintenance_pool() -> PgPool {
+    pool_options(2)
+        .connect_with(test_base())
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "cannot reach the test Postgres (set {TEST_DATABASE_URL_ENV}, default \
+                 {TEST_DATABASE_URL_DEFAULT}): {err} — is the compose stack up?"
+            )
+        })
+}
+
 #[cfg(test)]
 mod builder_seed_tests {
     use super::builder_credentials;
@@ -423,4 +844,3 @@ mod builder_seed_tests {
         }
     }
 }
-
