@@ -1,41 +1,36 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{COURSE_NOTE_TABLE, MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN};
+use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN};
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct CourseNoteId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct CourseNoteId(uuid::Uuid);
 
 impl CourseNoteId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
-    /// a course's notes list `id DESC` (newest first,
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: a course's notes list `id DESC` (newest first,
     /// [`crate::db::course_note::list_for_course`]), and a random low half
     /// scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(COURSE_NOTE_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(COURSE_NOTE_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct CourseNoteTitle(String);
 
 impl CourseNoteTitle {
@@ -49,7 +44,8 @@ impl CourseNoteTitle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct CourseNoteContent(String);
 
 impl CourseNoteContent {
@@ -63,7 +59,7 @@ impl CourseNoteContent {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CourseNote {
     pub(crate) id: CourseNoteId,
     pub(crate) course: CourseId,

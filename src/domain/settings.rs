@@ -11,7 +11,9 @@
 //! without a backfill (backfills crash boots — `DEFAULT` never rescues
 //! existing rows, and `UPDATE` re-validates whole records).
 
-use surrealdb::types::{RecordId, SurrealValue};
+
+use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 
 use crate::constant::{
     DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_DIETARY_TAGS,
@@ -21,7 +23,7 @@ use crate::constant::{
     MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES,
     MAX_MEAL_SERVING_MINUTE, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
     MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN,
-    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, SETTINGS_KEY, SETTINGS_TABLE,
+    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, SETTINGS_KEY,
 };
 use crate::domain::text_fold;
 use crate::error::ValidationError;
@@ -30,7 +32,7 @@ use crate::error::ValidationError;
 /// how many times an exam of that kind counts into its course's average.
 /// Weight lives here, not on the exam — reweighting a kind reweights every
 /// exam of that kind at once.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExamKindDef {
     name: String,
     weight: i64,
@@ -77,7 +79,7 @@ impl ExamKindDef {
 /// `540` (09:00) for a meal served at noon locally. `None` — every slot
 /// written before the field existed — falls back to midnight UTC, the old
 /// behaviour.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MealSlotDef {
     name: String,
     serving_minute: Option<i64>,
@@ -152,7 +154,7 @@ impl MealSlotDef {
 
 /// One grade-display band: marks at or above `min` (and below the next band's
 /// `min`) render as `label`. Display only — storage and averaging stay numeric.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GradeBand {
     min: i64,
     label: String,
@@ -192,12 +194,12 @@ impl GradeBand {
 /// like every other entity, an existing `Settings` is always internally
 /// consistent). Fields are crate-visible because [`crate::db::settings`]
 /// binds them directly in the compare-and-set guard.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Settings {
-    id: RecordId,
-    pub(crate) exam_kinds: Vec<ExamKindDef>,
+    pub(crate) id: String,
+    pub(crate) exam_kinds: Json<Vec<ExamKindDef>>,
     pub(crate) attendance_statuses: Vec<String>,
-    pub(crate) grade_bands: Vec<GradeBand>,
+    pub(crate) grade_bands: Json<Vec<GradeBand>>,
     /// Per-file byte cap for note uploads. `None` = the row predates the
     /// field (or the defaults) — reads as `DEFAULT_MAX_FILE_BYTES`.
     pub(crate) max_file_bytes: Option<i64>,
@@ -209,7 +211,7 @@ pub struct Settings {
     /// the columns are `option<…>`, never `DEFAULT []`: `save_if_unchanged`
     /// writes the whole row, so a field this struct did not carry would coerce
     /// to `NONE` and abort the transaction.
-    pub(crate) meal_slots: Option<Vec<MealSlotDef>>,
+    pub(crate) meal_slots: Option<Json<Vec<MealSlotDef>>>,
     pub(crate) dietary_tags: Option<Vec<String>>,
     /// Minutes before a meal at which booking *and* cancelling close. One knob
     /// for both deadlines; `None` = no cutoff at all, which is also what an
@@ -236,8 +238,9 @@ pub struct SettingsParams {
 }
 
 impl Settings {
-    pub(crate) fn record_id() -> RecordId {
-        RecordId::new(SETTINGS_TABLE, SETTINGS_KEY)
+    /// The singleton row's key (`settings.id` is `TEXT PRIMARY KEY`).
+    pub(crate) fn record_id() -> String {
+        SETTINGS_KEY.to_string()
     }
 
     /// The out-of-the-box policy — mirrors the constants that were previously
@@ -245,14 +248,16 @@ impl Settings {
     pub fn defaults() -> Self {
         Self {
             id: Self::record_id(),
-            exam_kinds: DEFAULT_EXAM_KINDS
-                .map(|(name, weight)| ExamKindDef {
-                    name: name.to_string(),
-                    weight,
-                })
-                .to_vec(),
+            exam_kinds: Json(
+                DEFAULT_EXAM_KINDS
+                    .map(|(name, weight)| ExamKindDef {
+                        name: name.to_string(),
+                        weight,
+                    })
+                    .to_vec(),
+            ),
             attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
-            grade_bands: Vec::new(),
+            grade_bands: Json(Vec::new()),
             max_file_bytes: None,
             chatbot_history_turns: None,
             max_chatbot_threads: None,
@@ -267,9 +272,9 @@ impl Settings {
     /// value it currently reads as.
     pub fn params(&self) -> SettingsParams {
         SettingsParams {
-            exam_kinds: self.exam_kinds.clone(),
+            exam_kinds: self.exam_kinds.0.clone(),
             attendance_statuses: self.attendance_statuses.clone(),
-            grade_bands: self.grade_bands.clone(),
+            grade_bands: self.grade_bands.0.clone(),
             max_file_bytes: self.get_max_file_bytes(),
             chatbot_history_turns: self.get_chatbot_history_turns(),
             max_chatbot_threads: self.get_max_chatbot_threads(),
@@ -396,21 +401,21 @@ impl Settings {
 
         Ok(Self {
             id: Self::record_id(),
-            exam_kinds,
+            exam_kinds: Json(exam_kinds),
             attendance_statuses,
-            grade_bands,
+            grade_bands: Json(grade_bands),
             max_file_bytes: Some(max_file_bytes),
             chatbot_history_turns: Some(chatbot_history_turns),
             max_chatbot_threads: Some(max_chatbot_threads),
             max_chatbot_message_len: Some(max_chatbot_message_len),
-            meal_slots: Some(meal_slots),
+            meal_slots: Some(Json(meal_slots)),
             dietary_tags: Some(dietary_tags),
             meal_cancel_cutoff_minutes,
         })
     }
 
     pub fn get_exam_kinds(&self) -> &[ExamKindDef] {
-        &self.exam_kinds
+        &self.exam_kinds.0
     }
 
     /// The weight of the kind named `kind` (exact match, like kind
@@ -419,6 +424,7 @@ impl Settings {
     /// (settings edits never rewrite history), so it must still count.
     pub fn exam_kind_weight(&self, kind: &str) -> Option<i64> {
         self.exam_kinds
+            .0
             .iter()
             .find(|def| def.get_name() == kind)
             .map(ExamKindDef::get_weight)
@@ -429,7 +435,7 @@ impl Settings {
     }
 
     pub fn get_grade_bands(&self) -> &[GradeBand] {
-        &self.grade_bands
+        &self.grade_bands.0
     }
 
     /// The per-file upload cap in bytes; the built-in default while the
@@ -463,7 +469,7 @@ impl Settings {
     /// one (including rows saved before the field existed). An explicitly
     /// stored empty list stays empty — that is "no meal program", not "unset".
     pub fn get_meal_slots(&self) -> Vec<MealSlotDef> {
-        self.meal_slots.clone().unwrap_or_else(|| {
+        self.meal_slots.as_ref().map(|slots| slots.0.clone()).unwrap_or_else(|| {
             DEFAULT_MEAL_SLOTS
                 .map(|name| MealSlotDef {
                     name: name.to_string(),
@@ -497,6 +503,7 @@ impl Settings {
     /// `f64` so course averages label the same way plain marks do.
     pub fn grade_label(&self, mark: f64) -> Option<&str> {
         self.grade_bands
+            .0
             .iter()
             .filter(|band| band.get_min() as f64 <= mark)
             .max_by_key(|band| band.get_min())

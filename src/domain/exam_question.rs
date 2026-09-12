@@ -1,47 +1,43 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
+use sqlx::types::Json;
 
 use crate::constant::{
-    EXAM_QUESTION_TABLE, MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN,
+    MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN,
     MIN_QUESTION_CHOICES,
 };
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::subject::SubjectId;
 use crate::error::ValidationError;
 use crate::validate::{validate_question_kind, validate_question_points, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ExamQuestionId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ExamQuestionId(uuid::Uuid);
 
 impl ExamQuestionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`: the
-    /// id *is* the question's presentation order
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: the id *is* the question's presentation order
     /// ([`crate::db::exam_question::list_for_exam`]
     /// sorts `id ASC`), and a random low half scrambles a burst of saves that
     /// lands inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(EXAM_QUESTION_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(EXAM_QUESTION_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct QuestionText(String);
 
 impl QuestionText {
@@ -57,7 +53,8 @@ impl QuestionText {
 
 /// A validated question kind: `choice` (pick one option, auto-scorable) or
 /// `text` (free text, judged by the grader).
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct QuestionKind(String);
 
 impl QuestionKind {
@@ -73,7 +70,8 @@ impl QuestionKind {
 
 /// A validated question weight in the auto-score, held to
 /// `[MIN_QUESTION_POINTS, MAX_QUESTION_POINTS]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct QuestionPoints(i64);
 
 impl QuestionPoints {
@@ -88,7 +86,8 @@ impl QuestionPoints {
 }
 
 /// One option's text: non-blank, at most `MAX_CHOICE_TEXT_LEN` characters.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type, serde::Serialize, serde::Deserialize)]
+#[sqlx(transparent)]
 pub struct ChoiceText(String);
 
 impl ChoiceText {
@@ -102,8 +101,8 @@ impl ChoiceText {
     }
 }
 
-/// An option's stable identity — a server-minted ULID, never reused, never
-/// taken from client input (it becomes part of an image row's record id and of
+/// An option's stable identity — a server-minted UUID, never reused, never
+/// taken from client input (it becomes part of an image row's slot key and of
 /// a URL path, so a client-shaped value would be an injection surface).
 ///
 /// This id is the whole point of the choice remodel. `correct`, the per-option
@@ -111,15 +110,19 @@ impl ChoiceText {
 /// reordering the list or deleting an option moves none of them. They used to
 /// be parallel arrays keyed by position, where any edit to the list silently
 /// re-pointed the others.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+///
+/// Stored as a bare string: it travels inside the choices JSON and names a
+/// slot in the image tables' `TEXT` columns.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type, serde::Serialize, serde::Deserialize)]
+#[sqlx(transparent)]
 pub struct ChoiceId(String);
 
 impl ChoiceId {
-    /// Plain `Ulid::generate()` deliberately: options are ordered by their position
-    /// in the stored `Vec`, never by id, so nothing here reads the id as a
-    /// clock — it only has to be unique.
+    /// Plain `Uuid::new_v4()` deliberately: options are ordered by their
+    /// position in the stored `Vec`, never by id, so nothing here reads the id
+    /// as a clock — it only has to be unique.
     fn generate() -> Self {
-        Self(Ulid::generate().to_string())
+        Self(uuid::Uuid::new_v4().to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -127,8 +130,9 @@ impl ChoiceId {
     }
 }
 
-/// One option of a choice question: its identity plus its text.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+/// One option of a choice question: its identity plus its text. Stored inside
+/// the `choices` JSONB column, in list order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Choice {
     id: ChoiceId,
     text: ChoiceText,
@@ -277,12 +281,12 @@ impl QuestionSpec {
     }
 }
 
-/// One question of an exam. Order within the exam is the id's ULID order
-/// (creation order); the kind-dependent columns always satisfy the
+/// One question of an exam. Order within the exam is the id's creation order;
+/// the kind-dependent columns always satisfy the
 /// [`QuestionSpec`] invariants because every write goes through one. Every
 /// question links to a subject of the exam's course — the handlers verify the
 /// subject's course matches before any write.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamQuestion {
     pub(crate) id: ExamQuestionId,
     pub(crate) exam: ExamId,
@@ -290,11 +294,10 @@ pub struct ExamQuestion {
     pub(crate) text: QuestionText,
     pub(crate) kind: QuestionKind,
     pub(crate) points: QuestionPoints,
-    pub(crate) choices: Option<Vec<Choice>>,
+    pub(crate) choices: Option<Json<Vec<Choice>>>,
     pub(crate) correct: Option<ChoiceId>,
     /// The bank template this question was created *from*, if it was inserted
     /// out of the bank. Written once, at insert.
-    #[surreal(default)]
     pub(crate) from_bank: Option<BankQuestionId>,
     /// The bank template most recently created *by saving this question* into
     /// the bank, if any. Written by
@@ -302,7 +305,6 @@ pub struct ExamQuestion {
     /// repeat save. Never set by an insert-from-bank: the two directions are
     /// separate columns precisely so "came from the bank" can't be misread as
     /// "already saved to the bank".
-    #[surreal(default)]
     pub(crate) banked_as: Option<BankQuestionId>,
 }
 
@@ -332,7 +334,7 @@ impl ExamQuestion {
     }
 
     pub fn get_choices(&self) -> Option<&[Choice]> {
-        self.choices.as_deref()
+        self.choices.as_ref().map(|json| json.0.as_slice())
     }
 
     pub fn get_correct(&self) -> Option<&ChoiceId> {
@@ -352,7 +354,7 @@ impl ExamQuestion {
     pub fn spec(&self) -> QuestionSpec {
         QuestionSpec::from_stored(
             self.kind.clone(),
-            self.choices.clone(),
+            self.choices.as_ref().map(|json| json.0.clone()),
             self.correct.clone(),
         )
     }
@@ -367,7 +369,7 @@ impl ExamQuestion {
             text: QuestionText::try_new(text).unwrap(),
             points: QuestionPoints::try_new(points).unwrap(),
             kind: spec.kind,
-            choices: spec.choices,
+            choices: spec.choices.map(Json),
             correct: spec.correct,
             from_bank: None,
             banked_as: None,
@@ -407,13 +409,13 @@ mod tests {
 
     /// A teacher saving several questions back to back gets them back in that
     /// order: `list_for_exam` sorts `id ASC`, so the ids minted inside one
-    /// millisecond have to sort in mint order. Revert `generate` to
-    /// `Ulid::generate()` and this fails — the low 80 bits are redrawn per id, so a
+    /// millisecond have to sort in mint order. Revert `generate` to a plain
+    /// random UUID and this fails — the random bits are redrawn per id, so a
     /// same-tick burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {
         let ids: Vec<String> = (0..500)
-            .map(|_| ExamQuestionId::generate().key().to_string())
+            .map(|_| ExamQuestionId::generate().key())
             .collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -491,8 +493,8 @@ mod tests {
         let built = spec(two_choices(), Some("b")).unwrap();
         let (_, choices, correct) = built.into_parts();
         let choices = choices.unwrap();
-        // Client labels never reach storage.
-        assert!(choices.iter().all(|c| c.get_id().as_str().len() == 26));
+        // Client labels never reach storage; a minted id is a hyphenated UUID.
+        assert!(choices.iter().all(|c| c.get_id().as_str().len() == 36));
         assert_ne!(choices[0].get_id(), choices[1].get_id());
         // `correct` resolved to the *second* option's minted id, by label.
         assert_eq!(correct.as_ref(), Some(choices[1].get_id()));
@@ -579,7 +581,7 @@ mod tests {
         use proptest::prelude::*;
 
         /// A stored question's options, built the only way they can be: through
-        /// `try_new` on create, so the ids are real minted ULIDs.
+        /// `try_new` on create, so the ids are real minted UUIDs.
         fn stored_set(n: usize) -> Vec<Choice> {
             let inputs = (0..n)
                 .map(|i| ChoiceInput {
@@ -604,19 +606,21 @@ mod tests {
         }
 
         fn key() -> impl Strategy<Value = Key> {
+            use proptest::prelude::*;
             prop_oneof![
                 4 => (0usize..10).prop_map(Key::Stored),
                 3 => prop_oneof![
                     Just(String::new()),
                     Just("new:1".to_string()),
                     "[a-z0-9]{1,5}",
-                    Just("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+                    Just("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f".to_string()),
                 ].prop_map(Key::Other),
                 1 => Just(Key::Null),
             ]
         }
 
         fn text() -> impl Strategy<Value = String> {
+            use proptest::prelude::*;
             prop_oneof![
                 6 => "[a-z ]{1,6}",
                 1 => Just(String::new()),
@@ -691,7 +695,7 @@ mod tests {
                         // freshly minted, so it can never take over a stored
                         // option's identity or its picture.
                         None => {
-                            prop_assert_eq!(choice.id.as_str().len(), 26);
+                            prop_assert_eq!(choice.id.as_str().len(), 36);
                             prop_assert!(!stored_ids.contains(&choice.id.as_str()));
                         }
                     }

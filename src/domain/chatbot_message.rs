@@ -7,72 +7,54 @@
 //! `failed` by the task that owns the bridge round trip, and a read
 //! projects a long-stale `pending` as failed without writing
 //! ([`ChatbotMessage::projected`]) — the durable repair for a dead process
-//! happens once, at boot, in `database.rs`.
-
-use std::sync::{LazyLock, Mutex};
-
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::{Generator, Ulid};
+//! happens once, at mint, in `database.rs`'s school migration sweep.
 
 use crate::constant::{
-    CHAT_MESSAGE_TABLE, CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, STALE_ERROR_CODE,
+    CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, STALE_ERROR_CODE,
 };
 use crate::domain::chatbot_thread::ChatbotThreadId;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-/// Mints message ids in write order. Unlike `Ulid::generate()`, whose 80 random
-/// low bits sort arbitrarily among ids minted in the same millisecond, this
-/// increments the previous id — so the `id` tie-break in the `ORDER BY` of
-/// [`list_for_thread`](crate::db::chatbot_message::list_for_thread) /
-/// [`list_tail`](crate::db::chatbot_message::list_tail) is the
-/// order the rows were written. The user prompt and the assistant row one POST
-/// writes back-to-back routinely share a millisecond, and a random tie-break
-/// there renders the answer *above* its own question — and hands the AI
-/// service a `[assistant, user]` history, breaking the oldest-first contract.
-static IDS: LazyLock<Mutex<Generator>> = LazyLock::new(|| Mutex::new(Generator::new()));
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ChatbotMessageId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ChatbotMessageId(uuid::Uuid);
 
 impl ChatbotMessageId {
+    /// Mints in write order. Unlike a plain random UUID, whose random low bits
+    /// sort arbitrarily among ids minted in the same millisecond, the
+    /// process-wide context increments — so the `id` tie-break in the
+    /// `ORDER BY` of
+    /// [`list_for_thread`](crate::db::chatbot_message::list_for_thread) /
+    /// [`list_tail`](crate::db::chatbot_message::list_tail) is the
+    /// order the rows were written. The user prompt and the assistant row one
+    /// POST writes back-to-back routinely share a millisecond, and a random
+    /// tie-break there renders the answer *above* its own question — and
+    /// hands the AI service a `[assistant, user]` history, breaking the
+    /// oldest-first contract.
     pub fn generate() -> Self {
-        let mut ids = IDS.lock().expect("chat id generator poisoned");
-        // The only error is overflow of the random bits *within* one
-        // millisecond — 2^80 ids deep, and it clears itself as soon as the
-        // clock ticks over, so retry rather than fall back to a random id
-        // (which would silently reintroduce the defect).
-        let ulid: Ulid = loop {
-            if let Ok(ulid) = ids.generate() {
-                break ulid;
-            }
-        };
-        Self(RecordId::new(CHAT_MESSAGE_TABLE, ulid.to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(CHAT_MESSAGE_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-/// Who said a turn. `untagged` + `rename_all` store it as the bare lowercase
-/// string the `role` column types as, and a value the enum doesn't know comes
-/// back as a deserialization error, never a panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// Who said a turn. Stored as the bare lowercase string the `role` column's
+/// CHECK allows; a value the enum doesn't know comes back as a decode error,
+/// never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum MessageRole {
     User,
     Assistant,
@@ -90,8 +72,8 @@ impl MessageRole {
 
 /// Where an assistant turn is in its lifecycle. A user turn is born
 /// `Complete` — nothing is ever awaited for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum MessageStatus {
     Pending,
     Complete,
@@ -110,8 +92,9 @@ impl MessageStatus {
 
 /// One turn's text. The hard ceiling only — the school-adjustable
 /// `max_chatbot_message_len` is the web layer's to enforce, below this.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ChatContent(pub(crate) String);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ChatContent(String);
 
 impl ChatContent {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
@@ -131,7 +114,7 @@ impl ChatContent {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatbotMessage {
     pub(crate) id: ChatbotMessageId,
     pub(crate) thread_id: ChatbotThreadId,
@@ -196,7 +179,7 @@ impl ChatbotMessage {
     /// thread load) run on every page and must not write, a write-back would
     /// race the answering task that is merely slow — closing the door on a
     /// reply that is still coming — and the durable repair for the real cause
-    /// (a dead process) already happens once, at boot. The stored row stays
+    /// (a dead process) already happens once, at mint. The stored row stays
     /// truthful; only the answer handed to the caller is projected.
     pub(crate) fn projected(mut self) -> Self {
         let stale_at = self.created_at.as_millis() + CHATBOT_PENDING_STALE_SECS * 1_000;
@@ -219,34 +202,16 @@ mod tests {
         assert!(ChatContent::try_new(&"x".repeat(MAX_CHATBOT_MESSAGE_LEN + 1)).is_err());
     }
 
-    #[tokio::test]
-    async fn role_and_status_store_as_bare_strings() {
-        // `TYPE string` columns: an object-wrapped enum would be rejected on
-        // write, and a junk string must read back as an error, not a panic.
-        for role in [MessageRole::User, MessageRole::Assistant] {
-            let value = role.into_value();
-            assert_eq!(
-                value,
-                surrealdb::types::Value::String(role.as_str().to_string())
-            );
-            assert_eq!(MessageRole::from_value(value).unwrap(), role);
-        }
-        for status in [
-            MessageStatus::Pending,
-            MessageStatus::Complete,
-            MessageStatus::Failed,
-        ] {
-            let value = status.into_value();
-            assert_eq!(
-                value,
-                surrealdb::types::Value::String(status.as_str().to_string())
-            );
-            assert_eq!(MessageStatus::from_value(value).unwrap(), status);
-        }
-        assert!(MessageRole::from_value(surrealdb::types::Value::String("system".into())).is_err());
-        assert!(
-            MessageStatus::from_value(surrealdb::types::Value::String("queued".into())).is_err()
-        );
+    /// The `role`/`status` columns are `TEXT` with CHECKs listing exactly
+    /// these spellings — queries match on them, so the storage form may not
+    /// drift from `as_str` (which `rename_all` mirrors).
+    #[test]
+    fn role_and_status_spellings_are_frozen() {
+        assert_eq!(MessageRole::User.as_str(), "user");
+        assert_eq!(MessageRole::Assistant.as_str(), "assistant");
+        assert_eq!(MessageStatus::Pending.as_str(), "pending");
+        assert_eq!(MessageStatus::Complete.as_str(), "complete");
+        assert_eq!(MessageStatus::Failed.as_str(), "failed");
     }
 
     #[tokio::test]
@@ -254,8 +219,8 @@ mod tests {
         let aged = |secs: i64| {
             ChatbotMessage {
                 id: ChatbotMessageId::generate(),
-                thread_id: ChatbotThreadId::from_key("c"),
-                user_id: UserId::from_key("u"),
+                thread_id: ChatbotThreadId::from_key("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f"),
+                user_id: UserId::from_key("0198f1a2-3b4c-7d5e-8f90-aa2b3c4d5e6f"),
                 role: MessageRole::Assistant,
                 content: ChatContent::empty(),
                 status: MessageStatus::Pending,

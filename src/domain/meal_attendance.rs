@@ -1,7 +1,7 @@
-//! Who actually ate. One row per (menu, student), keyed by a deterministic
-//! composite id — the same pair always maps to the same record, so marking is a
-//! single atomic UPSERT with no find-then-insert race, and re-marking flips the
-//! status instead of stacking a second row.
+//! Who actually ate. One row per (menu, student), keyed by the natural
+//! composite primary key — the same pair always maps to the same row, so
+//! marking is a single atomic upsert with no find-then-insert race, and
+//! re-marking flips the status instead of stacking a second row.
 //!
 //! **Attendance is reporting only — it has zero billing effect.** Booking is
 //! the sole charge trigger: a student who booked and did not eat still pays,
@@ -18,42 +18,63 @@
 //! The queries live in [`crate::db::meal_attendance`]; the web layer reads
 //! through [`crate::service::meal_attendance`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
 
-use crate::constant::{MEAL_ATTENDANCE_STATUSES, MEAL_ATTENDANCE_TABLE};
+use crate::constant::MEAL_ATTENDANCE_STATUSES;
 use crate::domain::menu::MenuId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MealAttendanceId(RecordId);
+/// The (menu, student) pair — the table's natural composite primary key. The
+/// same trick as
+/// [`MealBookingId`](crate::domain::meal_booking::MealBookingId). UUID strings
+/// carry only `-`, so `_` is an unambiguous joiner — and the student half is
+/// last, so the menu key (a `{date}_{slot}` pair, itself underscored) reads
+/// back whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MealAttendanceId {
+    menu: MenuId,
+    student: UserId,
+}
 
 impl MealAttendanceId {
-    /// A deterministic id for the (menu, student) pair — same trick as
-    /// [`MealBookingId`](crate::domain::meal_booking::MealBookingId). ULID keys
-    /// are alphanumeric, so `_` is an unambiguous joiner.
     pub fn composite(menu: &MenuId, student: &UserId) -> Self {
-        Self(RecordId::new(
-            MEAL_ATTENDANCE_TABLE,
-            format!("{}_{}", menu.key(), student.key()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            menu: menu.clone(),
+            student: *student,
         }
+    }
+
+    /// Parse the `{menu}_{student}` wire form. A key that parses as no pair
+    /// reads as the nil pair, which matches no row — exactly the 404 a
+    /// dangling composite key produced under the old store, without turning a
+    /// typo into a panic.
+    pub fn from_key(key: &str) -> Self {
+        let (menu, student) = key.rsplit_once('_').unwrap_or(("", ""));
+        Self {
+            menu: MenuId::from_key(menu),
+            student: UserId::from_key(student),
+        }
+    }
+
+    /// The `{menu}_{student}` wire form.
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.menu.key(), self.student.key())
+    }
+
+    pub fn menu(&self) -> &MenuId {
+        &self.menu
+    }
+
+    pub fn student(&self) -> UserId {
+        self.student
     }
 }
 
 /// `served` or `missed`, and nothing else — see the module header.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct MealAttendanceStatus(String);
 
 impl MealAttendanceStatus {
@@ -73,9 +94,8 @@ impl MealAttendanceStatus {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MealAttendance {
-    pub(crate) id: MealAttendanceId,
     pub(crate) menu: MenuId,
     pub(crate) student: UserId,
     pub(crate) status: MealAttendanceStatus,
@@ -84,10 +104,6 @@ pub struct MealAttendance {
 }
 
 impl MealAttendance {
-    pub fn get_id(&self) -> &MealAttendanceId {
-        &self.id
-    }
-
     pub fn get_menu(&self) -> &MenuId {
         &self.menu
     }

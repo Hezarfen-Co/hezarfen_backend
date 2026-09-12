@@ -13,9 +13,9 @@
 //! The queries live in [`crate::db::menu`]; the kitchen workflows (and the
 //! dish-cap lock) in [`crate::service::menu`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
 
-use crate::constant::{MAX_MENU_CAPACITY, MENU_TABLE, SLOT_REF_TABLE};
+use crate::constant::MAX_MENU_CAPACITY;
 use crate::domain::settings::MealSlotDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -26,48 +26,45 @@ use crate::error::ValidationError;
 /// [`crate::db::cap`]). The mirror of
 /// [`kind_ref`](crate::domain::exam_result::kind_ref) for exam kinds: the slot
 /// is snapshotted text on the menu, so this row is the only place the two
-/// tables' relationship is a single record concurrent writes can contend on.
-pub(crate) fn slot_ref(slot: &str) -> RecordId {
-    RecordId::new(SLOT_REF_TABLE, slot)
+/// tables' relationship is a single row concurrent writes can contend on.
+/// The `slot_ref` row is keyed by the slot's name.
+pub(crate) fn slot_ref(slot: &str) -> String {
+    slot.to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MenuId(RecordId);
+/// Typed menu row id — the `{date}_{slot}` pair joined with `_`. Not a minted
+/// id: the pair *is* the identity, the same trick the enrollment tables use.
+/// `date` is fixed-width `YYYY-MM-DD`, and slot names never carry `_`-breaking
+/// ambiguity, so two requests publishing the same meal race on one row and the
+/// loser is told "already exists" by the store.
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct MenuId(String);
 
 impl MenuId {
     /// The one id a menu for this day and slot can have. Deterministic on
-    /// purpose (the `EnrollmentId` trick): two requests publishing the same
-    /// meal race on a single record instead of writing two rows, so the loser
-    /// is told "already exists" by the store and answered the same 409 the
-    /// pre-check gives. `date` is fixed-width `YYYY-MM-DD`, so the `_` joiner
-    /// cannot be read two ways however the school spells its slots.
+    /// purpose (the enrollment trick): two requests publishing the same meal
+    /// race on a single row instead of writing two, so the loser is told
+    /// "already exists" by the store and answered the same 409 the pre-check
+    /// gives.
     pub fn for_slot(date: &MenuDate, slot: &MenuSlot) -> Self {
-        Self(RecordId::new(
-            MENU_TABLE,
-            format!("{}_{}", date.as_str(), slot.as_str()),
-        ))
+        Self(format!("{}_{}", date.as_str(), slot.as_str()))
     }
 
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(MENU_TABLE, key))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+        Self(key.to_string())
     }
 
     pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+        &self.0
     }
 }
 
 /// A calendar day as `YYYY-MM-DD`. Zero-padded and fixed-width on purpose:
 /// that makes the text sort chronologically, so the `?from=&to=` range filter
 /// and the newest-first ordering are plain string comparisons.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Type)]
+#[sqlx(transparent)]
 pub struct MenuDate(String);
 
 impl MenuDate {
@@ -87,7 +84,7 @@ impl MenuDate {
         // rather than by two independent checks that can drift apart. They did:
         // a hand-rolled `"+1".parse::<u32>()` accepted a signed component (std
         // does), `from_ymd_opt` was then handed the normalized number and said
-        // yes, and `2026-+1-01` became a *second* record id for the 1st of
+        // yes, and `2026-+1-01` became a *second* row id for the 1st of
         // January — its own capacity and seat counter, invisible to every
         // `date >= $from` range read ('+' sorts below '0'), and unbookable
         // besides, since chrono refuses to parse it back.
@@ -116,8 +113,7 @@ impl MenuDate {
     /// This is the whole day's deadline, not the meal's: a menu for *today* is
     /// still publishable and still bookable at any hour, whatever the slot's
     /// serving time says — that is [`MealCutoff`](crate::domain::meal_booking::MealCutoff)'s
-    /// separate business. `None` for a day that cannot be parsed (a row written
-    /// before `try_new` rejected impossible days).
+    /// separate business. `None` for a day that cannot be parsed.
     pub fn day_end(&self) -> Option<Timestamp> {
         let day = chrono::NaiveDate::parse_from_str(&self.0, "%Y-%m-%d").ok()?;
         Some(Timestamp::from_millis(
@@ -132,7 +128,8 @@ impl MenuDate {
 /// The meal slot a menu was published for, snapshotted as text. Validated
 /// against the school's *current* list at write time — that list is the only
 /// place slot names are defined, and this is the sole funnel into the column.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct MenuSlot(String);
 
 impl MenuSlot {
@@ -144,7 +141,7 @@ impl MenuSlot {
                 reason: "not one of the school's meal slots (see GET /settings)",
             });
         }
-        // The slot goes verbatim into the menu's record id ([`MenuId::for_slot`]),
+        // The slot goes verbatim into the menu's id ([`MenuId::for_slot`]),
         // and that id is a URL path segment: a slot named `a/b` publishes a menu
         // at `/meals/menus/2026-09-14_a/b`, which no route can ever address
         // again — the menu could not be read, edited or deleted.
@@ -182,15 +179,14 @@ pub fn validate_capacity(value: Option<i64>) -> Result<(), ValidationError> {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Menu {
     pub(crate) id: MenuId,
     pub(crate) date: MenuDate,
     pub(crate) slot: MenuSlot,
     pub(crate) capacity: Option<i64>,
-    /// The menu's revision (see [`MENU_VERSION_FIELD`](crate::constant::MENU_VERSION_FIELD)).
-    /// Absent on rows written before the column existed, which reads as
-    /// revision zero — the same thing `(version ?? 0)` says in the claim's
+    /// The menu's revision. `NULL` (never written by the current code) reads
+    /// as revision zero — the same thing `(version ?? 0)` says in the claim's
     /// `WHERE`. The seat counter is deliberately *not* here: it is the
     /// database's to own, and a whole-row save must never carry a stale copy
     /// of it.
@@ -217,8 +213,7 @@ impl Menu {
     }
 
     /// The revision a booking must still find on the row when it claims its
-    /// seat. Absent (a pre-column row) is revision zero, exactly as the `WHERE`
-    /// reads it.
+    /// seat. Absent is revision zero, exactly as the `WHERE` reads it.
     pub fn get_version(&self) -> i64 {
         self.version.unwrap_or(0)
     }
@@ -235,7 +230,6 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::Value;
 
     #[test]
     fn date_accepts_only_padded_calendar_days() {
@@ -268,7 +262,7 @@ mod tests {
 
     /// A signed component is not a calendar day, however willingly
     /// `"+1".parse::<u32>()` reads one out of it. Accepting one minted a
-    /// *second* record id for the same day — its own capacity and seat counter
+    /// *second* row id for the same day — its own capacity and seat counter
     /// — that sorted below every `?from=` bound (`+` is 0x2B, `0` is 0x30) and
     /// that the serving-instant parser could not read at all.
     #[test]
@@ -314,9 +308,6 @@ mod tests {
     fn a_day_ends_at_the_next_midnight_utc() {
         let day = MenuDate::try_new("1970-01-01").unwrap();
         assert_eq!(day.day_end().unwrap().as_millis(), 86_400_000);
-        // A row written before `try_new` refused impossible days has no end.
-        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
-        assert!(impossible.day_end().is_none());
     }
 
     #[test]
@@ -327,29 +318,19 @@ mod tests {
         assert!(MenuSlot::try_new("lunch", &[]).is_err());
     }
 
-    /// The slot becomes the menu's record id, and the id becomes a URL path
+    /// The slot becomes the menu's id, and the id becomes a URL path
     /// segment: a name carrying a separator publishes a menu at an address no
     /// route can match again. `MealSlotDef::try_new` refuses the name too, so
-    /// no school can define such a slot any more — this gate is what a settings
-    /// row written *before* that rule still runs into. Ordinary names — spaces
-    /// and Turkish letters included — are untouched; they percent-encode into
-    /// one segment as they always have.
+    /// no school can define such a slot any more — this gate is what a
+    /// settings row written *before* that rule still runs into. Ordinary names —
+    /// spaces and Turkish letters included — are untouched; they percent-encode
+    /// into one segment as they always have.
     #[test]
     fn a_slot_name_that_would_break_the_menu_url_is_refused() {
         // The only shape that can still carry such a name: a stored slot,
-        // decoded rather than constructed.
-        use surrealdb::types::Value;
-        let stale = |name: &str| {
-            let Value::Object(mut object) =
-                MealSlotDef::try_new("lunch", None).unwrap().into_value()
-            else {
-                panic!("a slot must encode as an object");
-            };
-            object.insert("name".to_string(), Value::String(name.into()));
-            vec![MealSlotDef::from_value(Value::Object(object)).unwrap()]
-        };
+        // which `try_kept` admits exactly because it is already on the row.
         let named = |name: &str| {
-            MenuSlot::try_new(name, &stale(name))
+            MenuSlot::try_new(name, &[MealSlotDef::try_kept(name, None).unwrap()])
                 .map(|slot| MenuId::for_slot(&MenuDate::try_new("2026-09-14").unwrap(), &slot))
         };
         for broken in ["a/b", "a\\b", "a?b", "a#b", "a%b"] {

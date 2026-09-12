@@ -7,48 +7,44 @@
 //! The marks themselves live in `board_stroke`, appended and never deleted: a
 //! clear bumps `epoch` so the canvas empties while the history stays
 //! replayable. The two stroke counters (`epoch_stroke_count`,
-//! `total_stroke_count`) are `option<int>` columns this struct deliberately
-//! does NOT carry — they are written only by the stroke path's conditional
-//! claim, so every mutation here is field-scoped `UPDATE … SET`. A whole-row
-//! `CONTENT` save would silently wipe both (src/constant.rs:717-722).
+//! `total_stroke_count`) are counter columns this struct deliberately does
+//! NOT carry — they are written only by the stroke path's conditional claim,
+//! so every mutation here is a field-scoped `UPDATE … SET`. A whole-row
+//! rewrite would silently wipe both.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{BOARD_TABLE, MAX_BOARD_PARTICIPANTS, MAX_BOARD_TITLE_LEN};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{MAX_BOARD_PARTICIPANTS, MAX_BOARD_TITLE_LEN};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct BoardId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct BoardId(uuid::Uuid);
 
 impl BoardId {
-    /// Monotonic, not `Ulid::generate()`: boards list newest-first by id, and a
-    /// random low half scrambles rows minted in the same millisecond.
+    /// Monotonic, not a plain random UUID: boards list newest-first by id, and
+    /// a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(BOARD_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row — a malformed path param stays a 404, exactly
+    /// like a well-formed one that names nothing.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(BOARD_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct BoardTitle(pub(crate) String);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct BoardTitle(String);
 
 impl BoardTitle {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
@@ -83,7 +79,7 @@ pub(crate) fn checked_participants(
     Ok(unique)
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Board {
     pub(crate) id: BoardId,
     pub(crate) creator: UserId,
@@ -162,10 +158,10 @@ mod tests {
     /// so no store is involved.
     fn a_board() -> Board {
         Board {
-            id: BoardId::from_key("b"),
-            creator: user("c"),
+            id: BoardId::from_key("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f"),
+            creator: user("0198f1a2-3b4c-7d5e-8f90-aaaa2b3c4d5e"),
             title: BoardTitle::try_new("Geometri").unwrap(),
-            participants: vec![user("p")],
+            participants: vec![user("0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f")],
             locked: false,
             locked_by: None,
             locked_at: None,
@@ -179,14 +175,14 @@ mod tests {
     fn the_two_predicates_are_the_permission_model() {
         let board = a_board();
         // Creator: draws AND commands.
-        assert!(board.is_participant(&user("c")));
-        assert!(board.is_creator(&user("c")));
+        assert!(board.is_participant(&user("0198f1a2-3b4c-7d5e-8f90-aaaa2b3c4d5e")));
+        assert!(board.is_creator(&user("0198f1a2-3b4c-7d5e-8f90-aaaa2b3c4d5e")));
         // Invited: draws only.
-        assert!(board.is_participant(&user("p")));
-        assert!(!board.is_creator(&user("p")));
+        assert!(board.is_participant(&user("0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f")));
+        assert!(!board.is_creator(&user("0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f")));
         // Stranger: neither.
-        assert!(!board.is_participant(&user("s")));
-        assert!(!board.is_creator(&user("s")));
+        assert!(!board.is_participant(&user("0198f1a2-3b4c-7d5e-8f90-cccc4d5e6f7a")));
+        assert!(!board.is_creator(&user("0198f1a2-3b4c-7d5e-8f90-cccc4d5e6f7a")));
     }
 
     #[test]
@@ -198,14 +194,12 @@ mod tests {
 
     #[test]
     fn participants_are_deduplicated_and_bounded() {
-        assert_eq!(
-            checked_participants(vec![user("p"), user("p")])
-                .unwrap()
-                .len(),
-            1
-        );
-        let many = (0..MAX_BOARD_PARTICIPANTS + 1)
-            .map(|n| UserId::from_key(&format!("u{n}")))
+        let one = user("0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f");
+        assert_eq!(checked_participants(vec![one.clone(), one]).unwrap().len(), 1);
+        // One over the ceiling is refused; each key must be a distinct
+        // *parseable* UUID, or the parser would collapse them all to nil.
+        let many = (0..=MAX_BOARD_PARTICIPANTS)
+            .map(|n| user(&format!("0198f1a2-3b4c-7d5e-8f90-{n:012x}")))
             .collect();
         assert!(checked_participants(many).is_err());
     }

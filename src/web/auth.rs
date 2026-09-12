@@ -31,7 +31,7 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
     let limiter = RateLimiter::per_minute(rate_limit.auth_per_minute, rate_limit.trust_proxy);
     // The budget survives a restart — the tier only means something if a
     // brute-forcer cannot reset it by waiting out a deploy.
-    limiter.share("auth", state.db.clone(), state.db_up.clone());
+    limiter.share("auth", state.db.clone());
     OpenApiRouter::new()
         .routes(routes!(register))
         .routes(routes!(login))

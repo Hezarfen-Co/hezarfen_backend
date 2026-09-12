@@ -7,52 +7,51 @@
 //! [`crate::db::class_member`] — this file is the row shape and its
 //! composite id.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::CLASS_MEMBER_TABLE;
-use crate::db::class_pump::link_id;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ClassMemberId(RecordId);
+/// The identity of one (class, user) pair. Not a row column: the table's
+/// primary key *is* the pair, and this struct's job is the underscore-joined
+/// wire form at the HTTP edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassMemberId {
+    pub(crate) class: ClassGroupId,
+    pub(crate) user: UserId,
+}
 
 impl ClassMemberId {
-    /// The record one (class, user) pair always maps to.
+    /// The one id a (class, user) pair can have.
     pub fn composite(class: &ClassGroupId, user: &UserId) -> Self {
-        Self(link_id(CLASS_MEMBER_TABLE, class, user.key()))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            class: class.clone(),
+            user: user.clone(),
         }
+    }
+
+    /// The underscore-joined wire form (`{class}_{user}`).
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.class.key(), self.user.key())
     }
 }
 
 /// One student in one class. `added_by` is who put them there.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassMember {
-    pub(crate) id: ClassMemberId,
     pub(crate) class: ClassGroupId,
     pub(crate) user: UserId,
     pub(crate) added_by: UserId,
-    /// When they were added, and the *only* thing "newest first" can mean here:
-    /// the row's id is the (class, user) pair, so ordering by it sorts the
-    /// roster by the student's account ULID. Optional because rows written
-    /// before this column carry no stamp — see the migration note.
+    /// When they were added, and the *only* thing "newest first" can mean
+    /// here: the row's primary key is the (class, user) pair, so ordering
+    /// falls to this stamp. Optional because rows written before this column
+    /// carry no stamp.
     pub(crate) added_at: Option<Timestamp>,
 }
 
 impl ClassMember {
-    pub fn get_id(&self) -> &ClassMemberId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> ClassMemberId {
+        ClassMemberId::composite(&self.class, &self.user)
     }
 
     pub fn get_class(&self) -> &ClassGroupId {

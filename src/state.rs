@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
@@ -40,8 +39,6 @@ pub struct AppState {
     pub exam_presence: ExamPresence,
     /// Live stroke fan-out for the shared whiteboards (see [`BoardHub`]).
     pub board_hub: BoardHub,
-    /// Whether the database socket answered its last ping (see [`DbHealth`]).
-    pub db_up: DbHealth,
     /// The QUIC bridge to the AI services, when one is configured
     /// (`AI_QUIC_ADDR`). `None` means AI features are off for this deployment
     /// — handlers must degrade rather than fail, since the core API has never
@@ -51,45 +48,6 @@ pub struct AppState {
     /// Noop unless `OTEL_EXPORTER_OTLP_ENDPOINT` configured an exporter, so
     /// recording into one is always safe and always cheap.
     pub metrics: crate::telemetry::Metrics,
-}
-
-/// Last known state of the database WebSocket, published by the keepalive task
-/// in `main` and read by the guard layer in [`crate::build_router`].
-///
-/// It exists because a query issued while the socket is down does not fail —
-/// it hangs. The SDK's reconnect loop stops draining its request channel while
-/// it retries, so the query is parked until the database returns, and *then*
-/// executes. Refusing at the edge is what keeps a 503 honest: nothing was
-/// queued, so the caller's retry cannot double-apply a write.
-///
-/// Starts up: `init` only returns once a connection and the migration
-/// succeeded, so the first ping has nothing to correct.
-#[derive(Clone)]
-pub struct DbHealth(Arc<AtomicBool>);
-
-impl Default for DbHealth {
-    fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
-    }
-}
-
-impl DbHealth {
-    /// Did the last ping answer?
-    pub fn is_up(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
-
-    /// Publish the latest ping verdict, logging only the transitions — a long
-    /// outage should not print a line every [`crate::constant::DB_KEEPALIVE_INTERVAL_SECS`].
-    pub fn set(&self, up: bool) {
-        if self.0.swap(up, Ordering::Relaxed) != up {
-            if up {
-                tracing::info!("database socket recovered — serving requests again");
-            } else {
-                tracing::error!("database socket down — refusing requests with 503");
-            }
-        }
-    }
 }
 
 /// The map key for `key` inside `slug`'s school. One process serves every

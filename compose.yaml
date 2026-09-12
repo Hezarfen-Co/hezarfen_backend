@@ -1,25 +1,18 @@
 services:
-  surrealdb:
-    image: docker.io/surrealdb/surrealdb:v3
-    container_name: hezarfen-surrealdb
-    # Distroless image; its default `nonroot` user can't write a fresh named
-    # volume (created root-owned). Run as root — only this service touches
-    # surreal-data, the backend never mounts it.
-    user: "0"
-    command:
-      [
-        "start",
-        "--user", "root",
-        "--pass", "root",
-        "surrealkv:/data/hezarfen.db",
-      ]
+  postgres:
+    image: docker.io/library/postgres:18-alpine
+    container_name: hezarfen-postgres
+    environment:
+      POSTGRES_USER: hezarfen
+      POSTGRES_PASSWORD: hezarfen
+      POSTGRES_DB: hezarfen_control
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - surreal-data:/data
+      - pgdata:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/surreal", "isready"]
+      test: ["CMD-SHELL", "pg_isready -U hezarfen -d hezarfen_control"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,13 +31,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8080"
-      DB_URL: ws://surrealdb:8000
-      DB_USER: root
-      DB_PASS: root
-      DB_NAMESPACE: hezarfen
       # The control database: the school registry + the builder accounts. Each
-      # school lives in a database of its own, named by its slug.
-      DB_DATABASE: control
+      # school lives in a Postgres database of its own, named from its slug.
+      DATABASE_URL: postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control
       FILES_PATH: /data/files
       RUST_LOG: info,hezarfen_backend=debug
       # First-boot builder seed: the operator who creates and suspends schools,
@@ -82,7 +71,7 @@ services:
     volumes:
       - hezarfen-data:/data
     depends_on:
-      surrealdb:
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
@@ -133,5 +122,5 @@ services:
 
 volumes:
   hezarfen-data:
-  surreal-data:
+  pgdata:
   openobserve-data:

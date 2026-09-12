@@ -1,58 +1,34 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use uuid::Uuid;
 
-use crate::constant::WORK_ENTRY_TABLE;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::{AppError, ValidationError};
 
-/// The one spelling of "this stint is inverted", shared by the handler's
-/// pre-flight check and the write-time `WHERE` guard that re-makes it against
-/// the stored row.
-pub(crate) fn out_before_in_error() -> AppError {
-    AppError::Validation(ValidationError::Invalid {
-        field: "check_out",
-        reason: "must be at or after check_in",
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct WorkEntryId(RecordId);
+/// Typed work-entry row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct WorkEntryId(Uuid);
 
 impl WorkEntryId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
+    /// Minted from the process-wide monotonic generator, not a random v4:
     /// the log sorts `check_in DESC, id DESC` and the id breaks the tie between
-    /// two stints checked in at the same instant. The `open_` key below never
-    /// ties with itself (one open stint per user), so it needs no ordering.
+    /// two stints checked in at the same instant.
     pub fn generate() -> Self {
-        Self(RecordId::new(WORK_ENTRY_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
-    /// The deterministic id of `user`'s *open* entry. At most one open stint
-    /// per user holds by construction: checking in is a single `INSERT IGNORE`
-    /// on this id (atomic — a second check-in changes nothing), and checking
-    /// out atomically takes the row and re-files it under a ULID id.
-    /// `open_` cannot collide with a ULID key (ULIDs are bare alphanumerics).
-    pub fn open_for(user: &UserId) -> Self {
-        Self(RecordId::new(
-            WORK_ENTRY_TABLE,
-            format!("open_{}", user.key()),
-        ))
-    }
-
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(WORK_ENTRY_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -60,9 +36,15 @@ impl WorkEntryId {
 /// `check_out` once closed. The wall clock is read server-side only — a
 /// client can never supply its own instants (managers correct closed entries
 /// through an explicit endpoint instead).
-#[derive(Debug, Clone, SurrealValue)]
+///
+/// "At most one open stint per staff member" is no longer carried by a
+/// deterministic key: it is a partial unique index on the table
+/// (`work_entry_open`) over rows whose `check_out` is NULL, so the database
+/// itself refuses a second check-in.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkEntry {
     pub(crate) id: WorkEntryId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) check_in: Timestamp,
     pub(crate) check_out: Option<Timestamp>,

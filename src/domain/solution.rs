@@ -1,17 +1,7 @@
-//! A solution offered on an approved pool question (see
-//! [`crate::domain::pool_question`]). Anyone in the school — student or staff
-//! — may offer one; rows list oldest first, reading as a discussion thread.
-//! Solutions die with their question (the question delete cascades here).
-//! Like a question, a solution may carry one photo (`image_*` metadata on the
-//! row, bytes on disk under a server-generated ULID) — but unlike a question
-//! it has no moderation state, so its author may edit the body and swap the
-//! photo at any time; there is nothing to freeze. The queries live in
-//! [`crate::db::solution`], the funnels in [`crate::service::solution`].
+use uuid::Uuid;
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{MAX_SOLUTION_BODY_LEN, SOLUTION_TABLE};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::MAX_SOLUTION_BODY_LEN;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::timestamp::Timestamp;
@@ -19,35 +9,37 @@ use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct SolutionId(RecordId);
+/// Typed solution row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct SolutionId(Uuid);
 
 impl SolutionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
+    /// Minted from the process-wide monotonic generator, not a random v4:
     /// solutions sort `offered_at ASC, id ASC` and the id *is* the tie-break
     /// ([`crate::db::solution::list_for`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(SOLUTION_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(SOLUTION_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct SolutionBody(String);
 
 impl SolutionBody {
@@ -61,15 +53,15 @@ impl SolutionBody {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Solution {
     pub(crate) id: SolutionId,
     pub(crate) question: PoolQuestionId,
     pub(crate) author: UserId,
     pub(crate) body: SolutionBody,
     pub(crate) offered_at: Timestamp,
-    /// The photo's on-disk blob name — a fresh ULID every upload; `None` when
-    /// the solution carries no image.
+    /// The photo's on-disk blob name — a fresh server-generated id every
+    /// upload; `None` when the solution carries no image.
     pub(crate) image_file: Option<String>,
     pub(crate) image_content_type: Option<FileContentType>,
     pub(crate) image_size: Option<i64>,

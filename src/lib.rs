@@ -5,7 +5,6 @@ pub mod database;
 pub mod db;
 pub mod domain;
 pub mod error;
-pub mod migration_sql;
 pub mod module;
 pub mod rate_limit;
 pub mod service;
@@ -219,12 +218,8 @@ pub fn build_router(state: AppState) -> Router {
     // Every tier's budget outlives the process it was spent in (see
     // [`rate_limit::RateLimiter::share`]). The chatbot tier is shared here too
     // rather than in `main`, so a router built anywhere gets the same behaviour.
-    api_limiter.share("api", state.db.clone(), state.db_up.clone());
-    state
-        .chatbot_limit
-        .share("chatbot", state.db.clone(), state.db_up.clone());
-
-    let db_up = state.db_up.clone();
+    api_limiter.share("api", state.db.clone());
+    state.chatbot_limit.share("chatbot", state.db.clone());
     let metrics = state.metrics.clone();
 
     let cors_allowlist = cors_allowlist_from_env();
@@ -242,13 +237,12 @@ pub fn build_router(state: AppState) -> Router {
     // request from a service is not a browser request from an IP: it has no
     // client address to bill the per-IP limiter (it would drain the shared
     // unknown-client budget), and `ETag`/CORS are browser concerns. Skipping the
-    // layers means skipping the db guard too, so the bridge runs the liveness
-    // check and the request timeout itself (see `ai::server`).
+    // layers means skipping the request deadline too, so the bridge applies the
+    // same deadline to its own dispatch (see `ai::server`).
     if let Some(ai) = &state.ai {
         ai.arm_api(
             service.clone(),
             state.tenants.clone(),
-            state.db_up.clone(),
             state.files_path.clone(),
             metrics.clone(),
         );
@@ -259,10 +253,7 @@ pub fn build_router(state: AppState) -> Router {
         // matching `If-None-Match`. Innermost, so it sees the handler's own
         // response (mutations and errors pass straight through untouched).
         .layer(middleware::from_fn(web::etag::etag))
-        .layer(middleware::from_fn(move |req: Request, next: Next| {
-            let health = db_up.clone();
-            async move { db_guard(health, req, next).await }
-        }))
+        .layer(middleware::from_fn(request_timeout))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let limiter = api_limiter.clone();
             async move { limiter.enforce(req, next).await }
@@ -463,38 +454,31 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Refuse work the database cannot currently do, and cap how long any request
-/// may wait on it.
+/// Cap how long any request may wait on the database. The deadline covers both
+/// the pool wait for a connection and the query run on it.
 ///
-/// Both halves exist because a query issued while the database socket is down
-/// never fails — the SDK parks it until the connection returns, so without a
-/// guard a handler waits out the entire outage holding a connection open.
-///
-/// Order matters. The liveness check comes first and is the honest path: it
-/// answers before the request touches the database, so nothing is queued and
-/// the caller's retry cannot double-apply a write. The timeout only catches
-/// requests that slipped through in the window between the socket dying and
-/// the keepalive noticing — those are already queued, hence the weaker
-/// [`AppError::DbTimeout`] verdict.
+/// The health half this guard used to carry is gone with the engine that
+/// needed it: a sqlx query issued on a dead pool fails with an error instead
+/// of being parked until the socket returns, so there is no known-outage
+/// verdict to publish and no queued work to refuse up front. What stays is
+/// the honest [`AppError::DbTimeout`] semantics: a request that outlives the
+/// deadline may or may not have applied its write, so a caller must not
+/// blind-retry it.
 ///
 /// Long-lived responses are unaffected: a WebSocket upgrade and an SSE stream
 /// both return their response immediately and do the work afterwards, so
 /// neither is measured against the timeout.
-async fn db_guard(health: state::DbHealth, req: Request, next: Next) -> Response {
+async fn request_timeout(req: Request, next: Next) -> Response {
     // `/limits` never touches the database — it serializes constants and this
-    // process's own configuration. Refusing it during an outage would be a
-    // pure own-goal: a frontend booting into a degraded backend is exactly
-    // when it needs the validation contract, and answering `503` would push it
-    // back to the hard-coded copy this endpoint exists to delete.
-    // `/health` and its `/` mirror are exempt for the same reason and one
-    // more: refusing them with the guard's own 503 would replace the probe's
-    // answer ("degraded, the database is down") with a generic body that names
-    // nothing. They read the keepalive's verdict and touch no database.
+    // process's own configuration. Holding it to the deadline would be a pure
+    // own-goal: a frontend booting into a degraded backend is exactly when it
+    // needs the validation contract. `/health` and its `/` mirror are exempt
+    // for the same reason and one more: their own probe is bounded at 2s, far
+    // inside this deadline, and the generic timeout body would replace the
+    // probe's answer ("degraded, the database is down") with one that names
+    // nothing.
     if matches!(req.uri().path(), "/limits" | "/health" | "/") {
         return next.run(req).await;
-    }
-    if !health.is_up() {
-        return AppError::DbUnavailable.into_response();
     }
     let timeout = std::time::Duration::from_secs(constant::REQUEST_TIMEOUT_SECS);
     match tokio::time::timeout(timeout, next.run(req)).await {
@@ -561,7 +545,7 @@ struct HealthResponse {
     /// one is not (today: the database).
     #[schema(example = "ok")]
     status: &'static str,
-    /// Did the database socket answer its last keepalive ping?
+    /// Did the bounded database probe (`SELECT 1`) answer?
     #[schema(example = "up")]
     db: &'static str,
     /// The optional AI bridge (see the `ai` tag).
@@ -580,9 +564,10 @@ struct AiHealth {
 
 /// Health probe: the database verdict and the AI bridge, `503` when degraded.
 ///
-/// Answers even while the database is down — it reads the keepalive's verdict
-/// and touches nothing — which is the whole point: a probe that 503s with an
-/// empty body says "down" without saying what is down.
+/// Probes the database with a `SELECT 1` bounded to 2s — far inside the
+/// request deadline — so a dead or wedged database answers `503` with a body
+/// that says what is down, instead of the poll hanging on a full request
+/// timeout.
 #[utoipa::path(
     get,
     path = "/health",
@@ -593,7 +578,14 @@ struct AiHealth {
     ),
 )]
 async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
-    let up = state.db_up.is_up();
+    let up = matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sqlx::query("SELECT 1").execute(&state.db),
+        )
+        .await,
+        Ok(Ok(_))
+    );
     let status = if up {
         axum::http::StatusCode::OK
     } else {

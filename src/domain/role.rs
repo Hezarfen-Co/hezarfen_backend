@@ -1,4 +1,4 @@
-use surrealdb::types::SurrealValue;
+use sqlx::Type;
 
 use crate::constant::ROLES;
 use crate::error::ValidationError;
@@ -20,12 +20,12 @@ use crate::error::ValidationError;
 /// exact `== Student` gate, so parents can't sit exams, enroll, or be marked on
 /// a roll call — they only read their own students' reports.
 ///
-/// `#[surreal(untagged, rename_all = "lowercase")]` makes each variant serialize
-/// to a bare lowercase string (`"student"`, `"teacher"`, …) instead of the
-/// default object-wrapped form, so it stores in the `role` column's `TYPE string`
-/// and round-trips straight back into the enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// [`Role`] derives [`sqlx::Type`] as a bare TEXT enum: each variant stores as
+/// its lowercase name (`"student"`, `"teacher"`, …) and round-trips straight
+/// back, which the `role` column's `CHECK` lists and every `role = 'teacher'`
+/// filter spells. [`Role::as_str`] must stay in lockstep with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Role {
     Ai,
     Parent,
@@ -92,7 +92,6 @@ impl Role {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::Value;
 
     #[tokio::test]
     async fn hierarchy_orders_low_to_high() {
@@ -167,14 +166,18 @@ mod tests {
         assert!(Role::try_from_str("").is_err());
     }
 
-    #[tokio::test]
-    async fn surreal_value_is_a_plain_string() {
-        // The whole point of `untagged`: the stored value is a bare string, so a
-        // `TYPE string` column accepts it. Guard that the encoding never regresses.
-        for role in ROLES {
-            let value = role.into_value();
-            assert_eq!(value, Value::String(role.as_str().to_string()));
-            assert_eq!(Role::from_value(value).unwrap(), role);
+    #[test]
+    fn sqlx_encodes_the_storage_form() {
+        // The whole point of the TEXT encoding: the stored value is the bare
+        // lowercase string, so the `role` column accepts it and every
+        // `role = 'teacher'` filter matches. Guard that the sqlx encoding
+        // never drifts from `as_str` — the CHECK constraint and the filters
+        // spell these same words.
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
+        for role in [Role::Ai, Role::Parent, Role::Student, Role::Teacher, Role::Manager, Role::Admin] {
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&role, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), role.as_str());
         }
     }
 }

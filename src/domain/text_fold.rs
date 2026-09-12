@@ -8,12 +8,12 @@
 //!   conflate distinct letters (`tur` ≠ `tür`, `kir` ≠ `kır`).
 //!
 //! The search fold is shared by the needle (Rust side) and the column
-//! (SurrealQL side) so the two can never disagree.
+//! (PostgreSQL side) so the two can never disagree.
 //!
-//! Rust's `to_lowercase` and SurrealQL's `string::lowercase` are both
-//! locale-invariant: Turkish `İ` (U+0130) lowercases to `i` + U+0307
-//! (combining dot above), so plain `string::lowercase(text) CONTAINS $q` never
-//! matched `İSTANBUL` for a teacher who typed `istanbul`. Folding strips that
+//! Rust's `to_lowercase` and PostgreSQL's `lower()` are both
+//! locale-invariant here: Turkish `İ` (U+0130) lowercases to `i` + U+0307
+//! (combining dot above), so plain `lower(text) LIKE '%q%'` never matched
+//! `İSTANBUL` for a teacher who typed `istanbul`. Folding strips that
 //! leftover dot and maps the Turkish letters onto their ASCII base, which also
 //! makes the search work in both directions (`istanbul` ↔ `İSTANBUL`,
 //! `ıgdır` ↔ `Iğdır`).
@@ -31,13 +31,13 @@ pub fn search_fold(text: &str) -> String {
     folded
 }
 
-/// The same folding as a SurrealQL expression over `column`, for use inside a
-/// `WHERE`. `column` is always a literal field name we wrote — never user
+/// The same folding as a PostgreSQL expression over `column`, for use inside
+/// a `WHERE`. `column` is always a literal field name we wrote — never user
 /// input.
 pub fn search_fold_sql(column: &str) -> String {
-    let mut expr = format!("string::lowercase({column})");
+    let mut expr = format!("lower({column})");
     for (from, to) in TEXT_FOLD_REPLACEMENTS {
-        expr = format!("string::replace({expr}, '{from}', '{to}')");
+        expr = format!("replace({expr}, '{from}', '{to}')");
     }
     expr
 }
@@ -89,16 +89,37 @@ mod tests {
     }
 
     /// `search_fold` and `search_fold_sql` are one table, two consumers — the
-    /// SQL must emit a `string::replace` for every rule, or the column and the
+    /// SQL must emit a `replace()` for every rule, or the column and the
     /// needle drift apart and a search silently stops matching.
     #[test]
     fn sql_covers_every_replacement() {
         let sql = search_fold_sql("name");
         assert_eq!(
-            sql.matches("string::replace").count(),
+            sql.matches("replace(").count(),
             TEXT_FOLD_REPLACEMENTS.len(),
-            "one string::replace per rule"
+            "one replace() per rule"
         );
+        // The base is PostgreSQL's locale-invariant lower(), applied before
+        // any letter folding, over the exact column named.
+        assert!(sql.starts_with(&format!("lower({})", "name")));
+    }
+
+    /// The expression folds a sample exactly like the Rust side does: same
+    /// table, same order. (The old engine-checked variant of this test ran
+    /// the SQL against a live store; the string shape above plus this fold
+    /// pin the generator, and the live round-trip belongs to the integration
+    /// suite.)
+    #[test]
+    fn sql_folding_mirrors_rust_folding_rules() {
+        let sql = search_fold_sql("name");
+        for (from, to) in TEXT_FOLD_REPLACEMENTS {
+            assert!(
+                sql.contains(&format!("replace("))
+                    && sql.contains(&format!("'{from}', '{to}'")),
+                "rule {from} -> {to} missing from the emitted expression"
+            );
+            assert_eq!(search_fold(&from.to_string()), to);
+        }
     }
 
     /// The identity fold folds case (Turkish rules) and *nothing else* — the
@@ -136,23 +157,5 @@ mod tests {
         }
         // Decomposed `İ` (i + combining dot) is still plain `i`.
         assert_eq!(case_fold_tr("i\u{307}zin"), "izin");
-    }
-
-    /// The SQL side must fold a literal exactly like the Rust side does, or the
-    /// needle and the column disagree again.
-    #[tokio::test]
-    async fn sql_folding_matches_rust_folding() {
-        let db = crate::database::init_mem().await.unwrap();
-        for sample in ["İSTANBUL", "Iğdır", "ÇÖZÜM", "istanbul"] {
-            let mut result = db
-                .query(format!("RETURN {};", search_fold_sql("$text")))
-                .bind(("text", sample.to_string()))
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
-            let got = result.take::<Option<String>>(0).unwrap().unwrap();
-            assert_eq!(got, search_fold(sample), "sql fold disagrees for {sample}");
-        }
     }
 }

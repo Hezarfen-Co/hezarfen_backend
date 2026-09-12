@@ -4,250 +4,253 @@
 //! WHY: `?limit=10` used to run an unbounded `SELECT *`, hand the whole table
 //! to the web layer and slice ten rows off it. The scan (and the decode of
 //! every row) grew with the table no matter how small the page was. Here the
-//! window is `LIMIT/START` in SQL, and `total` is a `count()` over the *same*
-//! `WHERE`, so a page can never disagree with the count that pages it.
+//! window is `LIMIT/OFFSET` in SQL, and `total` is a `count(*)` over the
+//! *same* `WHERE` as a second statement, so a page can never disagree with
+//! the count that pages it.
 //!
 //! ```ignore
-//! PagedList::new("note WHERE user = $usr", "ORDER BY id DESC")
-//!     .bind("usr", owner.record())
+//! PagedList::new("note WHERE user_id = $1", "ORDER BY id DESC")
+//!     .bind(owner.0)
 //!     .run::<Note>(limit, offset, db)
 //!     .await
 //! ```
 //!
-//! Paging stays opt-in: `limit = None, offset = 0` is the unpaged read, and it
-//! emits exactly one statement (no count — the rows in hand *are* the total),
-//! so internal callers that just want the list pay nothing.
+//! Paging stays opt-in: `limit = None, offset = 0` is the unpaged read, and
+//! it runs exactly one statement (no count — the rows in hand *are* the
+//! total), so internal callers that just want the list pay nothing.
 //!
-//! The count's result shape is the planner's to choose (see [`total_of`]) —
-//! both shapes decode to the same `total`.
+//! Runtime-checked SQL by design: `from_where` is assembled per call site,
+//! which is this module's named exemption from the compile-time `query!`
+//! rule. Placeholders are positional (`$1, $2, …`) in [`.bind`] order, and
+//! the window's own placeholders continue the numbering. The count is a plain
+//! `count(*)`, which always answers one `NOT NULL` row — no planner-shape
+//! decoding to preserve.
+//!
+//! The dynamic parts of every statement here are table/column names (in-crate
+//! constants and literals, never client text) and the `$n` numbers this
+//! builder prints itself; every value binds — which is the audit the
+//! [`AssertSqlSafe`] wraps stand on.
 //!
 //! Only for lists the database can express whole. A handler that filters rows
-//! in Rust after the read (visibility, audience resolution, a schedule window)
-//! must keep slicing in the web layer: a DB `LIMIT` in front of a Rust filter
-//! silently returns a short page.
+//! in Rust after the read (visibility, audience resolution, a schedule
+//! window) must keep slicing in the web layer: a DB `LIMIT` in front of a
+//! Rust filter silently returns a short page.
 
-use surrealdb::types::{SurrealValue, Value};
+use sqlx::postgres::{PgArguments, PgRow};
+use sqlx::{Arguments, AssertSqlSafe, FromRow};
+use uuid::Uuid;
 
 use crate::database::Database;
 use crate::error::AppError;
 
-pub struct PagedList {
-    /// Everything after `FROM`, e.g. `note WHERE user = $usr`. Shared verbatim
-    /// by the page and the count.
+/// One bound parameter of a runtime-checked builder's statement, in
+/// `$1, $2, …` order.
+///
+/// [`PagedList`] and [`crate::db::field_update::FieldUpdate`] are the named
+/// exemptions from the compile-time `query!` rule: their SQL is assembled at
+/// run time, so their parameters ride this closed enum — owned values, no
+/// borrow to tie a builder's lifetime to, [`Clone`] because one builder run
+/// can need the same `WHERE` bound twice (page, then count). A caller that
+/// needs a type the enum lacks adds a variant here; sqlx's borrow-tied
+/// dynamic binding does not survive being stored in a builder.
+#[derive(Clone, Debug)]
+pub(crate) enum Param {
+    I64(i64),
+    Text(String),
+    Uuid(Uuid),
+    /// A nullable column value: `None` binds SQL `NULL` with the uuid type
+    /// still named, so `IS NOT DISTINCT FROM $n` compares an absent link
+    /// truthfully.
+    OptUuid(Option<Uuid>),
+}
+
+impl Param {
+    /// Push onto runtime-checked arguments. sqlx defers encode failures to
+    /// execution, so there is nothing to check here.
+    pub(crate) fn add_to(self, args: &mut PgArguments) {
+        let _ = match self {
+            Param::I64(value) => args.add(value),
+            Param::Text(value) => args.add(value),
+            Param::Uuid(value) => args.add(value),
+            Param::OptUuid(value) => args.add(value),
+        };
+    }
+}
+
+impl From<i64> for Param {
+    fn from(value: i64) -> Self {
+        Self::I64(value)
+    }
+}
+
+impl From<String> for Param {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<Uuid> for Param {
+    fn from(value: Uuid) -> Self {
+        Self::Uuid(value)
+    }
+}
+
+impl From<Option<Uuid>> for Param {
+    fn from(value: Option<Uuid>) -> Self {
+        Self::OptUuid(value)
+    }
+}
+
+pub(crate) struct PagedList {
+    /// Everything after `FROM`, e.g. `note WHERE user_id = $1`. Placeholders
+    /// are positional in [`PagedList::bind`] order; shared verbatim by the
+    /// page and the count.
     from_where: String,
     /// The full `ORDER BY ...`, applied to the page only.
     order: &'static str,
-    bindings: Vec<(String, Value)>,
+    binds: Vec<Param>,
 }
 
 impl PagedList {
     /// `from_where` is a whole-table read (`"term"`) or a filtered one
-    /// (`"note WHERE user = $usr"`).
-    pub fn new(from_where: impl Into<String>, order: &'static str) -> Self {
+    /// (`"note WHERE user_id = $1"`).
+    pub(crate) fn new(from_where: impl Into<String>, order: &'static str) -> Self {
         Self {
             from_where: from_where.into(),
             order,
-            bindings: Vec::new(),
+            binds: Vec::new(),
         }
     }
 
-    /// Bind one variable of the `WHERE`. `limit` and `offset` are the two names
-    /// a caller must not use.
+    /// Bind the next positional parameter: the first call fills `$1`, the
+    /// second `$2`, … — `from_where` must carry the placeholders in the same
+    /// order.
     #[must_use]
-    pub fn bind<T: SurrealValue>(mut self, name: &'static str, value: T) -> Self {
-        self.bindings.push((name.to_string(), value.into_value()));
+    pub(crate) fn bind<T: Into<Param>>(mut self, value: T) -> Self {
+        self.binds.push(value.into());
         self
     }
 
-    /// The statements to run, and whether the second one (the count) is among
-    /// them. Split out so a test can read the SQL: the whole point of this type
-    /// is that `LIMIT`/`START` reach the database instead of a `Vec` slice.
-    fn statements(&self, limit: Option<i64>, offset: i64) -> (String, bool) {
-        let from_where = &self.from_where;
-        let window = match limit {
-            Some(_) => "LIMIT $limit START $offset",
-            None => "START $offset",
-        };
-        let mut sql = format!("SELECT * FROM {from_where} {} {window};", self.order);
-        // A window that can hide rows needs the count; an unpaged read from row
-        // zero already holds every row, so it stays a single statement.
+    /// The page statement and, when the window can hide rows, the count
+    /// statement. Split out so a test can read the SQL: the whole point of
+    /// this type is that `LIMIT/OFFSET` reach the database instead of a
+    /// `Vec` slice.
+    fn statements(&self, limit: Option<i64>, offset: i64) -> (String, Option<String>) {
+        let mut next = self.binds.len();
+        let mut sql = format!("SELECT * FROM {} {}", self.from_where, self.order);
+        if limit.is_some() {
+            next += 1;
+            sql.push_str(&format!(" LIMIT ${next}"));
+        }
+        // A window that can hide rows needs the count; an unpaged read from
+        // row zero already holds every row, so it stays a single statement.
         let counted = limit.is_some() || offset > 0;
         if counted {
-            sql.push_str(&format!(
-                "SELECT VALUE count() FROM {from_where} GROUP ALL;"
-            ));
+            next += 1;
+            sql.push_str(&format!(" OFFSET ${next}"));
         }
-        (sql, counted)
+        let count = counted.then(|| format!("SELECT count(*) FROM {}", self.from_where));
+        (sql, count)
     }
 
     /// The page plus the full row count. `limit = None` runs from `offset` to
     /// the end, matching the unpaged envelope.
-    pub async fn run<T: SurrealValue>(
+    pub(crate) async fn run<T>(
         self,
         limit: Option<i64>,
         offset: i64,
         db: &Database,
-    ) -> Result<(Vec<T>, i64), AppError> {
-        let (sql, counted) = self.statements(limit, offset);
-        let mut query = db
-            .query(sql)
-            .bind(("offset", offset))
-            .bind(("limit", limit.unwrap_or(0)));
-        for (name, value) in self.bindings {
-            query = query.bind((name, value));
+    ) -> Result<(Vec<T>, i64), AppError>
+    where
+        T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+    {
+        let (page_sql, count_sql) = self.statements(limit, offset);
+        let mut args = PgArguments::default();
+        for bind in self.binds.iter().cloned() {
+            bind.add_to(&mut args);
         }
-        let mut result = query.await?.check()?;
-        let rows = result.take::<Vec<T>>(0)?;
-        let total = match counted {
-            true => total_of(result.take::<Value>(1)?)?,
-            false => rows.len() as i64,
+        if let Some(limit) = limit {
+            Param::from(limit).add_to(&mut args);
+        }
+        if count_sql.is_some() {
+            Param::from(offset).add_to(&mut args);
+        }
+        let rows: Vec<T> =
+            sqlx::query_as_with(AssertSqlSafe(page_sql), args).fetch_all(db).await?;
+        let total = match count_sql {
+            Some(count_sql) => {
+                let mut args = PgArguments::default();
+                for bind in self.binds {
+                    bind.add_to(&mut args);
+                }
+                let scalar: i64 =
+                    sqlx::query_scalar_with(AssertSqlSafe(count_sql), args).fetch_one(db).await?;
+                scalar
+            }
+            None => rows.len() as i64,
         };
         Ok((rows, total))
-    }
-}
-
-/// The count statement's slot, in either shape the planner answers in.
-///
-/// `SELECT VALUE count() ... GROUP ALL` normally yields the projected int, but
-/// whenever the planner can answer the count straight out of an index or the
-/// table count (`IndexCountScan` — an indexed field compared to a value known
-/// at plan time, `grade IS NONE` or a *literal*, and any bare table read) it
-/// returns `{ count: N }` and drops the `SELECT VALUE` projection. Decoding
-/// only the int is where "Expected int, got object" came from; the number is
-/// the same either way. The in-memory engine never rewrites the plan, so only
-/// a real server ever produces the object.
-fn total_of(count: Value) -> Result<i64, AppError> {
-    // `GROUP ALL` yields no row at all when nothing matched.
-    let row = match count {
-        Value::Array(rows) => rows.into_iter().next().unwrap_or_default(),
-        other => other,
-    };
-    let row = match row {
-        Value::Object(mut object) => object.remove("count").unwrap_or_default(),
-        other => other,
-    };
-    match row.is_nullish() {
-        true => Ok(0),
-        false => row
-            .into_t::<i64>()
-            .map_err(|e| AppError::Internal(format!("count decode: {e}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database;
-    use crate::db::note;
-    use crate::domain::note::{NoteContent, NoteTitle};
-    use crate::domain::user::UserId;
-    use ulid::Ulid;
 
     fn list() -> PagedList {
-        PagedList::new("note WHERE user = $usr", "ORDER BY id DESC")
+        PagedList::new("note WHERE user_id = $1", "ORDER BY id DESC").bind(Uuid::nil())
     }
 
-    /// The window has to be SQL — a `Vec` slice would leave the scan unbounded,
-    /// which is the whole reason this type exists.
+    /// The window has to be SQL — a `Vec` slice would leave the scan
+    /// unbounded, which is the whole reason this type exists.
     #[test]
     fn a_paged_read_windows_and_counts_in_sql() {
-        let (sql, counted) = list().statements(Some(10), 20);
-        assert!(sql.contains("ORDER BY id DESC LIMIT $limit START $offset;"));
-        assert!(sql.contains("SELECT VALUE count() FROM note WHERE user = $usr GROUP ALL;"));
-        assert!(counted);
+        let (sql, count) = list().statements(Some(10), 20);
+        assert!(sql.contains("ORDER BY id DESC LIMIT $2 OFFSET $3"));
+        assert_eq!(
+            count.as_deref(),
+            Some("SELECT count(*) FROM note WHERE user_id = $1")
+        );
     }
 
-    /// A whole-table read counts the table as it stands — no `WHERE true` to
-    /// force a scan, because [`total_of`] now takes the count-from-index shape
-    /// that hack existed to avoid.
+    /// A whole-table read counts the bare table.
     #[test]
     fn an_unfiltered_list_counts_the_bare_table() {
-        let (sql, _) = PagedList::new("term", "ORDER BY starts_at DESC").statements(Some(5), 0);
-        assert!(sql.contains("SELECT VALUE count() FROM term GROUP ALL;"));
+        let (sql, count) =
+            PagedList::new("term", "ORDER BY starts_at DESC").statements(Some(5), 0);
+        assert!(sql.contains("LIMIT $1 OFFSET $2"));
+        assert_eq!(count.as_deref(), Some("SELECT count(*) FROM term"));
     }
 
-    /// Both shapes of the count slot mean the same number. The object is what
-    /// a real server returns whenever it answers `count()` from an index or the
-    /// table count; the in-memory engine only ever produces the int, so this is
-    /// the only place the object arm can be pinned. Drop that arm and the
-    /// second assert fails with "count decode: Expected int, got object" —
-    /// which is the 500 `GET /classes?grade=&limit=1` served.
-    #[test]
-    fn a_count_decodes_from_either_shape() {
-        let projected = Value::Array([Value::from_t(7i64)].into_iter().collect());
-        let from_index = Value::Array(
-            [Value::Object(
-                [("count".to_string(), Value::from_t(7i64))]
-                    .into_iter()
-                    .collect(),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        assert_eq!(total_of(projected).unwrap(), 7);
-        assert_eq!(total_of(from_index).unwrap(), 7);
-        // `GROUP ALL` yields no row at all when nothing matched.
-        assert_eq!(total_of(Value::Array(Default::default())).unwrap(), 0);
-        // Any other shape is an error, never a silently wrong `total`.
-        assert!(total_of(Value::Array([Value::from_t("7")].into_iter().collect())).is_err());
-    }
-
-    /// Unpaged from row zero: the rows in hand are the total, so no count runs.
+    /// Unpaged from row zero: the rows in hand are the total, so no count
+    /// runs.
     #[test]
     fn an_unpaged_read_stays_one_statement() {
-        let (sql, counted) = list().statements(None, 0);
-        assert!(sql.ends_with("ORDER BY id DESC START $offset;"));
-        assert!(!sql.contains("count()"));
-        assert!(!counted);
+        let (sql, count) = list().statements(None, 0);
+        assert_eq!(
+            sql,
+            "SELECT * FROM note WHERE user_id = $1 ORDER BY id DESC"
+        );
+        assert_eq!(count, None);
         // An offset without a limit still hides rows, so it needs the count.
-        assert!(list().statements(None, 3).1);
+        let (sql, count) = list().statements(None, 3);
+        assert!(sql.contains("OFFSET $2"));
+        assert!(!sql.contains("LIMIT"));
+        assert!(count.is_some());
     }
 
-    #[tokio::test]
-    async fn the_window_walks_the_rows_and_total_stays_the_whole_list() {
-        let db = database::init_mem().await.unwrap();
-        let user = UserId::from_key(&Ulid::generate().to_string());
-        for i in 0..5 {
-            note::create(
-                &db,
-                &user,
-                NoteTitle::try_new(&format!("n{i}")).unwrap(),
-                NoteContent::try_new("x").unwrap(),
-            )
-            .await
-            .unwrap();
-        }
-
-        // Every page is `limit` long and `total` ignores the window.
-        let (page, total) = note::list_for(&db, &user, Some(2), 0).await.unwrap();
-        assert_eq!((page.len(), total), (2, 5));
-        let (tail, total) = note::list_for(&db, &user, Some(2), 4).await.unwrap();
-        assert_eq!((tail.len(), total), (1, 5));
-        // Offset past the end is an empty page, not an error.
+    /// The window's placeholders continue the caller's numbering, in emission
+    /// order.
+    #[test]
+    fn window_placeholders_continue_the_where_numbering() {
+        let (sql, count) =
+            PagedList::new("note WHERE user_id = $1 AND archived_at IS NULL", "ORDER BY id")
+                .bind(Uuid::nil())
+                .statements(Some(2), 4);
+        assert!(sql.contains("LIMIT $2 OFFSET $3"));
         assert_eq!(
-            note::list_for(&db, &user, Some(2), 9)
-                .await
-                .unwrap()
-                .0
-                .len(),
-            0
-        );
-        // Unpaged, and unpaged-from-an-offset: the count still covers everything.
-        let (all, total) = note::list_for(&db, &user, None, 0).await.unwrap();
-        assert_eq!((all.len(), total), (5, 5));
-        let (rest, total) = note::list_for(&db, &user, None, 3).await.unwrap();
-        assert_eq!((rest.len(), total), (2, 5));
-
-        // The pages are consecutive slices of the unpaged list — page
-        // boundaries match the order the ORDER BY already produced.
-        let keys: Vec<&str> = all.iter().map(|note| note.get_id().key()).collect();
-        assert_eq!(
-            page.iter().map(|n| n.get_id().key()).collect::<Vec<_>>(),
-            keys[..2]
-        );
-        assert_eq!(
-            tail.iter().map(|n| n.get_id().key()).collect::<Vec<_>>(),
-            keys[4..]
+            count.as_deref(),
+            Some("SELECT count(*) FROM note WHERE user_id = $1 AND archived_at IS NULL")
         );
     }
 }

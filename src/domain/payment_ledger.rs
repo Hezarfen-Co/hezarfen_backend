@@ -1,11 +1,11 @@
 //! School fees: an **append-only** ledger of what a student was charged, what
 //! they paid against each charge, and what was paid back out.
 //!
-//! Nothing here ever `UPDATE`s or `DELETE`s a row, and no such path exists —
-//! every field is `READONLY` in the schema as well. A ledger line that can be
-//! edited or dropped silently rewrites a family's financial history with no
-//! trace of the rewrite; a mistake is corrected by appending the opposing line,
-//! which leaves both the mistake and the correction visible.
+//! Nothing here ever `UPDATE`s or `DELETE`s a row, and no such path exists. A
+//! ledger line that can be edited or dropped silently rewrites a family's
+//! financial history with no trace of the rewrite; a mistake is corrected by
+//! appending the opposing line, which leaves both the mistake and the
+//! correction visible.
 //!
 //! **The balance is never stored.** It is always the fold
 //!
@@ -31,103 +31,103 @@
 //! - **A reversal only undoes a negative-fold line** (a charge, or a refund).
 //!   A mistaken *credit* is corrected by a refund pointing at it, so that the
 //!   money leaving the school is always spelled the same way. A reversal itself
-//!   is never reversed (the id would collide with its own target's, and the
+//!   is never reversed (the key would collide with its own target's, and the
 //!   kind check refuses it): a charge dropped by mistake is re-raised by
 //!   assigning a fresh one-installment plan, which mints a new deterministic
-//!   charge id instead of resurrecting the old one.
+//!   charge key instead of resurrecting the old one.
 //! - **Every replayable line is keyed by its cause.** An installment charge's
-//!   id is `(plan, student, n)` and a reversal's is `<line>_r`, so replaying
-//!   either writes nothing at all, and an assignment that crashed half-way
-//!   self-heals when it is repeated. Money must never depend on a "has this
-//!   been billed yet?" scan: two concurrent requests can both read "not yet"
-//!   and both append.
+//!   key is `{assignment-key}_c{n}` and a reversal's is `{line-key}_r`, so
+//!   replaying either writes nothing at all, and an assignment that crashed
+//!   half-way self-heals when it is repeated. Money must never depend on a
+//!   "has this been billed yet?" scan: two concurrent requests can both read
+//!   "not yet" and both append.
+//!
+//! The ledger row ids are **derived TEXT keys**, not minted uuids — they are
+//! the identity the store's uniqueness check enforces (`id TEXT PRIMARY
+//! KEY`): a duplicate insert of the same key is the "already billed" answer.
+//!
+//! The writes and the balance reads live in [`crate::db::payment_ledger`];
+//! the credit/refund/reversal workflows in
+//! [`crate::service::payment_ledger`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
 
-use crate::constant::PAYMENT_LEDGER_TABLE;
 use crate::domain::fee_plan_assignment::FeePlanAssignmentId;
 // The three value types are the *same* money vocabulary the canteen ledger
 // speaks, so they are imported rather than copied: one cap, one trim rule, one
 // error message for both ledgers.
 pub use crate::domain::meal_ledger::{LedgerAmount, LedgerMethod, LedgerNote};
-use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct PaymentLedgerId(RecordId);
+/// The ledger line's id — a derived TEXT key (`id TEXT PRIMARY KEY`):
+/// `{assignment-key}_c{n}` for an installment charge, `{line-key}_r` for a
+/// reversal, `{target-key}_{marker}_{request_key}` for a keyed payment or
+/// refund, or a fresh uuid-string key otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct PaymentLedgerId(String);
 
 impl PaymentLedgerId {
-    /// A fresh id in write order — `Ulid::generate()`'s random low bits sort
-    /// arbitrarily within one millisecond, which would scramble the `id`
-    /// tie-break of the newest-first statement below.
+    /// A fresh key in write order — the process-wide uuid v7 generator's
+    /// string form, so the `id` tie-break of the newest-first statement below
+    /// still sorts in mint order.
     pub fn generate() -> Self {
-        Self(RecordId::new(PAYMENT_LEDGER_TABLE, next_ulid().to_string()))
+        Self(crate::domain::monotonic_id::next_uuid().to_string())
     }
 
+    /// Parse a stored key back into an id. Ledger keys are TEXT, so any
+    /// string round-trips.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(PAYMENT_LEDGER_TABLE, key))
+        Self(key.to_string())
     }
 
     /// The one charge line installment `n` (1-based) of this assignment may
-    /// ever have. The assignment key is already `<plan>_<student>`, so this is
-    /// `<plan>_<student>_c<n>`: two concurrent assigns derive the *same* ids
-    /// and so cannot bill a plan twice. Idempotence rests on identity, never on
-    /// a scan a concurrent writer can slip past.
+    /// ever have. The assignment key is already `{plan}_{student}`, so this is
+    /// `{plan}_{student}_c{n}`: two concurrent assigns derive the *same* keys
+    /// and so cannot bill a plan twice. Idempotence rests on identity, never
+    /// on a scan a concurrent writer can slip past.
     pub fn for_installment(assignment: &FeePlanAssignmentId, n: usize) -> Self {
-        Self(RecordId::new(
-            PAYMENT_LEDGER_TABLE,
-            format!("{}_c{n}", assignment.key()),
-        ))
+        Self(format!("{}_c{n}", assignment.key()))
     }
 
     /// The one reversal a line may ever have — a retried undo appends nothing
-    /// the second time — the id decides that, not a scan.
+    /// the second time — the key decides that, not a scan.
     pub fn for_reversal(line: &PaymentLedgerId) -> Self {
-        Self(RecordId::new(
-            PAYMENT_LEDGER_TABLE,
-            format!("{}_r", line.key()),
-        ))
+        Self(format!("{}_r", line.key()))
     }
 
-    /// The one line a `(target, request_key)` pair may ever have: `<target>_k_`
-    /// for a payment, `<target>_kr_` for a refund. Scoping the key by the line
-    /// it targets is what keeps one office's "receipt-114" from colliding with
-    /// another charge's, and the two markers keep the kinds apart the same way
-    /// `_c<n>` and `_r` do above.
+    /// The one line a `(target, request_key)` pair may ever have:
+    /// `{target}_k_{key}` for a payment, `{target}_kr_{key}` for a refund.
+    /// Scoping the key by the line it targets is what keeps one office's
+    /// "receipt-114" from colliding with another charge's, and the two markers
+    /// keep the kinds apart the same way `_c{n}` and `_r` do above.
     ///
     /// **The grammar parses uniquely because `_` joins the parts and cannot
-    /// appear inside one.** Every id here is `<ulid>_<ulid>_c<n>` optionally
-    /// followed by one `_k_<key>`, `_kr_<key>` or `_r` — plan and student keys
-    /// are ULIDs (`[0-9A-Z]` only) and a `request_key` is
+    /// appear inside one.** Every key here is `<uuid>_<uuid>_c<n>` optionally
+    /// followed by one `_k_<key>`, `_kr_<key>` or `_r` — uuid halves carry
+    /// only hex digits and `-`, and a `request_key` is
     /// [`crate::validate::validate_request_key`]'s `[A-Za-z0-9-]`, so no part
     /// can spell a separator plus a marker. That is not decoration: a key of
-    /// `abc_r` on a refund would derive exactly the id that refund's *reversal*
-    /// must own, and the loser of that collision would be handed a line of the
-    /// wrong kind and the wrong amount, with the real reversal impossible
-    /// forever after. The ban on `_` in a key is what makes the collision
-    /// unconstructible; `crate::db::payment_ledger::append` re-checks the
-    /// kind anyway.
+    /// `abc_r` on a refund would derive exactly the key that refund's
+    /// *reversal* must own, and the loser of that collision would be handed a
+    /// line of the wrong kind and the wrong amount, with the real reversal
+    /// impossible forever after. The ban on `_` in a key is what makes the
+    /// collision unconstructible; `crate::db::payment_ledger::append` re-checks
+    /// the kind anyway.
     pub fn for_request(target: &PaymentLedgerId, marker: &str, key: &PaymentRequestKey) -> Self {
-        Self(RecordId::new(
-            PAYMENT_LEDGER_TABLE,
-            format!("{}_{marker}_{}", target.key(), key.as_str()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+        Self(format!("{}_{marker}_{}", target.key(), key.as_str()))
     }
 
     pub fn key(&self) -> &str {
-        key_of(&self.0)
+        &self.0
     }
 }
 
 /// A client-chosen idempotence key for one payment or refund. Never stored as
-/// a column — it lives inside the line's record id, which is what makes a retry
-/// derive the row it already wrote instead of a second one.
+/// a column — it lives inside the line's derived key, which is what makes a
+/// retry derive the row it already wrote instead of a second one.
 #[derive(Debug, Clone)]
 pub struct PaymentRequestKey(String);
 
@@ -142,18 +142,10 @@ impl PaymentRequestKey {
     }
 }
 
-/// The bare key of a record id — how every id leaves this API.
-fn key_of(record: &RecordId) -> &str {
-    match &record.key {
-        RecordIdKey::String(key) => key,
-        _ => "",
-    }
-}
-
-/// What a line means. `untagged` + `rename_all` store it as the bare lowercase
-/// string the `kind` column types as, in lockstep with `PAYMENT_LEDGER_KINDS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// What a line means. Stored as the bare lowercase TEXT value the `kind`
+/// column carries, in lockstep with `PAYMENT_LEDGER_KINDS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum PaymentLedgerKind {
     Charge,
     Credit,
@@ -185,17 +177,18 @@ impl PaymentLedgerKind {
 
 /// Fields are crate-visible: [`crate::db::payment_ledger`] mints the charge
 /// rows, and [`crate::service::payment_ledger`] appends the credits, refunds,
-/// and reversals the cap lock authorizes.
-#[derive(Debug, Clone, SurrealValue)]
+/// and reversals the guard authorizes.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PaymentLedger {
     pub(crate) id: PaymentLedgerId,
     pub(crate) student: UserId,
     pub(crate) kind: PaymentLedgerKind,
     pub(crate) amount_minor: LedgerAmount,
-    /// What caused the line: a charge points at its `fee_plan_assignment`, a
-    /// credit at the charge it pays, a refund at the credit it returns, a
-    /// reversal at the line it undoes. Untyped, hence a bare `RecordId`.
-    pub(crate) source: Option<RecordId>,
+    /// What caused the line: a charge points at its `fee_plan_assignment`
+    /// row's `{plan}_{student}` key, a credit at the charge it pays, a refund
+    /// at the credit it returns, a reversal at the line it undoes.
+    /// Polymorphic by kind, hence a bare TEXT key — no foreign key.
+    pub(crate) source: Option<String>,
     /// When this installment falls due. Charges only — nothing else has one.
     pub(crate) due_at: Option<Timestamp>,
     pub(crate) method: Option<LedgerMethod>,
@@ -223,7 +216,7 @@ impl PaymentLedger {
 
     /// The cause's bare key; which table it lives in follows from the kind.
     pub fn get_source_key(&self) -> Option<&str> {
-        self.source.as_ref().map(key_of)
+        self.source.as_deref()
     }
 
     pub fn get_due_at(&self) -> Option<Timestamp> {
@@ -268,26 +261,24 @@ impl PaymentLedger {
 
 #[cfg(test)]
 mod tests {
-    use surrealdb::types::Value;
-
     use super::*;
     use crate::domain::fee_plan::FeePlanId;
-    use crate::domain::user::UserId;
 
-    /// The `kind` column is `TYPE string`: an object-wrapped enum would be
-    /// rejected on write, and a `kind = 'charge'` lookup would silently match
-    /// nothing.
+    /// The `kind` column is `TEXT` with a CHECK on these exact words; the
+    /// sqlx encoding must never drift from `as_str`, or a `kind = 'charge'`
+    /// lookup would silently match nothing.
     #[test]
-    fn kind_stores_as_a_bare_string() {
+    fn sqlx_encodes_the_storage_form() {
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for kind in [
             PaymentLedgerKind::Charge,
             PaymentLedgerKind::Credit,
             PaymentLedgerKind::Reversal,
             PaymentLedgerKind::Refund,
         ] {
-            let value = kind.into_value();
-            assert_eq!(value, Value::String(kind.as_str().to_string()));
-            assert_eq!(PaymentLedgerKind::from_value(value).unwrap(), kind);
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&kind, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), kind.as_str());
         }
     }
 
@@ -335,49 +326,50 @@ mod tests {
     }
 
     /// Idempotence rests on identity: the same (plan, student, installment)
-    /// must always derive the same charge id, and a reversal must be the one
+    /// must always derive the same charge key, and a reversal must be the one
     /// line its target can ever have.
     #[test]
-    fn a_charge_id_is_the_plan_the_student_and_the_installment() {
-        let assignment = FeePlanAssignmentId::composite(
-            &FeePlanId::from_key("plan1"),
-            &UserId::from_key("stu1"),
-        );
+    fn a_charge_key_is_the_plan_the_student_and_the_installment() {
+        const PLAN: &str = "018f1a00-0000-7000-8000-000000000001";
+        const STU: &str = "018f1a00-0000-7000-8000-000000000002";
+        let assignment = FeePlanAssignmentId::composite(&FeePlanId::from_key(PLAN), &UserId::from_key(STU));
         let first = PaymentLedgerId::for_installment(&assignment, 1);
-        assert_eq!(first.key(), "plan1_stu1_c1");
+        assert_eq!(first.key(), format!("{PLAN}_{STU}_c1"));
         assert_eq!(
             PaymentLedgerId::for_installment(&assignment, 1),
             first,
-            "a replayed assign must derive the same id, or it bills twice"
+            "a replayed assign must derive the same key, or it bills twice"
         );
         assert_ne!(PaymentLedgerId::for_installment(&assignment, 2), first);
         assert_eq!(
             PaymentLedgerId::for_reversal(&first).key(),
-            "plan1_stu1_c1_r"
+            format!("{PLAN}_{STU}_c1_r")
         );
     }
 
-    /// A `request_key` is only an idempotence key if it derives the same id
+    /// A `request_key` is only an idempotence key if it derives the same key
     /// every time, and only *safe* if it is scoped by the line it targets and
     /// tells a payment from a refund.
     #[test]
     fn a_request_key_is_scoped_by_its_target_and_its_kind() {
-        let charge = PaymentLedgerId::from_key("plan1_stu1_c1");
-        let other = PaymentLedgerId::from_key("plan1_stu1_c2");
+        const PLAN: &str = "018f1a00-0000-7000-8000-000000000001";
+        const STU: &str = "018f1a00-0000-7000-8000-000000000002";
+        let charge = PaymentLedgerId::from_key(format!("{PLAN}_{STU}_c1"));
+        let other = PaymentLedgerId::from_key(format!("{PLAN}_{STU}_c2"));
         let key = PaymentRequestKey::try_new("receipt-114").unwrap();
         let credit = PaymentLedgerId::for_request(&charge, "k", &key);
 
-        assert_eq!(credit.key(), "plan1_stu1_c1_k_receipt-114");
+        assert_eq!(credit.key(), format!("{PLAN}_{STU}_c1_k_receipt-114"));
         assert_eq!(
             PaymentLedgerId::for_request(&charge, "k", &key),
             credit,
-            "a retry must derive the same id, or it pays twice"
+            "a retry must derive the same key, or it pays twice"
         );
         assert_ne!(PaymentLedgerId::for_request(&other, "k", &key), credit);
         assert_ne!(PaymentLedgerId::for_request(&charge, "kr", &key), credit);
         assert_eq!(
             PaymentLedgerId::for_request(&credit, "kr", &key).key(),
-            "plan1_stu1_c1_k_receipt-114_kr_receipt-114"
+            format!("{PLAN}_{STU}_c1_k_receipt-114_kr_receipt-114")
         );
     }
 }

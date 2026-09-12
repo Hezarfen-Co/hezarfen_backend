@@ -14,8 +14,6 @@
 //!   table, so [`earned`] is a total function of [`BadgeStats`] with no I/O
 //!   and no configuration behind it.
 
-use surrealdb::types::SurrealValue;
-
 use crate::constant::{
     BADGES, EXAM_SAT_TOTAL_FIELD, HIGH_MARK_TOTAL_FIELD, HOMEWORK_ON_TIME_TOTAL_FIELD,
     HOMEWORK_SUBMITTED_TOTAL_FIELD, LESSONS_ATTENDED_TOTAL_FIELD, LESSONS_HELD_TOTAL_FIELD,
@@ -95,9 +93,11 @@ impl BadgeStat {
 }
 
 /// The lifetime counters one user has accumulated, as the badge rules see
-/// them. Every field is a count and never an `Option`: no rows is a true zero,
-/// and an account that predates the columns reads like a fresh one.
-#[derive(Debug, Clone, Default, SurrealValue)]
+/// them. Every field is a count and never an `Option`: the columns are
+/// `BIGINT NOT NULL DEFAULT 0`, so no rows is a true zero.
+/// Not a row shape of its own — it is a projection the user-row queries
+/// select into (`SELECT homework_submitted, … FROM app_user WHERE id = $1`).
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct BadgeStats {
     homework_submitted: i64,
     homework_on_time: i64,
@@ -195,8 +195,10 @@ pub fn earned(stats: &BadgeStats) -> Vec<&'static str> {
         .collect()
 }
 
-/// One badge one user has earned, and when.
-#[derive(Debug, Clone, SurrealValue)]
+/// One badge one user has earned, and when — a projection of the `badge_award`
+/// row (whose identity is the (user, badge) pair) down to the two served
+/// columns.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BadgeAward {
     badge: String,
     earned_at: Timestamp,
@@ -240,8 +242,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_rule_takes_every_threshold_at_or_below_the_count() {
+    #[test]
+    fn the_rule_takes_every_threshold_at_or_below_the_count() {
         let stats = BadgeStats {
             homework_submitted: 10,
             homework_on_time: 9,

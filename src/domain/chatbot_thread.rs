@@ -4,46 +4,42 @@
 //! [`crate::db::chatbot_message`], and deleting a thread cascades them; the
 //! threads' own persistence lives in [`crate::db::chatbot_thread`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{CHATBOT_THREAD_TABLE, MAX_CHATBOT_THREAD_TITLE_LEN};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{MAX_CHATBOT_THREAD_TITLE_LEN};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ChatbotThreadId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ChatbotThreadId(uuid::Uuid);
 
 impl ChatbotThreadId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
-    /// threads sort `updated_at DESC, id DESC` and the id breaks the tie
+    /// Mints from the process-wide monotonic generator, not a plain random
+    /// UUID: threads sort `updated_at DESC, id DESC` and the id breaks the tie
     /// between two threads last touched in the same millisecond,
     /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(CHATBOT_THREAD_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(CHATBOT_THREAD_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
+
 /// A user-chosen thread name. Required-and-bounded here; "untitled" is
 /// `Option<ChatbotThreadTitle>` on the row.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ChatbotThreadTitle(pub(crate) String);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ChatbotThreadTitle(String);
 
 impl ChatbotThreadTitle {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
@@ -56,7 +52,7 @@ impl ChatbotThreadTitle {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChatbotThread {
     pub(crate) id: ChatbotThreadId,
     pub(crate) user_id: UserId,

@@ -1,8 +1,7 @@
 use anyhow::Context;
 use hezarfen_backend::config::Config;
-use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::UserRateLimiter;
-use hezarfen_backend::state::{AppState, DbHealth};
+use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
 
 #[tokio::main]
@@ -29,10 +28,6 @@ async fn main() -> anyhow::Result<()> {
     // all of it idempotent and unconditional on every boot. School databases
     // come up lazily, one connection each, on first use.
     let tenants = database::init(&cfg).await?;
-    let db_up = DbHealth::default();
-    // The control connection is the one every request touches (the school
-    // lookup rides it), so it is the socket worth watching.
-    keepalive(tenants.control().clone(), db_up.clone());
     tokio::fs::create_dir_all(&cfg.files_path)
         .await
         .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
@@ -46,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
         chatbot_limit: UserRateLimiter::per_user_minute(cfg.chatbot_per_minute),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up,
         ai,
         metrics,
     });
@@ -64,76 +58,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!("shutting down");
     Ok(())
-}
-
-/// Ping the database forever so the WebSocket never sits idle long enough to
-/// be dropped, and publish each verdict to `health` so the request guard can
-/// refuse callers while the socket is down.
-///
-/// The ping needs its own deadline. A query issued while the socket is down
-/// does not fail — the SDK parks it until the connection returns, so an
-/// un-deadlined ping hangs exactly as long as the outage and never reports the
-/// outage it exists to detect.
-fn keepalive(db: Database, health: DbHealth) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            hezarfen_backend::constant::DB_KEEPALIVE_INTERVAL_SECS,
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let ping_timeout =
-            std::time::Duration::from_secs(hezarfen_backend::constant::DB_PING_TIMEOUT_SECS);
-        let metrics = hezarfen_backend::telemetry::Metrics::global();
-        // The transitions are what an operator is paged about; a line per tick
-        // would bury them. `None` until the first verdict, so that one always
-        // announces itself.
-        let mut was_up: Option<bool> = None;
-        let mut down_since: Option<tokio::time::Instant> = None;
-        loop {
-            interval.tick().await;
-            // corner-cut: an abandoned ping stays queued in the SDK and replays
-            // when the socket heals, so a long outage lands a burst of no-op
-            // `RETURN 1`s on recovery. Harmless; probe over a raw TCP dial
-            // instead if that burst ever shows up in a profile.
-            let started = tokio::time::Instant::now();
-            let outcome = tokio::time::timeout(ping_timeout, db.query("RETURN 1")).await;
-            let elapsed = started.elapsed();
-            metrics.db_ping_duration.record(elapsed.as_secs_f64(), &[]);
-            let up = match &outcome {
-                Ok(Ok(_)) => {
-                    tracing::debug!("database keepalive ping ok");
-                    true
-                }
-                Ok(Err(err)) => {
-                    tracing::debug!("database keepalive ping failed: {err}");
-                    false
-                }
-                Err(_) => {
-                    tracing::debug!("database keepalive ping timed out");
-                    false
-                }
-            };
-            health.set(up);
-            metrics.db_up.record(u64::from(up), &[]);
-            match (was_up, up) {
-                // The first verdict announces itself either way, so an operator
-                // reading the log can tell "healthy since boot" from "we never
-                // logged anything yet".
-                (None, true) => tracing::info!(db_up = true, "database reachable"),
-                (Some(true) | None, false) => {
-                    down_since = Some(started);
-                    tracing::warn!("database is down: the keepalive ping did not answer");
-                }
-                (Some(false), true) => {
-                    let outage_secs = down_since
-                        .take()
-                        .map_or(0.0, |since| since.elapsed().as_secs_f64());
-                    tracing::warn!(outage_secs, "database is back");
-                }
-                _ => {}
-            }
-            was_up = Some(up);
-        }
-    });
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM. As PID 1 in a container the process

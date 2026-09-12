@@ -1,40 +1,43 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
+use uuid::Uuid;
 
-use crate::constant::{MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN, SUBJECT_TABLE};
+use crate::constant::{MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN};
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct SubjectId(RecordId);
+/// Typed subject row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct SubjectId(Uuid);
 
 impl SubjectId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`: the
+    /// Minted from the process-wide monotonic generator, not a random v4: the
     /// id *is* the curriculum's order ([`crate::db::subject::list_for_course`]
     /// sorts `id ASC`), and a random low half scrambles a burst of saves that
     /// lands inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(SUBJECT_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(SUBJECT_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct SubjectName(String);
 
 impl SubjectName {
@@ -48,7 +51,8 @@ impl SubjectName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct SubjectDescription(String);
 
 impl SubjectDescription {
@@ -66,7 +70,7 @@ impl SubjectDescription {
 /// a subject of its exam's course, so results can later be read per topic. The
 /// course link is fixed at creation — a subject is course content, and moving
 /// it would strand the questions tagged with it.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Subject {
     pub(crate) id: SubjectId,
     pub(crate) course: CourseId,
@@ -98,13 +102,13 @@ mod tests {
 
     /// A teacher entering a curriculum gets it back in the order they typed it:
     /// `list_for_course` sorts `id ASC`, so the ids minted inside one
-    /// millisecond have to sort in mint order. Revert `generate` to
-    /// `Ulid::generate()` and this fails — the low 80 bits are redrawn per id, so a
-    /// same-tick burst comes out shuffled.
+    /// millisecond have to sort in mint order. Revert `generate` to a random
+    /// v4 and this fails — the low bits are redrawn per id, so a same-tick
+    /// burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {
         let ids: Vec<String> = (0..500)
-            .map(|_| SubjectId::generate().key().to_string())
+            .map(|_| SubjectId::generate().key())
             .collect();
         let mut sorted = ids.clone();
         sorted.sort();

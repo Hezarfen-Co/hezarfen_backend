@@ -1,8 +1,6 @@
 //! Personal-info newtypes shared by every account role — student, teacher,
 //! manager, and admin records all carry the same optional contact fields.
 
-use surrealdb::types::SurrealValue;
-
 use crate::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN, MAX_NAME_LEN};
 use crate::domain::badge::BadgeStats;
 use crate::domain::timestamp::Timestamp;
@@ -12,7 +10,8 @@ use crate::validate::{validate_email, validate_optional, validate_phone, validat
 /// A person's given or family name. One type serves both fields — the `field`
 /// tag only steers the error message ("name …" vs "surname …"). Stored trimmed;
 /// unicode is welcome (names are not ASCII).
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct PersonName(String);
 
 impl PersonName {
@@ -27,7 +26,8 @@ impl PersonName {
 }
 
 /// A plausibly-shaped email address (see [`validate_email`]). Stored trimmed.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Email(String);
 
 impl Email {
@@ -43,7 +43,8 @@ impl Email {
 
 /// A phone number: optional leading `+`, 7–15 digits, cosmetic separators
 /// allowed (see [`validate_phone`]). Stored trimmed, separators kept as given.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Phone(String);
 
 impl Phone {
@@ -65,7 +66,8 @@ impl Phone {
 /// UTC+14) legitimately submits a date the server's UTC calendar hasn't
 /// reached yet. Without the grace, "born today" entered from Istanbul or
 /// Auckland shortly after local midnight is wrongly rejected.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct BirthDate(String);
 
 impl BirthDate {
@@ -96,7 +98,8 @@ impl BirthDate {
 /// The name a profile shows instead of the legal one — a nickname, a shortened
 /// form, whatever the person answers to. Stored trimmed; unicode is welcome,
 /// same as [`PersonName`] and unlike the ASCII-only username.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct DisplayName(String);
 
 impl DisplayName {
@@ -113,7 +116,8 @@ impl DisplayName {
 /// A short self-description on the public profile. Free text within
 /// [`MAX_BIO_LEN`], blank allowed — an empty bio is a written-then-erased one,
 /// which is a legitimate state and not an error. Stored trimmed.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Bio(String);
 
 impl Bio {
@@ -136,7 +140,7 @@ impl Bio {
 /// One named struct on purpose: the auto-earned badge rules take a whole
 /// `ProfileStats` as their sole input, so a counter added here reaches them
 /// without touching a signature.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone)]
 pub struct ProfileStats {
     pub(crate) pomodoro_sessions: i64,
     pub(crate) pomodoro_focus_ms: i64,

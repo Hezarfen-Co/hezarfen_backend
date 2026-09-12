@@ -14,40 +14,35 @@
 //! the route-facing wrappers in [`crate::service::class_group`] — this file is
 //! the row shape, its newtypes and getters.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{CLASS_GROUP_TABLE, MAX_CLASS_GRADE_LEN, MAX_CLASS_NAME_LEN};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{MAX_CLASS_GRADE_LEN, MAX_CLASS_NAME_LEN};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ClassGroupId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ClassGroupId(uuid::Uuid);
 
 impl ClassGroupId {
     pub fn generate() -> Self {
-        Self(RecordId::new(CLASS_GROUP_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(CLASS_GROUP_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ClassName(String);
 
 impl ClassName {
@@ -64,7 +59,8 @@ impl ClassName {
 /// The school's own label for the year a class sits in ("9", "10-A",
 /// "anaokulu"). Free text on purpose — no school's grade ladder is the next
 /// one's — and optional: a club-shaped class has no grade at all.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ClassGrade(String);
 
 impl ClassGrade {
@@ -85,9 +81,8 @@ impl ClassGrade {
 /// `teacher` is the section's homeroom teacher (sınıf öğretmeni): optional, not
 /// refcounted, and merely a label pointing at a teacher-or-higher account — the
 /// web layer holds that bar, and a demotion sweeps the column
-/// ([`crate::db::class_group::unassign_everywhere`]). Rows written before the
-/// column exists carry no key at all, which reads back as `None`.
-#[derive(Debug, Clone, SurrealValue)]
+/// ([`crate::db::class_group::unassign_everywhere`]).
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassGroup {
     pub(crate) id: ClassGroupId,
     pub(crate) creator: UserId,

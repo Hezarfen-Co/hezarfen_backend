@@ -9,7 +9,7 @@
 //! `enrollment` rows, and an elective (seçmeli) placed by hand next to them is
 //! still an individual enrollment nothing here can see.
 //!
-//! This module is the pure shape: the id (the grade label *is* the record
+//! This module is the pure shape: the id (the grade label *is* the primary
 //! key, so "one blueprint per grade" holds by construction), the row, the
 //! pump's report types ([`Pumped`], [`Skip`], [`SectionStatus`]) and the
 //! shared skip vocabulary ([`skip_reason`]).
@@ -19,9 +19,7 @@
 //! in [`crate::service::class_blueprint`], the queries in
 //! [`crate::db::class_blueprint`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{CLASS_BLUEPRINT_TABLE, MAX_CLASS_COURSES};
+use crate::constant::{MAX_CLASS_COURSES};
 use crate::db::class_pump::{Attached, Axis};
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroupId};
@@ -29,37 +27,31 @@ use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ClassBlueprintId(RecordId);
+/// A grade label as the table's `TEXT` primary key — one blueprint per grade
+/// by construction, like the settings singleton's `'school'` row: the key is
+/// a name, not a minted entity id.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ClassBlueprintId(String);
 
 impl ClassBlueprintId {
-    /// The record one grade label always maps to. The label is the key, so
-    /// "one blueprint per grade" holds by construction rather than by a
-    /// find-then-insert that two managers can race — the shape
-    /// [`crate::domain::menu::MenuId::for_slot`] uses.
+    /// The key one grade label always maps to.
     pub fn for_grade(grade: &ClassGrade) -> Self {
-        Self(RecordId::new(CLASS_BLUEPRINT_TABLE, grade.as_str()))
+        Self(grade.as_str().to_string())
     }
 
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(CLASS_BLUEPRINT_TABLE, key))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+        Self(key.to_string())
     }
 
     pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+        &self.0
     }
 }
 
 /// One grade's template. `grade` is stored beside the key it *is*, so a read
 /// never has to parse a record id back into a domain value.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassBlueprint {
     pub(crate) id: ClassBlueprintId,
     pub(crate) grade: ClassGrade,
@@ -147,13 +139,13 @@ impl ClassBlueprint {
     }
 
     /// The grade a blueprint may be keyed on. Non-empty, because the label is
-    /// the record id and there is no blueprint for "no grade"; and free of the
-    /// characters that would make that id unaddressable as a URL path segment,
-    /// the second gate [`crate::domain::menu::MenuSlot`] carries for the same
-    /// reason. Grades were never validated for this, so a *class* may already
-    /// carry a label refused here — it simply cannot have a blueprint until it
-    /// is renamed, which is a 400 the caller can read rather than a route
-    /// nobody can reach.
+    /// the primary key and there is no blueprint for "no grade"; and free of
+    /// the characters that would make that key unaddressable as a URL path
+    /// segment, the second gate [`crate::domain::menu::MenuSlot`] carries for
+    /// the same reason. Grades were never validated for this, so a *class* may
+    /// already carry a label refused here — it simply cannot have a blueprint
+    /// until it is renamed, which is a 400 the caller can read rather than a
+    /// route nobody can reach.
     pub fn grade_key(value: &str) -> Result<ClassGrade, AppError> {
         if value.is_empty() {
             return Err(AppError::Validation(ValidationError::Empty("grade")));
@@ -215,12 +207,14 @@ mod tests {
     /// spend two of the ceiling's places on one course.
     #[test]
     fn a_course_list_is_deduplicated_and_bounded() {
-        let algebra = CourseId::from_key("algebra");
+        let algebra = CourseId::from_key("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f");
         let held = ClassBlueprint::course_list(vec![algebra.clone(), algebra.clone()]).unwrap();
         assert_eq!(held, vec![algebra]);
 
+        // One over the ceiling is refused; each key must be a distinct
+        // *parseable* UUID, or the parser would collapse them all to nil.
         let too_many: Vec<CourseId> = (0..=MAX_CLASS_COURSES)
-            .map(|n| CourseId::from_key(&n.to_string()))
+            .map(|n| CourseId::from_key(&format!("0198f1a2-3b4c-7d5e-8f90-{n:012x}")))
             .collect();
         assert!(ClassBlueprint::course_list(too_many).is_err());
     }
