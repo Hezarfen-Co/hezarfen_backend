@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT due_at AS \"due_at: Timestamp\" FROM homework\n               WHERE id = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))\n               FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "due_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "due_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "866efd5fe0b7f2b4524f747d9ef26100e13c48d4cb35d390d29c327180681c60"
+}

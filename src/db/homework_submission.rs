@@ -74,8 +74,15 @@ pub async fn upsert(
         // homework is gone, which is the 404 the web layer's own lookup
         // would have answered.
         let was_due = sqlx::query!(
-            r#"SELECT due_at AS "due_at: Timestamp" FROM homework WHERE id = $1 FOR UPDATE"#,
-            homework_id.uuid()
+            // The audience re-checks UNDER the lock: a narrowing PATCH commits
+            // between the web layer's pre-flight read and this write, and a
+            // student the homework no longer names must read as gone — the
+            // same 404 their own lookup answers.
+            r#"SELECT due_at AS "due_at: Timestamp" FROM homework
+               WHERE id = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
+               FOR UPDATE"#,
+            homework_id.uuid(),
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
