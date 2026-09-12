@@ -1,24 +1,13 @@
 //! The `note` table: one user's rows, listed newest first, deleted together
 //! with their attachment rows.
 
-use surrealdb::types::SurrealValue;
-
-use crate::database::Database;
+use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
 use crate::domain::note_file::NoteFile;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// What [`delete`]'s transaction removed: the note row (empty if it had
-/// already vanished) and every attachment row the cascade took with it — the
-/// only set whose blobs are safe to unlink.
-#[derive(Debug, SurrealValue)]
-struct DeleteOutcome {
-    note: Vec<Note>,
-    files: Vec<NoteFile>,
-}
 
 pub async fn create(
     db: &Database,
@@ -32,8 +21,20 @@ pub async fn create(
         title,
         content,
     };
-    let created: Option<Note> = db.create(note.id.record()).content(note).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create note".into()))
+    // whole-row-save-ok: insert of a fresh UUID row built in place by `new` — there is no prior row to clobber
+    let created = sqlx::query_as!(
+        Note,
+        r#"INSERT INTO note (id, app_user, title, content)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id, app_user AS "user", title, content"#,
+        note.id,
+        note.user,
+        note.title,
+        note.content
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(created)
 }
 
 /// Read a note only if it belongs to `owner`.
@@ -42,8 +43,15 @@ pub async fn read_owned(
     id: &NoteId,
     owner: &UserId,
 ) -> Result<Option<Note>, AppError> {
-    let note: Option<Note> = db.select(id.record()).await?;
-    Ok(note.filter(|note| &note.user == owner))
+    let note = sqlx::query_as!(
+        Note,
+        r#"SELECT id, app_user AS "user", title, content FROM note WHERE id = $1 AND app_user = $2"#,
+        id,
+        owner
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(note)
 }
 
 pub async fn list_for(
@@ -52,9 +60,9 @@ pub async fn list_for(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Note>, i64), AppError> {
-    PagedList::new("note WHERE user = $usr", "ORDER BY id DESC")
-        .bind("usr", owner.record())
-        .run(limit, offset, db)
+    PagedList::new("note WHERE app_user = $1", "ORDER BY id DESC")
+        .bind(owner.uuid())
+        .run::<Note>(limit, offset, db)
         .await
 }
 
@@ -70,9 +78,12 @@ pub async fn update(
     title: Option<NoteTitle>,
     content: Option<NoteContent>,
 ) -> Result<Note, AppError> {
-    FieldUpdate::new(note.id.record())
-        .set("title", title)
-        .set("content", content)
+    FieldUpdate::new("note", note.id.uuid())
+        .set("title", title.map(|title| title.as_str().to_string()))
+        .set(
+            "content",
+            content.map(|content| content.as_str().to_string()),
+        )
         .run::<Note>(db)
         .await
 }
@@ -88,42 +99,48 @@ pub async fn update(
 /// Children first, in one transaction, the way
 /// [`crate::db::course::delete`] does it: as two queries, an
 /// upload that committed in between kept its row while the note went, and
-/// nothing could ever list or delete it again.
+/// nothing could ever list or delete it again. The `rag_output` sweep rides
+/// here too: under real foreign keys a `rag_output` row citing this note
+/// would refuse the delete (`ON DELETE NO ACTION`), and the derived rows
+/// are exactly the thing that may never outlive its input — the web layer's
+/// separate `delete_for_note` call stays, as a harmless idempotent repeat.
 pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), AppError> {
-    let mut result = db
-        .query(
-            "BEGIN TRANSACTION;
-             LET $files = (DELETE note_file WHERE note = $note RETURN BEFORE);
-             LET $gone = (DELETE $note RETURN BEFORE);
-             RETURN { note: $gone, files: $files };
-             COMMIT TRANSACTION;",
+    tx_with_retry(db, true, async |conn| {
+        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id)
+            .execute(&mut *conn)
+            .await?;
+        let files = sqlx::query_as!(
+            NoteFile,
+            r#"DELETE FROM note_file WHERE note = $1 RETURNING id, note, name, content_type, size"#,
+            note.id
         )
-        .bind(("note", note.id.record()))
-        .await?
-        .check()?;
-    // BEGIN is slot 0, the two LETs slots 1-2; the RETURN is slot 3.
-    let outcome = result
-        .take::<Vec<DeleteOutcome>>(3)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to delete note".into()))?;
-    let note = outcome.note.into_iter().next().ok_or(AppError::NotFound)?;
-    Ok((note, outcome.files))
+        .fetch_all(&mut *conn)
+        .await?;
+        let gone = sqlx::query_as!(
+            Note,
+            r#"DELETE FROM note WHERE id = $1 RETURNING id, app_user AS "user", title, content"#,
+            note.id
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let note = gone.ok_or(AppError::NotFound)?;
+        Ok((note, files))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::note_file::{FileContentType, FileName};
 
     /// The blobs the handler unlinks are exactly the rows this transaction
     /// removed — including one uploaded after any pre-read snapshot would have
     /// been taken, which is the row whose blob used to leak.
     #[tokio::test]
     async fn delete_returns_the_attachment_rows_it_removed() {
-        use crate::domain::note_file::{FileContentType, FileName};
-
         let db = crate::database::init_mem().await.unwrap();
-        let owner = crate::domain::user::UserId::generate();
+        let owner = UserId::generate();
         let note = create(
             &db,
             &owner,

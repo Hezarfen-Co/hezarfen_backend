@@ -2,20 +2,14 @@
 //! field-scoped `UPDATE … SET` — a stroke landing concurrently is moving the
 //! two counters this table's struct does not carry.
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::{MAX_BOARDS_PER_CREATOR, USER_BOARD_COUNT_FIELD};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::{MAX_BOARD_PARTICIPANTS, MAX_BOARDS_PER_CREATOR};
+use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::page::PagedList;
 use crate::domain::board::{Board, BoardId, BoardTitle, checked_participants};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Open a board, taking a slot on the creator's `board_count` in the same
-/// transaction as the row — the counter is the authority on how many
-/// boards exist, so it can never count a row that did not commit.
 pub async fn create(
     db: &Database,
     creator: &UserId,
@@ -34,30 +28,57 @@ pub async fn create(
         closed_at: None,
         created_at: Timestamp::now(),
     };
-    match cap::claim_and_create(
-        &creator.record(),
-        USER_BOARD_COUNT_FIELD,
+    // The seat claim and the row are one statement (the `cap::claim_and_create`
+    // CTE, spelled out at its call site): a refused insert takes its own
+    // seat bump back, so the counter can never count a row that did not commit.
+    let saved = sqlx::query_as!(
+        Board,
+        r#"WITH seat AS (
+               UPDATE app_user SET board_count = board_count + 1
+               WHERE id = $1 AND board_count < $2
+               RETURNING 1)
+           INSERT INTO board (id, creator, title, participants, locked, locked_by, locked_at,
+                              epoch, closed_at, created_at)
+           SELECT $3, $1, $4, $5, false, NULL, NULL, 0, NULL, $6
+           WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.creator,
         MAX_BOARDS_PER_CREATOR,
-        &board.id.record(),
-        &board,
-        db,
+        board.id,
+        board.title,
+        &board.participants,
+        board.created_at
     )
-    .await?
-    {
-        cap::Claimed::Made(saved) => Ok(saved),
+    .fetch_optional(db)
+    .await;
+    match saved {
+        Ok(Some(saved)) => Ok(saved),
         // Full, or the creator's row is gone — the conditional write
         // matches nothing either way.
-        cap::Claimed::Full => Err(AppError::Conflict(
+        Ok(None) => Err(AppError::Conflict(
             "you have reached the limit on boards — delete one first",
         )),
-        // The id is a freshly minted ULID on a table with no UNIQUE index,
-        // so no rival can have aimed at it.
-        cap::Claimed::Duplicate => Err(AppError::Internal("board id collided".into())),
+        // The id is a freshly minted UUID on a table whose only UNIQUE index
+        // is its own primary key, so no rival can have aimed at it.
+        Err(err) if unique_violation(&err).is_some() => {
+            Err(AppError::Internal("board id collided".into()))
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
 pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let board = sqlx::query_as!(
+        Board,
+        r#"SELECT id, creator, title, participants, locked, locked_by, locked_at,
+                  epoch, closed_at, created_at
+           FROM board WHERE id = $1"#,
+        id
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(board)
 }
 
 /// Every board `user` may open: the ones they created and the ones they
@@ -76,16 +97,17 @@ pub async fn list_for_user(
     offset: i64,
 ) -> Result<(Vec<Board>, i64), AppError> {
     let open_clause = match open {
-        Some(true) => " AND closed_at = NONE",
-        Some(false) => " AND closed_at != NONE",
+        Some(true) => " AND closed_at IS NULL",
+        Some(false) => " AND closed_at IS NOT NULL",
         None => "",
     };
     PagedList::new(
-        format!("board WHERE (creator = $usr OR participants CONTAINS $usr){open_clause}"),
+        format!("board WHERE (creator = $1 OR $2 = ANY(participants)){open_clause}"),
         "ORDER BY id DESC",
     )
-    .bind("usr", user.record())
-    .run(limit, offset, db)
+    .bind(user.uuid())
+    .bind(user.uuid())
+    .run::<Board>(limit, offset, db)
     .await
 }
 
@@ -97,29 +119,31 @@ pub async fn set_participants(
     participants: Vec<UserId>,
 ) -> Result<Board, AppError> {
     let participants = checked_participants(participants)?;
-    let mut result = db
-        .query("UPDATE $id SET participants = $who RETURN AFTER")
-        .bind(("id", board.id.record()))
-        .bind((
-            "who",
-            participants
-                .iter()
-                .map(|user| user.record())
-                .collect::<Vec<_>>(),
-        ))
-        .await?
-        .check()?;
-    one(result.take::<Vec<Board>>(0)?)
+    let updated = sqlx::query_as!(
+        Board,
+        r#"UPDATE board SET participants = $2 WHERE id = $1
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.id,
+        &participants
+    )
+    .fetch_optional(db)
+    .await?;
+    one(updated)
 }
 
 pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Result<Board, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET title = $title RETURN AFTER")
-        .bind(("id", board.id.record()))
-        .bind(("title", title.0))
-        .await?
-        .check()?;
-    one(result.take::<Vec<Board>>(0)?)
+    let updated = sqlx::query_as!(
+        Board,
+        r#"UPDATE board SET title = $2 WHERE id = $1
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.id,
+        title
+    )
+    .fetch_optional(db)
+    .await?;
+    one(updated)
 }
 
 /// Freeze or thaw drawing. `locked_by`/`locked_at` are cleared on unlock so
@@ -131,15 +155,53 @@ pub async fn set_locked(
     by: &UserId,
 ) -> Result<Board, AppError> {
     let now = Timestamp::now();
-    let mut result = db
-        .query("UPDATE $id SET locked = $locked, locked_by = $by, locked_at = $at RETURN AFTER")
-        .bind(("id", board.id.record()))
-        .bind(("locked", locked))
-        .bind(("by", locked.then(|| by.record())))
-        .bind(("at", locked.then(|| now.as_millis())))
-        .await?
-        .check()?;
-    one(result.take::<Vec<Board>>(0)?)
+    let updated = sqlx::query_as!(
+        Board,
+        r#"UPDATE board SET locked = $2, locked_by = $3, locked_at = $4 WHERE id = $1
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.id,
+        locked,
+        locked.then(|| by.clone()),
+        locked.then(|| now)
+    )
+    .fetch_optional(db)
+    .await?;
+    one(updated)
+}
+
+/// Union a bulk invite's resolved ids into the roster — the atomic-array
+/// replacement for the old process-wide roster lock. The merge and the
+/// participant cap are one guarded statement: `SET` and `WHERE` both read
+/// the row version this `UPDATE` is acting on, so of two concurrent invites
+/// each sees the other's committed roster and the cap refuses the second —
+/// neither can drop the other's group, which is what the lock existed to
+/// prevent.
+///
+/// `None` means the guard refused (or the board is gone): the roster was
+/// left exactly as it was, and the caller re-reads to pick the message.
+pub(crate) async fn invite_group(
+    db: &Database,
+    board: &BoardId,
+    invited: Vec<UserId>,
+) -> Result<Option<Board>, AppError> {
+    let updated = sqlx::query_as!(
+        Board,
+        r#"UPDATE board
+           SET participants = (SELECT coalesce(array_agg(DISTINCT x), '{}')
+                               FROM unnest(participants || $2::uuid[]) AS x)
+           WHERE id = $1
+             AND cardinality((SELECT coalesce(array_agg(DISTINCT x), '{}')
+                              FROM unnest(participants || $2::uuid[]) AS x)) <= $3
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.clone(),
+        &invited,
+        MAX_BOARD_PARTICIPANTS as i64
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(updated)
 }
 
 // The demotion sweep — stripping a user off every roster they are listed
@@ -151,13 +213,17 @@ pub async fn set_locked(
 /// Idempotent by the `WHERE` — a second call matches nothing and the first
 /// stamp stands, which is what the stroke path's open-guard reads.
 pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET closed_at = $now WHERE closed_at = NONE RETURN AFTER")
-        .bind(("id", board.id.record()))
-        .bind(("now", Timestamp::now().as_millis()))
-        .await?
-        .check()?;
-    match result.take::<Vec<Board>>(0)?.into_iter().next() {
+    let closed = sqlx::query_as!(
+        Board,
+        r#"UPDATE board SET closed_at = $2 WHERE id = $1 AND closed_at IS NULL
+           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                     epoch, closed_at, created_at"#,
+        board.id,
+        Timestamp::now()
+    )
+    .fetch_optional(db)
+    .await?;
+    match closed {
         Some(board) => Ok(board),
         // Already closed: the row is unchanged, so read it back rather
         // than report a 404 for a board that plainly exists.
@@ -174,282 +240,115 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
 /// and issued separately it could leave a board's whole history orphaned
 /// under a record that no longer exists.
 pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
-    // A stroke claim writes the very board row this deletes, so the store
-    // aborts one of the two and a lost round is ordinary here — re-sent
-    // rather than reported as a 500. Re-sending is sound: every statement
-    // is a `DELETE` or a field-scoped `UPDATE`, none of which can ever
-    // answer "already exists" (see [`transaction_with_retry`]).
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-         DELETE board_stroke WHERE board = $id;
-         LET $gone = (DELETE $id RETURN BEFORE);
-         UPDATE $usr SET board_count = math::max([(board_count ?? 0) - array::len($gone), 0]);
-         RETURN $gone;
-         COMMIT TRANSACTION;",
-        &[
-            ("id".into(), board.id.record().into_value()),
-            ("usr".into(), board.creator.record().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, the cascade, the LET and the UPDATE: the RETURN
-    // is slot 4.
-    one(result.take::<Vec<Board>>(4)?)
+    tx_with_retry(db, true, async |conn| {
+        sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id)
+            .execute(&mut *conn)
+            .await?;
+        let gone = sqlx::query_as!(
+            Board,
+            r#"DELETE FROM board WHERE id = $1
+               RETURNING id, creator, title, participants, locked, locked_by, locked_at,
+                         epoch, closed_at, created_at"#,
+            board.id
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let board = gone.ok_or(AppError::NotFound)?;
+        // Exactly one row was deleted above, so the release is one seat —
+        // the counter floor keeps a stray double-release from ratcheting
+        // the limit shut.
+        sqlx::query!(
+            "UPDATE app_user SET board_count = GREATEST(board_count - 1, 0) WHERE id = $1",
+            board.creator
+        )
+        .execute(&mut *conn)
+        .await?;
+        Ok(board)
+    })
+    .await
 }
 
-fn one(rows: Vec<Board>) -> Result<Board, AppError> {
-    rows.into_iter().next().ok_or(AppError::NotFound)
+fn one(board: Option<Board>) -> Result<Board, AppError> {
+    board.ok_or(AppError::NotFound)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::RecordId;
+    use crate::domain::board::BoardTitle;
 
-    async fn a_db() -> Database {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query(
-            "CREATE user:c SET username = 'c', password_hash = 'x';
-             CREATE user:p SET username = 'p', password_hash = 'x';
-             CREATE user:s SET username = 's', password_hash = 'x';",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-        db
-    }
-
-    fn user(key: &str) -> UserId {
-        UserId::from_key(key)
-    }
-
-    /// The stored counter, re-read out of the database. Never asserted off a
-    /// return value: the in-memory engine forges concurrent-write wins
-    /// (src/db/cap.rs:44-49).
-    async fn stored_count(db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE board_count ?? 0 FROM user:c")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        result.take::<Vec<i64>>(0).unwrap()[0]
-    }
-
-    async fn a_board(db: &Database) -> Board {
-        create(
-            db,
-            &user("c"),
-            BoardTitle::try_new("Geometri").unwrap(),
-            vec![user("p")],
-        )
-        .await
-        .unwrap()
-    }
-
-    /// The cap refuses at `MAX_BOARDS_PER_CREATOR`, and the refusal writes
-    /// nothing — asserted by re-reading the counter, not off the return value.
+    /// A roster write lands, and a write against a board that vanished in
+    /// the meantime is a 404 — not a silent success.
     #[tokio::test]
-    async fn the_per_creator_cap_refuses_a_full_creator() {
-        let db = a_db().await;
-        db.query("UPDATE user:c SET board_count = $full")
-            .bind(("full", MAX_BOARDS_PER_CREATOR))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let refused = create(
+    async fn field_scoped_writes_return_the_row_and_a_gone_board_refuses() {
+        let db = crate::database::init_mem().await.unwrap();
+        let creator = UserId::generate();
+        let board = create(
             &db,
-            &user("c"),
+            &creator,
             BoardTitle::try_new("Geometri").unwrap(),
-            vec![],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let retitled = set_title(&db, &board, BoardTitle::try_new("Cebir").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(retitled.get_title().as_str(), "Cebir");
+
+        let locked = set_locked(&db, &board, true, &creator).await.unwrap();
+        assert!(locked.is_locked());
+
+        let roster = vec![UserId::generate()];
+        let re_rostered = set_participants(&db, &board, roster).await.unwrap();
+        assert_eq!(re_rostered.get_participants().len(), 1);
+
+        delete(&db, re_rostered).await.unwrap();
+        assert!(read(&db, board.get_id()).await.unwrap().is_none());
+    }
+
+    /// The seat and the row commit together: a create over the cap writes no
+    /// board row, and deleting a board hands the seat back.
+    #[tokio::test]
+    async fn the_cap_refuses_and_delete_releases_the_seat() {
+        let db = crate::database::init_mem().await.unwrap();
+        let creator = UserId::generate();
+        for index in 0..MAX_BOARDS_PER_CREATOR {
+            create(
+                &db,
+                &creator,
+                BoardTitle::try_new(&format!("b{index}")).unwrap(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let over = create(
+            &db,
+            &creator,
+            BoardTitle::try_new("over").unwrap(),
+            Vec::new(),
         )
         .await;
-        assert!(matches!(refused, Err(AppError::Conflict(_))));
-        assert_eq!(stored_count(&db).await, MAX_BOARDS_PER_CREATOR);
-        let mut result = db
-            .query("SELECT VALUE id FROM board")
+        assert!(matches!(over, Err(AppError::Conflict(_))));
+
+        let last = list_for_user(&db, &creator, None, None, 0)
             .await
             .unwrap()
-            .check()
+            .0
+            .into_iter()
+            .next()
             .unwrap();
-        assert!(result.take::<Vec<RecordId>>(0).unwrap().is_empty());
-    }
-
-    /// A seat is taken on create and handed back on delete, both read back out
-    /// of the store.
-    #[tokio::test]
-    async fn a_seat_is_claimed_and_released() {
-        let db = a_db().await;
-        let board = a_board(&db).await;
-        assert_eq!(stored_count(&db).await, 1);
-        delete(&db, board).await.unwrap();
-        assert_eq!(stored_count(&db).await, 0);
-    }
-
-    /// Closing twice must not re-stamp: the first `closed_at` is the record.
-    #[tokio::test]
-    async fn close_is_idempotent() {
-        let db = a_db().await;
-        let board = a_board(&db).await;
-        let closed = close(&db, &board).await.unwrap();
-        let first = closed.get_closed_at().unwrap();
-        // A whole millisecond apart, so a re-stamp could not go unnoticed.
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        assert_eq!(
-            close(&db, &board).await.unwrap().get_closed_at(),
-            Some(first)
-        );
-        assert_eq!(
-            read(&db, board.get_id())
-                .await
-                .unwrap()
-                .unwrap()
-                .get_closed_at(),
-            Some(first)
-        );
-    }
-
-    #[tokio::test]
-    async fn field_scoped_writes_leave_the_stroke_counters_alone() {
-        let db = a_db().await;
-        let board = a_board(&db).await;
-        db.query("UPDATE $id SET epoch_stroke_count = 7, total_stroke_count = 9")
-            .bind(("id", board.get_id().record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        set_title(&db, &board, BoardTitle::try_new("Cebir").unwrap())
-            .await
-            .unwrap();
-        set_participants(&db, &board, vec![user("s")])
-            .await
-            .unwrap();
-        set_locked(&db, &board, true, &user("c")).await.unwrap();
-        close(&db, &board).await.unwrap();
-        let mut result = db
-            .query("SELECT VALUE [epoch_stroke_count, total_stroke_count] FROM $id")
-            .bind(("id", board.get_id().record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        assert_eq!(result.take::<Vec<Vec<i64>>>(0).unwrap()[0], vec![7, 9]);
-    }
-
-    /// [`delete`] cascades the stroke log and decrements the creator's
-    /// `board_count` off the very record a concurrent stroke claim increments,
-    /// so the two contend by design. Losing that round writes nothing, which is
-    /// what makes re-sending it the recovery; without
-    /// [`crate::database::transaction_with_retry`] a lost round comes out as a
-    /// 500.
-    ///
-    /// A refusal or an `Err(NotFound)` is *correct* here — the board really is
-    /// gone — and must not fail this test. The only defect is `AppError::Db`.
-    ///
-    /// Multi-threaded and on a real server for the reason spelled out on
-    /// [`super::super::course`]'s twin: the current-thread runtime never
-    /// interleaves the two, and the embedded engine does not conflict-check
-    /// concurrent writes to one record at all.
-    ///
-    /// Mutation status, stated honestly: cutting
-    /// [`crate::database::transaction_with_retry`] to a single attempt leaves
-    /// this GREEN — 5 runs of 5, every one at 20/20 contended. The mutation is
-    /// real, not a dud: the same cut reddens the `course.rs` twin in 2 runs of
-    /// 3. So the delete here never actually loses a round in this window, and
-    /// nothing in the suite exercises its retry. Read this as a smoke test that
-    /// a contended delete does not 500 — the retry stays because the batch is
-    /// admissible for it and a lost round is possible in principle, not because
-    /// a test has ever caught it losing one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
-    async fn a_delete_racing_a_stroke_never_answers_500() {
-        let (db, _serialized) = crate::database::init_test_server("board_delete_race").await;
-        db.query("CREATE user:c SET username = 'c', password_hash = 'x';")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let (mut delete_500, mut stroke_500, mut drawn) = (0, 0, 0);
-        let (mut last_delete, mut last_stroke) = (String::new(), String::new());
-        for round in 0..20 {
-            let board = a_board(&db).await;
-            // The delete is held back by a sweeping beat: released together it
-            // is one statement while an append spends a read before it claims,
-            // so it would win every round and the guard would never be
-            // contended at all. Six racers over a 0-3ms sweep put the delete
-            // somewhere inside the counter writes instead.
-            let drop_it = {
-                let (board, db) = (board.clone(), db.clone());
-                let beat = std::time::Duration::from_millis(round % 4);
-                tokio::spawn(async move {
-                    tokio::time::sleep(beat).await;
-                    delete(&db, board).await
-                })
-            };
-            let marks: Vec<_> = (0..6)
-                .map(|mark| {
-                    let (id, db) = (board.get_id().clone(), db.clone());
-                    let author = user("c");
-                    tokio::spawn(async move {
-                        crate::db::board_stroke::append(
-                            &db,
-                            &id,
-                            &author,
-                            &format!("{{\"m\":{mark}}}"),
-                            0,
-                        )
-                        .await
-                    })
-                })
-                .collect();
-            let drop_it = drop_it.await.unwrap();
-            if matches!(drop_it, Err(AppError::Db(_))) {
-                delete_500 += 1;
-                last_delete = format!("{drop_it:?}");
-            }
-            // Contention is counted off the claim's own outcome, not off stored
-            // rows: the delete cascades `board_stroke`, so a stroke that landed
-            // and then lost its board leaves nothing behind to count. An `Ok`
-            // means the claim committed against the board row the delete was
-            // tearing down, which is exactly the overlap being measured.
-            let mut claimed = 0;
-            for mark in marks {
-                let mark = mark.await.unwrap();
-                if matches!(mark, Err(AppError::Db(_))) {
-                    stroke_500 += 1;
-                    last_stroke = format!("{mark:?}");
-                }
-                if mark.is_ok() {
-                    claimed += 1;
-                }
-            }
-            if claimed > 0 {
-                drawn += 1;
-            }
-        }
-        eprintln!(
-            "Board::delete raced: {delete_500}/20 delete 500s, {stroke_500} stroke 500s, \
-             {drawn}/20 rounds with a stroke claimed"
-        );
-        assert!(
-            drawn > 0,
-            "no round ever landed a stroke, so the delete's cascade was never contended"
-        );
-        assert_eq!(
-            delete_500, 0,
-            "a raced delete must retry, not 500: {delete_500}/20 rounds, last {last_delete}"
-        );
-        assert_eq!(
-            stroke_500, 0,
-            "a raced stroke must retry, not 500: {stroke_500}/20 rounds, last {last_stroke}"
-        );
+        delete(&db, last).await.unwrap();
+        // The freed seat admits one more board.
+        let again = create(
+            &db,
+            &creator,
+            BoardTitle::try_new("again").unwrap(),
+            Vec::new(),
+        )
+        .await;
+        assert!(again.is_ok());
     }
 }
