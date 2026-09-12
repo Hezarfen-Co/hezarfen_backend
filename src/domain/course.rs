@@ -20,7 +20,7 @@ impl CourseId {
 
     /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
     /// cannot take the newtype. Static `query!` binds take `self` directly.
-    pub fn uuid(&self) -> Uuid {
+    pub fn uuid(&self) -> uuid::Uuid {
         self.0
     }
 
@@ -33,8 +33,11 @@ impl CourseId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
-
 }
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct CourseTitle(String);
+
 impl CourseTitle {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
         validate_required("title", value, MAX_COURSE_TITLE_LEN)?;

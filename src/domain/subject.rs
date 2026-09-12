@@ -40,8 +40,11 @@ impl SubjectId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
-
 }
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct SubjectName(String);
+
 impl SubjectName {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
         validate_required("name", value, MAX_SUBJECT_NAME_LEN)?;
@@ -109,9 +112,7 @@ mod tests {
     /// burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {
-        let ids: Vec<String> = (0..500)
-            .map(|_| SubjectId::generate().key())
-            .collect();
+        let ids: Vec<String> = (0..500).map(|_| SubjectId::generate().key()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);

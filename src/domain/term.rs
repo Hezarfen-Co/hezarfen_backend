@@ -40,7 +40,6 @@ impl TermId {
     pub fn key(&self) -> String {
         self.0.to_string()
     }
-
 }
 pub fn gone_error() -> AppError {
     AppError::Validation(ValidationError::Invalid {

@@ -11,7 +11,6 @@ use crate::domain::course::CourseId;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::AppError;
 
-
 pub async fn create(
     db: &Database,
     course: &CourseId,

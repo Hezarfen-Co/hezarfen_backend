@@ -1,7 +1,7 @@
 //! Course workflows: the archived-term gate every course-scoped write pays,
 //! the staffing changes a manager makes, and the delete that collects the
-//! image/homework/note-file blob keys under the exam and homework locks
-//! before the cascade sweeps those rows. The queries live in
+//! image/homework/note-file blob keys before the guarded cascade sweeps
+//! those rows. The queries live in
 //! [`crate::db::course`].
 
 use crate::database::Database;
@@ -135,24 +135,13 @@ pub struct DeleteOutcome {
 /// Delete the course: collect the image/homework/note-file blob keys, then
 /// run the cascading delete.
 ///
-/// Writer lease of [`crate::service::exam_attempt::EXAM_LOCK`], for
-/// `delete_exam`'s reason: this cascade sweeps the course's exams *and their
-/// attempts*, and an attempt is the one exam child whose write cannot
-/// collide with the sweep (its claim lands on the student's row, never the
-/// exam's). Narrower here — the delete is refused while anyone is enrolled,
-/// so a start would have to pass its enrollment gate and then have that
-/// enrollment removed under it — but the hole is the same one and so is the
-/// lease.
-///
-/// And the homework half of the same cascade, for
-/// [`crate::web::homework::delete_homework`]'s reason: it sweeps the
-/// course's homework with its submissions, files and results, and grading
-/// ([`crate::db::homework_result::grade`]) writes a
-/// result row against a homework it only *read*, which a delete committing
-/// alongside is invisible to. Without this lease the grade lands behind the
-/// sweep: an orphan `homework_result` under a vanished homework, plus a
-/// `marks_given_total` on the grader no ungrade can reach. Lock order here
-/// is EXAM_LOCK then HOMEWORK_LOCK, the only path that takes both.
+/// The old writer leases on the exam-attempt and homework state are gone
+/// with the store that needed them: this cascade is one guarded
+/// transaction whose retry answers a child write that raced it mid-sweep
+/// (`is_retryable_cascade` — a foreign key naming a row the racing write
+/// just landed), so an attempt started or a grade written beside the sweep
+/// is either swept by the re-sent cascade or refused by the very foreign
+/// key it would have orphaned. No lock can out-guard that.
 ///
 /// The keys are read before the delete because it takes their rows with it;
 /// a refused delete just drops them unused. Unlinking the blobs stays the
@@ -160,8 +149,6 @@ pub struct DeleteOutcome {
 /// blob.
 pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, AppError> {
     require_open(db, course).await?;
-    let _guard = crate::service::exam_attempt::EXAM_LOCK.write().await;
-    let _homework_guard = crate::service::homework::HOMEWORK_LOCK.write().await;
     let image_files = crate::db::question_image::file_keys_for_course(db, course.get_id()).await?;
     let answer_image_files =
         crate::db::answer_image::file_keys_for_course(db, course.get_id()).await?;
