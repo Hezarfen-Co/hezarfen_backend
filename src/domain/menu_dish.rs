@@ -5,8 +5,8 @@
 //! at any layer. `tags` are validated against the school's `dietary_tags`
 //! list, the same contract a menu's `slot` has with `meal_slots`.
 //!
-//! The queries live in [`crate::db::menu_dish`]; the dish-cap gate and the
-//! write lock in [`crate::service::menu`].
+//! The queries live in [`crate::db::menu_dish`]; the dish-cap gate in
+//! [`crate::service::menu`].
 
 use sqlx::Type;
 use uuid::Uuid;

@@ -1,14 +1,11 @@
 //! The `meal_booking` table: row reads, the two listings, and the folded
-//! transactions every seat moves by — [`claim_and_place`] (seat + row + charge
-//! in one `BEGIN…COMMIT`) and [`release_seat`] (flip + counter + refund in
-//! one). The book/cancel workflows that sequence these live in
-//! [`crate::service::meal_booking`]; the row shape and the deadline checks in
-//! [`crate::domain::meal_booking`].
+//! transactions every seat moves by — [`claim_and_place`] (seat + row +
+//! charge in one transaction) and [`release_seat`] (flip + counter + refund
+//! in one). The book/cancel workflows that sequence these live in
+//! [`crate::service::meal_booking`]; the row shape and the deadline checks
+//! in [`crate::domain::meal_booking`].
 
-use surrealdb::types::RecordId;
-
-use crate::constant::{CAP_WRITE_TRIES, MENU_SEAT_COUNT_FIELD, MENU_VERSION_FIELD};
-use crate::database::{Database, backoff, lost_the_race};
+use crate::database::{Database, tx_with_retry};
 use crate::db::cap::Claimed;
 use crate::db::page::PagedList;
 use crate::domain::meal_booking::{MealBooking, MealBookingId};
@@ -19,7 +16,16 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 
 pub async fn read(db: &Database, id: &MealBookingId) -> Result<Option<MealBooking>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        MealBooking,
+        "SELECT menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at
+         FROM meal_booking WHERE menu = $1 AND student = $2",
+        id.menu().key(),
+        *id.student(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Every booking on a menu, cancelled ones included — the kitchen's list.
@@ -30,10 +36,10 @@ pub async fn list_for_menu(
     offset: i64,
 ) -> Result<(Vec<MealBooking>, i64), AppError> {
     PagedList::new(
-        "meal_booking WHERE menu = $menu",
-        "ORDER BY created_at DESC, id DESC",
+        "meal_booking WHERE menu = $1",
+        "ORDER BY created_at DESC, student DESC",
     )
-    .bind("menu", menu.record())
+    .bind(menu.key().to_string())
     .run(limit, offset, db)
     .await
 }
@@ -41,10 +47,10 @@ pub async fn list_for_menu(
 /// Every seat held for one of `students`, newest first — a caller's own
 /// list is themselves plus whoever they hold a *live* parent link to.
 ///
-/// Deliberately **not** `booked_by = $usr`: who placed a booking is history
-/// written onto a READONLY column, and history is not a read grant. A
-/// parent whose link was revoked (by an unlink or by the student-side role
-/// sweep) would otherwise keep a live view of the child's seat, watching
+/// Deliberately **not** `booked_by`: who placed a booking is history
+/// written onto a fixed column, and history is not a read grant. A parent
+/// whose link was revoked (by an unlink or by the student-side role sweep)
+/// would otherwise keep a live view of the child's seat, watching
 /// cancellations made long after the link died — exactly what
 /// [`ensure_can_observe`](crate::service::parent_link::ensure_can_observe) refuses. The
 /// caller re-derives the list from the links on every read, so the view
@@ -55,34 +61,52 @@ pub async fn list_for_students(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<MealBooking>, i64), AppError> {
-    PagedList::new(
-        "meal_booking WHERE student IN $students",
-        "ORDER BY created_at DESC, id DESC",
+    if students.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let keys: Vec<String> = students.iter().map(UserId::key).collect();
+    let rows = sqlx::query_as!(
+        MealBooking,
+        "SELECT menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at
+         FROM meal_booking WHERE student = ANY($1::uuid[])
+         ORDER BY created_at DESC, menu DESC
+         LIMIT $2 OFFSET $3",
+        keys,
+        limit,
+        offset,
     )
-    .bind(
-        "students",
-        students.iter().map(UserId::record).collect::<Vec<_>>(),
-    )
-    .run(limit, offset, db)
-    .await
+    .fetch_all(db)
+    .await?;
+    // The window's own total — the same count the paging envelope answers.
+    let total = if limit.is_some() || offset != 0 {
+        sqlx::query_scalar!(
+            "SELECT count(*) FROM meal_booking WHERE student = ANY($1::uuid[])",
+            keys,
+        )
+        .fetch_one(db)
+        .await? as i64
+    } else {
+        rows.len() as i64
+    };
+    Ok((rows, total))
 }
 
 /// Take the seat **and** place the row in one transaction, at the menu
 /// revision the price was read at.
 ///
-/// The seat and the row cannot be two steps. The id is the (menu, student)
-/// pair, so two `POST`s of the same seat both find no row and both claim —
-/// and on a tight cap the second is then told "full" for a seat it never
-/// owed, while the winner's row may not even be visible yet. Here the
-/// duplicate `CREATE` aborts the transaction, which takes its increment with
-/// it: the counter never counts a row that does not exist, and a loser is
-/// answered with the winner's booking instead of a refusal. Same shape as
-/// [`cap::claim_and_create`](crate::db::cap::claim_and_create), with the
-/// revision guard and the revival of a cancelled row that the general form
-/// does not carry.
+/// The seat and the row cannot be two steps. The row key is the (menu,
+/// student) pair, so two `POST`s of the same seat both find no row and both
+/// claim — and on a tight cap the second is then told "full" for a seat it
+/// never owed, while the winner's row may not even be visible yet. Here the
+/// duplicate insert answers [`Claimed::Duplicate`] and the caller replays
+/// the winner, while the whole transaction (seat bump included) rolls back
+/// on any refused path: the counter never counts a row that does not exist.
+/// Same shape as the [`crate::db::cap`] claim recipe, with the revision
+/// guard and the revival of a cancelled row that the general form does not
+/// carry.
 ///
 /// A cancelled row is revived in place (a fresh attempt at `price`) rather
-/// than recreated: `booked_by` and `created_at` are READONLY history — who
+/// than recreated: `booked_by` and `created_at` are fixed history — who
 /// opened the seat, and when.
 ///
 /// **The charge rides this transaction too**, for the same reason the
@@ -93,118 +117,135 @@ pub async fn list_for_students(
 /// moved past. That is why `row.attempt` is minted by the *caller*: the
 /// charge's id is (seat, attempt), so the number cannot be the revival's own
 /// `attempt + 1` any more. The revival is fenced on the attempt it read
-/// instead, so a rival that revived first loses this claim (the `CREATE`
-/// below then finds the row and aborts the whole transaction) rather than
-/// billing its attempt at this call's id.
+/// instead, so a rival that revived first loses this claim (the insert below
+/// then finds the row and answers `Duplicate`) rather than billing its
+/// attempt at this call's id.
 ///
-/// The charge is created only if it is not already there — a duplicate
-/// `CREATE` would abort the transaction and cost the seat, and an attempt
+/// The charge is created only if it is not already there — an attempt
 /// billed twice is the one thing money code may never do.
 pub(crate) async fn claim_and_place(
     db: &Database,
-    seats: &RecordId,
+    menu: &MenuId,
     cap: i64,
     seen: i64,
     row: &MealBooking,
     price: Option<LedgerAmount>,
     charge: Option<&MealLedger>,
 ) -> Result<Claimed<MealBooking>, AppError> {
-    // Empty when the menu is free: a seat that costs nothing owes no line.
-    let bill = match charge {
-        Some(_) => {
-            "IF array::len((SELECT VALUE id FROM $charge)) = 0 \
-                 { CREATE $charge CONTENT $line };"
-        }
-        None => "",
-    };
-    // Slots count BEGIN, three LETs, three IFs and — when there is money to
-    // take — the charge's IF, so the RETURN is slot 7 or 8.
-    let returned = if charge.is_some() { 8 } else { 7 };
-    // Parenthesized `??` throughout: `a ?? 0 = $seen` binds the wrong way.
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $held = (SELECT VALUE id FROM $id WHERE status = 'booked');
-         IF array::len($held) > 0 {{ THROW 'held' }};
-         LET $seat = (UPDATE $menu SET {MENU_SEAT_COUNT_FIELD} = \
-             ({MENU_SEAT_COUNT_FIELD} ?? 0) + 1 \
-             WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) < $cap \
-               AND ({MENU_VERSION_FIELD} ?? 0) = $seen RETURN VALUE id);
-         IF array::len($seat) = 0 {{ THROW 'no_seat' }};
-         LET $revived = (UPDATE $id SET status = 'booked', attempt = $attempt, \
-             price_minor = $price, cancelled_at = NONE \
-             WHERE status = 'cancelled' AND attempt = $attempt - 1 RETURN AFTER);
-         IF array::len($revived) = 0 {{ CREATE $id CONTENT $row }};
-         {bill}
-         RETURN SELECT * FROM ONLY $id;
-         COMMIT TRANSACTION;"
-    );
-    // Every booking on one menu contends on that menu's single counter row,
-    // which is one HTTP burst of racers on a single parent — the case
-    // `CAP_WRITE_TRIES` is sized for. Three immediate re-sends with no
-    // backoff just re-synchronized them and 409'd the fourth student.
-    // Admissible: a lost round aborts the whole transaction (nothing
-    // written, no seat, no charge), and the two `CREATE`s that could
-    // legitimately answer "already exists" are read as `Claimed::Duplicate`
-    // below *before* the conflict check, so no decision is ever re-asked.
-    for attempt in 0..CAP_WRITE_TRIES {
-        backoff(attempt).await;
-        let query = db
-            .query(sql.as_str())
-            .bind(("menu", seats.clone()))
-            .bind(("cap", cap))
-            .bind(("seen", seen))
-            .bind(("id", row.id.record()))
-            .bind(("attempt", row.attempt))
-            .bind(("price", price))
-            .bind(("row", row.clone()));
-        let query = match charge {
-            Some(line) => query
-                .bind(("charge", line.get_id().record()))
-                .bind(("line", line.clone())),
-            None => query,
-        };
-        let mut result = match query.await {
-            Ok(result) => result,
-            Err(err) if lost_the_race(&err) => continue,
-            Err(err) => return Err(err.into()),
-        };
-        // An aborted transaction errors *every* slot, most with a generic
-        // "not executed" — only the failing slot says why, so scan them all.
-        let mut errors = result.take_errors();
-        if errors
-            .values()
-            .any(|error| error.to_string().contains("no_seat"))
-        {
-            return Ok(Claimed::Full);
-        }
-        if errors
-            .values()
-            .any(|error| error.to_string().contains("held") || error.is_already_exists())
-        {
+    let menu_key = menu.key().to_string();
+    let student = row.student;
+    let attempt = row.attempt;
+    tx_with_retry(db, false, async |tx| {
+        // Already held? Same attempt, same price it was taken at — answered
+        // as `Duplicate`, which the caller replays into the winner's row
+        // (and its charge) without claiming anything.
+        let held = sqlx::query!(
+            "SELECT 1 AS held FROM meal_booking
+             WHERE menu = $1 AND student = $2 AND status = 'booked'",
+            menu_key,
+            student,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if held.is_some() {
             return Ok(Claimed::Duplicate);
         }
-        if errors.values().any(lost_the_race) {
-            continue;
+        // The seat: one conditional single-row write on the menu, atomic
+        // under Postgres — of the racers only `cap` of them per revision
+        // get a non-empty result, and the rest are refused with nothing
+        // written.
+        let seat = sqlx::query!(
+            "UPDATE menu SET seats_booked = seats_booked + 1
+             WHERE id = $1 AND seats_booked < $2 AND COALESCE(version, 0) = $3
+             RETURNING 1 AS seat",
+            menu_key,
+            cap,
+            seen,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seat.is_none() {
+            return Ok(Claimed::Full);
         }
-        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-            return Err(error.into());
-        }
-        return match result.take::<Option<MealBooking>>(returned)? {
-            Some(placed) => Ok(Claimed::Made(placed)),
-            None => Err(AppError::Internal("failed to book the meal".into())),
+        // Revive a cancelled row only while it still stands at the attempt
+        // this call read — the fence that keeps a rival's revival from
+        // being billed at this call's ids.
+        let revived = sqlx::query_as!(
+            MealBooking,
+            "UPDATE meal_booking
+             SET status = 'booked', attempt = $3, price_minor = $4, cancelled_at = NULL
+             WHERE menu = $1 AND student = $2
+               AND status = 'cancelled' AND attempt = $3 - 1
+             RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+            menu_key,
+            student,
+            attempt,
+            price,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let placed = match revived {
+            Some(row) => Some(row),
+            None => {
+                // No row (or a rival moved it past this attempt): place a
+                // fresh one. A rival that landed first answers `Duplicate`
+                // — nothing here overwrites its row.
+                let inserted = sqlx::query_as!(
+                    MealBooking,
+                    "INSERT INTO meal_booking
+                         (menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (menu, student) DO NOTHING
+                     RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+                    menu_key,
+                    student,
+                    row.booked_by,
+                    row.status,
+                    row.attempt,
+                    price,
+                    row.cancelled_at,
+                    row.created_at,
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                inserted
+            }
         };
-    }
-    Err(AppError::Conflict(
-        "the menu kept changing underneath this booking",
-    ))
+        let Some(placed) = placed else {
+            return Ok(Claimed::Duplicate);
+        };
+        // The charge rides the same transaction; already there (a replayed
+        // POST of this seat) means fine — nothing is written twice.
+        if let Some(line) = charge {
+            sqlx::query!(
+                "INSERT INTO meal_ledger
+                     (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (id) DO NOTHING",
+                line.id.key(),
+                line.student,
+                line.kind,
+                line.amount_minor,
+                line.source,
+                line.method,
+                line.note,
+                line.recorded_by,
+                line.created_at,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(Claimed::Made(placed))
+    })
+    .await
 }
 
 /// Flip the seat to `cancelled` and give it back to the menu's counter **in
 /// one transaction**, so the two can never disagree: a decrement that ran
 /// without the flip frees a seat still held, and a flip without the
-/// decrement locks a seat nothing can ever release. The counter follows the
-/// flip's own result (`array::len`), so a row already cancelled — by a
-/// racing cancel, or by this call retried — decrements nothing.
+/// decrement locks a seat nothing can ever release. The decrement rides the
+/// flip's own result, so a row already cancelled — by a racing cancel, or
+/// by this call retried — decrements nothing.
 ///
 /// **The refund rides this transaction too**, and it has to: the flip and a
 /// reversal appended after it are two writes, and a crash in between leaves
@@ -230,77 +271,78 @@ pub(crate) async fn claim_and_place(
 /// reversal id is burnt for good.
 ///
 /// `None` = the row was not this call's own `booked` attempt any more.
-/// Retried while the store reports a write conflict: the menu row is
-/// contended by every booking on it, and that contention is the cap
-/// working, not an error.
 pub async fn release_seat(
     db: &Database,
     booked: &MealBooking,
     recorded_by: &UserId,
 ) -> Result<Option<MealBooking>, AppError> {
     let refund = MealLedger::reversal_for(booked, recorded_by);
-    // Guarded three ways: nothing was flipped (a rival cancelled first, and
-    // its own transaction carried the refund), the charge never landed, or
-    // this attempt is already refunded — none of which may abort the flip.
-    let reverse = match refund {
-        Some(_) => {
-            "IF array::len($flipped) > 0 \
-                 AND array::len((SELECT VALUE id FROM $charge)) > 0 \
-                 AND array::len((SELECT VALUE id FROM $reversal)) = 0 \
-                 { CREATE $reversal CONTENT $line };"
+    let menu_key = booked.menu.key().to_string();
+    let student = booked.student;
+    let attempt = booked.attempt;
+    let cancelled_at = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        let flipped = sqlx::query_as!(
+            MealBooking,
+            "UPDATE meal_booking SET status = 'cancelled', cancelled_at = $3
+             WHERE menu = $1 AND student = $2 AND status = 'booked' AND attempt = $4
+             RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+            menu_key,
+            student,
+            cancelled_at,
+            attempt,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if flipped.is_some() {
+            sqlx::query!(
+                "UPDATE menu SET seats_booked = GREATEST(seats_booked - 1, 0) WHERE id = $1",
+                menu_key,
+            )
+            .execute(&mut *tx)
+            .await?;
         }
-        None => "",
-    };
-    // Slots count BEGIN, the LET, the seat UPDATE and — when there is money
-    // to give back — the IF.
-    let returned = if refund.is_some() { 4 } else { 3 };
-    // Same burst on the same counter as the book side, so the same patience
-    // (see [`claim_and_place`]) — a cancel that gave up left the seat
-    // held with the charge standing. Admissible: the round aborts having
-    // written nothing, and a re-send finds the row already `cancelled`, so
-    // the flip matches nothing, the counter moves nothing and the guarded
-    // reversal — keyed to (seat, attempt) — is not written twice.
-    for attempt in 0..CAP_WRITE_TRIES {
-        backoff(attempt).await;
-        let attempted = async {
-            let query = db
-                .query(format!(
-                    "BEGIN TRANSACTION;
-                     LET $flipped = (UPDATE $id SET status = 'cancelled', \
-                         cancelled_at = $now \
-                         WHERE status = 'booked' AND attempt = $attempt RETURN AFTER);
-                     UPDATE $menu SET {MENU_SEAT_COUNT_FIELD} = math::max([\
-                         ({MENU_SEAT_COUNT_FIELD} ?? 0) - array::len($flipped), 0]);
-                     {reverse}
-                     RETURN $flipped;
-                     COMMIT TRANSACTION;"
-                ))
-                .bind(("id", booked.id.record()))
-                .bind(("menu", booked.menu.record()))
-                .bind(("attempt", booked.attempt))
-                .bind(("now", Timestamp::now()));
-            let query = match &refund {
-                Some((charge, line)) => query
-                    .bind(("charge", charge.record()))
-                    .bind(("reversal", line.get_id().record()))
-                    .bind(("line", line.clone())),
-                None => query,
-            };
-            let mut result = query.await?.check()?;
-            result.take::<Vec<MealBooking>>(returned)
+        // Guarded three ways: nothing was flipped (a rival cancelled first,
+        // and its own transaction carried the refund), the charge never
+        // landed, or this attempt is already refunded — none of which may
+        // abort the flip.
+        if let (true, Some((charge, line))) = (flipped.is_some(), &refund) {
+            let charge_there = sqlx::query!(
+                "SELECT 1 AS there FROM meal_ledger WHERE id = $1",
+                charge.key(),
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            let reversal_there = sqlx::query!(
+                "SELECT 1 AS there FROM meal_ledger WHERE id = $1",
+                line.id.key(),
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if charge_there.is_some() && reversal_there.is_none() {
+                sqlx::query!(
+                    "INSERT INTO meal_ledger
+                         (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (id) DO NOTHING",
+                    line.id.key(),
+                    line.student,
+                    line.kind,
+                    line.amount_minor,
+                    line.source,
+                    line.method,
+                    line.note,
+                    line.recorded_by,
+                    line.created_at,
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         }
-        .await;
-        match attempted {
-            Ok(rows) => return Ok(rows.into_iter().next()),
-            Err(err) if lost_the_race(&err) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Err(AppError::Conflict(
-        "the menu kept changing underneath this cancellation",
-    ))
+        Ok(flipped)
+    })
+    .await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,9 +9,10 @@
 //!
 //! **No process-wide lock guards this domain**, and deliberately: every
 //! invariant booking depends on is a *single-record* conditional write (the
-//! menu's `seats_booked` counter and the attempt-fenced row flip), which
-//! SurrealDB itself serializes — a cross-record lock would add contention
-//! without deciding anything the transactions do not already. What the
+//! menu's `seats_booked` counter and the attempt-fenced row flip), which the
+//! guarded writes themselves serialize — a cross-record lock would add
+//! contention without deciding anything the transactions do not already.
+//! What the
 //! service layer owns here is the *sequence*: read the menu, refuse a past
 //! day or a closed cutoff before anything is claimed, settle the attempt
 //! number before the charge id exists, and map the claim's outcomes
@@ -62,7 +63,6 @@ pub async fn book(
     cutoff: &MealCutoff,
 ) -> Result<MealBooking, AppError> {
     let id = MealBookingId::composite(menu, student);
-    let seats = menu.record();
     for attempt in 0..CAP_WRITE_TRIES {
         backoff(attempt).await;
         let fresh = menu::read(db, menu).await?.ok_or(AppError::NotFound)?;
@@ -135,7 +135,7 @@ pub async fn book(
         let charge = MealLedger::charge_for(&fresh_row, booked_by);
         match meal_booking::claim_and_place(
             db,
-            &seats,
+            menu,
             fresh.get_capacity().unwrap_or(cap::UNLIMITED),
             fresh.get_version(),
             &fresh_row,
