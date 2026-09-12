@@ -51,7 +51,7 @@ pub async fn list_for_class(
 ) -> Result<(Vec<ClassCourse>, i64), AppError> {
     PagedList::new(
         format!("{CLASS_COURSE_TABLE} WHERE class = $1"),
-        "ORDER BY attached_at DESC, class DESC, course DESC",
+        "ORDER BY attached_at DESC NULLS LAST, class DESC, course DESC",
     )
     .bind(class.uuid())
     .run(limit, offset, db)

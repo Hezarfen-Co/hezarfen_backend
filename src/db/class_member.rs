@@ -22,7 +22,7 @@ pub async fn list_for_class(
 ) -> Result<(Vec<ClassMember>, i64), AppError> {
     PagedList::new(
         format!("{CLASS_MEMBER_TABLE} WHERE class = $1"),
-        "ORDER BY added_at DESC, class DESC, app_user DESC",
+        "ORDER BY added_at DESC NULLS LAST, class DESC, app_user DESC",
     )
     .bind(class.uuid())
     .run(limit, offset, db)
@@ -40,7 +40,7 @@ pub async fn list_for_user(
 ) -> Result<(Vec<ClassMember>, i64), AppError> {
     PagedList::new(
         format!("{CLASS_MEMBER_TABLE} WHERE app_user = $1"),
-        "ORDER BY added_at DESC, class DESC, app_user DESC",
+        "ORDER BY added_at DESC NULLS LAST, class DESC, app_user DESC",
     )
     .bind(user.uuid())
     .run(limit, offset, db)
