@@ -216,8 +216,8 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
         .execute(&mut *conn)
         .await?;
         if bumped.rows_affected() != 1 {
-            // Unreachable under the row lock; the guard text is the old
-            // THROW marker, kept for the audit trail.
+            // Unreachable under the row lock; the text is the old
+            // refusal marker, kept for the audit trail.
             return Err(AppError::Internal(CLEAR_REFUSED.to_string()));
         }
         let marker = sqlx::query_as!(
@@ -304,18 +304,23 @@ pub async fn history(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<BoardStroke>, i64), AppError> {
-    let scope = match epoch {
-        Some(_) => " AND epoch = $2",
-        None => "",
+    // The builder binds positionally in call order, so each optional clause
+    // takes the placeholder number its position in the bind sequence gives
+    // it — epoch (when present) is always $2, the marker filter $3 only
+    // when the epoch clause is there too.
+    let (scope, kinds) = match (epoch.is_some(), marks_only) {
+        (true, true) => (" AND epoch = $2", " AND kind != $3"),
+        (true, false) => (" AND epoch = $2", ""),
+        (false, true) => ("", " AND kind != $2"),
+        (false, false) => ("", ""),
     };
-    let kinds = if marks_only { " AND kind != $3" } else { "" };
     let mut list = PagedList::new(
         format!("board_stroke WHERE board = $1{scope}{kinds}"),
         "ORDER BY id",
     )
     .bind(board.uuid());
-    if epoch.is_some() {
-        list = list.bind(epoch.unwrap_or_default());
+    if let Some(epoch) = epoch {
+        list = list.bind(epoch);
     }
     if marks_only {
         list = list.bind(KIND_CLEAR.to_string());
