@@ -236,6 +236,9 @@ CREATE TABLE homework_file (
     name         TEXT NOT NULL,
     content_type TEXT NOT NULL,
     size         BIGINT NOT NULL,
+    -- The on-disk blob name (GC key) — READONLY in the old schema, app
+    -- discipline now.
+    file         TEXT NOT NULL,
     created_at   BIGINT NOT NULL
 );
 
