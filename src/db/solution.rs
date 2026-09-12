@@ -1,54 +1,54 @@
-//! The `solution` table: offers (through the pool question's
-//! existence-move), the question-scoped reads and page, the grouped counts,
+//! The `solution` table: offers (their question's existence enforced by the
+//! real foreign key), the question-scoped read and page, the grouped counts,
 //! and the unconditional body/image writes of an unmoderated row. The pure
 //! entity and newtypes live in [`crate::domain::solution`]; the web layer
 //! reaches these through [`crate::service::solution`].
 
 use std::collections::HashMap;
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::database::Database;
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
-use crate::db::pool_question::bump_question_and_write;
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
 use crate::error::AppError;
 
-/// One `GROUP BY question` row of [`counts_for`].
-#[derive(SurrealValue)]
-struct SolutionCount {
-    question: PoolQuestionId,
-    n: i64,
+/// Offer the solution. `NotFound` = the question is gone, and nothing was
+/// written: the insert's foreign key (`solution_question_fkey`) refuses an
+/// orphan the old existence-move transaction spent five statements dodging —
+/// a bare create landing inside
+/// [`crate::db::pool_question::delete`]'s window used to be swept by
+/// nothing and left a solution no route could ever reach or remove (every
+/// path to one goes through its question), photo blob included.
+///
+/// The author's own foreign key never fires in practice (the request
+/// carries a live session user) and stays a database error if it ever does;
+/// only the question's key maps to the 404.
+pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppError> {
+    match sqlx::query_as!(
+        Solution,
+        r#"INSERT INTO solution (id, question, author, body, offered_at)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *"#,
+        solution.id,
+        solution.question,
+        solution.author,
+        solution.body,
+        solution.offered_at,
+    )
+    .fetch_one(db)
+    .await
+    {
+        Ok(row) => Ok(row),
+        Err(err) if is_question_gone(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+    }
 }
 
-/// Offer the solution. `NotFound` = the question is gone, and nothing was
-/// written: the create rides [`bump_question_and_write`], so the question's
-/// existence is a *write* to its row rather than a read the handler made a
-/// moment earlier — a bare create landing inside
-/// [`crate::db::pool_question::delete`]'s
-/// window was swept by nothing and left a solution no route could ever
-/// reach or remove (every path to one goes through its question), photo
-/// blob included.
-///
-/// Re-sendable despite the `CREATE`: `$id` is a ULID minted once per call
-/// on a table with no `UNIQUE` index, so a re-send cannot answer "already
-/// exists" — the one thing the retry could not survive.
-pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppError> {
-    // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-    let (question, id) = (solution.question.clone(), solution.id.record());
-    bump_question_and_write(
-        &question,
-        "CREATE $id CONTENT $solution",
-        vec![
-            ("id".into(), id.into_value()),
-            ("solution".into(), solution.into_value()),
-        ],
-        db,
-    )
-    .await?
-    .ok_or_else(|| AppError::Internal("failed to create solution".into()))
+/// Did this insert fail on the *question* foreign key — the parent-gone
+/// refusal — rather than some unrelated database fault?
+fn is_question_gone(err: &sqlx::Error) -> bool {
+    err.as_database_error().and_then(|db| db.constraint()) == Some("solution_question_fkey")
 }
 
 /// Read a solution only if it belongs to `question` — keeps the nested
@@ -58,32 +58,40 @@ pub async fn read_for(
     id: &SolutionId,
     question: &PoolQuestionId,
 ) -> Result<Option<Solution>, AppError> {
-    let solution: Option<Solution> = db.select(id.record()).await?;
-    Ok(solution.filter(|solution| &solution.question == question))
+    let row = sqlx::query_as!(
+        Solution,
+        "SELECT * FROM solution WHERE id = $1 AND question = $2",
+        id,
+        question
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// The question's solutions, oldest first — a discussion reads downward.
 /// Ordered by `offered_at`; the `id` tiebreak only makes same-millisecond
-/// offers *stable* across re-queries, not insertion-ordered (ULID low bits
-/// are random within a millisecond, so same-ms order is arbitrary).
+/// offers *stable* across re-queries (the ids are write-ordered UUIDv7, so
+/// same-ms rows still sort by mint order).
 pub async fn list_for(
     db: &Database,
     question: &PoolQuestionId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Solution>, i64), AppError> {
+    // `.uuid()` feeds the builder its raw bind value — exact, typed.
     PagedList::new(
-        "solution WHERE question = $q",
+        "solution WHERE question = $1",
         "ORDER BY offered_at ASC, id ASC",
     )
-    .bind("q", question.record())
+    .bind(question.uuid())
     .run(limit, offset, db)
     .await
 }
 
 /// Per-question solution tallies for a page of questions, in one grouped
 /// query — a per-row `count()` would cost a query per question. Keys are
-/// question record keys; a question with no solutions has no entry, so
+/// the questions' wire keys; a question with no solutions has no entry, so
 /// the caller reads misses as zero.
 pub async fn counts_for(
     db: &Database,
@@ -92,18 +100,19 @@ pub async fn counts_for(
     if questions.is_empty() {
         return Ok(HashMap::new());
     }
-    let ids: Vec<RecordId> = questions.iter().map(|question| question.record()).collect();
-    let mut result = db
-        .query(
-            "SELECT question, count() AS n FROM solution WHERE question IN $qs GROUP BY question",
-        )
-        .bind(("qs", ids))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<SolutionCount>>(0)?
+    let ids: Vec<PoolQuestionId> = questions.iter().copied().collect();
+    let rows = sqlx::query!(
+        r#"SELECT question AS "question: PoolQuestionId", count(*) AS n
+           FROM solution
+           WHERE question = ANY($1)
+           GROUP BY question"#,
+        ids,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|row| (row.question.key().to_string(), row.n))
+        .map(|row| (row.question.key(), row.n))
         .collect())
 }
 
@@ -115,13 +124,15 @@ pub async fn set_body(
     id: &SolutionId,
     body: &SolutionBody,
 ) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query("UPDATE $s SET body = $b RETURN AFTER")
-        .bind(("s", id.record()))
-        .bind(("b", body.clone()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+    let row = sqlx::query_as!(
+        Solution,
+        "UPDATE solution SET body = $2 WHERE id = $1 RETURNING *",
+        id,
+        body
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Point the solution at a freshly written image blob. Unconditional for
@@ -129,6 +140,9 @@ pub async fn set_body(
 /// `image_file` is the replaced blob the caller must remove; `None` means
 /// the row was deleted mid-flight (the fresh blob is the caller's orphan
 /// to take back off disk).
+///
+/// The row lock makes the before-read and the write one switch, so two
+/// racing uploads can never both be told they replaced the same blob.
 pub async fn set_image(
     db: &Database,
     id: &SolutionId,
@@ -136,33 +150,68 @@ pub async fn set_image(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query("UPDATE $s SET image_file = $file, image_content_type = $ct, image_size = $size RETURN BEFORE")
-        .bind(("s", id.record()))
-        .bind(("file", file.to_string()))
-        .bind(("ct", content_type.clone()))
-        .bind(("size", size))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+    tx_with_retry(db, false, async |tx| {
+        let before = sqlx::query_as!(
+            Solution,
+            "SELECT * FROM solution WHERE id = $1 FOR UPDATE",
+            *id
+        )
+        .fetch_optional(tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE solution
+               SET image_file = $2, image_content_type = $3, image_size = $4
+               WHERE id = $1"#,
+            *id,
+            file,
+            content_type,
+            size,
+        )
+        .execute(tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Detach the solution's image. Returns the *before* row — its
 /// `image_file` is the blob the caller must remove.
 pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query(
-            "UPDATE $s SET image_file = NONE, image_content_type = NONE, image_size = NONE \
-             RETURN BEFORE",
+    tx_with_retry(db, false, async |tx| {
+        let before = sqlx::query_as!(
+            Solution,
+            "SELECT * FROM solution WHERE id = $1 FOR UPDATE",
+            *id
         )
-        .bind(("s", id.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+        .fetch_optional(tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE solution
+               SET image_file = NULL, image_content_type = NULL, image_size = NULL
+               WHERE id = $1"#,
+            *id,
+        )
+        .execute(tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppError> {
-    let deleted: Option<Solution> = db.delete(solution.id.record()).await?;
+    let deleted = sqlx::query_as!(
+        Solution,
+        "DELETE FROM solution WHERE id = $1 RETURNING *",
+        solution.id
+    )
+    .fetch_optional(db)
+    .await?;
     deleted.ok_or(AppError::NotFound)
 }
 

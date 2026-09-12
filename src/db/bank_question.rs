@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use surrealdb::types::{RecordId, SurrealValue};
+use sqlx::types::Json;
 
-use crate::constant::USAGE_COUNTS_SQL;
-use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::database::{Database, tx_with_retry};
+use crate::db::page::{PagedList, Param};
 use crate::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam::ExamId;
@@ -20,21 +20,6 @@ use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// One `GROUP BY from_bank` row of [`usage_counts`].
-#[derive(SurrealValue)]
-struct UsageCount {
-    from_bank: BankQuestionId,
-    n: i64,
-}
-
-/// What one [`delete`] transaction removed — the template (an empty list once
-/// someone else deleted it first) and the image rows swept with it.
-#[derive(SurrealValue)]
-struct DeleteOutcome {
-    question: Vec<BankQuestion>,
-    images: Vec<BankQuestionImage>,
-}
 
 pub async fn create(
     db: &Database,
@@ -85,24 +70,52 @@ async fn insert(
         BankVisibility::default(),
         Timestamp::now(),
     );
-    let created: Option<BankQuestion> = db.create(question.id.record()).content(question).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create bank question".into()))
+    let row = sqlx::query_as!(
+        BankQuestion,
+        r#"INSERT INTO bank_question
+               (id, owner, subject, text, kind, points, choices, correct,
+                source_exam, visibility, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           RETURNING *"#,
+        question.id,
+        question.owner,
+        question.subject,
+        question.text,
+        question.kind,
+        question.points,
+        question.choices,
+        question.correct,
+        question.source_exam,
+        question.visibility,
+        question.created_at,
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row)
 }
 
 pub async fn read(db: &Database, id: &BankQuestionId) -> Result<Option<BankQuestion>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        BankQuestion,
+        "SELECT * FROM bank_question WHERE id = $1",
+        id
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
-/// One page of the bank the caller may see, **newest first** (ULID ids sort by
-/// creation, so `id DESC` is newest-first) — plus the total row count under
-/// the same filters, so a client can page past the window.
+/// One page of the bank the caller may see, **newest first** (`id DESC` is
+/// mint order — the ids are write-ordered UUIDv7) — plus the total row count
+/// under the same filters, so a client can page past the window.
 ///
-/// Every filter is a WHERE clause and the window is a real `LIMIT`/`START`:
-/// the old version read the whole table and sliced it in memory, which hid
-/// every template past the client's first page. `q` is a case- and
-/// diacritic-insensitive fragment of the question text (blank = no text
-/// filter): needle and column both go through
-/// [`crate::domain::text_fold`], so `istanbul` finds `İSTANBUL` and back.
+/// The window is a real `LIMIT`/`OFFSET` handed to the database (the
+/// [`PagedList`] builder: the filters are runtime-conditional, which is that
+/// builder's named exemption from the compile-time macros). `q` is a case-
+/// and diacritic-insensitive fragment of the question text (blank = no text
+/// filter): needle and column both go through [`crate::domain::text_fold`],
+/// so `istanbul` finds `İSTANBUL` and back. `position` rather than `LIKE`
+/// keeps the needle a *literal* substring — no `%`/`_` wildcard surprises.
 ///
 /// `visible_to` is the security filter, and it is a WHERE clause like every
 /// other one — never a post-filter, or `total` would count templates the
@@ -113,11 +126,13 @@ pub async fn read(db: &Database, id: &BankQuestionId) -> Result<Option<BankQuest
 /// `visibility` is the *user's* filter ("only mine" / "shared with the
 /// school") and is ANDed on top of that gate, so it can only ever narrow:
 /// `school` still hides another teacher's private rows, and `private`
-/// intersected with the gate leaves exactly the caller's own drafts. It
-/// joins the same `clauses` vec as the rest, so `total` honours it too —
-/// a count that ignored it would break paging.
-// Flat filter args, like every other `list` here — a builder struct for
-// four `Option`s and a window would be more machinery than the call sites.
+/// intersected with the gate leaves exactly the caller's own drafts. It is
+/// part of the same WHERE, so `total` honours it too — a count that ignored
+/// it would break paging.
+///
+/// The uuid filters bind raw through the id newtypes' [`crate::domain`]
+/// `uuid()` accessor — [`Param::Uuid`] keeps the comparison exact, typed
+/// rather than textual.
 #[allow(clippy::too_many_arguments)]
 pub async fn list(
     db: &Database,
@@ -130,70 +145,53 @@ pub async fn list(
     offset: i64,
 ) -> Result<(Vec<BankQuestion>, i64), AppError> {
     let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
-    let mut clauses = Vec::new();
-    if visible_to.is_some() {
-        clauses.push("(visibility = 'school' OR owner = $viewer)");
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Param> = Vec::new();
+    if let Some(viewer) = visible_to {
+        binds.push(Param::Uuid(viewer.uuid()));
+        clauses.push(format!(
+            "(visibility = 'school' OR owner = ${})",
+            binds.len()
+        ));
     }
-    if visibility.is_some() {
-        clauses.push("visibility = $visibility");
+    if let Some(visibility) = visibility {
+        binds.push(Param::Text(visibility.as_str().to_string()));
+        clauses.push(format!("visibility = ${}", binds.len()));
     }
-    if owner.is_some() {
-        clauses.push("owner = $owner");
+    if let Some(owner) = owner {
+        binds.push(Param::Uuid(owner.uuid()));
+        clauses.push(format!("owner = ${}", binds.len()));
     }
-    if subject.is_some() {
-        clauses.push("subject = $subject");
+    if let Some(subject) = subject {
+        binds.push(Param::Uuid(subject.uuid()));
+        clauses.push(format!("subject = ${}", binds.len()));
     }
-    let text_clause = format!("{} CONTAINS $q", search_fold_sql("text"));
-    if needle.is_some() {
-        clauses.push(text_clause.as_str());
+    if let Some(needle) = needle {
+        binds.push(Param::Text(needle));
+        clauses.push(format!(
+            "position(${} in {}) > 0",
+            binds.len(),
+            search_fold_sql("text")
+        ));
     }
-    let where_clause = if clauses.is_empty() {
-        "true".to_string()
+    let from_where = if clauses.is_empty() {
+        "bank_question WHERE true".to_string()
     } else {
-        clauses.join(" AND ")
-    };
-    // `START` alone (no `LIMIT`) is the unpaged case — `?limit` is opt-in.
-    let window = match limit {
-        Some(_) => "LIMIT $limit START $offset",
-        None => "START $offset",
+        format!("bank_question WHERE {}", clauses.join(" AND "))
     };
     // The count runs over the *same* WHERE, so `total` can never disagree
     // with what paging through the list actually yields.
-    let mut query = db
-        .query(format!(
-            "SELECT * FROM bank_question WHERE {where_clause} ORDER BY id DESC {window};
-             SELECT VALUE count() FROM bank_question WHERE {where_clause} GROUP ALL;"
-        ))
-        .bind(("offset", offset));
-    if let Some(viewer) = visible_to {
-        query = query.bind(("viewer", viewer.record()));
+    let mut page = PagedList::new(from_where, "ORDER BY id DESC");
+    for bind in binds {
+        page = page.bind(bind);
     }
-    if let Some(visibility) = visibility {
-        query = query.bind(("visibility", visibility.as_str().to_string()));
-    }
-    if let Some(owner) = owner {
-        query = query.bind(("owner", owner.record()));
-    }
-    if let Some(subject) = subject {
-        query = query.bind(("subject", subject.record()));
-    }
-    if let Some(needle) = needle {
-        query = query.bind(("q", needle));
-    }
-    if let Some(limit) = limit {
-        query = query.bind(("limit", limit));
-    }
-    let mut result = query.await?.check()?;
-    let questions = result.take::<Vec<BankQuestion>>(0)?;
-    // `GROUP ALL` yields no row at all when nothing matched.
-    let total = result.take::<Vec<i64>>(1)?.first().copied().unwrap_or(0);
-    Ok((questions, total))
+    page.run(limit, offset, db).await
 }
 
 /// How many exam questions were instantiated from each of `ids` — the
 /// `from_bank` side of the provenance link, tallied for a whole page in
 /// **one** grouped query (a `count()` per row would be the N+1 this page
-/// already had removed once). Keys are template record keys; a template
+/// already had removed once). Keys are the templates' wire keys; a template
 /// nobody ever used has no entry at all, so the caller reads a miss as
 /// zero — and the UI can stay quiet rather than print "0".
 ///
@@ -207,16 +205,22 @@ pub async fn usage_counts(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-    let mut result = db
-        .query(USAGE_COUNTS_SQL)
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<UsageCount>>(0)?
+    let ids: Vec<BankQuestionId> = ids.iter().map(|id| (*id).clone()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT from_bank AS "from_bank: BankQuestionId", count(*) AS n
+           FROM exam_question
+           WHERE from_bank = ANY($1)
+           GROUP BY from_bank"#,
+        ids,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|row| (row.from_bank.key().to_string(), row.n))
+        .filter_map(|row| {
+            let n = row.n;
+            row.from_bank.map(|from_bank| (from_bank.key(), n))
+        })
         .collect())
 }
 
@@ -228,22 +232,13 @@ pub async fn usage_counts(
 /// field is re-stated from the snapshot, and the kind/choices/correct trio
 /// has to be (a text-only edit re-submits the stored options *with their
 /// ids* so each keeps its picture) — so without the compare-and-set the
-/// later writer silently reverts the earlier one — and the window is a
-/// database round trip wide, which is exactly how far apart two concurrent
-/// requests to this one process can sit.
+/// later writer silently reverts the earlier one.
 ///
 /// Every field the merge re-states is in the guard, which is the same list
-/// the `SET` writes. `choices` is compared whole: its objects carry two
-/// required string keys, so none is ever dropped for being `NONE` (the trap
-/// [`crate::db::settings::save_if_unchanged`] works around).
-///
-/// Rides [`write_with_retry`] because an image write now moves this row too
-/// ([`crate::db::bank_question_image::upsert`]): an upload landing in the
-/// same instant makes the store answer "conflict, retry", and a bare
-/// `check()` would turn that into a 500 for an edit that only had to be
-/// re-sent. A lost round writes nothing, and the guard is re-evaluated on
-/// the next one, so a genuine stale merge still comes back as `None`.
-/// Admissible: an `UPDATE` can never answer "already exists".
+/// the `SET` writes; the nullable ones compare `IS NOT DISTINCT FROM`, so an
+/// absent subject/correct/choices guards truthfully. Postgres needs no retry
+/// loop around this: the guard re-evaluates on the row lock at execution, so
+/// a rival write either predates this statement's snapshot or loses its own.
 pub async fn update_if_unchanged(
     db: &Database,
     expected: BankQuestion,
@@ -254,42 +249,40 @@ pub async fn update_if_unchanged(
     visibility: BankVisibility,
 ) -> Result<Option<BankQuestion>, AppError> {
     let (kind, choices, correct) = spec.into_parts();
-    let rows: Vec<BankQuestion> = write_with_retry(
-        db,
-        "UPDATE $id SET subject = $subject, text = $text, points = $points,
-         kind = $kind, choices = $choices, correct = $correct,
-         visibility = $visibility
-         WHERE subject = $was_subject AND text = $was_text
-           AND points = $was_points AND kind = $was_kind
-           AND choices = $was_choices AND correct = $was_correct
-           AND visibility = $was_visibility
-         RETURN AFTER",
-        &[
-            (
-                "was_subject".into(),
-                expected.subject.clone().map(|s| s.record()).into_value(),
-            ),
-            ("was_text".into(), expected.text.clone().into_value()),
-            ("was_points".into(), expected.points.into_value()),
-            ("was_kind".into(), expected.kind.clone().into_value()),
-            ("was_choices".into(), expected.choices.clone().into_value()),
-            ("was_correct".into(), expected.correct.clone().into_value()),
-            (
-                "was_visibility".into(),
-                expected.visibility.clone().into_value(),
-            ),
-            ("id".into(), expected.id.record().into_value()),
-            ("subject".into(), subject.map(|s| s.record()).into_value()),
-            ("text".into(), text.into_value()),
-            ("points".into(), points.into_value()),
-            ("kind".into(), kind.into_value()),
-            ("choices".into(), choices.into_value()),
-            ("correct".into(), correct.into_value()),
-            ("visibility".into(), visibility.into_value()),
-        ],
+    let choices = choices.map(Json);
+    let row = sqlx::query_as!(
+        BankQuestion,
+        r#"UPDATE bank_question SET
+               subject = $2, text = $3, points = $4, kind = $5,
+               choices = $6, correct = $7, visibility = $8
+           WHERE id = $1
+             AND subject IS NOT DISTINCT FROM $9
+             AND text = $10
+             AND points = $11
+             AND kind = $12
+             AND choices IS NOT DISTINCT FROM $13
+             AND correct IS NOT DISTINCT FROM $14
+             AND visibility = $15
+           RETURNING *"#,
+        expected.id,
+        subject,
+        text,
+        points,
+        kind,
+        choices,
+        correct,
+        visibility,
+        expected.subject,
+        expected.text,
+        expected.points,
+        expected.kind,
+        expected.choices,
+        expected.correct,
+        expected.visibility,
     )
+    .fetch_optional(db)
     .await?;
-    Ok(rows.into_iter().next())
+    Ok(row)
 }
 
 /// Delete the template and cascade-remove its bank images, so none points
@@ -297,59 +290,53 @@ pub async fn update_if_unchanged(
 /// actually removed come back with it: the blobs are the web layer's to
 /// take off disk, but only for *these* rows — an upload that committed
 /// after the caller listed the template's images is swept here too, and a
-/// pre-read snapshot would strand its blob for good
-/// ([`crate::db::note::delete`]'s story, this domain over).
+/// pre-read snapshot would strand its blob for good.
 ///
-/// Children first, in one transaction: as two queries, a failure between
-/// them left image rows swept under a template that survived, or (the other
-/// order) a template gone with its images still there. Rides the retry
-/// because an image write now moves this very row
-/// ([`crate::db::bank_question_image::upsert`]) — the two contend by
-/// design, and a lost round through a bare `check()` would be a 500 for a
-/// delete that only had to be re-sent. Admissible: no `UPDATE` or `DELETE`
-/// in here can answer "already exists".
-///
-/// Exam questions tied to this template keep living: only their provenance
-/// links are cleared, field-scoped (never a whole-row save — the question
-/// isn't ours and may be edited concurrently), so nothing can read a link to
-/// a template that no longer exists. *Both* directions point at a template,
-/// so both are cleared: `from_bank` on the questions instantiated from it,
-/// and `banked_as` on the question it was saved out of.
+/// All four statements are one transaction, children before the parent so
+/// the foreign keys never refuse the parent delete: the provenance links
+/// clear first (exam questions tied to this template keep living — only the
+/// links go, field-scoped, in both directions: `from_bank` on the questions
+/// instantiated from it and `banked_as` on the question it was saved out
+/// of), then the image sweep, then the row. `cascade = true` because an
+/// image upsert committing inside this window makes the parent delete
+/// answer 23503 — a mid-cascade race the retry loop re-runs, sweeping the
+/// latecomer with it.
 pub async fn delete(
     db: &Database,
     target: BankQuestion,
 ) -> Result<(BankQuestion, Vec<BankQuestionImage>), AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-         LET $images = (DELETE bank_question_image WHERE bank_question = $b RETURN BEFORE);
-         UPDATE exam_question SET from_bank = NONE WHERE from_bank = $b;
-         UPDATE exam_question SET banked_as = NONE WHERE banked_as = $b;
-         LET $gone = (DELETE $b RETURN BEFORE);
-         RETURN { question: $gone, images: $images };
-         COMMIT TRANSACTION;",
-        &[("b".into(), target.id.record().into_value())],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    let outcome = result
-        .take::<Vec<DeleteOutcome>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to delete bank question".into()))?;
-    let question = outcome
-        .question
-        .into_iter()
-        .next()
+    tx_with_retry(db, true, async |tx| {
+        let id = target.id.clone();
+        sqlx::query!(
+            "UPDATE exam_question SET from_bank = NULL WHERE from_bank = $1",
+            id
+        )
+        .execute(tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE exam_question SET banked_as = NULL WHERE banked_as = $1",
+            id
+        )
+        .execute(tx)
+        .await?;
+        let images = sqlx::query_as!(
+            BankQuestionImage,
+            "DELETE FROM bank_question_image WHERE bank_question = $1 RETURNING *",
+            id
+        )
+        .fetch_all(tx)
+        .await?;
+        let question = sqlx::query_as!(
+            BankQuestion,
+            "DELETE FROM bank_question WHERE id = $1 RETURNING *",
+            id
+        )
+        .fetch_optional(tx)
+        .await?
         .ok_or(AppError::NotFound)?;
-    Ok((question, outcome.images))
+        Ok((question, images))
+    })
+    .await
 }
 
 #[cfg(test)]
