@@ -51,11 +51,13 @@ async fn a_kind_off_the_schools_list_cannot_be_graded_even_with_a_live_counter()
 
     // The corrupt half a lost settings race used to leave: the name is off the
     // list, but its counter says "in service".
-    db.query("UPSERT kind_ref:midterm SET retired = false")
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO kind_ref (name, count, retired) VALUES ('midterm', 0, false)
+         ON CONFLICT (name) DO UPDATE SET retired = false",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
 
     let res = send(
         &app,
@@ -318,29 +320,20 @@ async fn clear(app: &axum::Router, cookie: &str, board: &str) -> common::Res {
 
 /// Rows on `board_stroke` for one board, markers included.
 async fn rows(db: &hezarfen_backend::database::Database, board: &str) -> usize {
-    let mut result = db
-        .query("SELECT VALUE id FROM board_stroke WHERE board = $b")
-        .bind(("b", BoardId::from_key(board).record()))
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM board_stroke WHERE board = $1")
+        .bind(BoardId::from_key(board))
+        .fetch_one(db)
         .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len()
+        .unwrap() as usize
 }
 
 /// The board's stored epoch — the clear's other half.
 async fn stored_epoch(db: &hezarfen_backend::database::Database, board: &str) -> i64 {
-    let mut result = db
-        .query("SELECT VALUE epoch FROM $b")
-        .bind(("b", BoardId::from_key(board).record()))
+    sqlx::query_scalar::<_, i64>("SELECT epoch FROM board WHERE id = $1")
+        .bind(BoardId::from_key(board))
+        .fetch_one(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<i64>>(0).unwrap()[0]
 }
 
 /// The clear marker is a row on the table, so the lifetime counter has to
@@ -399,15 +392,13 @@ async fn a_clear_marker_is_charged_to_the_lifetime_counter() {
 
 /// `(epoch_stroke_count, total_stroke_count)` as the store holds them.
 async fn counters(db: &hezarfen_backend::database::Database, board: &str) -> (i64, i64) {
-    let mut result = db
-        .query("SELECT VALUE [epoch_stroke_count ?? 0, total_stroke_count ?? 0] FROM $b")
-        .bind(("b", BoardId::from_key(board).record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    let rows: Vec<Vec<i64>> = result.take(0).unwrap();
-    (rows[0][0], rows[0][1])
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT epoch_stroke_count, total_stroke_count FROM board WHERE id = $1",
+    )
+    .bind(BoardId::from_key(board))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// A menu's record id is `<date>_<slot>` and that id is a URL path segment, so
@@ -451,10 +442,10 @@ async fn a_slot_name_that_no_menu_id_could_carry_is_refused_by_settings() {
     // wedge an edit that never touches the meal slots. The carried-over list
     // goes back into the row as it stands (`MealSlotDef::try_new` runs on the
     // *request's* slots only), so an unrelated PATCH still lands.
-    db.query("UPDATE settings:school SET meal_slots = [{ name: 'a/b', serving_minute: NONE }]")
+    sqlx::query("UPDATE settings SET meal_slots = $1 WHERE id = 'school'")
+        .bind(json!([{ "name": "a/b", "serving_minute": null }]))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     let res = send(
         &app,
@@ -472,66 +463,6 @@ async fn a_slot_name_that_no_menu_id_could_carry_is_refused_by_settings() {
     );
 }
 
-/// A board an older binary cleared carries a lifetime counter short by one row
-/// per past clear, because the marker only started paying it on 2026-08-02 —
-/// and `MAX_BOARD_STROKES` bounds *rows*, so an under-counted board can outgrow
-/// the table cap it is supposed to obey. Boot recomputes the counter from the
-/// rows themselves, which is what the counter means.
-#[tokio::test]
-async fn a_boards_lifetime_counter_is_repaired_from_its_rows_on_boot() {
-    let (app, db) = app_and_db().await;
-    let ali = login(&app, "ali").await;
-    let ali_id = me_id(&app, &ali).await;
-    let res = send(
-        &app,
-        "POST",
-        "/boards",
-        Some(&ali),
-        Some(json!({ "title": "Geometri", "participants": [] })),
-    )
-    .await;
-    let board = id_of(&res.body);
-    hezarfen_backend::db::board_stroke::append(
-        &db,
-        &BoardId::from_key(&board),
-        &UserId::from_key(&ali_id),
-        "{\"p\":[1,2]}",
-        0,
-    )
-    .await
-    .expect("append");
-    clear(&app, &ali, &board).await;
-    assert_eq!(rows(&db, &board).await, 2, "the stroke and its marker");
-
-    // Age the row to what the previous binary left behind: the marker charged
-    // nothing, so the counter counts the stroke alone.
-    db.query("UPDATE $b SET total_stroke_count = 1")
-        .bind(("b", BoardId::from_key(&board).record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    assert_eq!(counters(&db, &board).await, (0, 1));
-
-    hezarfen_backend::database::migrate(&db)
-        .await
-        .expect("re-migration");
-    assert_eq!(
-        counters(&db, &board).await,
-        (0, 2),
-        "the counter is the board's row count again"
-    );
-
-    // Idempotent: it recomputes the same number, it does not add one per boot —
-    // the failure mode a counter repair actually has.
-    for _ in 0..2 {
-        hezarfen_backend::database::migrate(&db)
-            .await
-            .expect("re-migration");
-    }
-    assert_eq!(counters(&db, &board).await, (0, 2));
-    assert_eq!(rows(&db, &board).await, 2, "and it wrote no rows");
-}
 
 /// A slot name the school *already stores* must stay submittable.
 ///
@@ -559,14 +490,20 @@ async fn a_stale_slot_name_no_longer_wedges_the_rest_of_the_list() {
 
     // The list as a database written before the rule holds it, plus the menu
     // reference that makes dropping the name a 409.
-    db.query(
-        "UPDATE settings:school SET meal_slots = \
-         [{ name: 'a/b', serving_minute: NONE }, { name: 'lunch', serving_minute: NONE }];
-         UPSERT slot_ref:`a/b` SET count = 1;",
+    sqlx::query("UPDATE settings SET meal_slots = $1 WHERE id = 'school'")
+        .bind(json!([
+            { "name": "a/b", "serving_minute": null },
+            { "name": "lunch", "serving_minute": null },
+        ]))
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO slot_ref (name, count, retired) VALUES ('a/b', 1, false)
+         ON CONFLICT (name) DO UPDATE SET count = 1",
     )
+    .execute(&db)
     .await
-    .unwrap()
-    .check()
     .unwrap();
 
     // Editing the *rest* of the list works, stale name carried along.

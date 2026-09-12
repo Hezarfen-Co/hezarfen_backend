@@ -348,6 +348,34 @@ pub async fn set_role_cascade(
     // higher-ranked `Send` check `tx_with_retry`'s future must pass.
     let target = *target;
     tx_with_retry(db, true, async move |tx| {
+        // The floor's serialization point: a demotion takes the admin set's
+        // row locks *before* the write, so two same-instant demotions of
+        // each other cannot both count the other as the surviving admin —
+        // the loser re-counts against the winner's commit and refuses
+        // here. (The predicate on the `UPDATE` below stays as the write's
+        // own guard; under these locks it can no longer be raced past.)
+        if role != Role::Admin {
+            let current = sqlx::query!(
+                r#"SELECT role AS "role: Role" FROM app_user WHERE id = $1"#,
+                target.uuid()
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.role);
+            if current == Some(Role::Admin) {
+                let admins = sqlx::query_as::<_, (uuid::Uuid,)>(
+                    "SELECT id FROM app_user WHERE role = 'admin' FOR UPDATE",
+                )
+                .fetch_all(&mut *tx)
+                .await?;
+                if admins.len() <= 1 {
+                    return Err(AppError::Conflict(
+                        "the school must keep at least one admin — promote another account first",
+                    ));
+                }
+            }
+        }
+
         // The role write, floor guard included. `$2 <> 'admin'` arms the
         // guard only for a demotion: a promotion or a same-role rewrite can
         // never orphan the admins.
@@ -808,7 +836,7 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::Password;
 
     fn png() -> FileContentType {
@@ -831,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_profile_write_cannot_revert_a_role_change() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("aysenur", &db).await;
 
         // A PATCH /users/me handler reads its snapshot (role = student)...
@@ -875,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_avatar_upload_cannot_revert_a_role_change() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("berk", &db).await;
 
         // The upload handler holds its snapshot (role = student)...
@@ -928,7 +956,7 @@ mod tests {
     /// no route ever collects.
     #[tokio::test]
     async fn the_avatar_writers_return_the_replaced_blob() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("ceyda", &db).await;
 
         let before = set_avatar(&db, user.get_id(), "blob-1", &png(), 10)

@@ -233,27 +233,41 @@ async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
     }
 }
 
-/// A term row written before `archived_at` existed has no such column. It must
-/// still decode — as an open term — or the migration would have needed a
-/// backfill it deliberately does not have.
+/// A term row with no `archived_at` (NULL = open) must decode and stay
+/// archivable — the row a pre-port database arrives with is not special.
 #[tokio::test]
 async fn a_pre_migration_term_row_still_decodes_as_open() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "archive_legacy_manager", "manager").await;
 
-    db.query("CREATE term:legacy SET name = 'old', starts_at = 100, ends_at = 200")
+    let legacy = hezarfen_backend::domain::term::TermId::generate();
+    sqlx::query("INSERT INTO term (id, name, starts_at, ends_at) VALUES ($1, 'old', 100, 200)")
+        .bind(legacy)
+        .execute(&db)
         .await
-        .expect("legacy term query")
-        .check()
-        .expect("legacy term check");
+        .expect("legacy term query");
 
-    let res = send(&app, "GET", "/terms/legacy", Some(&manager), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/terms/{}", legacy.key()),
+        Some(&manager),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "pre-migration row must decode");
     assert_eq!(res.body["name"], "old");
     assert!(res.body["archived_at"].is_null(), "absent = open");
 
     // And it is still writable, archiving included.
-    let archived = send(&app, "POST", "/terms/legacy/archive", Some(&manager), None).await;
+    let archived = send(
+        &app,
+        "POST",
+        &format!("/terms/{}/archive", legacy.key()),
+        Some(&manager),
+        None,
+    )
+    .await;
     assert_eq!(archived.status, StatusCode::OK);
     assert!(archived.body["archived_at"].as_i64().is_some());
 }

@@ -300,14 +300,14 @@ impl FieldUpdate {
         let guard_sql = if conditions.is_empty() {
             String::new()
         } else {
-            format!(" WHERE {}", conditions.join(" AND "))
+            format!("{} AND ", conditions.join(" AND "))
         };
         // The row id binds last, after the CAS value.
         binds.push(Param::Uuid(self.id));
         let id_at = binds.len();
         let update = format!(
-            "UPDATE {} SET {}{} WHERE id = ${id_at} RETURNING *",
-            self.table, set_sql, guard_sql
+            "UPDATE {} SET {} WHERE {guard_sql}id = ${id_at} RETURNING *",
+            self.table, set_sql
         );
         let rows: Vec<PgRow> = match moved {
             Some(rc) => {

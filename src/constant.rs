@@ -414,21 +414,6 @@ pub const MAX_EXAM_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 /// default — is the classic single sitting.
 pub const MAX_EXAM_ATTEMPTS: i64 = 100;
 pub const UNLIMITED_EXAM_ATTEMPTS: i64 = 0;
-
-/// Cadence of the background keepalive query on the database WebSocket. The
-/// traffic keeps the connection from being dropped as idle; when it does drop,
-/// the ping also makes the SDK notice and reconnect long before the next real
-/// request would. Doubles as the liveness probe behind
-/// [`crate::state::DbHealth`], so this is also the widest window in which a
-/// request can reach a socket already known-dead — keep it short.
-pub const DB_KEEPALIVE_INTERVAL_SECS: u64 = 5;
-
-/// How long a keepalive ping may hang before the socket counts as down. The
-/// SDK parks queries indefinitely while it reconnects (its retry loop stops
-/// draining the request channel), so the ping needs its own deadline or the
-/// probe hangs with everything else and never reports.
-pub const DB_PING_TIMEOUT_SECS: u64 = 2;
-
 /// Ceiling on a single HTTP request. Backstop for requests that reached the
 /// database in the window between the socket dying and the keepalive noticing:
 /// without it they park until the database returns, which can be hours.

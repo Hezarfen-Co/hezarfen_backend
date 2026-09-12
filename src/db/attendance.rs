@@ -3,7 +3,7 @@
 //! persistence half; the workflow that decides it lives in
 //! [`crate::service::attendance`].
 
-use crate::database::{Database, foreign_key_violation};
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::EventId;
@@ -26,28 +26,48 @@ pub async fn mark(
     status: AttendanceStatus,
     marked_by: &UserId,
 ) -> Result<Attendance, AppError> {
-    match query_as!(
-        Attendance,
-        "INSERT INTO attendance (event, app_user, status, marked_by)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
-         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
-                  status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
-        event.uuid(),
-        user.uuid(),
-        status.as_str(),
-        marked_by.uuid()
-    )
-    .fetch_one(db)
+    // Owned captures (`Send` rule of `tx_with_retry`'s closure).
+    let event = event.clone();
+    let user = *user;
+    let marked_by = *marked_by;
+    tx_with_retry(db, false, async move |tx| {
+        // The existence gate and the collision key: the event row is locked
+        // inside the mark's own transaction, so a concurrent delete cascade
+        // either lands whole before the mark (404, nothing stored) or queues
+        // behind the mark's commit — and then its sweep, reading after that
+        // commit, takes the mark's row with it. Without the lock the insert
+        // never queued on the event at all: a mark racing
+        // `DELETE /events/{id}` could commit an orphan its cascade's
+        // already-run sweep never saw.
+        let live = sqlx::query!(
+            r#"SELECT 1 AS "one!: i64" FROM event WHERE id = $1 FOR NO KEY UPDATE"#,
+            event.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            // The event row is gone: exactly today's "no such event" refusal.
+            // (The foreign keys name users the routes already authenticated;
+            // a violation there stays a database error, as before.)
+            return Err(AppError::NotFound);
+        }
+        let row = query_as!(
+            Attendance,
+            "INSERT INTO attendance (event, app_user, status, marked_by)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
+             RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                      status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
+            event.uuid(),
+            user.uuid(),
+            status.as_str(),
+            marked_by.uuid()
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(row)
+    })
     .await
-    {
-        Ok(row) => Ok(row),
-        // The event row is gone: exactly today's "no such event" refusal.
-        // (The other foreign keys name users the routes already authenticated;
-        // a violation there stays a database error, as before.)
-        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
-        Err(err) => Err(err.into()),
-    }
 }
 
 pub async fn list_for_event(

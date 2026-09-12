@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) AS \"sessions!: i64\",\n                  COALESCE(sum(finished_at - started_at), 0) AS \"focus_ms!: i64\"\n           FROM pomodoro_session\n           WHERE app_user = $1 AND finished_at IS NOT NULL",
+  "query": "SELECT count(*) AS \"sessions!: i64\",\n                  COALESCE(sum(finished_at - started_at), 0)::BIGINT AS \"focus_ms!: i64\"\n           FROM pomodoro_session\n           WHERE app_user = $1 AND finished_at IS NOT NULL",
   "describe": {
     "columns": [
       {
@@ -12,7 +12,7 @@
       {
         "ordinal": 1,
         "name": "focus_ms!: i64",
-        "type_info": "Numeric",
+        "type_info": "Int8",
         "origin": "Expression"
       }
     ],
@@ -26,5 +26,5 @@
       null
     ]
   },
-  "hash": "7637d8ff1d6caf97b2de396315c95e4f33670bc298ef7898e68d711801a38a41"
+  "hash": "359eba2c5bf9ed23c74001a159dd10c4f68e85c0116689d175e59f713c43a947"
 }

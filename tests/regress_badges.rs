@@ -349,11 +349,10 @@ fn soon() -> i64 {
 /// the past — which is what makes the counter's own gate worth having, since a
 /// client can only ever schedule *forward* into an unheld lesson.
 async fn ring_the_bell(db: &Database, session: &str) {
-    db.query("UPDATE type::record('course_session', $id) SET starts_at = 1")
-        .bind(("id", session.to_string()))
+    sqlx::query("UPDATE course_session SET starts_at = 1 WHERE id = $1")
+        .bind(hezarfen_backend::domain::course_session::CourseSessionId::from_key(session))
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 }
 
@@ -505,13 +504,15 @@ async fn a_correction_lowers_the_counter_but_never_takes_the_badge_back() {
 async fn stint(app: &Router, db: &Database, cookie: &str, user: &str) {
     let started = send(app, "POST", "/pomodoro/start", Some(cookie), None).await;
     assert_eq!(started.status, StatusCode::CREATED, "{}", started.body);
-    db.query("UPDATE type::record('pomodoro_session', $id) SET started_at = started_at - $ms")
-        .bind(("id", format!("open_{user}")))
-        .bind(("ms", MIN_COUNTED_POMODORO_MS))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    sqlx::query(
+        "UPDATE pomodoro_session SET started_at = started_at - $2
+         WHERE app_user = $1 AND finished_at IS NULL",
+    )
+    .bind(hezarfen_backend::domain::user::UserId::from_key(user))
+    .bind(MIN_COUNTED_POMODORO_MS)
+    .execute(db)
+    .await
+    .unwrap();
     let finished = send(app, "POST", "/pomodoro/finish", Some(cookie), None).await;
     assert_eq!(finished.status, StatusCode::OK, "{}", finished.body);
     assert_eq!(
@@ -532,14 +533,13 @@ async fn stint(app: &Router, db: &Database, cookie: &str, user: &str) {
 /// day boundary — the streak's day arithmetic itself is the domain suite's to
 /// pin, and what this buys is the *badge* arriving on a real profile.
 async fn age_one_day(db: &Database, user: &str) {
-    db.query(format!(
-        "UPDATE type::record('user', $id)
-         SET {STUDY_STREAK_LAST_DAY_FIELD} = {STUDY_STREAK_LAST_DAY_FIELD} - 1"
-    ))
-    .bind(("id", user.to_string()))
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE app_user SET {STUDY_STREAK_LAST_DAY_FIELD} = \
+         {STUDY_STREAK_LAST_DAY_FIELD} - 1 WHERE id = $1"
+    )))
+    .bind(hezarfen_backend::domain::user::UserId::from_key(user))
+    .execute(db)
     .await
-    .unwrap()
-    .check()
     .unwrap();
 }
 
@@ -617,42 +617,40 @@ async fn a_profile_read_owes_nothing_the_write_site_already_paid() {
     let asker_id = me_id(&app, &asker).await;
     let bystander = login(&app, "nobody").await;
 
-    // The counter row is seeded so the probe reads a real zero: selecting from
-    // a table nothing has written yet is an error, not an empty answer.
-    db.query(
-        "UPSERT type::record('award_write_probe', 'n') SET n = 0;
-         DEFINE EVENT award_write ON badge_award WHEN true THEN {
-             UPSERT type::record('award_write_probe', 'n') SET n = (n ?? 0) + 1;
-         };",
-    )
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
-    let writes = || async {
-        db.query("SELECT VALUE n FROM award_write_probe:n")
-            .await
-            .unwrap()
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .first()
-            .copied()
-            .unwrap_or(0)
+    // The award table watched through its rows: the read must not add, remove
+    // or alter one. (The old engine counted writes with a `DEFINE EVENT`;
+    // Postgres has no triggers to hang that on, and the write the guard
+    // bites on — an insert, or a re-stamp of `earned_at` — always changes
+    // what the rows hold.)
+    let awards = || async {
+        let rows: Vec<(uuid::Uuid, String, Option<i64>)> =
+            sqlx::query_as("SELECT app_user, badge, earned_at FROM badge_award ORDER BY app_user, badge")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        rows
     };
-    assert_eq!(writes().await, 0, "nothing has been awarded yet");
+    assert_eq!(
+        awards().await.len(),
+        0,
+        "nothing has been awarded yet"
+    );
 
     // One approval, and `pool_published_1` is earned — by the route, not by
     // any later read.
     let question = ask(&app, &asker, "Integral").await;
     approve(&app, &teacher, &question).await;
-    let written = writes().await;
-    assert!(written > 0, "the approval never wrote the asker's award");
+    let written = awards().await;
+    assert!(
+        !written.is_empty(),
+        "the approval never wrote the asker's award"
+    );
 
     let mine = my_profile(&app, &asker).await;
     assert_eq!(badge_ids(&mine), ["pool_published_1"], "{mine}");
+    let after_read = awards().await;
     assert_eq!(
-        writes().await,
-        written,
+        after_read, written,
         "a profile read wrote to the award table"
     );
 
@@ -662,9 +660,9 @@ async fn a_profile_read_owes_nothing_the_write_site_already_paid() {
     profile_of(&app, &bystander, &asker_id).await;
     let empty = my_profile(&app, &bystander).await;
     assert_eq!(badge_ids(&empty), Vec::<&str>::new(), "{empty}");
+    let after_more = awards().await;
     assert_eq!(
-        writes().await,
-        written,
+        after_more, written,
         "reading a profile that owes nothing still wrote"
     );
 }

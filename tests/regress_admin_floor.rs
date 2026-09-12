@@ -15,17 +15,13 @@ use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
-use surrealdb::types::RecordId;
 
 /// How many accounts hold `admin` right now, out of the store.
 async fn admin_count(db: &Database) -> usize {
-    let mut result = db
-        .query("SELECT VALUE id FROM user WHERE role = 'admin'")
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_user WHERE role = 'admin'")
+        .fetch_one(db)
         .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<RecordId>>(0).unwrap().len()
+        .unwrap() as usize
 }
 
 /// Two admins demote each other at the same instant. Both `RequireAdmin`
@@ -162,7 +158,7 @@ async fn a_promoted_student_leaves_the_parent_list() {
 
     common::set_role(&db, "can", "teacher").await;
     assert_eq!(
-        rows("SELECT VALUE id FROM parent_link", &db).await,
+        rows("SELECT parent FROM parent_link", &db).await,
         1,
         "the stale link is the premise of this test"
     );
@@ -184,7 +180,10 @@ async fn a_promoted_student_leaves_the_parent_list() {
 }
 
 /// Ids `sql` selects.
-async fn rows(sql: &str, db: &Database) -> usize {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result.take::<Vec<RecordId>>(0).unwrap().len()
+async fn rows(sql: &'static str, db: &Database) -> usize {
+    sqlx::query_as::<_, (uuid::Uuid,)>(sql)
+        .fetch_all(db)
+        .await
+        .unwrap()
+        .len()
 }

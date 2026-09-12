@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO attendance (event, app_user, status, marked_by)\n         VALUES ($1, $2, $3, $4)\n         ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4\n         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
+  "query": "INSERT INTO attendance (event, app_user, status, marked_by)\n             VALUES ($1, $2, $3, $4)\n             ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4\n             RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
   "describe": {
     "columns": [
       {
@@ -63,5 +63,5 @@
       false
     ]
   },
-  "hash": "2a620228d66fce9990a0b490f42955fa98e8199049288827f24080db9578e212"
+  "hash": "98f14d5a29c39911636d47058ce39fd2e48177276cf04ef529625326b414a1ca"
 }

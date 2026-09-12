@@ -13,7 +13,6 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{create_course, create_exam, enroll, login_as, me_id, send};
-use hezarfen_backend::database;
 use serde_json::{Value, json};
 
 /// The two kinds these tests move in and out of the school's list.
@@ -370,31 +369,3 @@ async fn a_published_menu_pins_its_meal_slot() {
     );
 }
 
-/// Marks and menus written before the counters existed still hold their name
-/// down: the boot backfill counts them once. Aged by deleting the counter rows
-/// a live binary keeps — which is exactly the state an older binary's database
-/// arrives in.
-#[tokio::test]
-async fn rows_written_before_the_counters_are_counted_at_boot() {
-    let school = school_with_kinds(&["lab", "quiz"]).await;
-    assert_eq!(school.grade(80).await.status, StatusCode::OK);
-
-    school
-        .db
-        .query("DELETE kind_ref; DELETE slot_ref;")
-        .await
-        .expect("age the database")
-        .check()
-        .expect("aged");
-
-    // Without the backfill the mark is invisible to the guard and the kind
-    // walks straight out of the list.
-    database::migrate(&school.db).await.expect("reboot");
-
-    let res = school.set_kinds(&["quiz"]).await;
-    assert_eq!(res.status, StatusCode::CONFLICT);
-    assert_eq!(
-        res.body["error"],
-        "exams of kind 'lab' are already graded — the kind cannot be removed"
-    );
-}

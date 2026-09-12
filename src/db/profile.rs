@@ -42,7 +42,7 @@ pub async fn load(
 ) -> Result<ProfileStats, AppError> {
     let totals = sqlx::query!(
         r#"SELECT count(*) AS "sessions!: i64",
-                  COALESCE(sum(finished_at - started_at), 0) AS "focus_ms!: i64"
+                  COALESCE(sum(finished_at - started_at), 0)::BIGINT AS "focus_ms!: i64"
            FROM pomodoro_session
            WHERE app_user = $1 AND finished_at IS NOT NULL"#,
         user.uuid()
@@ -85,7 +85,7 @@ pub async fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     async fn a_user(username: &str, db: &Database) -> crate::domain::user::User {
@@ -104,7 +104,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_account_with_no_history_reads_as_zeros() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("profil-bos", &db).await;
 
         let stats = load(&db, user.get_id(), 3, 1).await.unwrap();
@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_finished_stints_count_and_an_open_one_is_invisible() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("profil-dolu", &db).await;
 
         sqlx::query(
@@ -148,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_negative_stint_sum_is_floored_at_zero() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("profil-terstarihi", &db).await;
 
         // A stint closed by a wall clock that stepped backwards: the sum is

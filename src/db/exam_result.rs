@@ -134,12 +134,15 @@ pub async fn grade(
         .map(|row| row.mark);
         if before.is_none() {
             // `kind_retired`: the mark's own transaction refusing a name
-            // the school has retired. Zero rows — retired, or the ref row
-            // gone with the kind — refuse the claim; a live row takes the
-            // count.
+            // the school has retired. An absent row reads as zero
+            // references, in service — the claim mints it, exactly like a
+            // menu publish mints an absent `slot_ref`. A row already
+            // retired refuses the claim: the guarded update skips, the
+            // `RETURNING` comes back empty.
             let claimed = sqlx::query!(
-                r#"UPDATE kind_ref SET count = kind_ref.count + 1
-                   WHERE name = $1 AND retired = false
+                r#"INSERT INTO kind_ref (name, count, retired) VALUES ($1, 1, false)
+                   ON CONFLICT (name) DO UPDATE SET count = kind_ref.count + 1
+                   WHERE kind_ref.retired IS DISTINCT FROM TRUE
                    RETURNING 1 AS n"#,
                 kind,
             )
@@ -387,25 +390,18 @@ pub async fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use sqlx::Row as _;
+
+    use crate::database::init_test_db;
 
     #[tokio::test]
     async fn retakes_keep_a_mark_per_sitting_with_the_latest_as_grade_of_record() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMAAAAAAAAAAAAAAAA");
-        let user = UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA");
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1a1");
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000a11a");
+        let teacher = UserId::from_key(TEACHER);
         // The exam has to be real: a mark is refused on one that isn't.
-        db.query(
-            "CREATE $ex SET creator = $t, course = course:c, title = 't',
-             description = '', kind = 'midterm'",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("t", teacher.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        an_exam(&db, &exam, "midterm").await;
 
         // Grade sitting #1, then a retake as sitting #2 — two rows, not one.
         super::grade(
@@ -469,10 +465,10 @@ mod tests {
     /// a mark land on an exam that no longer existed.
     #[tokio::test]
     async fn a_mark_is_refused_on_an_exam_that_no_longer_exists() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTGONEEXAMAAAAAAAAAAAA");
-        let user = UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA");
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e2c1");
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000a11a");
+        let teacher = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
 
         let refused = super::grade(
             &db,
@@ -494,44 +490,64 @@ mod tests {
         assert_eq!(counters(&db, "midterm").await, (0, 0));
     }
 
-    /// The two counters, re-read out of the store — never off a return value,
-    /// which the in-memory engine forges wins on (see `cap::CLAIM_LOCK`). A
-    /// missing `kind_ref` row is a zero, which is exactly how the backfill
-    /// treats it (`tests/persistence.rs` — no zero pass, deliberately).
+    /// The two counters, re-read out of the store — never off a return value.
+    /// A missing `kind_ref` row is a zero, and the exams' counts aggregate to
+    /// zero over an empty table the same way.
     async fn counters(db: &Database, kind: &str) -> (i64, i64) {
-        let mut result = db
-            .query(
-                "SELECT VALUE count ?? 0 FROM kind_ref WHERE record::id(id) = $kind;
-                 SELECT VALUE result_count ?? 0 FROM exam;",
-            )
-            .bind(("kind", kind.to_string()))
+        let kind_count = sqlx::query("SELECT count FROM kind_ref WHERE name = $1")
+            .bind(kind)
+            .fetch_optional(db)
             .await
             .unwrap()
-            .check()
+            .map(|row| row.try_get::<i64, _>(0).unwrap())
+            .unwrap_or(0);
+        let exam_count = sqlx::query("SELECT COALESCE(sum(result_count), 0) FROM exam")
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
             .unwrap();
-        let kinds: Vec<i64> = result.take(0).unwrap();
-        let exams: Vec<i64> = result.take(1).unwrap();
-        (
-            kinds.into_iter().next().unwrap_or(0),
-            exams.into_iter().next().unwrap_or(0),
-        )
+        (kind_count, exam_count)
     }
 
     async fn an_exam(db: &Database, exam: &ExamId, kind: &str) {
-        db.query(
-            "CREATE $ex SET creator = user:t, course = course:c, title = 't',
-             description = '', kind = $kind",
+        // The exam has to be real: a mark is refused on one that isn't. Its
+        // creator and course are real parents now, so the fixture grows them
+        // too (the teacher idempotently — [`the_two_people`] re-runs it).
+        let teacher = UserId::from_key(TEACHER);
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
         )
-        .bind(("ex", exam.record()))
-        .bind(("kind", kind.to_string()))
+        .bind(teacher.uuid())
+        .execute(db)
         .await
-        .unwrap()
-        .check()
+        .unwrap();
+        let course = CourseId::generate();
+        sqlx::query(
+            "INSERT INTO course (id, creator, title, description) \
+             VALUES ($1, $2, 'c', '')",
+        )
+        .bind(course.uuid())
+        .bind(teacher.uuid())
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO exam (id, creator, course, title, description, kind) \
+             VALUES ($1, $2, $3, 't', '', $4)",
+        )
+        .bind(exam.uuid())
+        .bind(teacher.uuid())
+        .bind(course.uuid())
+        .bind(kind)
+        .execute(db)
+        .await
         .unwrap();
     }
 
-    const STUDENT: &str = "01TESTSTUDENTAAAAAAAAAAAAA";
-    const TEACHER: &str = "01TESTTEACHERAAAAAAAAAAAAA";
+    const STUDENT: &str = "019732e3-7b00-7000-8000-00000000a11a";
+    const TEACHER: &str = "019732e3-7b00-7000-8000-00000000acdc";
 
     /// The tests' handle on [`super::grade`] with the grader and target
     /// pinned to the two test people.
@@ -560,8 +576,8 @@ mod tests {
     /// drifted them upward and froze the kind out of the settings for good.
     #[tokio::test]
     async fn a_new_mark_moves_both_counters_and_a_regrade_moves_neither() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMCOUNTAAAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1c4");
         an_exam(&db, &exam, "midterm").await;
 
         grade(&db, &exam, 1, 40, "midterm").await.unwrap();
@@ -580,36 +596,38 @@ mod tests {
     /// The two badge counters, re-read out of the store: the grader's marks
     /// given and the student's high marks.
     async fn badge_counters(db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) FROM $grader;
-                 SELECT VALUE ({HIGH_MARK_TOTAL_FIELD} ?? 0) FROM $student;"
-            ))
-            .bind(("grader", UserId::from_key(TEACHER).record()))
-            .bind(("student", UserId::from_key(STUDENT).record()))
+        let given = sqlx::query("SELECT marks_given_total FROM app_user WHERE id = $1")
+            .bind(UserId::from_key(TEACHER).uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
+            .try_get::<i64, _>(0)
             .unwrap();
-        let given: Vec<i64> = result.take(0).unwrap();
-        let high: Vec<i64> = result.take(1).unwrap();
-        (
-            given.into_iter().next().unwrap_or(0),
-            high.into_iter().next().unwrap_or(0),
-        )
+        let high = sqlx::query("SELECT high_mark_total FROM app_user WHERE id = $1")
+            .bind(UserId::from_key(STUDENT).uuid())
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
+            .unwrap();
+        (given, high)
     }
 
-    /// The rows a counter needs to land on — `UPDATE` writes nothing to a user
-    /// that does not exist, so the badge tests must make both real.
+    /// The rows a counter needs to land on — an `UPDATE` writes nothing to a
+    /// user that does not exist, so the badge tests must make both real.
+    /// Idempotent: [`an_exam`] may already have grown the teacher.
     async fn the_two_people(db: &Database) {
-        for key in [TEACHER, STUDENT] {
-            db.query("CREATE $usr SET username = $name, password_hash = 'x'")
-                .bind(("usr", UserId::from_key(key).record()))
-                .bind(("name", key.to_string()))
-                .await
-                .unwrap()
-                .check()
-                .unwrap();
+        for (role, key) in [("teacher", TEACHER), ("student", STUDENT)] {
+            sqlx::query(
+                "INSERT INTO app_user (id, username, password_hash, role) \
+                 VALUES ($1, $2, 'x', $3) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(UserId::from_key(key).uuid())
+            .bind(key)
+            .bind(role)
+            .execute(db)
+            .await
+            .unwrap();
         }
     }
 
@@ -618,8 +636,8 @@ mod tests {
     /// while a retake — a distinct seq, so a distinct row — counts on its own.
     #[tokio::test]
     async fn a_grade_credits_the_grader_once_and_a_high_mark_the_student() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMBADGEAAAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1b2");
         an_exam(&db, &exam, "midterm").await;
         the_two_people(&db).await;
 
@@ -645,8 +663,8 @@ mod tests {
     /// an award, once earned, is never taken back.
     #[tokio::test]
     async fn ungrading_gives_the_badge_counters_back() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMUNGRADEAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1ba");
         an_exam(&db, &exam, "midterm").await;
         the_two_people(&db).await;
         let student = UserId::from_key(STUDENT);
@@ -692,8 +710,8 @@ mod tests {
     /// and looped it into a permanent badge.
     #[tokio::test]
     async fn a_regrade_across_the_line_moves_the_student_counter_with_it() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMREGRADEAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1e6");
         an_exam(&db, &exam, "midterm").await;
         the_two_people(&db).await;
         let student = UserId::from_key(STUDENT);
@@ -754,9 +772,9 @@ mod tests {
     /// and deleted — the first exam's credit must still be standing.
     #[tokio::test]
     async fn one_exams_regrade_never_eats_another_exams_high_mark() {
-        let db = init_mem().await.unwrap();
-        let first = ExamId::from_key("01TESTEXAMSTEALONEAAAAAAAA");
-        let second = ExamId::from_key("01TESTEXAMSTEALTWOAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let first = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1a8");
+        let second = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1a9");
         an_exam(&db, &first, "midterm").await;
         an_exam(&db, &second, "midterm").await;
         the_two_people(&db).await;
@@ -786,15 +804,14 @@ mod tests {
     /// A refused mark leaves the badge counters where the other two are left.
     #[tokio::test]
     async fn a_refused_mark_credits_nobody() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMBADGEDRAFTAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1b3");
         an_exam(&db, &exam, "midterm").await;
         the_two_people(&db).await;
-        db.query("UPDATE $ex SET draft = true")
-            .bind(("ex", exam.record()))
+        sqlx::query("UPDATE exam SET draft = TRUE WHERE id = $1")
+            .bind(exam.uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         assert!(grade(&db, &exam, 1, 100, "midterm").await.is_err());
@@ -806,10 +823,19 @@ mod tests {
     /// enforcing the same invariant from the other side.
     #[tokio::test]
     async fn a_retired_kind_refuses_the_mark_and_leaves_both_counters_alone() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMRETIREDAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1f7");
         an_exam(&db, &exam, "midterm").await;
-        assert!(cap::retire(&kind_ref("midterm"), &db).await.unwrap());
+        // Retire the kind the way the settings guard does: the counter row
+        // flips to retired, which nothing references yet, so the flip lands.
+        sqlx::query(
+            "INSERT INTO kind_ref (name, count, retired) VALUES ('midterm', 0, TRUE)
+             ON CONFLICT (name) DO UPDATE SET retired = TRUE
+             WHERE kind_ref.count = 0 AND kind_ref.retired IS DISTINCT FROM TRUE",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
 
         let refused = grade(&db, &exam, 1, 40, "midterm").await;
         assert!(
@@ -828,14 +854,13 @@ mod tests {
     /// runs before the claim now, so there is nothing to give back.
     #[tokio::test]
     async fn a_draft_exam_refuses_the_mark_and_leaves_both_counters_alone() {
-        let db = init_mem().await.unwrap();
-        let exam = ExamId::from_key("01TESTEXAMDRAFTAAAAAAAAAAA");
+        let (db, _leases) = init_test_db().await;
+        let exam = ExamId::from_key("019732e3-7b00-7000-8000-00000000e1d5");
         an_exam(&db, &exam, "midterm").await;
-        db.query("UPDATE $ex SET draft = true")
-            .bind(("ex", exam.record()))
+        sqlx::query("UPDATE exam SET draft = TRUE WHERE id = $1")
+            .bind(exam.uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         let refused = grade(&db, &exam, 1, 40, "midterm").await;
