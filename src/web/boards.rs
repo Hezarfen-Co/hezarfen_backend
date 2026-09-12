@@ -37,7 +37,6 @@ use crate::domain::event::EventId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
-use crate::service::board::BOARD_ROSTER_LOCK;
 use crate::service::{board, board_stroke};
 use crate::state::AppState;
 use crate::tenant::Slug;
@@ -444,14 +443,12 @@ async fn update_board(
     Path(id): Path<String>,
     Json(req): Json<UpdateBoard>,
 ) -> Result<Json<BoardResponse>, AppError> {
-    // A roster PATCH reads the current list (to keep the ids that stopped
-    // qualifying) before replacing it, so it is the other read-modify-write of
-    // this field and takes the same lock — one an invite could otherwise land
-    // inside. Title- and lock-only edits never touch the array and are not held.
-    let _guard = match req.participants.is_some() {
-        true => Some(BOARD_ROSTER_LOCK.lock().await),
-        false => None,
-    };
+    // A roster PATCH resolves against the roster as this request read it
+    // (to keep the ids that stopped qualifying) and replaces it with one
+    // field-scoped write: the request carries the whole intended roster, so
+    // it is a creator-driven replace, not a merge — an invite committing
+    // between the read and this write is superseded by the PATCH, which is
+    // the route's contract.
     let mut board = board::board_for(&id, &user, &st.db).await?;
     if req.participants.is_some() || req.locked.is_some() {
         board::ensure_creator(&board, &user)?;
@@ -732,11 +729,12 @@ async fn invite_board(
     Path(id): Path<String>,
     Json(req): Json<InviteSource>,
 ) -> Result<Json<BoardResponse>, AppError> {
-    // Held across the read *and* the write: this is a read-modify-write of one
-    // array, so two invites landing together would each union their group into
-    // the same roster and the second write would drop the first one's people —
-    // silently, with both callers told 200. See [`BOARD_ROSTER_LOCK`].
-    let _guard = BOARD_ROSTER_LOCK.lock().await;
+    // The merge is one atomic guarded statement (see
+    // `crate::db::board::invite_group`): two invites landing together both
+    // union into the
+    // roster the row holds at write time, so neither can drop the other's
+    // people — the property the old process-wide roster lock provided, now
+    // enforced by the row itself.
     let board = board::board_for(&id, &user, &st.db).await?;
     board::ensure_creator(&board, &user)?;
     let invited = req.resolve(&user, &st.db).await?;

@@ -11,7 +11,7 @@
 //!   never rewrite a menu already published under it.
 //!
 //! The queries live in [`crate::db::menu`]; the kitchen workflows (and the
-//! dish-cap lock) in [`crate::service::menu`].
+//! dish-cap gate) in [`crate::service::menu`].
 
 use sqlx::Type;
 

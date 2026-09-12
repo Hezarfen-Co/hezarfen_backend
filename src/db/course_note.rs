@@ -1,11 +1,7 @@
-//! The `course_note` table: a teacher-authored note attached to a course,
-//! listed newest first, deleted together with its attachment rows.
+//! The `course_note` table: a course's shared notes, newest first, deleted
+//! together with their attachment rows.
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::ENROLLMENT_COUNT_FIELD;
-use crate::database::Database;
-use crate::db::cap;
+use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
@@ -13,15 +9,6 @@ use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, Co
 use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// What [`delete`]'s transaction removed: the note row (empty if it had
-/// already vanished) and every attachment row the cascade took with it — the
-/// only set whose blobs are safe to unlink.
-#[derive(Debug, SurrealValue)]
-struct DeleteOutcome {
-    note: Vec<CourseNote>,
-    files: Vec<CourseNoteFile>,
-}
 
 pub async fn create(
     db: &Database,
@@ -37,23 +24,41 @@ pub async fn create(
         title,
         content,
     };
-    // The course row is *written* (bumped and put back), not read, so this
-    // collides with `Course::delete`'s cascade: a note that outlives its
-    // course is unreachable forever — every route to it goes through the
-    // course. See [`cap::touch_and_create`].
-    cap::touch_and_create(
-        &course.record(),
-        ENROLLMENT_COUNT_FIELD,
-        &note.id.record(),
-        &note,
-        db,
+    // whole-row-save-ok: insert of a fresh UUID row built in place — there is no prior row to clobber.
+    // The course row is *referenced* (a real foreign key the store now
+    // enforces), so a note that races `Course::delete`'s cascade is refused
+    // as 23503 instead of outliving its course — a note whose course is gone
+    // is unreachable forever, every route to it going through the course.
+    // That refusal is the parent-gone 404 the touch trick used to produce.
+    let created = sqlx::query_as!(
+        CourseNote,
+        r#"INSERT INTO course_note (id, course, author, title, content)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, course, author, title, content"#,
+        note.id,
+        note.course,
+        note.author,
+        note.title,
+        note.content
     )
-    .await?
-    .ok_or(AppError::NotFound)
+    .fetch_one(db)
+    .await;
+    match created {
+        Ok(row) => Ok(row),
+        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub async fn read(db: &Database, id: &CourseNoteId) -> Result<Option<CourseNote>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let note = sqlx::query_as!(
+        CourseNote,
+        r#"SELECT id, course, author, title, content FROM course_note WHERE id = $1"#,
+        id
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(note)
 }
 
 pub async fn list_for_course(
@@ -62,9 +67,9 @@ pub async fn list_for_course(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<CourseNote>, i64), AppError> {
-    PagedList::new("course_note WHERE course = $crs", "ORDER BY id DESC")
-        .bind("crs", course.record())
-        .run(limit, offset, db)
+    PagedList::new("course_note WHERE course = $1", "ORDER BY id DESC")
+        .bind(course.uuid())
+        .run::<CourseNote>(limit, offset, db)
         .await
 }
 
@@ -80,9 +85,12 @@ pub async fn update(
     title: Option<CourseNoteTitle>,
     content: Option<CourseNoteContent>,
 ) -> Result<CourseNote, AppError> {
-    FieldUpdate::new(note.id.record())
-        .set("title", title)
-        .set("content", content)
+    FieldUpdate::new("course_note", note.id.uuid())
+        .set("title", title.map(|title| title.as_str().to_string()))
+        .set(
+            "content",
+            content.map(|content| content.as_str().to_string()),
+        )
         .run::<CourseNote>(db)
         .await
 }
@@ -92,29 +100,40 @@ pub async fn update(
 /// Blob files on disk are the web layer's to remove, but only for *these*
 /// rows — a row uploaded after the caller listed the note's files is
 /// deleted here too, and a pre-read snapshot would strand its blob.
+///
+/// The `rag_output` sweep rides in the same transaction: `rag_output`
+/// references this table through a real foreign key (`ON DELETE NO
+/// ACTION`), so a derived row left behind would refuse the delete — and a
+/// derived row outliving its note is exactly what the cascade exists to
+/// prevent. The web layer's separate `delete_for_note` call stays, as a
+/// harmless idempotent repeat.
 pub async fn delete(
     db: &Database,
     note: CourseNote,
 ) -> Result<(CourseNote, Vec<CourseNoteFile>), AppError> {
-    let mut result = db
-        .query(
-            "BEGIN TRANSACTION;
-             LET $files = (DELETE course_note_file WHERE course_note = $note RETURN BEFORE);
-             LET $gone = (DELETE $note RETURN BEFORE);
-             RETURN { note: $gone, files: $files };
-             COMMIT TRANSACTION;",
+    tx_with_retry(db, true, async |conn| {
+        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id)
+            .execute(&mut *conn)
+            .await?;
+        let files = sqlx::query_as!(
+            CourseNoteFile,
+            r#"DELETE FROM course_note_file WHERE course_note = $1
+               RETURNING id, course_note, name, content_type, size"#,
+            note.id
         )
-        .bind(("note", note.id.record()))
-        .await?
-        .check()?;
-    // BEGIN is slot 0, the two LETs slots 1-2; the RETURN is slot 3.
-    let outcome = result
-        .take::<Vec<DeleteOutcome>>(3)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to delete course note".into()))?;
-    let note = outcome.note.into_iter().next().ok_or(AppError::NotFound)?;
-    Ok((note, outcome.files))
+        .fetch_all(&mut *conn)
+        .await?;
+        let gone = sqlx::query_as!(
+            CourseNote,
+            r#"DELETE FROM course_note WHERE id = $1 RETURNING id, course, author, title, content"#,
+            note.id
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let note = gone.ok_or(AppError::NotFound)?;
+        Ok((note, files))
+    })
+    .await
 }
 
 #[cfg(test)]

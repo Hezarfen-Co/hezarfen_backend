@@ -4,56 +4,70 @@
 //! their validated fields live in [`crate::domain::homework_file`]; the
 //! upload workflow around them in [`crate::service::homework_file`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::{
-    MAX_HOMEWORK_FILES_PER_SUBMISSION, SUBMISSION_FILE_COUNT_FIELD, SUBMISSION_OPEN_GUARD,
-};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::MAX_HOMEWORK_FILES_PER_SUBMISSION;
+use crate::database::{Database, tx_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_file::HomeworkFile;
+use crate::domain::homework_file::HomeworkFileId;
+use crate::domain::homework_submission::HomeworkSubmissionId;
+use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
-
-/// What [`delete`]'s transaction reports: whether the submission
-/// was still open (`open` = 1, the gate bit) and the row it then removed. Two
-/// answers in one object because an empty `gone` alone cannot say whether the
-/// delete was refused or the file had simply vanished.
-#[derive(Debug, SurrealValue)]
-struct DeleteOutcome {
-    open: i64,
-    gone: Vec<HomeworkFile>,
-}
 
 /// Persist the row assembled by
 /// [`HomeworkFile::new`](crate::domain::homework_file::HomeworkFile::new),
 /// refusing once its submission already holds
 /// [`MAX_HOMEWORK_FILES_PER_SUBMISSION`] (an `Err(Conflict)`)
 /// or once a grade has frozen it (`Ok(None)`, so the web layer keeps its own
-/// wording). Both are decided by one [`cap::claim_when_and_create`] on the
-/// submission row — the seat and the file row commit together, so a crash
-/// between them can no longer leave a slot claimed by a file that does not
-/// exist, and a losing upload never has to be un-counted. Which of the two
-/// conditions refused it is read back afterwards, off the losing path only,
-/// and only to pick the message: `Claimed::Full` says "full *or* graded *or*
-/// the submission is gone".
+/// wording). Both are decided by one guarded insert on the submission row —
+/// the seat (`UPDATE … file_count + 1 WHERE file_count < $cap AND
+/// graded_by_result IS NULL`) and the file row commit together in one CTE, so
+/// a crash between them can no longer leave a slot claimed by a file that
+/// does not exist, and a losing upload never has to be un-counted. Which of
+/// the two conditions refused it is read back afterwards, off the losing
+/// path only, and only to pick the message: zero rows says "full *or* graded
+/// *or* the submission is gone".
 pub async fn insert(db: &Database, file: HomeworkFile) -> Result<Option<HomeworkFile>, AppError> {
-    // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-    match cap::claim_when_and_create(
-        &file.submission.record(),
-        SUBMISSION_FILE_COUNT_FIELD,
+    let created = sqlx::query_as!(
+        HomeworkFile,
+        r#"WITH seat AS (
+               UPDATE homework_submission SET file_count = file_count + 1
+               WHERE id = $2 AND file_count < $1 AND graded_by_result IS NULL
+               RETURNING 1
+           )
+           INSERT INTO homework_file (id, submission, name, content_type, size, file, created_at)
+           SELECT $3, $2, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING id AS "id: HomeworkFileId",
+                     submission AS "submission: HomeworkSubmissionId",
+                     name AS "name: FileName",
+                     content_type AS "content_type: FileContentType",
+                     size,
+                     file,
+                     created_at AS "created_at: Timestamp""#,
         MAX_HOMEWORK_FILES_PER_SUBMISSION as i64,
-        SUBMISSION_OPEN_GUARD,
-        &file.id.record(),
-        &file,
-        db,
+        file.submission,
+        file.id,
+        file.name,
+        file.content_type,
+        file.size,
+        file.file,
+        file.created_at,
     )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(Some(created)),
-        cap::Claimed::Full => {
+    .fetch_optional(db)
+    .await
+    .map_err(|err| {
+        // The id is a fresh v7 minted by `new`, so a row already holding it
+        // is a collision, not a re-upload.
+        if crate::database::unique_violation(&err).is_some() {
+            AppError::Internal("homework file id collided".into())
+        } else {
+            AppError::from(err)
+        }
+    })?;
+    match created {
+        Some(row) => Ok(Some(row)),
+        None => {
             if super::homework_submission::is_graded(db, &file.submission).await? {
                 return Ok(None);
             }
@@ -61,9 +75,6 @@ pub async fn insert(db: &Database, file: HomeworkFile) -> Result<Option<Homework
                 "the submission already holds the maximum of 10 files — delete one first",
             ))
         }
-        // The id is a fresh ULID minted by `new`, so a row already holding it
-        // is a collision, not a re-upload.
-        cap::Claimed::Duplicate => Err(AppError::Internal("homework file id collided".into())),
     }
 }
 
@@ -74,8 +85,21 @@ pub async fn read_for(
     id: &crate::domain::homework_file::HomeworkFileId,
     submission: &crate::domain::homework_submission::HomeworkSubmissionId,
 ) -> Result<Option<HomeworkFile>, AppError> {
-    let file: Option<HomeworkFile> = db.select(id.record()).await?;
-    Ok(file.filter(|file| &file.submission == submission))
+    Ok(sqlx::query_as!(
+        HomeworkFile,
+        r#"SELECT id AS "id: HomeworkFileId",
+                  submission AS "submission: HomeworkSubmissionId",
+                  name AS "name: FileName",
+                  content_type AS "content_type: FileContentType",
+                  size,
+                  file,
+                  created_at AS "created_at: Timestamp"
+           FROM homework_file WHERE id = $1 AND submission = $2"#,
+        id,
+        submission
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Read a file by id only if it hangs off a submission to `homework` — the
@@ -89,16 +113,23 @@ pub async fn read_in_homework(
     id: &crate::domain::homework_file::HomeworkFileId,
     homework: &HomeworkId,
 ) -> Result<Option<HomeworkFile>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM homework_file WHERE id = $id AND submission IN \
-             (SELECT VALUE id FROM homework_submission WHERE homework = $hw)",
-        )
-        .bind(("id", id.record()))
-        .bind(("hw", homework.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<HomeworkFile>>(0)?.into_iter().next())
+    Ok(sqlx::query_as!(
+        HomeworkFile,
+        r#"SELECT id AS "id: HomeworkFileId",
+                  submission AS "submission: HomeworkSubmissionId",
+                  name AS "name: FileName",
+                  content_type AS "content_type: FileContentType",
+                  size,
+                  file,
+                  created_at AS "created_at: Timestamp"
+           FROM homework_file
+           WHERE id = $1
+             AND submission IN (SELECT id FROM homework_submission WHERE homework = $2)"#,
+        id,
+        homework
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// All of `submission`'s files, newest first.
@@ -106,40 +137,56 @@ pub async fn list_for_submission(
     db: &Database,
     submission: &crate::domain::homework_submission::HomeworkSubmissionId,
 ) -> Result<Vec<HomeworkFile>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM homework_file WHERE submission = $sub ORDER BY id DESC")
-        .bind(("sub", submission.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<HomeworkFile>>(0)?)
+    Ok(sqlx::query_as!(
+        HomeworkFile,
+        r#"SELECT id AS "id: HomeworkFileId",
+                  submission AS "submission: HomeworkSubmissionId",
+                  name AS "name: FileName",
+                  content_type AS "content_type: FileContentType",
+                  size,
+                  file,
+                  created_at AS "created_at: Timestamp"
+           FROM homework_file WHERE submission = $1 ORDER BY id DESC"#,
+        submission
+    )
+    .fetch_all(db)
+    .await?)
 }
 
-/// How many files `submission` holds — the cap check reads this under the
-/// lock. Counting via the rows (not a `count()` query) keeps it identical
-/// to `NoteFile`'s proven cap check; at a ceiling of 10 the cost is nil.
+/// How many files `submission` holds. Counting the rows (not the counter
+/// column) keeps it identical to `NoteFile`'s proven cap check; at a ceiling
+/// of 10 the cost is nil.
 pub async fn count_for_submission(
     db: &Database,
     submission: &crate::domain::homework_submission::HomeworkSubmissionId,
 ) -> Result<usize, AppError> {
-    Ok(list_for_submission(db, submission).await?.len())
+    let row = sqlx::query!(
+        r#"SELECT count(*) AS "count: i64" FROM homework_file WHERE submission = $1"#,
+        submission
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.count as usize)
 }
 
 /// The blob names behind every file of every submission to `homework` —
-/// collected *before* the homework-delete cascade wipes the rows, so the
-/// web layer can unlink them once the rows are gone.
+/// the GC keys of a homework delete (collected inside the delete's own
+/// transaction by [`crate::db::homework::delete`]; this read backs it and
+/// the tests).
 pub async fn file_keys_for_homework(
     db: &Database,
     homework: &HomeworkId,
 ) -> Result<Vec<String>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE file FROM homework_file \
-             WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework = $hw)",
-        )
-        .bind(("hw", homework.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<String>>(0)?)
+    Ok(sqlx::query!(
+        r#"SELECT file FROM homework_file
+           WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
+        homework
+    )
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| row.file)
+    .collect())
 }
 
 /// The blob names behind every homework file of `course` — collected
@@ -148,17 +195,19 @@ pub async fn file_keys_for_course(
     db: &Database,
     course: &CourseId,
 ) -> Result<Vec<String>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE file FROM homework_file WHERE submission IN ( \
-               SELECT VALUE id FROM homework_submission \
-               WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course) \
-             )",
-        )
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<String>>(0)?)
+    Ok(sqlx::query!(
+        r#"SELECT file FROM homework_file
+           WHERE submission IN (
+               SELECT id FROM homework_submission
+               WHERE homework IN (SELECT id FROM homework WHERE course = $1)
+           )"#,
+        course
+    )
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| row.file)
+    .collect())
 }
 
 /// Delete the row and give its slot back in the same transaction. The
@@ -167,57 +216,58 @@ pub async fn file_keys_for_course(
 ///
 /// The gate is the first statement: a conditional write on the *submission*
 /// row — the "last touched" re-stamp a file delete owes the late flag
-/// anyway — carrying [`SUBMISSION_OPEN_GUARD`]. Nothing else in the
-/// transaction runs unless it bit, so a grade landing concurrently either
-/// stamps first (this delete is refused, `Ok(None)`) or stamps after (the
-/// file was already gone when it graded). `Err(NotFound)` still means the
-/// file row itself had vanished.
-///
-/// Sound to re-send while the store answers "conflict, retry", and it has
-/// to be: the gate writes the *submission* row, the very record an upload's
-/// [`insert`] claims its seat on, and both handlers hold only
-/// `HOMEWORK_LOCK.read()` — so a concurrent add and delete of two files of
-/// one submission contend by design, and a lost round used to come back as
-/// a 500 on a request that had written nothing. Only `UPDATE` and `DELETE`
-/// are in the batch, and neither can legitimately answer "already exists",
-/// which is what makes the whole of it re-sendable.
+/// anyway. Its row lock is also the serialization point against an upload's
+/// seat claim on the same row: one of the two waits, and the winner re-reads
+/// the counter before moving it, so no lost round and no 500 — a grade
+/// landing concurrently either stamps first (this delete is refused,
+/// `Ok(None)`) or stamps after (the file was already gone when it graded).
+/// `Err(NotFound)` still means the file row itself had vanished.
 pub async fn delete(db: &Database, file: HomeworkFile) -> Result<Option<HomeworkFile>, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $open = (UPDATE $sub SET updated_at = $now \
-                 WHERE {SUBMISSION_OPEN_GUARD} RETURN VALUE id);
-             LET $gone = IF array::len($open) > 0 {{ (DELETE $id RETURN BEFORE) }} ELSE {{ [] }};
-             UPDATE $sub SET file_count = math::max([(file_count ?? 0) - array::len($gone), 0]);
-             RETURN {{ open: array::len($open), gone: $gone }};
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("id".into(), file.id.record().into_value()),
-            ("sub".into(), file.submission.record().into_value()),
-            ("now".into(), Timestamp::now().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // BEGIN is slot 0, the two LETs slots 1-2 and the counter fix slot 3;
-    // the RETURN is slot 4.
-    let outcome: Option<DeleteOutcome> = result.take::<Vec<DeleteOutcome>>(4)?.into_iter().next();
-    let outcome =
-        outcome.ok_or_else(|| AppError::Internal("failed to delete homework file".into()))?;
-    if outcome.open == 0 {
-        return Ok(None);
-    }
-    outcome
-        .gone
-        .into_iter()
-        .next()
-        .map(Some)
-        .ok_or(AppError::NotFound)
+    let now = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        let open = sqlx::query!(
+            r#"UPDATE homework_submission SET updated_at = $2
+               WHERE id = $1 AND graded_by_result IS NULL
+               RETURNING 1 AS "open: i32""#,
+            file.submission,
+            now
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if open.is_none() {
+            return Ok(None);
+        }
+        let gone = sqlx::query_as!(
+            HomeworkFile,
+            r#"DELETE FROM homework_file WHERE id = $1 AND submission = $2
+               RETURNING id AS "id: HomeworkFileId",
+                         submission AS "submission: HomeworkSubmissionId",
+                         name AS "name: FileName",
+                         content_type AS "content_type: FileContentType",
+                         size,
+                         file,
+                         created_at AS "created_at: Timestamp""#,
+            file.id,
+            file.submission
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        match gone {
+            Some(row) => {
+                sqlx::query!(
+                    "UPDATE homework_submission SET file_count = GREATEST(file_count - 1, 0)
+                     WHERE id = $1",
+                    file.submission
+                )
+                .execute(&mut *tx)
+                .await?;
+                Ok(Some(row))
+            }
+            // The submission was open but the file had already vanished.
+            None => Err(AppError::NotFound),
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
