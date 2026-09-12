@@ -32,6 +32,12 @@ impl HomeworkSubmissionId {
         Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
     /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
     /// which matches no row.
     pub fn from_key(key: &str) -> Self {
