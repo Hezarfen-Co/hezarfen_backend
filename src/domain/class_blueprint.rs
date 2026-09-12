@@ -15,11 +15,10 @@
 //! shared skip vocabulary ([`skip_reason`]).
 //!
 //! The behavior lives one layer down: the edit-retro-pump, the apply/sweep
-//! engine and its [`crate::service::class_blueprint::BLUEPRINT_LOCK`] lease
-//! in [`crate::service::class_blueprint`], the queries in
+//! engine in [`crate::service::class_blueprint`], the queries in
 //! [`crate::db::class_blueprint`].
 
-use crate::constant::{MAX_CLASS_COURSES};
+use crate::constant::MAX_CLASS_COURSES;
 use crate::db::class_pump::{Attached, Axis};
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroupId};
@@ -53,6 +52,9 @@ impl ClassBlueprintId {
 /// never has to parse a record id back into a domain value.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassBlueprint {
+    /// The table's `TEXT` primary key column, stored once and read into both
+    /// this field and `grade` — the key *is* the grade label.
+    #[sqlx(rename = "grade")]
     pub(crate) id: ClassBlueprintId,
     pub(crate) grade: ClassGrade,
     pub(crate) courses: Vec<CourseId>,

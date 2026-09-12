@@ -3,8 +3,6 @@
 //! The transactions live in [`crate::db::class_pump`] and
 //! [`crate::db::class_course`].
 
-use surrealdb::types::SurrealValue;
-
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::db::class_course;
@@ -84,25 +82,13 @@ pub async fn attach(
 /// into it. A course that was not attached is a [`AppError::NotFound`],
 /// raised here rather than left to each caller to re-derive from a boolean.
 ///
-/// A student another attached class still claims keeps their row, re-tagged
-/// to that class (see [`crate::db::class_pump::detach`]).
+/// to that class (see [`class_pump::detach_course`]).
 pub async fn detach(
     db: &Database,
     class: &ClassGroupId,
     course: &CourseId,
 ) -> Result<(), AppError> {
-    let gone = class_pump::detach(
-        db,
-        "$link",
-        Axis::Course,
-        &[(
-            "link".into(),
-            crate::domain::class_course::ClassCourseId::composite(class, course)
-                .record()
-                .into_value(),
-        )],
-    )
-    .await?;
+    let gone = class_pump::detach_course(db, class, course, None).await?;
     (gone > 0).then_some(()).ok_or(AppError::NotFound)
 }
 

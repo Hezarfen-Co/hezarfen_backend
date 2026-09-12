@@ -27,10 +27,6 @@
 //! repairs before it deletes — and it runs one transaction per pair too, for
 //! the same reason the pump does.
 
-use tokio::sync::RwLock;
-
-use surrealdb::types::RecordId;
-
 use crate::database::Database;
 use crate::db::class_blueprint;
 use crate::db::class_course;
@@ -39,44 +35,10 @@ use crate::db::class_pump::Attached;
 use crate::domain::class_blueprint::{
     ClassBlueprint, ClassBlueprintId, Pumped, SectionStatus, Skip, skip_reason,
 };
-use crate::domain::class_group::{ClassGrade, ClassGroup};
+use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId};
 use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// Serializes a blueprint's delete against the attaches made on its behalf.
-///
-/// [`delete`] removes the row and then sweeps by the provenance
-/// tag, and every guarded attach reads that same row *inside* its own
-/// transaction ([`crate::db::class_pump::attach`]'s `source` claim). Those
-/// two are a cross-record read-then-write racing a write to the record read,
-/// which `BEGIN`/`COMMIT` does not serialize (SurrealDB write skew): a pump can
-/// see the blueprint alive, have the delete commit and sweep past it, and only
-/// then commit its own `class_course` row — tagged with a record that no longer
-/// exists and that no sweep can ever reach again, since the grade label *is*
-/// the id. Delete-first and the in-transaction claim narrow that window; this
-/// closes it.
-///
-/// The delete holds the **write** lease across its compare-and-set and the read
-/// that fixes the set of rows it will sweep — and no further. That is the whole
-/// invariant: the sweep's row set must contain every attach this blueprint ever
-/// committed, and no attach may commit one afterwards. An attach already in
-/// flight holds the read lease, so the write lease waits for it and its row is
-/// in the set; an attach starting after the lease is released finds the row
-/// deleted and answers [`Attached::SourceGone`], writing nothing. The detaching
-/// itself — one transaction per row, unbounded — therefore runs lease-free,
-/// because `tokio`'s `RwLock` is *fair*: held across that loop, it parked every
-/// concurrent `POST /classes` at every other grade behind one grade's delete.
-/// Each guarded attach holds the **read** lease for the span of its own
-/// transaction — taken per course in [`apply_to`], never around
-/// a whole pump, so a delete waits behind one attach rather than an unbounded
-/// loop.
-///
-/// In-process is deployment-wide here: one process by contract, with
-/// stop-the-world upgrades — the same argument
-/// [`crate::service::settings::SETTINGS_LOCK`] makes. No other lock is taken
-/// under it, so it has no ordering rule to break.
-pub(crate) static BLUEPRINT_LOCK: RwLock<()> = RwLock::const_new(());
 
 /// Write the blueprint after settling the course list
 /// ([`ClassBlueprint::course_list`]) — the same validation, in the same
@@ -137,13 +99,12 @@ pub async fn list_all(
 /// templated course — what [`status`] reports and the next pump
 /// repairs — where the diff's failure was a row no call could reach.
 ///
-/// Takes no [`BLUEPRINT_LOCK`] lease, deliberately: holding the write lease
-/// across its own pump would deadlock on the read lease that pump takes,
-/// and a lease would close nothing anyway — the pump's claim asks whether
-/// the blueprint *exists*, not what it holds, so an edit racing a pump is
-/// only ever the retro-pump this feature is built on. Rows a racing edit
-/// leaves behind stay reachable, because [`delete`] sweeps the whole
-/// tag rather than a list.
+/// Takes no lease of its own, deliberately: a lease held across its own pump
+/// would deadlock on the locks that pump takes, and it would close nothing
+/// anyway — the attach's claim asks whether the blueprint *exists*, not what
+/// it holds, so an edit racing a pump is only ever the retro-pump this
+/// feature is built on. Rows a racing edit leaves behind stay reachable,
+/// because [`delete`] sweeps the whole tag rather than a list.
 pub async fn set_courses(
     db: &Database,
     blueprint: ClassBlueprint,
@@ -185,57 +146,55 @@ pub async fn set_courses(
 /// mirror image of a race: a `PATCH` adding a course and pumping it while
 /// this ran landed rows tagged with a blueprint the delete then removed,
 /// and nothing could ever sweep them again — the grade label *is* the
-/// record id, so only a blueprint recreated at that grade could even name
+/// primary key, so only a blueprint recreated at that grade could even name
 /// them. Never revert to sweep-first.
 ///
-/// Deleting first plus the pump's own in-transaction claim on this row
-/// ([`Attached::SourceGone`]) **narrows** that window; it does not close
-/// it. The claim is a read of `class_blueprint` in a transaction that
-/// writes `class_course`, racing this delete's write to
-/// `class_blueprint` — a cross-record pair `BEGIN`/`COMMIT` does not
-/// serialize, so a pump that read the row alive can still commit its link
-/// after the sweep has run. [`BLUEPRINT_LOCK`] is what closes it: the write
-/// lease below spans the compare-and-set and the sweep, the read lease in
-/// [`apply_to`] spans each attach, and the deployment runs one
-/// process by contract, which makes an in-process lock the whole answer.
+/// Deleting first plus the attach's in-transaction claim on this row
+/// ([`Attached::SourceGone`]) **closes** that window outright: the claim is
+/// not a bare read but a `FOR KEY SHARE` row lock on `class_blueprint`, the
+/// one strength a `DELETE` of the row cannot take. A sourced attach that
+/// started first holds the row and this delete's `DELETE` waits behind it —
+/// the row the attach commits is then in the set the sweep reads; an attach
+/// starting after the delete finds no row and writes nothing. (Under the
+/// old engine the claim was a plain read that no `BEGIN`/`COMMIT` pair
+/// serialized against this delete's write, and a process-wide `RwLock` had
+/// to stand in; the row lock is the same answer without the process.)
 ///
-/// What is left is a **process crash** between the delete and the sweep — a
-/// lock does not survive the process. That leaves inert `class_course` rows
-/// tagged with a blueprint that is gone; they are still detachable one at a
-/// time at `DELETE /classes/{id}/courses/{course}`, and every counter stays
-/// exact because each detach is its own transaction.
+/// What is left is a **process crash** between the delete and the sweep.
+/// That leaves inert `class_course` rows tagged with a blueprint that is
+/// gone; they are still detachable one at a time at
+/// `DELETE /classes/{id}/courses/{course}`, and every counter stays exact
+/// because each detach is its own transaction.
 ///
 /// The delete is a compare-and-set on the list this caller read, like
 /// [`set_courses`]: an edit landing in between is a `409` rather than
 /// a silent detach of somebody else's additions. Known hole, accepted: the
-/// grade label *is* the record id and the comparison is by **content**, so
+/// grade label *is* the primary key and the comparison is by **content**, so
 /// a blueprint deleted and recreated at the same grade with the same list
 /// satisfies `WHERE courses = $held` and this call deletes the *new* row.
+///
 /// Content-equal is intent-equal — the end state is the one the caller
 /// asked for — and telling the two apart needs a revision column on the
 /// row, which nothing else here would use.
 pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppError> {
-    let doomed = {
-        // Held across the delete and the read that fixes the sweep's row
-        // set, and released before the detaching: no attach can commit a row
-        // this read did not see, and none that starts afterwards writes one
-        // at all.
-        let _lease = BLUEPRINT_LOCK.write().await;
-        if !class_blueprint::delete_if_unchanged(db, &blueprint.id, blueprint.courses.clone())
-            .await?
-        {
-            // Matched nothing: the row is gone, or its list moved since this
-            // caller read it. Only this path pays for the read that tells
-            // them apart.
-            return match read(db, &blueprint.id).await? {
-                Some(_) => Err(AppError::Conflict(
-                    "this blueprint changed since you read it — re-read and retry",
-                )),
-                None => Err(AppError::NotFound),
-            };
-        }
-        class_blueprint::sourced_links(db, &blueprint.id, &[]).await?
-    };
+    if !class_blueprint::delete_if_unchanged(db, &blueprint.id, blueprint.courses.clone()).await? {
+        // Matched nothing: the row is gone, or its list moved since this
+        // caller read it. Only this path pays for the read that tells
+        // them apart.
+        return match read(db, &blueprint.id).await? {
+            Some(_) => Err(AppError::Conflict(
+                "this blueprint changed since you read it — re-read and retry",
+            )),
+            None => Err(AppError::NotFound),
+        };
+    }
+    // The row set is read after the delete, and the delete itself is what
+    // serializes it against the attaches: a sourced attach holds a `FOR KEY
+    // SHARE` on the blueprint row across its transaction, so its row lands
+    // before this delete (and is in the set this read then sees) or finds the
+    // row gone and writes nothing at all. No attach can commit a row this
+    // read did not see, and none that starts afterwards writes one.
+    let doomed = class_blueprint::sourced_links(db, &blueprint.id, &[]).await?;
     class_blueprint::drop_links(db, &blueprint.id, doomed).await
 }
 
@@ -246,13 +205,13 @@ pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppE
 ///
 /// This is the *only* place a sourced attach is made — [`pump`], the
 /// create-time and per-class pumps in [`crate::web::classes`] all come
-/// through here — so it is where each one takes [`BLUEPRINT_LOCK`] for
-/// reading, one course at a time. A delete landing mid-pump is then clean
-/// by construction: the attaches that already committed are found by its
-/// tag sweep, and the ones that have not yet started meet the deleted row
-/// at their own in-transaction claim and answer `blueprint_deleted`. Per
-/// course rather than per pump, because the pump's loop is unbounded and a
-/// delete may not wait behind all of it.
+/// through here — and each attach's transaction takes a `FOR KEY SHARE`
+/// lock on the blueprint row itself, one course at a time. A delete landing
+/// mid-pump is then clean by construction: the attaches that already
+/// committed are found by its tag sweep, and the ones that have not yet
+/// started meet the deleted row at their own in-transaction claim and
+/// answer `blueprint_deleted`. Per course rather than per pump, because the
+/// pump's loop is unbounded and a delete may not wait behind all of it.
 ///
 /// One class, so `blueprint_deleted` is an ordinary skip here: the courses
 /// after it are not tried, because the template they would ask for is the
@@ -289,11 +248,9 @@ async fn apply_courses(
         if dead.contains(course) {
             continue;
         }
-        let landed = {
-            let _lease = BLUEPRINT_LOCK.read().await;
+        let landed =
             class_course::attach_sourced(db, class.get_id(), course, by, Some(&blueprint.id))
-                .await?
-        };
+                .await?;
         if matches!(landed, Attached::PivotGone) {
             class_blueprint::prune(db, &blueprint.id, course).await?;
             dead.push(course.clone());
@@ -321,9 +278,9 @@ async fn apply_courses(
 /// since a section cannot make either of them untrue. A course that no
 /// longer exists is pruned and skipped on the first class that meets it and
 /// left out of every class after it. And a `blueprint_deleted` **aborts the
-/// grade loop**: under [`BLUEPRINT_LOCK`] that answer is precisely "a
-/// delete landed mid-pump", so it is reported once and the remaining
-/// classes are not walked.
+/// grade loop**: the attach's `FOR KEY SHARE` row-lock claim makes that
+/// answer precisely "a delete landed mid-pump", so it is reported once and
+/// the remaining classes are not walked.
 ///
 /// The abort is still a `Ok(..)`, not an error: the attaches that committed
 /// before the delete stand (its sweep took the ones it could reach), and a
@@ -391,9 +348,9 @@ pub async fn status(
     if sections.is_empty() {
         return Ok(Vec::new());
     }
-    let classes: Vec<RecordId> = sections
+    let classes: Vec<ClassGroupId> = sections
         .iter()
-        .map(|class| class.get_id().record())
+        .map(|class| class.get_id().clone())
         .collect();
     let held = class_blueprint::held_links(db, classes).await?;
     Ok(sections

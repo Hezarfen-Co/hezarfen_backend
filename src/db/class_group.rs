@@ -1,13 +1,10 @@
-//! The `class_group` table: the row, its term reference claimed through
-//! [`crate::db::cap`] in the same transaction as the link, and the 0/0 delete
-//! guard. The archived-term guard and the route-facing wrappers live in
+//! The `class_group` table: the row, its term reference claimed through the
+//! [`crate::db::cap`] shapes in the same statement as the link, and the 0/0
+//! delete guard. The archived-term guard and the route-facing wrappers live in
 //! [`crate::service::class_group`].
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::{CLASS_COURSE_COUNT_FIELD, CLASS_MEMBER_COUNT_FIELD, TERM_CLASS_COUNT_FIELD};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::{CLASS_GROUP_TABLE, TERM_CLASS_COUNT_FIELD};
+use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
@@ -15,16 +12,13 @@ use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The `THROW` marker the delete guard aborts with — a class that still holds
-/// students or courses, or a class row that is no longer there.
-const LINKS_MARK: &str = "class_links";
-
 /// Create the class, claiming a reference on the term it links (if any) in
-/// the *same transaction* as the row, exactly as
+/// the *same statement* as the row, exactly as
 /// [`crate::db::course::create`] does: the claim is a
 /// conditional write on the term row, so it fails when the term is already
-/// gone, it makes the term undeletable the instant this link exists, and no
-/// crash can leave either half without the other.
+/// gone, it makes the term undeletable the instant this link exists, and — the
+/// claim and the insert being one CTE — no crash and no refused claim can
+/// leave either half without the other.
 pub async fn create(
     db: &Database,
     creator: &UserId,
@@ -33,40 +27,77 @@ pub async fn create(
     term: Option<TermId>,
     teacher: Option<UserId>,
 ) -> Result<ClassGroup, AppError> {
-    let class = ClassGroup {
-        id: ClassGroupId::generate(),
-        creator: creator.clone(),
-        name,
-        grade,
-        term,
-        teacher,
-    };
-    let id = class.id.record();
-    let Some(term) = class.term.clone() else {
-        let created: Option<ClassGroup> = db.create(id).content(class).await?;
-        return created.ok_or_else(|| AppError::Internal("failed to create class".into()));
-    };
-    match cap::claim_and_create(
-        &term.record(),
-        TERM_CLASS_COUNT_FIELD,
-        cap::UNLIMITED,
-        &id,
-        &class,
-        db,
-    )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(created),
-        // Uncapped, so "full" can only mean the conditional write matched no
-        // term row at all — the claim doubles as the existence check.
-        cap::Claimed::Full => Err(term::gone_error()),
-        // Unreachable: the id is a ULID this call just generated.
-        cap::Claimed::Duplicate => Err(AppError::Internal("failed to create class".into())),
+    let id = ClassGroupId::generate();
+    match &term {
+        Some(term) => {
+            // The claim and the insert are one statement: atomic without an
+            // explicit transaction, exactly like every other
+            // single-statement guard.
+            let written = sqlx::query_as!(
+                ClassGroup,
+                r#"WITH seat AS (
+                       UPDATE term SET class_count = class_count + 1
+                        WHERE id = $1
+                        RETURNING 1)
+                   INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                   SELECT $2, $3, $4, $5, $1, $6 WHERE EXISTS (SELECT 1 FROM seat)
+                   RETURNING id, creator, name, grade, term, teacher"#,
+                term.uuid(),
+                id.uuid(),
+                creator.uuid(),
+                name.as_str(),
+                grade.as_deref(),
+                teacher.as_ref()
+            )
+            .fetch_optional(db)
+            .await;
+            match written {
+                Ok(Some(created)) => Ok(created),
+                // Uncapped, so a zero-row claim can only mean the conditional
+                // write matched no term row at all — the claim doubles as the
+                // existence check.
+                Ok(None) => Err(term::gone_error()),
+                // The term row is locked by the claim's own UPDATE, so this
+                // is unreachable; a defensible answer beats a 500.
+                Err(e) if crate::database::foreign_key_violation(&e) => Err(term::gone_error()),
+                // Unreachable: the id was minted one line above.
+                Err(e) if crate::database::unique_violation(&e).is_some() => {
+                    Err(AppError::Internal("failed to create class".into()))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        None => {
+            let created = sqlx::query_as!(
+                ClassGroup,
+                r#"INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING id, creator, name, grade, term, teacher"#,
+                id.uuid(),
+                creator.uuid(),
+                name.as_str(),
+                grade.as_deref(),
+                term.as_ref(),
+                teacher.as_ref()
+            )
+            .fetch_optional(db)
+            .await?;
+            // Unreachable: the id is a v7 uuid this call just generated.
+            created.ok_or_else(|| AppError::Internal("failed to create class".into()))
+        }
     }
 }
 
 pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let class = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id, creator, name, grade, term, teacher
+           FROM class_group WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(class)
 }
 
 /// Every class, newest first — or one grade's, when `grade` narrows it:
@@ -84,13 +115,16 @@ pub async fn list_all(
     offset: i64,
 ) -> Result<(Vec<ClassGroup>, i64), AppError> {
     let list = match grade {
-        None => PagedList::new("class_group", "ORDER BY id DESC"),
-        // A gradeless class stores no `grade` key at all (SurrealDB drops a
-        // key valued NONE), and an absent field reads back as NONE — so the
-        // one comparison covers both spellings.
-        Some(None) => PagedList::new("class_group WHERE grade IS NONE", "ORDER BY id DESC"),
-        Some(Some(grade)) => PagedList::new("class_group WHERE grade = $grade", "ORDER BY id DESC")
-            .bind("grade", grade.as_str().to_string()),
+        None => PagedList::new(CLASS_GROUP_TABLE, "ORDER BY id DESC"),
+        Some(None) => PagedList::new(
+            format!("{CLASS_GROUP_TABLE} WHERE grade IS NULL"),
+            "ORDER BY id DESC",
+        ),
+        Some(Some(grade)) => PagedList::new(
+            format!("{CLASS_GROUP_TABLE} WHERE grade = $1"),
+            "ORDER BY id DESC",
+        )
+        .bind(grade.as_str().to_string()),
     };
     list.run(limit, offset, db).await
 }
@@ -114,30 +148,34 @@ pub async fn update(
     teacher: Option<Option<UserId>>,
 ) -> Result<ClassGroup, AppError> {
     let (claim, release) = term::ref_move(class.term.as_ref(), &term);
-    let expected = class.term.as_ref().map(TermId::record);
-    FieldUpdate::new(class.id.record())
-        .set("name", name)
-        .set("grade", grade)
-        .set("term", term.map(|term| term.map(|term| term.record())))
+    let expected = class.term.as_ref().map(TermId::uuid);
+    FieldUpdate::new(CLASS_GROUP_TABLE, class.id.uuid())
+        .set("name", name.map(|name| name.as_str().to_string()))
+        .set(
+            "grade",
+            grade.map(|grade| grade.map(|grade| grade.as_str().to_string())),
+        )
+        .set("term", term.map(|term| term.map(|term| term.uuid())))
         // Not refcounted: a homeroom assignment is a label, so it rides the
         // plain `set` path and never arms the term CAS.
         .set(
             "teacher",
-            teacher.map(|teacher| teacher.map(|teacher| teacher.record())),
+            teacher.map(|teacher| teacher.map(|teacher| teacher.uuid())),
         )
         .refcount(
+            "term",
             TERM_CLASS_COUNT_FIELD,
             "term",
             expected,
-            claim,
-            release,
+            claim.map(|term| term.uuid()),
+            release.map(|term| term.uuid()),
             term::gone_error(),
         )
         .run::<ClassGroup>(db)
         .await
 }
 
-/// The classes `ids` names, in no particular order — the join behind
+/// The classes `ids` name, in no particular order — the join behind
 /// "which class section is this student in", where the ids come from
 /// `class_member` rows already paged. Ids that name no row are simply
 /// absent.
@@ -145,13 +183,16 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(ClassGroupId::record).collect();
-    let mut result = db
-        .query("SELECT * FROM class_group WHERE id IN $ids")
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ClassGroup>>(0)?)
+    let ids: Vec<ClassGroupId> = ids.to_vec();
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id, creator, name, grade, term, teacher
+           FROM class_group WHERE id = ANY($1)"#,
+        ids as _
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
 }
 
 /// Every class section at one grade label, in no particular order — what a
@@ -161,23 +202,28 @@ pub async fn list_for_grade(
     db: &Database,
     grade: &ClassGrade,
 ) -> Result<Vec<ClassGroup>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM class_group WHERE grade = $grade")
-        .bind(("grade", grade.as_str().to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ClassGroup>>(0)?)
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id, creator, name, grade, term, teacher
+           FROM class_group WHERE grade = $1"#,
+        grade.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
 }
 
-/// Strip `user` from every class they were the homeroom teacher of — the
+/// Clear the homeroom teacher everywhere `user` held one — the
 /// sweep for a user demoted below `teacher`, who may no longer hold one.
 /// The mirror of [`crate::db::course::unassign_everywhere`];
 /// nothing is counted on this column, so there is no reference to give back.
 pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), AppError> {
-    db.query("UPDATE class_group SET teacher = NONE WHERE teacher = $usr")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        r#"UPDATE class_group SET teacher = NULL WHERE teacher = $1"#,
+        user.uuid()
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -189,49 +235,48 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// `false` = refused, nothing was written. Both counts are read off the
 /// class's own row, so the check and the delete are one conditional write on
 /// one record — a member or attach racing this either claims first (and the
-/// delete is refused) or finds the row gone (and is refused itself).
+/// delete is refused) or finds the row gone (and is refused itself). The
 /// `Err(NotFound)` keeps the answer a concurrent *delete* used to get.
 pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> {
-    // Parenthesized `??` throughout: `n ?? 0 = 0` parses as `n ?? (0 = 0)`,
-    // which is truthy for every row and would delete a class still in use.
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $gone = (DELETE $class WHERE ({CLASS_MEMBER_COUNT_FIELD} ?? 0) = 0 \
-             AND ({CLASS_COURSE_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
-         IF array::len($gone) = 0 {{ THROW '{LINKS_MARK}' }};
-         FOR $row IN $gone {{
-             IF $row.term != NONE {{
-                 UPDATE $row.term SET {TERM_CLASS_COUNT_FIELD} = \
-                     math::max([({TERM_CLASS_COUNT_FIELD} ?? 0) - 1, 0]);
-             }};
-         }};
-         COMMIT TRANSACTION;"
-    );
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the marker, and a lost
-    // round is re-sent rather than reported (see [`transaction_with_retry`]).
-    let (_, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[("class".into(), class.id.record().into_value())],
-        &[LINKS_MARK],
-    )
-    .await?;
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(LINKS_MARK))
-    {
-        // Still linked or already gone: the guard cannot tell those apart,
-        // and only the refusal path pays for the extra read that can.
-        return match read(db, &class.id).await? {
-            Some(_) => Ok(false),
-            None => Err(AppError::NotFound),
+    tx_with_retry(db, false, async |tx| {
+        let gone = sqlx::query!(
+            r#"DELETE FROM class_group
+               WHERE id = $1
+                 AND class_member_count = 0 AND class_course_count = 0
+               RETURNING term AS "term: Option<uuid::Uuid>""#,
+            class.id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = gone else {
+            // Still linked or already gone: the guard cannot tell those
+            // apart, and only the refusal path pays for the extra read that
+            // can.
+            let standing = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
+                class.id.uuid()
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            return if standing {
+                Ok(false)
+            } else {
+                Err(AppError::NotFound)
+            };
         };
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    Ok(true)
+        if let Some(term) = row.term {
+            sqlx::query!(
+                r#"UPDATE term SET class_count = GREATEST(class_count - 1, 0)
+                   WHERE id = $1"#,
+                term
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(true)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -547,9 +592,10 @@ mod tests {
         let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let dead = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
+        let dead =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let dead_id = dead.get_id().clone();
         assert!(crate::db::term::delete(&db, dead).await.unwrap());
         let class = class_on(Some(from.get_id().clone()), &db).await;
@@ -610,9 +656,10 @@ mod tests {
         let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let other = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
+        let other =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let class = class_on(Some(from.get_id().clone()), &db).await;
         let stale = class.clone();
         update(

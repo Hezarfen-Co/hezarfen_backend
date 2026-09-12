@@ -2,91 +2,46 @@
 //! `enrollment` row that link implies reconciled with it, in one transaction.
 //!
 //! A class section (şube) has two link tables — `class_member` (a student in
-//! it) and
-//! `class_course` (a course attached to it) — and the *product* of the two is
-//! the roster it owes: every member is enrolled in every attached course, in
-//! real `enrollment` rows tagged [`source`](crate::domain::enrollment) with the
-//! class that wrote them. Adding a member and attaching a course are therefore
-//! the same operation seen along its two axes, and so are removing one and
-//! detaching the other. That axis is what these two primitives take as a
-//! parameter, so the four public operations are each a couple of lines.
+//! it) and `class_course` (a course attached to it) — and the *product* of the
+//! two is the roster it owes: every member is enrolled in every attached
+//! course, in real `enrollment` rows tagged [`source`](crate::domain::enrollment)
+//! with the class that wrote them. Adding a member and attaching a course are
+//! therefore the same operation seen along its two axes, and so are removing
+//! one and detaching the other.
 //!
 //! What is *not* one primitive is attach and detach. They share no statement:
-//! one gates on "this pair already holds a row" and claims two counters
-//! upwards, the other gates on nothing, releases, and has to decide per
-//! enrollment row whether a *rival* class still claims it. Folding them behind
-//! a direction flag would be one function containing two, so the seam stays
-//! where the SQL puts it.
+//! one gates on "this pair already holds a row" and claims a counter upwards,
+//! the other gates on nothing, releases, and has to decide per enrollment row
+//! whether a *rival* class still claims it.
 //!
-//! Everything here writes counters the way [`crate::db::cap`] does — a
-//! single-record conditional `UPDATE`, never a count-then-write — and every
-//! `??` is parenthesized, because `n ?? 0 < $cap` parses as `n ?? (0 < $cap)`
-//! and is truthy for every row.
+//! Every invariant is one Postgres statement or one row lock, in the shapes
+//! [`crate::db::cap`] documents: the class counter is claimed by a conditional
+//! `UPDATE` fused with the link's `INSERT` (one CTE — a refused insert takes
+//! its own seat bump back), a duplicate is the link table's natural composite
+//! primary key answering as `23505`, a gone parent is a real `FOREIGN KEY`
+//! answering as `23503`, and the row locks (`FOR KEY SHARE` / `FOR NO KEY
+//! UPDATE`) put each transaction on the very record a racing writer must
+//! touch. A refusal is an early `Err` (or an `Ok` verdict) from the
+//! [`crate::database::tx_with_retry`] closure — a decision, never a retry.
 
-use surrealdb::types::{RecordId, SurrealValue, Value};
+use sqlx::postgres::PgConnection;
 
-use crate::constant::{
-    CLASS_COURSE_COUNT_FIELD, CLASS_COURSE_TABLE, CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE,
-    ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS,
-};
-use crate::database::{Database, transaction_with_retry};
+use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
+use crate::database::{Database, foreign_key_violation, tx_with_retry, unique_violation};
 use crate::db::cap;
-use crate::db::class_group;
+use crate::domain::class_blueprint::ClassBlueprintId;
+use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::ClassGroupId;
+use crate::domain::class_member::ClassMember;
+use crate::domain::course::CourseId;
+use crate::domain::role::Role;
+use crate::domain::timestamp::Timestamp;
+use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The `THROW` markers [`attach`] aborts with. `FULL_MARK` and `MISSING_MARK`
-/// are *prefixes*: the record id of the course the loop stopped on is appended
-/// to them, because neither "the class does not fit" nor "that course is gone"
-/// is answerable without naming the course, and the loop only learns which one
-/// at runtime. The whole id and not just the key, so the refusal names
-/// something a caller can look up without knowing which table it came from.
-///
-/// `MISSING_MARK` is deliberately not `FULL_MARK`: a seat claim that matches
-/// nothing means "full" *or* "no such row", and reporting a class-course link
-/// left pointing at a deleted course as a full course sends the caller to raise
-/// a capacity that does not exist, on a class every member add now fails on.
-///
-/// `CAP_MARK` is the class counter's claim matching nothing, which is "the
-/// class is full" *or* "the class is gone" — one conditional write cannot say
-/// which, so it stays one marker and the read that tells them apart is paid for
-/// only on that path (the same shape as
-/// [`crate::db::enrollment::enroll`]). It is not `GONE_MARK`:
-/// that one is the *pivot* claim, which is a different row.
-///
-/// `OVER_MARK` is the *other* axis already standing above its own ceiling —
-/// which no claim on this axis can see, and which is what bounds this
-/// transaction's write loop (see [`Axis::cap`]). It is its own marker because
-/// "this class holds too many courses" is not an answer anyone can act on when
-/// it is reported as "this class holds too many students".
-///
-/// `SOURCE_MARK` is the record that *asked* for this attach — a grade blueprint
-/// — being gone by the time the transaction runs. It is the only marker a
-/// caller opts into (only a sourced attach states the claim), and it exists
-/// because a blueprint's delete sweeps by that tag: a row landing after the
-/// sweep would carry the name of a template no sweep can ever reach again.
-const HELD_MARK: &str = "class_held";
-const GONE_MARK: &str = "class_gone";
-const CAP_MARK: &str = "class_cap";
-const OVER_MARK: &str = "class_over";
-const SOURCE_MARK: &str = "class_no_blueprint";
-const FULL_MARK: &str = "class_full:";
-const MISSING_MARK: &str = "class_no_course:";
-
-/// An in-transaction existence claim as its own two statements: read `read`
-/// into `$name`, and abort with `mark` when it matched nothing.
-///
-/// Two statements and not one string, because [`attach`] takes the `CREATE`'s
-/// result slot off the *length* of its statement list — a pair returned as one
-/// element would count as one slot and silently read the wrong result back.
-fn claim(name: &str, read: &str, mark: &str) -> Vec<String> {
-    vec![
-        format!("LET ${name} = ({read})"),
-        format!("IF array::len(${name}) = 0 {{ THROW '{mark}' }}"),
-    ]
-}
-
-/// What [`attach`] settled.
+/// What [`attach_course`]'s attach settled. The caller answers each verdict —
+/// a hand attach turns them into this route's errors; a blueprint pump reads
+/// them and carries on ([`crate::domain::class_blueprint`]).
 #[derive(Debug)]
 pub(crate) enum Attached<T> {
     /// The link row, the counter and every enrollment it implied committed
@@ -103,11 +58,10 @@ pub(crate) enum Attached<T> {
     /// between them names the wrong one half the time.
     ///
     /// On the **member** axis the pivot is the student, and this means their
-    /// row is gone *or* their role no longer is `student`
-    /// ([`Axis::pivot_claim`]). Its one caller answers that as the `400` the
-    /// route's own read already answers, never as [`Attached::refusal_code`]'s
-    /// `course_deleted` — which is the course axis's word for it and would name
-    /// a record this refusal is not about.
+    /// row is gone *or* their role no longer is `student`. Its one caller
+    /// answers that as the `400` the route's own read already answers, never
+    /// as [`Attached::refusal_code`]'s `course_deleted` — which is the course
+    /// axis's word for it and would name a record this refusal is not about.
     PivotGone,
     /// The class is at its own ceiling on this axis. Nothing was written, and
     /// it is told apart from [`Attached::Gone`] because a full class is a
@@ -147,16 +101,14 @@ impl<T> Attached<T> {
     /// one cause can never grow two codes.
     ///
     /// Each code names the record that actually failed. The two "gone" answers
-    /// are a *class* delete ([`Attached::Gone`] → `class_deleted`, the class
-    /// counter's claim matching nothing on a row a re-read no longer finds) and
-    /// a *course* delete ([`Attached::PivotGone`] → `course_deleted`, the
-    /// course's own claim matching nothing) — and telling a manager the class
-    /// vanished when the course did sends them to look at a section that is
-    /// standing right there. `linked_course_missing` is a third: *another*
-    /// course already attached to this class no longer exists, and it must be
-    /// detached before this attach can be retried. `blueprint_deleted` is a
-    /// pump losing the template itself mid-run — the only refusal that says
-    /// nothing about the (class, course) pair it names.
+    /// are a *class* delete ([`Attached::Gone`] → `class_deleted`) and a
+    /// *course* delete ([`Attached::PivotGone`] → `course_deleted`) — and
+    /// telling a manager the class vanished when the course did sends them to
+    /// look at a section that is standing right there. `linked_course_missing`
+    /// is a third: *another* course already attached to this class no longer
+    /// exists, and it must be detached before this attach can be retried.
+    /// `blueprint_deleted` is a pump losing the template itself mid-run — the
+    /// only refusal that says nothing about the (class, course) pair it names.
     ///
     /// The `axis` is a parameter because two of these answers name a *different
     /// ceiling* on each of them: [`Attached::ClassFull`] is the ceiling of the
@@ -182,6 +134,7 @@ impl<T> Attached<T> {
 /// Which way the pump runs: the loop below needs a `(course, user)` pair per
 /// enrollment, and each caller supplies one side as a constant and reads the
 /// other off the class's *other* link table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Axis {
     /// A student joining: the courses come from `class_course`.
     Member,
@@ -190,122 +143,36 @@ pub(crate) enum Axis {
 }
 
 impl Axis {
-    /// The `SELECT` that yields this run's `(course, user)` pairs, with `$pivot`
-    /// bound to the fixed side. In-crate text, never client input.
-    fn pairs(&self) -> String {
-        match self {
-            Axis::Member => format!(
-                "SELECT VALUE {{ course: course, user: $pivot }} \
-                 FROM {CLASS_COURSE_TABLE} WHERE class = $class"
-            ),
-            Axis::Course => format!(
-                "SELECT VALUE {{ course: $pivot, user: user }} \
-                 FROM {CLASS_MEMBER_TABLE} WHERE class = $class"
-            ),
-        }
-    }
-
-    /// The enrollment rows a *detached* link of this axis is responsible for,
-    /// as a `WHERE` fragment over `enrollment`. Read off the deleted link row
-    /// rather than a bound parameter, so one loop serves a single detach and a
-    /// user's whole membership alike.
-    fn scope(&self) -> &'static str {
-        match self {
-            Axis::Member => "user = $link.user",
-            Axis::Course => "course = $link.course",
-        }
-    }
-
-    /// The in-transaction proof that this axis's *pivot* row is still there,
-    /// as the statements that claim it.
-    ///
-    /// The class counter's conditional claim covers the class; nothing covered
-    /// the course. With an empty roster the pair loop in [`attach`] touches no
-    /// row at all, so a concurrent `DELETE /courses/{id}` conflicts with
-    /// nothing — SurrealDB does not conflict-check that (write-skew) — and the
-    /// attach commits a `class_course` row pointing at a course that no longer
-    /// exists. A conditional write on the course row *is* the check: it matches
-    /// nothing once the row is gone, and it puts this transaction on the very
-    /// record the course's delete guard writes.
-    ///
-    /// The counter is *moved* — bumped, gated, then restored to the value this
-    /// transaction found — because re-stating it verbatim claims nothing: an
-    /// `UPDATE` that leaves the document unchanged is elided by SurrealDB 3.2.3
-    /// and never enters the write set, so `count = count` sat on no key at all
-    /// and a concurrent `DELETE /courses/{id}` committed beside it with both
-    /// callers told OK (measured on 3.2.3, counter present and absent alike).
-    /// Same shape as [`crate::db::exam_answer::save`]: the
-    /// restore is by captured value, `NONE` included, so the row is
-    /// byte-identical afterwards and the boot backfill still sees the `NONE` it
-    /// seeds off. Both statements are inside the transaction, so an abort
-    /// between them cannot leave a course counting a seat nobody took.
-    ///
-    /// The member axis moves a counter on the *user* row for the same reason in
-    /// a different key ([`cap::role_claim`]): a role change away from `student`
-    /// sweeps this class membership and every enrollment it pumped, on a
-    /// snapshot, so a join landing after that snapshot leaves a non-student on
-    /// a roster — counted against the class's delete guard — with nothing left
-    /// to re-sweep. Its refusal is [`Attached::PivotGone`] like the course
-    /// axis's, because both mean "the row this link hangs off may no longer
-    /// carry it".
-    fn pivot_claim(&self) -> Vec<String> {
-        match self {
-            Axis::Member => cap::role_claim(
-                "pivot",
-                &format!("!= '{}'", crate::domain::role::Role::Student.as_str()),
-                GONE_MARK,
-            ),
-            Axis::Course => {
-                let mut claimed = vec![format!(
-                    "LET $was_alive = (SELECT VALUE {ENROLLMENT_COUNT_FIELD} FROM ONLY $pivot)"
-                )];
-                claimed.extend(claim(
-                    "alive",
-                    &format!(
-                        "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
-                         ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id"
-                    ),
-                    GONE_MARK,
-                ));
-                claimed.push(format!(
-                    "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = $was_alive"
-                ));
-                claimed
-            }
-        }
-    }
-
     /// The class counter this axis's link rows are counted on. Taken off the
     /// axis rather than passed in beside it, because the two are one fact and a
     /// call site that paired the member axis with the course counter would
-    /// compile, pass every test — both are `&str` — and desync the class delete
-    /// guard forever.
-    fn counter(&self) -> &'static str {
+    /// compile, pass every test — both are `&'static str` — and desync the
+    /// class delete guard forever.
+    fn counter(self) -> &'static str {
         match self {
-            Axis::Member => CLASS_MEMBER_COUNT_FIELD,
-            Axis::Course => CLASS_COURSE_COUNT_FIELD,
+            Axis::Member => "class_member_count",
+            Axis::Course => "class_course_count",
         }
     }
 
-    /// How many link rows this axis's counter may reach. Taken off the axis
-    /// beside the counter it bounds, for the same reason.
+    /// How many link rows this axis's counter may reach.
     ///
-    /// This is what makes the pair loop in [`attach`] finite, and it does it
-    /// *crosswise*: the member axis's loop iterates the class's `class_course`
-    /// rows, which the course axis's counter caps, and the course axis's loop
-    /// iterates its `class_member` rows, which the member axis's counter caps.
-    /// So bounding the two counters bounds both write loops — one transaction
-    /// can never carry more than `MAX_CLASS_MEMBERS`/`MAX_CLASS_COURSES`
-    /// enrollment writes.
+    /// This is what makes the pair loop in [`add_member`]/[`attach_course`]
+    /// finite, and it does it *crosswise*: the member axis's loop iterates the
+    /// class's `class_course` rows, which the course axis's counter caps, and
+    /// the course axis's loop iterates its `class_member` rows, which the
+    /// member axis's counter caps. So bounding the two counters bounds both
+    /// write loops — one transaction can never carry more than
+    /// `MAX_CLASS_MEMBERS`/`MAX_CLASS_COURSES` enrollment writes.
     ///
     /// Crosswise is also why the claim alone is not enough. It bounds the axis
     /// being *added*, and the loop it runs is the length of the *other* one: a
     /// class that already holds more members than `MAX_CLASS_MEMBERS` — the
     /// layer shipped before either ceiling existed, so a real volume can carry
     /// one — could still have a course attached, and that attach writes one
-    /// enrollment per member. So [`attach`] checks the other axis too
+    /// enrollment per member. So the attach checks the other axis too
     /// ([`Axis::other`]), and the bound holds for stale classes as well.
-    fn cap(&self) -> i64 {
+    fn cap(self) -> i64 {
         match self {
             Axis::Member => MAX_CLASS_MEMBERS,
             Axis::Course => MAX_CLASS_COURSES,
@@ -315,7 +182,7 @@ impl Axis {
     /// The refusal code for "the class is *at* this axis's ceiling"
     /// ([`Attached::ClassFull`]), taken off the axis beside the `cap` it
     /// reports, because that ceiling and its name are one fact.
-    fn at_ceiling_code(&self) -> &'static str {
+    fn at_ceiling_code(self) -> &'static str {
         match self {
             Axis::Member => "class_at_roster_ceiling",
             Axis::Course => "class_at_course_ceiling",
@@ -327,7 +194,7 @@ impl Axis {
     /// may be ([`Attached::ClassOverloaded`]). Answered off the axis that is
     /// over, never the one being attached — the two are always different axes,
     /// which is exactly what the blind version got wrong.
-    fn over_ceiling_code(&self) -> &'static str {
+    fn over_ceiling_code(self) -> &'static str {
         match self {
             Axis::Member => "class_roster_too_large",
             Axis::Course => "class_course_list_too_large",
@@ -337,7 +204,7 @@ impl Axis {
     /// The axis whose link rows this one's write loop iterates — its counter is
     /// the length of that loop, and its ceiling is therefore the second half of
     /// the bound.
-    fn other(&self) -> Axis {
+    fn other(self) -> Axis {
         match self {
             Axis::Member => Axis::Course,
             Axis::Course => Axis::Member,
@@ -345,7 +212,447 @@ impl Axis {
     }
 }
 
-// The sweep a role change *off* `student` owes — every class membership (each
+/// The pivot of an attach: the row the link hangs off on its own axis, which
+/// must still be there — and, on the member axis, still name a `student` —
+/// when the transaction runs.
+enum Pivot<'a> {
+    User(&'a UserId),
+    Course(&'a CourseId),
+}
+
+/// The verdicts the shared prechecks can settle before any counter moves.
+enum Early {
+    Duplicate,
+    SourceGone,
+    PivotGone,
+    Overloaded,
+}
+
+fn refusal_of<T>(early: Early) -> Attached<T> {
+    match early {
+        Early::Duplicate => Attached::Duplicate,
+        Early::SourceGone => Attached::SourceGone,
+        Early::PivotGone => Attached::PivotGone,
+        Early::Overloaded => Attached::ClassOverloaded,
+    }
+}
+
+/// The gates that run before any counter moves, in the order their answers
+/// outrank each other:
+///
+/// 1. **Duplicate** — "you are already in" outranks "there is no room": a
+///    caller whose row a rival placed a moment ago must not be told a course
+///    is full about seats they already hold. (The link table's own primary key
+///    re-answers this below as `23505` for a rival landing inside the window —
+///    same verdict, no second seat.)
+/// 2. **Source** — the blueprint that asked for this attach is still there. A
+///    `FOR KEY SHARE` row lock on the blueprint row: it serializes the attach
+///    against the blueprint's own delete — the closure the old process-wide
+///    lease provided, now on the row itself. A concurrent blueprint `DELETE`
+///    waits behind it and its sweep finds the committed row, while an attach
+///    starting after the delete finds no row and writes nothing. `KEY SHARE`
+///    is the weakest strength that blocks the delete, so two sourced attaches
+///    still run concurrently, exactly as they did under the old shared read
+///    lease.
+/// 3. **Pivot** — the member axis takes the [`cap` role-claim
+///    recipe](crate::db::cap)'s `FOR NO KEY UPDATE` handshake on the user row:
+///    a role change away from `student` sweeps this membership, and demotion
+///    and join now serialize on that row lock in both directions. The course
+///    axis takes a `FOR KEY SHARE` on the course row, which a concurrent
+///    course delete cannot take — the old bump-and-restore existence proof,
+///    now a plain lock.
+/// 4. **Overloaded** — the *other* axis standing above its own ceiling, which
+///    no claim on this axis can see, and which is what bounds this
+///    transaction's write loop.
+async fn early_verdicts(
+    tx: &mut PgConnection,
+    class: &ClassGroupId,
+    axis: Axis,
+    pivot: Pivot<'_>,
+    source: Option<&ClassBlueprintId>,
+) -> Result<Option<Early>, AppError> {
+    let held = match pivot {
+        Pivot::User(user) => sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM class_member WHERE class = $1 AND app_user = $2"#,
+            class as _,
+            user as _
+        )
+        .fetch_optional(tx)
+        .await?
+        .is_some(),
+        Pivot::Course(course) => sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM class_course WHERE class = $1 AND course = $2"#,
+            class as _,
+            course as _
+        )
+        .fetch_optional(tx)
+        .await?
+        .is_some(),
+    };
+    if held {
+        return Ok(Some(Early::Duplicate));
+    }
+    if let Some(source) = source {
+        let alive = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM class_blueprint WHERE grade = $1 FOR KEY SHARE"#,
+            source as _
+        )
+        .fetch_optional(tx)
+        .await?
+        .is_some();
+        if !alive {
+            return Ok(Some(Early::SourceGone));
+        }
+    }
+    match pivot {
+        Pivot::User(user) => {
+            let row = sqlx::query!(
+                r#"SELECT role AS "role: Role" FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
+                user as _
+            )
+            .fetch_optional(tx)
+            .await?;
+            if row.map(|row| row.role) != Some(Role::Student) {
+                return Ok(Some(Early::PivotGone));
+            }
+        }
+        Pivot::Course(course) => {
+            let alive = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one" FROM course WHERE id = $1 FOR KEY SHARE"#,
+                course as _
+            )
+            .fetch_optional(tx)
+            .await?
+            .is_some();
+            if !alive {
+                return Ok(Some(Early::PivotGone));
+            }
+        }
+    }
+    // Read off the class row inside the transaction that claims it, so the
+    // count this refuses on is the one the pair loop below would iterate.
+    let over = match axis.other() {
+        Axis::Member => sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM class_group
+               WHERE id = $1 AND class_member_count > $2"#,
+            class as _,
+            Axis::Member.cap(),
+        )
+        .fetch_optional(tx)
+        .await?
+        .is_some(),
+        Axis::Course => sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM class_group
+               WHERE id = $1 AND class_course_count > $2"#,
+            class as _,
+            Axis::Course.cap(),
+        )
+        .fetch_optional(tx)
+        .await?
+        .is_some(),
+    };
+    Ok(over.then_some(Early::Overloaded))
+}
+
+/// Write the member link and enroll the student into every course the class is
+/// already attached to, or write nothing at all.
+///
+/// A student already enrolled in one of those courses keeps the row they
+/// have — no seat is charged, and the existing row's `source` is left exactly
+/// as it was, so a hand-placed student is never quietly adopted by a class.
+/// A course with no free seat refuses the *whole* join rather than half of it.
+///
+/// The class counter is claimed by the conditional half of the CTE below
+/// rather than a bare increment, so a class deleted out from under this run
+/// matches nothing and the whole cascade aborts: [`Attached::Gone`] instead of
+/// a counter on a row that no longer exists. The same write carries
+/// [`Axis::Member`]'s cap, which is what keeps the pair loop — and therefore
+/// this transaction — finite: [`Attached::ClassFull`] once the class is at its
+/// ceiling. Claim and insert are one statement, so a refused insert takes its
+/// own seat bump back.
+pub(crate) async fn add_member(
+    db: &Database,
+    class: &ClassGroupId,
+    user: &UserId,
+    by: &UserId,
+) -> Result<Attached<ClassMember>, AppError> {
+    let added_at = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        if let Some(early) =
+            early_verdicts(tx, class, Axis::Member, Pivot::User(user), None).await?
+        {
+            return Ok(refusal_of(early));
+        }
+        // The claim and the link are one statement (the cap recipe's CTE): the
+        // conditional `UPDATE` on the class row gates the `INSERT`, so a full
+        // or gone class writes nothing at all.
+        let inserted = match sqlx::query_scalar!(
+            r#"WITH seat AS (
+                   UPDATE class_group SET class_member_count = class_member_count + 1
+                    WHERE id = $1 AND class_member_count < $2
+                    RETURNING 1)
+               INSERT INTO class_member (class, app_user, added_by, added_at)
+               SELECT $1, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM seat)
+               RETURNING 1 AS "one""#,
+            class as _,
+            Axis::Member.cap(),
+            user as _,
+            by as _,
+            added_at as _
+        )
+        .execute(tx)
+        .await
+        {
+            Ok(result) => result,
+            // A rival landed in the window between the gate and the insert:
+            // the link table's own primary key answers, same verdict as the
+            // gate, no second seat.
+            Err(e) if unique_violation(&e) == Some("class_member_class_user") => {
+                return Ok(Attached::Duplicate);
+            }
+            // The student row vanished mid-run despite the locked pivot claim.
+            Err(e) if foreign_key_violation(&e) => return Ok(Attached::PivotGone),
+            Err(e) => return Err(e.into()),
+        };
+        if inserted.rows_affected() == 0 {
+            // Full, or the class is gone — the claim matches nothing either
+            // way, and only this path pays for the read that tells them apart.
+            let standing = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
+                class as _
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            return Ok(if standing {
+                Attached::ClassFull
+            } else {
+                Attached::Gone
+            });
+        }
+        let courses: Vec<uuid::Uuid> = sqlx::query_scalar!(
+            r#"SELECT course AS "course: uuid::Uuid" FROM class_course WHERE class = $1"#,
+            class as _
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row.course)
+        .collect();
+        let pairs = courses.into_iter().map(|course| (course, user.uuid()));
+        match enroll_pairs(tx, class, pairs, by).await? {
+            Sweep::Done => {}
+            Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
+            Sweep::Full(course) => return Ok(Attached::Full(course)),
+        }
+        Ok(Attached::Made(ClassMember {
+            class: class.clone(),
+            user: *user,
+            added_by: *by,
+            added_at: Some(added_at),
+        }))
+    })
+    .await
+}
+
+/// Write the course link and enroll the class's whole roster into it, or
+/// write nothing at all.
+///
+/// Students already in the course keep the rows they have — no seat charged,
+/// `source` untouched — and a roster that does not fit refuses the whole
+/// attach rather than filling the course to its cap and stopping.
+///
+/// `source` is the blueprint whose behalf this attach runs on, and supplying
+/// it adds one more claim: that it is still there when the transaction runs
+/// ([`Attached::SourceGone`]) — the `FOR KEY SHARE` lock that serializes this
+/// transaction against the blueprint's own delete. A hand attach owns itself
+/// and passes `None`.
+pub(crate) async fn attach_course(
+    db: &Database,
+    class: &ClassGroupId,
+    course: &CourseId,
+    by: &UserId,
+    source: Option<&ClassBlueprintId>,
+) -> Result<Attached<ClassCourse>, AppError> {
+    let attached_at = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        if let Some(early) =
+            early_verdicts(tx, class, Axis::Course, Pivot::Course(course), source).await?
+        {
+            return Ok(refusal_of(early));
+        }
+        let inserted = match sqlx::query_scalar!(
+            r#"WITH seat AS (
+                   UPDATE class_group SET class_course_count = class_course_count + 1
+                    WHERE id = $1 AND class_course_count < $2
+                    RETURNING 1)
+               INSERT INTO class_course (class, course, attached_by, attached_at, source)
+               SELECT $1, $3, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
+               RETURNING 1 AS "one""#,
+            class as _,
+            Axis::Course.cap(),
+            course as _,
+            by as _,
+            attached_at as _,
+            source as _
+        )
+        .execute(tx)
+        .await
+        {
+            Ok(result) => result,
+            Err(e) if unique_violation(&e) == Some("class_course_class_course") => {
+                return Ok(Attached::Duplicate);
+            }
+            Err(e) if foreign_key_violation(&e) => return Ok(Attached::PivotGone),
+            Err(e) => return Err(e.into()),
+        };
+        if inserted.rows_affected() == 0 {
+            let standing = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
+                class as _
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            return Ok(if standing {
+                Attached::ClassFull
+            } else {
+                Attached::Gone
+            });
+        }
+        let members: Vec<uuid::Uuid> = sqlx::query_scalar!(
+            r#"SELECT app_user AS "app_user: uuid::Uuid" FROM class_member WHERE class = $1"#,
+            class as _
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row.app_user)
+        .collect();
+        let pairs = members.into_iter().map(|user| (course.uuid(), user));
+        match enroll_pairs(tx, class, pairs, by).await? {
+            Sweep::Done => {}
+            Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
+            Sweep::Full(course) => return Ok(Attached::Full(course)),
+        }
+        Ok(Attached::Made(ClassCourse {
+            class: class.clone(),
+            course: *course,
+            attached_by: *by,
+            source: source.cloned(),
+            attached_at: Some(attached_at),
+        }))
+    })
+    .await
+}
+
+/// What the shared enrollment loop settled for its pairs.
+enum Sweep {
+    /// Every pair holds the row it owes.
+    Done,
+    /// One of the pairs' courses is gone, named by its key: a stale link.
+    CourseGone(String),
+    /// One of the pairs' courses has no free seat, named by its key.
+    Full(String),
+}
+
+/// Enroll every `(course, user)` pair that has no row yet, each against its
+/// own course's capacity, skipping — never charging — the pairs that do.
+///
+/// Per pair, in the order the refusals outrank each other: the pair's own row
+/// answers "already enrolled" (skip, no seat); the course row answers "gone"
+/// *before* the seat claim, so a stale link is never mis-reported as a
+/// capacity problem; the seat claim is a conditional `UPDATE` on the course
+/// row (live cap — `capacity` as it stands at write time, `NULL` reading as
+/// unlimited); and the insert rides the seat it claimed. A rival that lands
+/// between the gate and the insert answers `23505`, and the bump is given
+/// back before the skip — the outcome a re-sent transaction used to reach by
+/// seeing the rival's row at its gate.
+///
+/// Every abort stops the loop inside the caller's transaction: not one of the
+/// earlier seats in the same run survives, which is the whole point of doing
+/// this in a transaction.
+async fn enroll_pairs(
+    tx: &mut PgConnection,
+    class: &ClassGroupId,
+    pairs: impl Iterator<Item = (uuid::Uuid, uuid::Uuid)>,
+    by: &UserId,
+) -> Result<Sweep, AppError> {
+    for (course, user) in pairs {
+        let held = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
+            course,
+            user
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if held {
+            continue;
+        }
+        let alive = sqlx::query_scalar!(r#"SELECT 1 AS "one" FROM course WHERE id = $1"#, course)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !alive {
+            return Ok(Sweep::CourseGone(course.to_string()));
+        }
+        let seat = sqlx::query_scalar!(
+            r#"UPDATE course SET enrollment_count = enrollment_count + 1
+               WHERE id = $1 AND enrollment_count < COALESCE(capacity, $2)
+               RETURNING 1 AS "one""#,
+            course,
+            cap::UNLIMITED,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !seat {
+            return Ok(Sweep::Full(course.to_string()));
+        }
+        let wrote = sqlx::query_scalar!(
+            r#"INSERT INTO enrollment (course, app_user, enrolled_by, source)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (course, app_user) DO NOTHING
+               RETURNING 1 AS "one""#,
+            course,
+            user,
+            by as _,
+            class as _
+        )
+        .fetch_optional(&mut *tx)
+        .await;
+        match wrote {
+            Ok(Some(_)) => {}
+            // A rival placed the pair in the window: their row stands, no
+            // second seat, and the claim this run took is given back — the
+            // skip wins over the capacity answer, exactly as a re-sent
+            // transaction found the row at its gate.
+            Ok(None) => {
+                sqlx::query!(
+                    r#"UPDATE course SET enrollment_count = enrollment_count - 1
+                       WHERE id = $1"#,
+                    course
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            Err(e) if unique_violation(&e) == Some("enrollment_course_user") => {
+                sqlx::query!(
+                    r#"UPDATE course SET enrollment_count = enrollment_count - 1
+                       WHERE id = $1"#,
+                    course
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Sweep::Done)
+}
+
+// The sweep a role change *off` `student` owes — every class membership (each
 // class getting its member count back) and every enrollment row (each course
 // getting its seat back) — is two of the arms of
 // [`crate::service::user::set_role`], because it belongs in the same
@@ -355,328 +662,239 @@ impl Axis {
 // counters back, so the class passed its zero-zero delete guard and the rows
 // were left pointing at a class no sweep could ever reach again.
 
-/// Write `link` and enroll everything it implies, or write nothing at all.
-///
-/// The order is the one [`cap::claim_and_create`] settled on and for the same
-/// reason: the link is looked for *before* any counter moves, so "you are
-/// already in" outranks "there is no room" — a caller whose row a rival placed
-/// a moment ago must not be told a course is full about seats they already
-/// hold.
-///
-/// The class counter is claimed by a conditional write rather than a bare
-/// increment, so a class deleted out from under this run matches nothing and
-/// the whole cascade aborts: [`Attached::Gone`] instead of a counter on a row
-/// that no longer exists. The same write carries the axis's [`Axis::cap`],
-/// which is what keeps the pair loop below — and therefore this transaction —
-/// finite: [`Attached::ClassFull`] once the class is at its ceiling.
-///
-/// Every enrollment in the loop is *skipped* when the pair already has a row —
-/// no seat charged, and the existing row's `source` left exactly as it was, so
-/// a hand-placed student is never quietly adopted by a class. Only the pairs
-/// that had no row at all are charged, each against its own course's capacity.
-///
-/// On admissibility ([`crate::database::transaction_with_retry`]): every
-/// `CREATE` here is preceded by its own in-transaction existence check, so an
-/// "already exists" can only come from a rival that landed inside that window —
-/// and re-sending the whole cascade then *sees* the row and takes the other
-/// branch. The retry converges instead of re-asking a settled question, which
-/// is the restriction's actual test.
-///
-/// `source` is the record whose behalf this attach runs on — a grade blueprint
-/// — and supplying it adds one more claim: that it is still there when the
-/// transaction runs ([`Attached::SourceGone`]). A hand attach owns itself and
-/// passes `None`.
-pub(crate) async fn attach<T: SurrealValue + Clone>(
-    db: &Database,
-    class: &ClassGroupId,
-    axis: Axis,
-    new: (&RecordId, &T),
-    pivot: RecordId,
-    by: RecordId,
-    source: Option<RecordId>,
-) -> Result<Attached<T>, AppError> {
-    let (link, row) = new;
-    let count_field = axis.counter();
-    let pairs = axis.pairs();
-    let other = axis.other();
-    let over_field = other.counter();
-    // One statement per element, because the `CREATE`'s result slot is this
-    // list's own length at the moment it is pushed. It used to be a
-    // hand-counted constant with a case per optional claim, and only the path
-    // carrying that claim would ever have paid for a miscount.
-    let mut statements = vec![
-        "BEGIN TRANSACTION".to_string(),
-        "LET $held = (SELECT VALUE id FROM $link)".to_string(),
-        format!("IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }}"),
-    ];
-    if source.is_some() {
-        statements.extend(claim("source", "SELECT VALUE id FROM $guard", SOURCE_MARK));
-    }
-    statements.extend(axis.pivot_claim());
-    // Read off the class row inside the transaction that claims it, so the
-    // count this refuses on is the one the pair loop below would iterate.
-    statements.push(format!(
-        "LET $over = (SELECT VALUE id FROM $class WHERE ({over_field} ?? 0) > $other_cap)"
-    ));
-    statements.push(format!(
-        "IF array::len($over) > 0 {{ THROW '{OVER_MARK}' }}"
-    ));
-    statements.push(format!(
-        "LET $counted = (UPDATE $class SET {count_field} = ({count_field} ?? 0) + 1 \
-         WHERE ({count_field} ?? 0) < $class_cap RETURN VALUE id)"
-    ));
-    statements.push(format!(
-        "IF array::len($counted) = 0 {{ THROW '{CAP_MARK}' }}"
-    ));
-    // Taken as it is pushed: this is the slot the link row comes back out of.
-    let made = statements.len();
-    statements.push("CREATE $link CONTENT $row".to_string());
-    statements.push(format!(
-        "FOR $pair IN (({pairs}) ?? []) {{
-             LET $seat_of = type::record('{ENROLLMENT_TABLE}', string::concat(
-                 record::id($pair.course), '_', record::id($pair.user)));
-             IF array::len((SELECT VALUE id FROM $seat_of)) = 0 {{
-                 IF array::len((SELECT VALUE id FROM $pair.course)) = 0 {{
-                     THROW '{MISSING_MARK}' + <string>$pair.course
-                 }};
-                 LET $seat = (UPDATE $pair.course SET {ENROLLMENT_COUNT_FIELD} = \
-                     ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 \
-                     WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) < (capacity ?? $unlimited) \
-                     RETURN VALUE id);
-                 IF array::len($seat) = 0 {{
-                     THROW '{FULL_MARK}' + <string>$pair.course
-                 }};
-                 CREATE $seat_of CONTENT {{ course: $pair.course, user: $pair.user, \
-                     enrolled_by: $by, source: $class }};
-             }};
-         }}"
-    ));
-    statements.push("COMMIT TRANSACTION".to_string());
-    let sql = format!("{};", statements.join(";\n"));
-    let mut bindings = vec![
-        ("class".into(), class.record().into_value()),
-        ("link".into(), link.clone().into_value()),
-        ("row".into(), row.clone().into_value()),
-        ("pivot".into(), pivot.into_value()),
-        ("by".into(), by.into_value()),
-        ("unlimited".into(), cap::UNLIMITED.into_value()),
-        ("class_cap".into(), axis.cap().into_value()),
-        ("other_cap".into(), other.cap().into_value()),
-    ];
-    if let Some(guard) = source {
-        bindings.push(("guard".into(), guard.into_value()));
-    }
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &bindings,
-        &[
-            HELD_MARK,
-            GONE_MARK,
-            OVER_MARK,
-            SOURCE_MARK,
-            CAP_MARK,
-            FULL_MARK,
-            MISSING_MARK,
-        ],
-    )
-    .await?;
-    // "Already linked" is read first: it outranks both refusals below, and the
-    // gate aborts before either could fire.
-    //
-    // Only the `THROW` is read, never an `is_already_exists` off the `CREATE`
-    // itself. A rival landing in the window between the gate and the create
-    // makes the store answer "already exists", which
-    // [`transaction_with_retry`] treats as a lost round and re-sends — and that
-    // re-send is the right answer, because the second pass *sees* the row at
-    // the gate. Reading it here would also mis-file the enrollment `CREATE`'s
-    // version of the same answer as "already in this class".
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(HELD_MARK))
-    {
-        return Ok(Attached::Duplicate);
-    }
-    // The blueprint that asked for this attach is gone, and that outranks every
-    // refusal below it: none of them is an answer anyone can act on once the
-    // template that wanted the row has been deleted — and its claim stands
-    // first in the transaction, so it aborts before they could fire anyway.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(SOURCE_MARK))
-    {
-        return Ok(Attached::SourceGone);
-    }
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(GONE_MARK))
-    {
-        return Ok(Attached::PivotGone);
-    }
-    // Read before the ceiling below: a class over the *other* axis's ceiling is
-    // refused whether or not this axis has room, and being told it is full on
-    // an axis with places left is an answer nobody can act on.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(OVER_MARK))
-    {
-        return Ok(Attached::ClassOverloaded);
-    }
-    // Full, or the class is gone — the counter claim matches nothing either
-    // way, and only this path pays for the read that tells them apart.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(CAP_MARK))
-    {
-        return Ok(match class_group::read(db, class).await? {
-            Some(_) => Attached::ClassFull,
-            None => Attached::Gone,
-        });
-    }
-    // The stale link is read before "full": both come out of the same seat
-    // claim matching nothing, and only one of them is a capacity problem.
-    if let Some(course) = errors
-        .values()
-        .find_map(|error| named_course(&error.to_string(), MISSING_MARK))
-    {
-        return Ok(Attached::CourseGone(course));
-    }
-    if let Some(course) = errors
-        .values()
-        .find_map(|error| named_course(&error.to_string(), FULL_MARK))
-    {
-        return Ok(Attached::Full(course));
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    result
-        .take::<Vec<T>>(made)?
-        .into_iter()
-        .next()
-        .map(Attached::Made)
-        .ok_or_else(|| AppError::Internal("the class pump wrote no link row".into()))
-}
-
-/// The course id out of a `<mark><table>:<key>` abort. Table names and the
-/// generated ULID keys here are alphanumeric and `:` joins them, so the id ends
-/// where the store's own wrapping around the thrown text begins.
-fn named_course(message: &str, mark: &str) -> Option<String> {
-    let id: String = message
-        .split_once(mark)?
-        .1
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
-        .collect();
-    (!id.is_empty()).then_some(id)
-}
-
-/// Drop the link rows `links` names, give each class its counter back, and
-/// sweep the enrollment rows those links pumped. Answers how many link rows
-/// went, so a caller whose link was a single pair can turn zero into a 404.
+/// Take a student out of a class and sweep the enrollments the class pumped
+/// for them. Answers how many link rows went (0 or 1), so the caller can turn
+/// zero into a 404.
 ///
 /// The sweep is *repair-first*: an enrollment this class wrote is only deleted
-/// once no other class still claims it. Two classes attached to the same course
-/// share a student — the second attach skipped the row the first had already
-/// written, so the row carries only the first class's name — and deleting it on
-/// the first class's way out would unenroll a student the second class is still
-/// responsible for. So the row is re-tagged to that rival instead, and only a
-/// row nobody is left to claim is deleted and its seat given back. The heir is
-/// the lowest class id among the claimants: a deterministic pick, so a repeat
-/// of the same sweep lands on the same class.
+/// once no other class still claims it. Two classes attached to the same
+/// course share a student — the second attach skipped the row the first had
+/// already written, so the row carries only the first class's name — and
+/// deleting it on the first class's way out would unenroll a student the
+/// second class is still responsible for. So the row is re-tagged to that
+/// rival instead, and only a row nobody is left to claim is deleted and its
+/// seat given back. The heir is the lowest class id among the claimants: a
+/// deterministic pick (uuid order is mint order), so a repeat of the same
+/// sweep lands on the same class.
 ///
-/// That pick is then **claimed**, by the bump-and-restore
-/// [`Axis::pivot_claim`] documents, before the row is handed over. Both reads
-/// behind it are pure, and this sweep is long — one pass per enrollment row the
-/// link implies — so `DELETE /classes/{heir}/members/{user}` and
-/// `DELETE /classes/{heir}/courses/{course}` could both commit inside it, their
-/// write sets disjoint from this one, and leave the row tagged with a class
-/// holding neither link: a `class_group` whose own 0/0 delete guard then passes,
-/// stranding an enrollment nothing can ever sweep (the state the note above
-/// [`attach`] says must not exist). Every one of those writers moves a counter
-/// on the heir's own row, so moving it here too puts this transaction on the
-/// record they write and the store settles it. The field is
-/// `class_member_count` for both axes: what has to collide is the *record*, and
-/// a class whose membership or course list moved has had one of the two written
-/// either way.
+/// That pick is then **claimed** — a `FOR NO KEY UPDATE` read of the heir's
+/// class row, no counter moved — before the row is handed over. Both reads
+/// behind it are pure, and this sweep is long — one pass per enrollment row
+/// the link implies — so `DELETE /classes/{heir}/members/{user}` and
+/// `DELETE /classes/{heir}/courses/{course}` could both commit inside it and
+/// leave the row tagged with a class holding neither link: a `class_group`
+/// whose own 0/0 delete guard then passes, stranding an enrollment nothing can
+/// ever sweep. Every one of those writers moves a counter on the heir's own
+/// row, so the row lock here puts this transaction on the record they write
+/// and the two settle in either order. A claim that matches nothing is an
+/// heir whose class row is gone — a stale link outliving its class — and it
+/// takes the release arm rather than tagging the row with an id no route can
+/// reach.
 ///
-/// A claim that matches nothing is an heir whose class row is gone — a stale
-/// link outliving its class — and it takes the release arm rather than tagging
-/// the row with a record no route can reach.
-///
-/// Sweeps tolerate rows that are already gone. `Course::delete` wipes a
+/// Sweeps tolerate rows that are already gone. A course delete wipes a
 /// course's enrollments wholesale while the `class_member` rows survive it, so
 /// "this class has a member" and "that member has a live pumped row" are
 /// independent facts and the loop simply finds nothing to sweep.
-///
-/// Admissible by construction: `DELETE` and `UPDATE` only, so no statement in
-/// the cascade can answer "already exists" and every lost round is a plain
-/// re-send.
-pub(crate) async fn detach(
+pub(crate) async fn remove_member(
     db: &Database,
-    links: &str,
-    axis: Axis,
-    bindings: &[(String, Value)],
+    class: &ClassGroupId,
+    user: &UserId,
 ) -> Result<i64, AppError> {
-    let count_field = axis.counter();
-    let scope = axis.scope();
-    // Nobody is left to claim the row: it goes, and its seat with it. Written
-    // once and used from both arms below, because "the heir's claim matched
-    // nothing" is the same answer as "there was no heir".
-    let release = format!(
-        "DELETE $row.id;
-                     UPDATE $row.course SET {ENROLLMENT_COUNT_FIELD} = \
-                         math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);"
-    );
-    let sweep = format!(
-        "FOR $row IN ((SELECT id, course, user FROM {ENROLLMENT_TABLE} \
-                 WHERE {scope} AND source = $link.class) ?? []) {{
-                 LET $rivals = (SELECT VALUE class FROM {CLASS_COURSE_TABLE} \
-                     WHERE course = $row.course AND class != $link.class);
-                 LET $heir = array::first(array::sort((SELECT VALUE class \
-                     FROM {CLASS_MEMBER_TABLE} WHERE user = $row.user AND class IN $rivals)));
-                 IF $heir != NONE {{
-                     LET $was_heir = (SELECT VALUE {CLASS_MEMBER_COUNT_FIELD} FROM ONLY $heir);
-                     LET $claimed = (UPDATE $heir SET {CLASS_MEMBER_COUNT_FIELD} = \
-                         ({CLASS_MEMBER_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-                     UPDATE $heir SET {CLASS_MEMBER_COUNT_FIELD} = $was_heir;
-                     IF array::len($claimed) > 0 {{
-                         UPDATE $row.id SET source = $heir;
-                     }} ELSE {{
-                         {release}
-                     }};
-                 }} ELSE {{
-                     {release}
-                 }};
-             }};"
-    );
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $gone = (DELETE {links} RETURN BEFORE);
-         FOR $link IN ($gone ?? []) {{
-             UPDATE $link.class SET {count_field} = math::max([({count_field} ?? 0) - 1, 0]);
-             {sweep}
-         }};
-         RETURN array::len($gone);
-         COMMIT TRANSACTION;"
-    );
-    let (mut result, mut errors) = transaction_with_retry(db, &sql, bindings, &[]).await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
+    tx_with_retry(db, true, async |tx| {
+        let gone = sqlx::query_scalar!(
+            r#"DELETE FROM class_member WHERE class = $1 AND app_user = $2
+               RETURNING 1 AS "one""#,
+            class as _,
+            user as _
+        )
+        .fetch_optional(tx)
+        .await?;
+        let Some(_) = gone else {
+            return Ok(0);
+        };
+        sqlx::query!(
+            r#"UPDATE class_group
+               SET class_member_count = GREATEST(class_member_count - 1, 0)
+               WHERE id = $1"#,
+            class as _
+        )
+        .execute(&mut *tx)
+        .await?;
+        sweep_enrollments(
+            tx,
+            class,
+            sqlx::query!(
+                r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
+                   FROM enrollment WHERE app_user = $1 AND source = $2"#,
+                user as _,
+                class as _
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|row| (row.course, row.app_user))
+            .collect::<Vec<_>>(),
+        )
+        .await?;
+        Ok(1)
+    })
+    .await
+}
+
+/// Detach `course` from `class` and sweep the enrollments the class pumped
+/// into it. `source`, when given, re-asserts the provenance tag on the link's
+/// own delete — a blueprint sweep may only take back rows its own tag owns.
+/// Answers how many link rows went, so a caller whose link was a single pair
+/// can turn zero into a 404. The sweep underneath is the shared one: a student
+/// a second class still claims is re-tagged rather than unenrolled.
+pub(crate) async fn detach_course(
+    db: &Database,
+    class: &ClassGroupId,
+    course: &CourseId,
+    source: Option<&ClassBlueprintId>,
+) -> Result<i64, AppError> {
+    tx_with_retry(db, true, async |tx| {
+        let gone = match source {
+            Some(source) => {
+                sqlx::query_scalar!(
+                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2 AND source = $3
+                       RETURNING 1 AS "one""#,
+                    class as _,
+                    course as _,
+                    source as _
+                )
+                .fetch_optional(tx)
+                .await?
+            }
+            None => {
+                sqlx::query_scalar!(
+                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2
+                       RETURNING 1 AS "one""#,
+                    class as _,
+                    course as _
+                )
+                .fetch_optional(tx)
+                .await?
+            }
+        };
+        let Some(_) = gone else {
+            return Ok(0);
+        };
+        sqlx::query!(
+            r#"UPDATE class_group
+               SET class_course_count = GREATEST(class_course_count - 1, 0)
+               WHERE id = $1"#,
+            class as _
+        )
+        .execute(&mut *tx)
+        .await?;
+        sweep_enrollments(
+            tx,
+            class,
+            sqlx::query!(
+                r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
+                   FROM enrollment WHERE course = $1 AND source = $2"#,
+                course as _,
+                class as _
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|row| (row.course, row.app_user))
+            .collect::<Vec<_>>(),
+        )
+        .await?;
+        Ok(1)
+    })
+    .await
+}
+
+/// The repair-first tail both detaches share: for every enrollment row the
+/// deleted link owned, hand it to a rival class that still claims it, or
+/// delete it and give the course its seat back.
+///
+/// The heir is the lowest class id among the rivals that carry both this
+/// course *and* the student — the same deterministic pick on every repeat. Its
+/// class row is read `FOR NO KEY UPDATE` (a claim that moves no counter: the
+/// class_member row already covers the student, and the enrollment is counted
+/// on the course) so a concurrent member/course write on the heir serializes
+/// behind this transaction; a claim matching nothing is a gone heir, and the
+/// row takes the release arm.
+async fn sweep_enrollments(
+    tx: &mut PgConnection,
+    class: &ClassGroupId,
+    rows: Vec<(uuid::Uuid, uuid::Uuid)>,
+) -> Result<(), AppError> {
+    for (course, user) in rows {
+        let heir = sqlx::query_scalar!(
+            r#"SELECT cm.class AS "class: uuid::Uuid"
+               FROM class_member cm
+               JOIN class_course cc ON cc.class = cm.class AND cc.course = $1
+               WHERE cm.app_user = $2 AND cm.class <> $3
+               ORDER BY cm.class
+               LIMIT 1"#,
+            course,
+            user,
+            class as _
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.class);
+        let Some(heir) = heir else {
+            release(tx, course, user).await?;
+            continue;
+        };
+        let claimed = sqlx::query_scalar!(
+            r#"SELECT class_member_count AS "heir_count: i64" FROM class_group
+               WHERE id = $1 FOR NO KEY UPDATE"#,
+            heir
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if claimed.is_none() {
+            release(tx, course, user).await?;
+            continue;
+        }
+        sqlx::query!(
+            r#"UPDATE enrollment SET source = $1 WHERE course = $2 AND app_user = $3"#,
+            heir,
+            course,
+            user
+        )
+        .execute(&mut *tx)
+        .await?;
     }
-    // Slots count BEGIN, the LET and the FOR: the RETURN is slot 3.
-    Ok(result.take::<Vec<i64>>(3)?.into_iter().next().unwrap_or(0))
+    Ok(())
 }
 
-/// A composite id for a `(class, other)` link, the shape
-/// [`crate::domain::enrollment::EnrollmentId::composite`] uses: the same pair
-/// always maps to the same record, so one row per pair holds by construction
-/// and a duplicate is something the store can *see* rather than something a
-/// find-then-insert has to race.
-pub(crate) fn link_id(table: &str, class: &ClassGroupId, other: &str) -> RecordId {
-    RecordId::new(table, format!("{}_{}", class.key(), other))
+/// Nobody is left to claim the row: it goes, and its seat with it. The seat
+/// is only given back when the delete actually took the row — a course
+/// delete's wholesale sweep may have taken both while this transaction read
+/// them, and both halves vanish together there.
+async fn release(
+    tx: &mut PgConnection,
+    course: uuid::Uuid,
+    user: uuid::Uuid,
+) -> Result<(), AppError> {
+    let deleted = sqlx::query!(
+        r#"DELETE FROM enrollment WHERE course = $1 AND app_user = $2"#,
+        course,
+        user
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if deleted > 0 {
+        sqlx::query!(
+            r#"UPDATE course SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+               WHERE id = $1"#,
+            course
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

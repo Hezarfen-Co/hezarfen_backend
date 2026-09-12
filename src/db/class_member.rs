@@ -11,10 +11,9 @@ use crate::domain::class_member::ClassMember;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The class's roster, newest first — by when the student was added, not by
-/// their account id, which is what the composite record id sorts on.
-/// A row older than the column carries no stamp at all, and NONE sorts last
-/// under DESC — which is the honest place for a row of unknown age.
+/// The class's roster, newest first — by when the student was added. The
+/// composite primary key is the tiebreaker (class, then user: the two halves
+/// of the id this order used to sort), which makes the order total.
 pub async fn list_for_class(
     db: &Database,
     class: &ClassGroupId,
@@ -22,10 +21,10 @@ pub async fn list_for_class(
     offset: i64,
 ) -> Result<(Vec<ClassMember>, i64), AppError> {
     PagedList::new(
-        format!("{CLASS_MEMBER_TABLE} WHERE class = $class"),
-        "ORDER BY added_at DESC, id DESC",
+        format!("{CLASS_MEMBER_TABLE} WHERE class = $1"),
+        "ORDER BY added_at DESC, class DESC, app_user DESC",
     )
-    .bind("class", class.record())
+    .bind(class.uuid())
     .run(limit, offset, db)
     .await
 }
@@ -40,10 +39,10 @@ pub async fn list_for_user(
     offset: i64,
 ) -> Result<(Vec<ClassMember>, i64), AppError> {
     PagedList::new(
-        format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
-        "ORDER BY added_at DESC, id DESC",
+        format!("{CLASS_MEMBER_TABLE} WHERE app_user = $1"),
+        "ORDER BY added_at DESC, class DESC, app_user DESC",
     )
-    .bind("usr", user.record())
+    .bind(user.uuid())
     .run(limit, offset, db)
     .await
 }
