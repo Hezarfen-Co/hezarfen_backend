@@ -211,7 +211,7 @@ async fn delete_one(
     // pre-read list — an upload that landed in between is in the cascade too.
     let (_, files) = service::note::delete(&st.db, note).await?;
     for file in &files {
-        remove_blob(&st.files_path, file.get_id().key()).await;
+        remove_blob(&st.files_path, &file.get_id().key()).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -284,7 +284,7 @@ async fn upload_file(
     // Blob first, row second — a stored row always points at a real blob. If
     // the row insert fails, take the fresh blob back out.
     let file = NoteFile::new(note.get_id(), name, content_type, upload.data.len() as i64);
-    let path = blob_path(&st.files_path, file.get_id().key());
+    let path = blob_path(&st.files_path, &file.get_id().key());
     crate::web::ensure_files_dir(&st.files_path).await?;
     tokio::fs::write(&path, &upload.data)
         .await
@@ -356,7 +356,7 @@ async fn download_file(
     let file = service::note_file::read_for(&st.db, &NoteFileId::from_key(&file_id), note.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id().key()))
+    let bytes = tokio::fs::read(blob_path(&st.files_path, &file.get_id().key()))
         .await
         .map_err(|err| {
             // The row exists but its blob doesn't — that's server-side damage
@@ -410,7 +410,7 @@ async fn delete_file(
         .await?
         .ok_or(AppError::NotFound)?;
     let file = service::note_file::delete(&st.db, file).await?;
-    remove_blob(&st.files_path, file.get_id().key()).await;
+    remove_blob(&st.files_path, &file.get_id().key()).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -646,7 +646,7 @@ async fn open_blob(
 
     // The row exists but its blob does not: server-side damage (a lost volume
     // path), exactly as `download_file` reads it — not the service's `404`.
-    let path = blob_path(&api.files_dir(&slug), file.get_id().key());
+    let path = blob_path(&api.files_dir(&slug), &file.get_id().key());
     let handle = tokio::fs::File::open(&path).await.map_err(|e| {
         (
             "unavailable",

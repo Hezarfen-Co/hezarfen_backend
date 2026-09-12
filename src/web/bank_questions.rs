@@ -560,13 +560,13 @@ async fn list_questions(
     let items = questions
         .iter()
         .map(|question| {
-            let images = buckets.get(question.get_id().key()).unwrap_or(&empty);
+            let images = buckets.get(&question.get_id().key()).unwrap_or(&empty);
             let subject_name = question
                 .get_subject()
-                .and_then(|subject| subject_names.get(subject.key()).cloned())
+                .and_then(|subject| subject_names.get(&subject.key()).cloned())
                 .unwrap_or_default();
             let owner_name = people
-                .get(question.get_owner().key())
+                .get(&question.get_owner().key())
                 .map(|person| {
                     person
                         .display_name
@@ -574,7 +574,7 @@ async fn list_questions(
                         .unwrap_or_else(|| person.username.clone())
                 })
                 .unwrap_or_default();
-            let used_count = used.get(question.get_id().key()).copied().unwrap_or(0);
+            let used_count = used.get(&question.get_id().key()).copied().unwrap_or(0);
             BankQuestionResponse::with_names(question, images, subject_name, owner_name, used_count)
         })
         .collect();
@@ -651,7 +651,9 @@ async fn update_question(
     owned_question(&st, &user, &bid).await?;
     let patch = bank_question::BankQuestionPatch {
         subject: match req.subject_id {
-            Some(ref subject_id) => Some(crate::service::subject::must_exist(&st.db, subject_id).await?),
+            Some(ref subject_id) => {
+                Some(crate::service::subject::must_exist(&st.db, subject_id).await?)
+            }
             None => None,
         },
         text: match req.text {

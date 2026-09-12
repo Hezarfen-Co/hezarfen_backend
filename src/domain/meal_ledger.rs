@@ -333,7 +333,7 @@ impl MealLedger {
             student: booking.get_student().clone(),
             kind: MealLedgerKind::Reversal,
             amount_minor: amount,
-            source: Some(charge.key()),
+            source: Some(charge.key().to_string()),
             method: None,
             note: None,
             recorded_by: recorded_by.clone(),

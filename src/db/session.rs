@@ -21,8 +21,8 @@ pub async fn create(db: &Database, user: &UserId) -> Result<Session, AppError> {
                      app_user AS "user: UserId",
                      token AS "token: SessionToken",
                      expires_at AS "expires_at: Timestamp""#,
-        id.0,
-        user.0,
+        id.uuid(),
+        user.uuid(),
         token.as_str(),
         expires_at.as_millis(),
     )
@@ -57,7 +57,7 @@ pub async fn delete_by_token(db: &Database, token: &str) -> Result<(), AppError>
 /// the new credential means nothing while a cookie minted under the old one
 /// still authenticates.
 pub async fn delete_by_user(db: &Database, user: &UserId) -> Result<(), AppError> {
-    sqlx::query!("DELETE FROM user_session WHERE app_user = $1", user.0)
+    sqlx::query!("DELETE FROM user_session WHERE app_user = $1", user.uuid())
         .execute(db)
         .await?;
     Ok(())
@@ -69,7 +69,7 @@ pub async fn delete_by_user(db: &Database, user: &UserId) -> Result<(), AppError
 /// forever.
 pub async fn purge_expired(db: &Database) -> Result<u64, AppError> {
     let now = Timestamp::now().as_millis();
-    let (deleted,) = sqlx::query!(
+    let row = sqlx::query!(
         r#"WITH gone AS (
                             DELETE FROM user_session WHERE expires_at < $1 RETURNING 1
                         )
@@ -78,7 +78,7 @@ pub async fn purge_expired(db: &Database) -> Result<u64, AppError> {
     )
     .fetch_one(db)
     .await?;
-    Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+    Ok(u64::try_from(row.deleted).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

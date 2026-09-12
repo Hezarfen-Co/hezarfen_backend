@@ -151,6 +151,14 @@ impl BankQuestion {
         self.correct.as_ref()
     }
 
+    /// The stored options of a choice template (`None` for a text one) — the
+    /// same shape [`crate::domain::exam_question::ExamQuestion::get_choices`]
+    /// gives the exam side, so the web layer's response builder reads both
+    /// alike.
+    pub fn get_choices(&self) -> Option<&[Choice]> {
+        self.choices.as_ref().map(|json| json.0.as_slice())
+    }
+
     pub fn get_source_exam(&self) -> Option<&ExamId> {
         self.source_exam.as_ref()
     }

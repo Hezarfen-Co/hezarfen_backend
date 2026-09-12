@@ -92,8 +92,8 @@ use axum::response::Response;
 use tokio::time::Instant;
 
 use crate::constant::{
-    PURGE_AT, RATE_LIMIT_OVERFLOW_MAX, RATE_LIMIT_TABLE, RATE_SYNC_INTERVAL_SECS,
-    RATE_SYNC_MAX_KEYS, RATE_SYNC_TIMEOUT_SECS,
+    PURGE_AT, RATE_LIMIT_OVERFLOW_MAX, RATE_SYNC_INTERVAL_SECS, RATE_SYNC_MAX_KEYS,
+    RATE_SYNC_TIMEOUT_SECS,
 };
 use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
@@ -474,9 +474,12 @@ where
                 // has passed can never be read again.
                 if swept != epoch {
                     swept = epoch;
-                    let sql = format!("DELETE FROM {RATE_LIMIT_TABLE} WHERE window_start < $1");
-                    if let Err(err) =
-                        with_deadline(sqlx::query(&sql).bind(epoch).execute(&db)).await
+                    if let Err(err) = with_deadline(
+                        sqlx::query("DELETE FROM rate_limit WHERE window_start < $1")
+                            .bind(epoch)
+                            .execute(&db),
+                    )
+                    .await
                     {
                         tracing::warn!(%err, "rate-limit sweep failed; retrying next window");
                     }
@@ -549,17 +552,18 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
     // (`row_key` folds the epoch in), so a conflict can only be another
     // limiter of the same tier folding the same client inside the same window
     // — the ON CONFLICT fold is exactly the replay that must add, not clobber.
-    let mut fold = sqlx::QueryBuilder::<sqlx::Postgres>::new();
-    fold.push("INSERT INTO ")
-        .push(RATE_LIMIT_TABLE)
-        .push(" (id, hits, window_start) ");
+    let mut fold = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO rate_limit (id, hits, window_start) ",
+    );
     fold.push_values(pending.iter(), |mut b, p| {
         b.push_bind(row_key(tier, &p.key, epoch))
             .push_bind(i64::from(p.delta))
             .push_bind(epoch);
     });
-    fold.push(" ON CONFLICT (id) DO UPDATE SET hits = rate_limit.hits + EXCLUDED.hits RETURNING id, hits");
-    let rows: Vec<(String, i64)> = match with_deadline(fold.build_query_as()).await {
+    fold.push(
+        " ON CONFLICT (id) DO UPDATE SET hits = rate_limit.hits + EXCLUDED.hits RETURNING id, hits",
+    );
+    let rows: Vec<(String, i64)> = match with_deadline(fold.build_query_as().fetch_all(db)).await {
         Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(%err, tier, "rate-limit sync failed; counting locally until it recovers");

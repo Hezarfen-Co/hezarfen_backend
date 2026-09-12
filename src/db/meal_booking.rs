@@ -8,7 +8,7 @@
 use crate::database::{Database, tx_with_retry};
 use crate::db::cap::Claimed;
 use crate::db::page::PagedList;
-use crate::domain::meal_booking::{MealBooking, MealBookingId};
+use crate::domain::meal_booking::{MealBooking, MealBookingId, MealBookingStatus};
 use crate::domain::meal_ledger::{LedgerAmount, MealLedger};
 use crate::domain::menu::MenuId;
 use crate::domain::timestamp::Timestamp;
@@ -18,10 +18,10 @@ use crate::error::AppError;
 pub async fn read(db: &Database, id: &MealBookingId) -> Result<Option<MealBooking>, AppError> {
     let row = sqlx::query_as!(
         MealBooking,
-        "SELECT menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at
+        "SELECT menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"
          FROM meal_booking WHERE menu = $1 AND student = $2",
         id.menu().key(),
-        *id.student(),
+        id.student().uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -64,14 +64,14 @@ pub async fn list_for_students(
     if students.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let keys: Vec<String> = students.iter().map(UserId::key).collect();
+    let ids: Vec<uuid::Uuid> = students.iter().map(UserId::uuid).collect();
     let rows = sqlx::query_as!(
         MealBooking,
-        "SELECT menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at
+        "SELECT menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"
          FROM meal_booking WHERE student = ANY($1::uuid[])
          ORDER BY created_at DESC, menu DESC
          LIMIT $2 OFFSET $3",
-        keys,
+        &ids,
         limit,
         offset,
     )
@@ -81,10 +81,11 @@ pub async fn list_for_students(
     let total = if limit.is_some() || offset != 0 {
         sqlx::query_scalar!(
             "SELECT count(*) FROM meal_booking WHERE student = ANY($1::uuid[])",
-            keys,
+            &ids,
         )
         .fetch_one(db)
-        .await? as i64
+        .await?
+        .unwrap_or(0)
     } else {
         rows.len() as i64
     };
@@ -133,9 +134,28 @@ pub(crate) async fn claim_and_place(
     charge: Option<&MealLedger>,
 ) -> Result<Claimed<MealBooking>, AppError> {
     let menu_key = menu.key().to_string();
-    let student = row.student;
+    let student = row.student.uuid();
     let attempt = row.attempt;
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures only: a closure holding a `&T` fails the higher-ranked
+    // `Send` check `tx_with_retry`'s future must pass.
+    let booked_by = row.booked_by.uuid();
+    let status = row.status.as_str();
+    let cancelled_at = row.cancelled_at.map(|t| t.as_millis());
+    let created_at = row.created_at.as_millis();
+    let charge = charge.map(|line| {
+        (
+            line.id.key().to_string(),
+            line.student.uuid(),
+            line.kind.as_str(),
+            line.amount_minor.as_minor(),
+            line.source.clone(),
+            line.method.as_ref().map(|m| m.as_str().to_string()),
+            line.note.as_ref().map(|n| n.as_str().to_string()),
+            line.recorded_by.uuid(),
+            line.created_at.as_millis(),
+        )
+    });
+    tx_with_retry(db, false, async move |tx| {
         // Already held? Same attempt, same price it was taken at — answered
         // as `Duplicate`, which the caller replays into the winner's row
         // (and its charge) without claiming anything.
@@ -175,12 +195,12 @@ pub(crate) async fn claim_and_place(
             "UPDATE meal_booking
              SET status = 'booked', attempt = $3, price_minor = $4, cancelled_at = NULL
              WHERE menu = $1 AND student = $2
-               AND status = 'cancelled' AND attempt = $3 - 1
-             RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+               AND status = 'cancelled' AND attempt = $3::bigint - 1
+             RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"",
             menu_key,
             student,
             attempt,
-            price,
+            price.map(LedgerAmount::as_minor),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -196,15 +216,15 @@ pub(crate) async fn claim_and_place(
                          (menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                      ON CONFLICT (menu, student) DO NOTHING
-                     RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+                     RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"",
                     menu_key,
                     student,
-                    row.booked_by,
-                    row.status,
-                    row.attempt,
-                    price,
-                    row.cancelled_at,
-                    row.created_at,
+                    booked_by,
+                    status,
+                    attempt,
+                    price.map(LedgerAmount::as_minor),
+                    cancelled_at,
+                    created_at,
                 )
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -216,21 +236,23 @@ pub(crate) async fn claim_and_place(
         };
         // The charge rides the same transaction; already there (a replayed
         // POST of this seat) means fine — nothing is written twice.
-        if let Some(line) = charge {
+        if let Some((id, student, kind, amount, source, method, note, recorded_by, created_at)) =
+            &charge
+        {
             sqlx::query!(
                 "INSERT INTO meal_ledger
                      (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT (id) DO NOTHING",
-                line.id.key(),
-                line.student,
-                line.kind,
-                line.amount_minor,
-                line.source,
-                line.method,
-                line.note,
-                line.recorded_by,
-                line.created_at,
+                id.as_str(),
+                student,
+                kind,
+                amount,
+                source.as_deref(),
+                method.as_deref(),
+                note.as_deref(),
+                recorded_by,
+                created_at,
             )
             .execute(&mut *tx)
             .await?;
@@ -278,18 +300,18 @@ pub async fn release_seat(
 ) -> Result<Option<MealBooking>, AppError> {
     let refund = MealLedger::reversal_for(booked, recorded_by);
     let menu_key = booked.menu.key().to_string();
-    let student = booked.student;
+    let student = booked.student.uuid();
     let attempt = booked.attempt;
     let cancelled_at = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let flipped = sqlx::query_as!(
             MealBooking,
             "UPDATE meal_booking SET status = 'cancelled', cancelled_at = $3
              WHERE menu = $1 AND student = $2 AND status = 'booked' AND attempt = $4
-             RETURNING menu, student, booked_by, status, attempt, price_minor, cancelled_at, created_at",
+             RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\", booked_by AS \"booked_by: UserId\", status AS \"status: MealBookingStatus\", attempt, price_minor AS \"price_minor: LedgerAmount\", cancelled_at AS \"cancelled_at: Timestamp\", created_at AS \"created_at: Timestamp\"",
             menu_key,
             student,
-            cancelled_at,
+            cancelled_at.as_millis(),
             attempt,
         )
         .fetch_optional(&mut *tx)
@@ -326,14 +348,14 @@ pub async fn release_seat(
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      ON CONFLICT (id) DO NOTHING",
                     line.id.key(),
-                    line.student,
-                    line.kind,
-                    line.amount_minor,
-                    line.source,
-                    line.method,
-                    line.note,
-                    line.recorded_by,
-                    line.created_at,
+                    line.student.uuid(),
+                    line.kind.as_str(),
+                    line.amount_minor.as_minor(),
+                    line.source.as_deref(),
+                    line.method.as_ref().map(|m| m.as_str()),
+                    line.note.as_ref().map(|n| n.as_str()),
+                    line.recorded_by.uuid(),
+                    line.created_at.as_millis(),
                 )
                 .execute(&mut *tx)
                 .await?;

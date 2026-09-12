@@ -41,13 +41,15 @@ pub async fn create(
                         RETURNING 1)
                    INSERT INTO class_group (id, creator, name, grade, term, teacher)
                    SELECT $2, $3, $4, $5, $1, $6 WHERE EXISTS (SELECT 1 FROM seat)
-                   RETURNING id, creator, name, grade, term, teacher"#,
+                   RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
+                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     term AS "term: TermId", teacher AS "teacher: UserId""#,
                 term.uuid(),
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
-                grade.as_deref(),
-                teacher.as_ref()
+                grade.as_ref().map(ClassGrade::as_str),
+                teacher.as_ref().map(UserId::uuid)
             )
             .fetch_optional(db)
             .await;
@@ -72,13 +74,15 @@ pub async fn create(
                 ClassGroup,
                 r#"INSERT INTO class_group (id, creator, name, grade, term, teacher)
                    VALUES ($1, $2, $3, $4, $5, $6)
-                   RETURNING id, creator, name, grade, term, teacher"#,
+                   RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
+                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     term AS "term: TermId", teacher AS "teacher: UserId""#,
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
-                grade.as_deref(),
-                term.as_ref(),
-                teacher.as_ref()
+                grade.as_ref().map(ClassGrade::as_str),
+                term.as_ref().map(TermId::uuid),
+                teacher.as_ref().map(UserId::uuid)
             )
             .fetch_optional(db)
             .await?;
@@ -91,7 +95,9 @@ pub async fn create(
 pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>, AppError> {
     let class = sqlx::query_as!(
         ClassGroup,
-        r#"SELECT id, creator, name, grade, term, teacher
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = $1"#,
         id.uuid()
     )
@@ -183,12 +189,14 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<ClassGroupId> = ids.to_vec();
+    let ids: Vec<uuid::Uuid> = ids.iter().map(ClassGroupId::uuid).collect();
     let classes = sqlx::query_as!(
         ClassGroup,
-        r#"SELECT id, creator, name, grade, term, teacher
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = ANY($1)"#,
-        ids as _
+        &ids
     )
     .fetch_all(db)
     .await?;
@@ -204,7 +212,9 @@ pub async fn list_for_grade(
 ) -> Result<Vec<ClassGroup>, AppError> {
     let classes = sqlx::query_as!(
         ClassGroup,
-        r#"SELECT id, creator, name, grade, term, teacher
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
            FROM class_group WHERE grade = $1"#,
         grade.as_str()
     )
@@ -243,7 +253,7 @@ pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> 
             r#"DELETE FROM class_group
                WHERE id = $1
                  AND class_member_count = 0 AND class_course_count = 0
-               RETURNING term AS "term: Option<uuid::Uuid>""#,
+               RETURNING term AS "term: uuid::Uuid""#,
             class.id.uuid()
         )
         .fetch_optional(&mut *tx)

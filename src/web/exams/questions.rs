@@ -261,10 +261,10 @@ pub(crate) async fn question_page(
             let mut item = QuestionResponse::new(
                 question,
                 images
-                    .get(question.get_id().key())
+                    .get(question.get_id().key().as_str())
                     .map_or(&[][..], Vec::as_slice),
             );
-            if hidden.contains(question.get_id().key()) {
+            if hidden.contains(question.get_id().key().as_str()) {
                 item.correct = None;
             }
             item

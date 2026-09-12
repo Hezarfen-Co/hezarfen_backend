@@ -7,6 +7,7 @@
 use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::cap;
 use crate::db::page::PagedList;
+use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
@@ -64,8 +65,8 @@ pub async fn enroll(
         // already in" still outranks everything.
         let held = sqlx::query!(
             r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
-            course,
-            user,
+            course.uuid(),
+            user.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -77,7 +78,7 @@ pub async fn enroll(
         // demotion (see the doc above).
         let role = sqlx::query!(
             r#"SELECT role FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
-            user,
+            user.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -98,11 +99,12 @@ pub async fn enroll(
                   RETURNING 1)
                INSERT INTO enrollment (course, app_user, enrolled_by, source)
                SELECT $1, $3, $4, NULL WHERE EXISTS (SELECT 1 FROM seat)
-               RETURNING course, app_user AS "user", enrolled_by, source"#,
-            course,
+               RETURNING course AS "course: CourseId", app_user AS "user: UserId",
+                          enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId""#,
+            course.uuid(),
             cap::UNLIMITED,
-            user,
-            enrolled_by,
+            user.uuid(),
+            enrolled_by.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -161,9 +163,10 @@ async fn disown_if_pumped(db: &Database, existing: Enrollment) -> Result<Enrollm
         Enrollment,
         r#"UPDATE enrollment SET source = NULL
            WHERE course = $1 AND app_user = $2
-           RETURNING course, app_user AS "user", enrolled_by, source"#,
-        existing.get_course(),
-        existing.get_user(),
+           RETURNING course AS "course: CourseId", app_user AS "user: UserId",
+                      enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId""#,
+        existing.get_course().uuid(),
+        existing.get_user().uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -184,10 +187,11 @@ pub async fn read_for_user(
 ) -> Result<Option<Enrollment>, AppError> {
     let row = sqlx::query_as!(
         Enrollment,
-        r#"SELECT course, app_user AS "user", enrolled_by, source
+        r#"SELECT course AS "course: CourseId", app_user AS "user: UserId",
+               enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId"
            FROM enrollment WHERE course = $1 AND app_user = $2"#,
-        course,
-        user,
+        course.uuid(),
+        user.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -231,9 +235,10 @@ pub async fn remove(
                     enrollment_count - (SELECT count(*) FROM gone), 0)
               WHERE id = $1
               RETURNING 1)
-           SELECT course, app_user AS "user", enrolled_by, source FROM gone"#,
-        course,
-        user,
+           SELECT course AS "course: CourseId", app_user AS "user: UserId",
+               enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId" FROM gone"#,
+        course.uuid(),
+        user.uuid(),
     )
     .fetch_optional(db)
     .await?;

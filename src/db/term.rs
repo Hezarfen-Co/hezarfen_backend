@@ -29,11 +29,13 @@ pub async fn create(
         Term,
         r#"INSERT INTO term (id, name, starts_at, ends_at, archived_at)
            VALUES ($1, $2, $3, $4, NULL)
-           RETURNING id, name, starts_at, ends_at, archived_at"#,
-        term.id,
-        term.name,
-        term.starts_at,
-        term.ends_at,
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
+        term.name.as_str(),
+        term.starts_at.as_millis(),
+        term.ends_at.as_millis(),
     )
     .fetch_one(db)
     .await?;
@@ -43,8 +45,10 @@ pub async fn create(
 pub async fn read(db: &Database, id: &TermId) -> Result<Option<Term>, AppError> {
     let term = sqlx::query_as!(
         Term,
-        r#"SELECT id, name, starts_at, ends_at, archived_at FROM term WHERE id = $1"#,
-        id,
+        r#"SELECT id AS "id: TermId", name AS "name: TermName",
+                  starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                  archived_at AS "archived_at: Timestamp" FROM term WHERE id = $1"#,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -101,7 +105,7 @@ pub async fn delete(db: &Database, term: Term) -> Result<bool, AppError> {
     let gone = sqlx::query!(
         r#"DELETE FROM term
            WHERE id = $1 AND course_count = 0 AND class_count = 0"#,
-        term.id,
+        term.id.uuid(),
     )
     .execute(db)
     .await?;
@@ -124,9 +128,11 @@ pub async fn archive(db: &Database, term: Term) -> Result<Term, AppError> {
         Term,
         r#"UPDATE term SET archived_at = $2
            WHERE id = $1 AND archived_at IS NULL
-           RETURNING id, name, starts_at, ends_at, archived_at"#,
-        term.id,
-        Timestamp::now(),
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
+        Timestamp::now().as_millis(),
     )
     .fetch_optional(db)
     .await?;
@@ -144,8 +150,10 @@ pub async fn unarchive(db: &Database, term: Term) -> Result<Term, AppError> {
         Term,
         r#"UPDATE term SET archived_at = NULL
            WHERE id = $1 AND archived_at IS NOT NULL
-           RETURNING id, name, starts_at, ends_at, archived_at"#,
-        term.id,
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
     )
     .fetch_optional(db)
     .await?;

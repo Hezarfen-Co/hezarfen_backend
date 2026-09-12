@@ -63,7 +63,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 /// Push one frame to whoever is in the room right now. An empty room is the
 /// normal case, not a failure.
 fn fan_out(st: &AppState, slug: &Slug, board: &BoardId, frame: serde_json::Value) {
-    st.board_hub.publish(slug, board.key(), frame.to_string());
+    st.board_hub.publish(slug, &board.key(), frame.to_string());
 }
 
 /// The roster frame every path that changes the invite list must publish. A
@@ -677,7 +677,7 @@ impl InviteSource {
                         field: "event",
                         reason: "no such event",
                     }))?;
-                crate::service::event::members(db, event.get_audience(), event.get_id()).await
+                crate::service::event::members(db, &event).await
             }
         }
     }

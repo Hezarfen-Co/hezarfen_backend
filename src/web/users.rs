@@ -490,7 +490,7 @@ async fn set_role(
     for board in boards {
         st.board_hub.publish(
             &slug,
-            board.get_id().key(),
+            board.get_id().key().as_str(),
             json!({
                 "type": "participants",
                 "creator": board.get_creator().key(),
@@ -505,7 +505,7 @@ async fn set_role(
         if let Some(closed_at) = board.get_closed_at() {
             st.board_hub.publish(
                 &slug,
-                board.get_id().key(),
+                board.get_id().key().as_str(),
                 json!({"type": "closed", "closed_at": closed_at.as_millis()}).to_string(),
             );
         }

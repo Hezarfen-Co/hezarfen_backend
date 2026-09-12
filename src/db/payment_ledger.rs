@@ -21,7 +21,9 @@ use crate::database::Database;
 use crate::db::page::PagedList;
 use crate::domain::fee_plan::Installment;
 use crate::domain::fee_plan_assignment::FeePlanAssignment;
-use crate::domain::payment_ledger::{PaymentLedger, PaymentLedgerId, PaymentLedgerKind};
+use crate::domain::payment_ledger::{
+    LedgerAmount, LedgerMethod, LedgerNote, PaymentLedger, PaymentLedgerId, PaymentLedgerKind,
+};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -56,28 +58,32 @@ pub(crate) async fn append(
                ON CONFLICT (id) DO NOTHING
                RETURNING id, student, kind, amount_minor, source, due_at, method, note,
                          recorded_by, created_at)
-           SELECT id AS "id!", student AS "student!",
+           SELECT id AS "id!: PaymentLedgerId", student AS "student!: UserId",
                   kind AS "kind!: PaymentLedgerKind",
-                  amount_minor AS "amount_minor!", source, due_at, method, note,
-                  recorded_by AS "recorded_by!", created_at AS "created_at!"
+                  amount_minor AS "amount_minor!: LedgerAmount", source,
+                  due_at AS "due_at: Timestamp", method AS "method: LedgerMethod",
+                  note AS "note: LedgerNote",
+                  recorded_by AS "recorded_by!: UserId", created_at AS "created_at!: Timestamp"
            FROM ins
            UNION ALL
-           SELECT id AS "id!", student AS "student!",
+           SELECT id AS "id!: PaymentLedgerId", student AS "student!: UserId",
                   kind AS "kind!: PaymentLedgerKind",
-                  amount_minor AS "amount_minor!", source, due_at, method, note,
-                  recorded_by AS "recorded_by!", created_at AS "created_at!"
+                  amount_minor AS "amount_minor!: LedgerAmount", source,
+                  due_at AS "due_at: Timestamp", method AS "method: LedgerMethod",
+                  note AS "note: LedgerNote",
+                  recorded_by AS "recorded_by!: UserId", created_at AS "created_at!: Timestamp"
            FROM payment_ledger
            WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM ins)"#,
-        row.id,
-        row.student,
-        row.kind,
-        row.amount_minor,
+        row.id.key(),
+        row.student.uuid(),
+        row.kind.as_str(),
+        row.amount_minor.as_minor(),
         row.source,
-        row.due_at,
-        row.method,
-        row.note,
-        row.recorded_by,
-        row.created_at,
+        row.due_at.map(|t| t.as_millis()),
+        row.method.as_ref().map(|m| m.as_str()),
+        row.note.as_ref().map(|n| n.as_str()),
+        row.recorded_by.uuid(),
+        row.created_at.as_millis(),
     )
     .fetch_optional(exe)
     .await?;
@@ -98,10 +104,13 @@ pub async fn read(
 ) -> Result<Option<PaymentLedger>, AppError> {
     sqlx::query_as!(
         PaymentLedger,
-        "SELECT id, student, kind, amount_minor, source, due_at, method, note, \
-                recorded_by, created_at \
+        "SELECT id AS \"id: PaymentLedgerId\", student AS \"student: UserId\",
+                kind AS \"kind: PaymentLedgerKind\", amount_minor AS \"amount_minor: LedgerAmount\",
+                source, due_at AS \"due_at: Timestamp\", method AS \"method: LedgerMethod\",
+                note AS \"note: LedgerNote\", recorded_by AS \"recorded_by: UserId\",
+                created_at AS \"created_at: Timestamp\"
          FROM payment_ledger WHERE id = $1",
-        id,
+        id.key(),
     )
     .fetch_optional(exe)
     .await
@@ -125,7 +134,7 @@ pub async fn charge_for_installment(
     append(
         exe,
         PaymentLedger {
-            id: PaymentLedgerId::for_installment(assignment.get_id(), n),
+            id: PaymentLedgerId::for_installment(&assignment.get_id(), n),
             student: assignment.get_student().clone(),
             kind: PaymentLedgerKind::Charge,
             amount_minor: installment.get_amount_minor(),
@@ -190,7 +199,7 @@ pub async fn balance_of(db: &Database, student: &UserId) -> Result<i64, AppError
                 COALESCE(sum(amount_minor), 0)::bigint AS \"total!: i64\", \
                 count(*)::bigint AS \"lines!: i64\" \
          FROM payment_ledger WHERE student = $1 GROUP BY kind",
-        student,
+        student.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -223,14 +232,14 @@ pub(crate) async fn lock_for_cap(
         let row = sqlx::query!(
             r#"SELECT kind AS "kind: PaymentLedgerKind", source
                FROM payment_ledger WHERE id = $1 FOR UPDATE"#,
-            key,
+            key.key(),
         )
         .fetch_optional(&mut *exe)
         .await?;
         next = match row {
             // Keep walking while the row points at another *ledger* row.
             Some(row) if row.kind != PaymentLedgerKind::Charge => {
-                row.source.map(PaymentLedgerId::from_key)
+                row.source.map(|s| PaymentLedgerId::from_key(&s))
             }
             // A charge's source is an assignment key, not a ledger row —
             // and by then the root lock is held, which is the point.

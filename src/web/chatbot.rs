@@ -386,7 +386,7 @@ async fn send_message(
 ) -> Result<Response, AppError> {
     // Charged first: a rejected turn must cost nothing and leave no row.
     st.chatbot_limit
-        .enforce_user(&scoped_key(&slug, user.get_id().key()))?;
+        .enforce_user(&scoped_key(&slug, user.get_id().key().as_str()))?;
 
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let settings = service::settings::load(&st.db).await?;

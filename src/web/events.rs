@@ -37,7 +37,7 @@ impl Scheduled for Event {
         self.get_ends_at().map(|at| at.as_millis())
     }
 
-    fn order_key(&self) -> &str {
+    fn order_key(&self) -> String {
         self.get_id().key()
     }
 }
@@ -723,9 +723,9 @@ async fn roster(
 
     let mut members = service::event::members(&st.db, &event).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
-    members.sort_by(|a, b| a.key().cmp(b.key()));
+    members.sort_by(|a, b| a.key().cmp(&b.key()));
     let (marks, _) = crate::service::attendance::list_for_event(&st.db, &event_id, None, 0).await?;
-    let by_user: HashMap<&str, &Attendance> = marks
+    let by_user: HashMap<String, &Attendance> = marks
         .iter()
         .map(|attendance| (attendance.get_user().key(), attendance))
         .collect();
@@ -736,14 +736,14 @@ async fn roster(
     let window = paginate(&members, limit, offset);
     let ids = window.iter().cloned().chain(window.iter().filter_map(|m| {
         by_user
-            .get(m.key())
+            .get(m.key().as_str())
             .map(|attendance| attendance.get_marked_by().clone())
     }));
     let people = person_map(ids, &st.db).await?;
     let items = window
         .iter()
         .map(|member| {
-            let mark = by_user.get(member.key());
+            let mark = by_user.get(member.key().as_str());
             RosterEntry {
                 user: PersonRef::resolve(&people, member),
                 status: mark.map(|attendance| attendance.get_status().as_str().to_string()),

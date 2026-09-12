@@ -125,7 +125,12 @@ impl FieldUpdate {
     /// row stays editable field by field. `NULL` on either side passes,
     /// exactly like [`crate::web::check_time_range`] skipping an absent end.
     #[must_use]
-    pub(crate) fn ordered(mut self, low: &'static str, high: &'static str, refused: AppError) -> Self {
+    pub(crate) fn ordered(
+        mut self,
+        low: &'static str,
+        high: &'static str,
+        refused: AppError,
+    ) -> Self {
         self.ordered = Some((low, high, refused));
         self
     }
@@ -374,71 +379,75 @@ async fn run_with_refcount<T>(
 where
     T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
 {
-    let mut slot: Option<AppError> = Some(refused);
-    let outcome = tx_with_retry(db, false, async |tx| {
+    // Owned captures + `async move`: the closure's future must be Send and
+    // general enough for axum's handler registration — borrowed captures
+    // (`async |tx|` over `&mut`/`&T`) fail that check tree-wide.
+    let mut refused = Some(refused);
+    let outcome = tx_with_retry(db, false, async move |tx| {
         let binds = binds.clone();
-            if let Some(release) = release {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {counter_table} \
+        if let Some(release) = release {
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {counter_table} \
                      SET {counter_field} = GREATEST({counter_field} - 1, 0) WHERE id = $1"
-                )))
-                .bind(release)
-                .execute(&mut *tx)
-                .await?;
-            }
-            // The conditional claim doubles as the existence check: zero rows
-            // is the claimed row being gone, the caller's own refusal.
-            if let Some(claim) = claim {
-                let seat: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "UPDATE {counter_table} SET {counter_field} = {counter_field} + 1 \
+            )))
+            .bind(release)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // The conditional claim doubles as the existence check: zero rows
+        // is the claimed row being gone, the caller's own refusal.
+        if let Some(claim) = claim {
+            let seat: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "UPDATE {counter_table} SET {counter_field} = {counter_field} + 1 \
                      WHERE id = $1 RETURNING 1"
-                )))
-                .bind(claim)
-                .fetch_optional(&mut *tx)
-                .await?;
-                if seat.is_none() {
-                    return Err(slot.take().unwrap_or_else(|| mark(REFUSAL_MARK)));
-                }
+            )))
+            .bind(claim)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if seat.is_none() {
+                return Err(refused.take().unwrap_or_else(|| mark(REFUSAL_MARK)));
             }
-            let mut args = PgArguments::default();
-            for bind in binds.iter().cloned() {
-                bind.add_to(&mut args);
-            }
-            let rows: Vec<T> = sqlx::query_as_with(AssertSqlSafe(update.as_str()), args)
-                .fetch_all(&mut *tx)
-                .await?;
-            if !rows.is_empty() {
-                return Ok(rows);
-            }
-            // Zero rows: the caller's own guard bit, the row deleted in the
-            // window after the handler's read, or — the CAS only — the link
-            // moved since the handler read it. Nothing was written yet either
-            // way, so the probe that tells the cases apart is free: it matches
-            // only a row that is *there*, whose *own* guards still hold, and
-            // whose link has moved off what the handler read — which is the
-            // CAS, and nothing else, having bitten. Carrying the caller's
-            // guards is what keeps that true when a write is refused for
-            // *both* reasons at once: a `.guard()`/`.ordered()` refusal is the
-            // caller's own answer to give, and reporting it as "the link
-            // moved" would send the client to re-read a link that was never
-            // its problem.
-            let mut args = PgArguments::default();
-            for bind in binds {
-                bind.add_to(&mut args);
-            }
-            let live: Option<i32> = sqlx::query_scalar_with(AssertSqlSafe(probe.as_str()), args)
-                .fetch_optional(&mut *tx)
-                .await?;
-            match live {
-                Some(_) => Err(mark(STALE_MARK)),
-                None => Err(mark(GONE_MARK)),
-            }
+        }
+        let mut args = PgArguments::default();
+        for bind in binds.iter().cloned() {
+            bind.add_to(&mut args);
+        }
+        let rows: Vec<T> = sqlx::query_as_with(AssertSqlSafe(update.as_str()), args)
+            .fetch_all(&mut *tx)
+            .await?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        // Zero rows: the caller's own guard bit, the row deleted in the
+        // window after the handler's read, or — the CAS only — the link
+        // moved since the handler read it. Nothing was written yet either
+        // way, so the probe that tells the cases apart is free: it matches
+        // only a row that is *there*, whose *own* guards still hold, and
+        // whose link has moved off what the handler read — which is the
+        // CAS, and nothing else, having bitten. Carrying the caller's
+        // guards is what keeps that true when a write is refused for
+        // *both* reasons at once: a `.guard()`/`.ordered()` refusal is the
+        // caller's own answer to give, and reporting it as "the link
+        // moved" would send the client to re-read a link that was never
+        // its problem.
+        let mut args = PgArguments::default();
+        for bind in binds {
+            bind.add_to(&mut args);
+        }
+        let live: Option<i32> = sqlx::query_scalar_with(AssertSqlSafe(probe.as_str()), args)
+            .fetch_optional(&mut *tx)
+            .await?;
+        match live {
+            Some(_) => Err(mark(STALE_MARK)),
+            None => Err(mark(GONE_MARK)),
+        }
     })
     .await;
     match outcome {
-        Err(AppError::Internal(m)) if m == REFUSAL_MARK => {
-            Err(slot.take().unwrap_or_else(|| mark(REFUSAL_MARK)))
-        }
+        // The mark only ever leaves the closure once the real refusal was
+        // spent, so it is the final answer here (today's slot.take() could
+        // never resurrect it either).
+        Err(AppError::Internal(m)) if m == REFUSAL_MARK => Err(mark(REFUSAL_MARK)),
         Err(AppError::Internal(m)) if m == STALE_MARK => Err(AppError::Conflict(STALE_MOVE)),
         // The row is gone: exactly the "wrote nothing" answer the plain path
         // reports, so the caller's refusal is unchanged.
@@ -446,4 +455,3 @@ where
         other => other,
     }
 }
-

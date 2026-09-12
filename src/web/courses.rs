@@ -273,7 +273,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
         }
     }
     // Both sources come newest-first; re-sort so the merged list is too.
-    courses.sort_by(|a, b| b.get_id().key().cmp(a.get_id().key()));
+    courses.sort_by(|a, b| b.get_id().key().cmp(&a.get_id().key()));
     Ok(courses)
 }
 

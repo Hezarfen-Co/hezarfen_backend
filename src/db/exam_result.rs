@@ -23,8 +23,8 @@ async fn find(db: &Database, exam: &ExamId, user: &UserId) -> Result<Option<Exam
                   mark AS "mark: Mark", graded_by AS "graded_by: UserId"
            FROM exam_result WHERE exam = $1 AND app_user = $2
            ORDER BY seq DESC LIMIT 1"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_optional(db)
     .await?)
@@ -109,7 +109,7 @@ pub async fn grade(
     tx_with_retry(db, false, async |conn| {
         let exam_row = sqlx::query!(
             r#"SELECT draft AS "draft: bool" FROM exam WHERE id = $1 FOR UPDATE"#,
-            exam as &ExamId,
+            exam.uuid(),
         )
         .fetch_optional(&mut *conn)
         .await?;
@@ -122,8 +122,8 @@ pub async fn grade(
         let before = sqlx::query!(
             r#"SELECT mark AS "mark: Mark" FROM exam_result
                WHERE exam = $1 AND app_user = $2 AND seq = $3"#,
-            exam as &ExamId,
-            user as &UserId,
+            exam.uuid(),
+            user.uuid(),
             seq,
         )
         .fetch_optional(&mut *conn)
@@ -137,7 +137,7 @@ pub async fn grade(
             let claimed = sqlx::query!(
                 r#"UPDATE kind_ref SET count = kind_ref.count + 1
                    WHERE name = $1 AND retired = false
-                   RETURNING 1"#,
+                   RETURNING 1 AS n"#,
                 kind,
             )
             .fetch_optional(&mut *conn)
@@ -147,14 +147,14 @@ pub async fn grade(
             }
             sqlx::query!(
                 r#"UPDATE exam SET result_count = exam.result_count + 1 WHERE id = $1"#,
-                exam as &ExamId,
+                exam.uuid(),
             )
             .execute(&mut *conn)
             .await?;
             sqlx::query!(
                 r#"UPDATE app_user SET marks_given_total = app_user.marks_given_total + 1
                    WHERE id = $1"#,
-                graded_by as &UserId,
+                graded_by.uuid(),
             )
             .execute(&mut *conn)
             .await?;
@@ -166,7 +166,7 @@ pub async fn grade(
                 r#"UPDATE app_user SET high_mark_total =
                        GREATEST(high_mark_total + $2, 0)
                    WHERE id = $1"#,
-                user as &UserId,
+                user.uuid(),
                 high,
             )
             .execute(&mut *conn)
@@ -180,11 +180,11 @@ pub async fn grade(
                    SET mark = EXCLUDED.mark, graded_by = EXCLUDED.graded_by
                RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                          mark AS "mark: Mark", graded_by AS "graded_by: UserId""#,
-            exam as &ExamId,
-            user as &UserId,
+            exam.uuid(),
+            user.uuid(),
             seq,
-            mark,
-            graded_by as &UserId,
+            mark.as_i64(),
+            graded_by.uuid(),
         )
         .fetch_one(&mut *conn)
         .await?;
@@ -207,8 +207,8 @@ pub async fn list_for_user_in_course(
            FROM exam_result r JOIN exam e ON e.id = r.exam
            WHERE r.app_user = $1 AND e.course = $2
            ORDER BY r.exam DESC, r.seq DESC"#,
-        user as &UserId,
-        course as &CourseId,
+        user.uuid(),
+        course.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -222,7 +222,7 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamResul
                   mark AS "mark: Mark", graded_by AS "graded_by: UserId"
            FROM exam_result WHERE exam = $1
            ORDER BY exam DESC, seq DESC"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -242,8 +242,8 @@ pub async fn list_all_for_exam_user(
                   mark AS "mark: Mark", graded_by AS "graded_by: UserId"
            FROM exam_result WHERE exam = $1 AND app_user = $2
            ORDER BY seq ASC"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -298,11 +298,11 @@ pub async fn remove(
             r#"WITH gone AS (
                    DELETE FROM exam_result
                    WHERE exam = $1 AND app_user = $2
-                   RETURNING mark AS "mark: Mark", graded_by AS "graded_by: UserId", seq)
+                   RETURNING mark, graded_by, seq)
                SELECT seq, mark AS "mark: Mark", graded_by AS "graded_by: UserId"
                FROM gone ORDER BY seq ASC"#,
-            exam as &ExamId,
-            user as &UserId,
+            exam.uuid(),
+            user.uuid(),
         )
         .fetch_all(&mut *conn)
         .await?;
@@ -320,7 +320,7 @@ pub async fn remove(
         sqlx::query!(
             r#"UPDATE exam SET result_count = GREATEST(exam.result_count - $2, 0)
                WHERE id = $1"#,
-            exam as &ExamId,
+            exam.uuid(),
             gone.len() as i64,
         )
         .execute(&mut *conn)
@@ -334,7 +334,7 @@ pub async fn remove(
                 r#"UPDATE app_user SET high_mark_total =
                        GREATEST(high_mark_total - $2, 0)
                    WHERE id = $1"#,
-                user as &UserId,
+                user.uuid(),
                 high,
             )
             .execute(&mut *conn)
@@ -358,7 +358,7 @@ pub async fn remove(
                 r#"UPDATE app_user SET marks_given_total =
                        GREATEST(marks_given_total - $2, 0)
                    WHERE id = $1"#,
-                grader as &UserId,
+                grader.uuid(),
                 n,
             )
             .execute(&mut *conn)

@@ -34,6 +34,16 @@ pub async fn load(db: &Database) -> Result<Settings, AppError> {
 /// wherever the new policy was merged from a loaded snapshot.
 pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppError> {
     // whole-row-save-ok: test-only seeding; every production write merges from a loaded snapshot and goes through save_if_unchanged
+    let exam_kinds = serde_json::to_value(&settings.exam_kinds.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let grade_bands = serde_json::to_value(&settings.grade_bands.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let meal_slots = settings
+        .meal_slots
+        .as_ref()
+        .map(|slots| serde_json::to_value(&slots.0))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
     let saved = sqlx::query_as!(
         Settings,
         r#"INSERT INTO settings (id, exam_kinds, attendance_statuses, grade_bands,
@@ -63,15 +73,15 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
                      meal_slots AS "meal_slots: Json<Vec<MealSlotDef>>",
                      dietary_tags,
                      meal_cancel_cutoff_minutes"#,
-        settings.exam_kinds,
-        settings.attendance_statuses,
-        settings.grade_bands,
+        exam_kinds,
+        settings.attendance_statuses.as_slice(),
+        grade_bands,
         settings.max_file_bytes,
         settings.chatbot_history_turns,
         settings.max_chatbot_message_len,
         settings.max_chatbot_threads,
-        settings.meal_slots,
-        settings.dietary_tags,
+        meal_slots,
+        settings.dietary_tags.as_deref(),
         settings.meal_cancel_cutoff_minutes,
     )
     .fetch_one(db)
@@ -114,6 +124,26 @@ pub async fn save_if_unchanged<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
+    let exam_kinds = serde_json::to_value(&settings.exam_kinds.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let grade_bands = serde_json::to_value(&settings.grade_bands.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let meal_slots = settings
+        .meal_slots
+        .as_ref()
+        .map(|slots| serde_json::to_value(&slots.0))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_exam_kinds = serde_json::to_value(&expected.exam_kinds.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_grade_bands = serde_json::to_value(&expected.grade_bands.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_meal_slots = expected
+        .meal_slots
+        .as_ref()
+        .map(|slots| serde_json::to_value(&slots.0))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
     let saved = sqlx::query_as!(
         Settings,
         r#"INSERT INTO settings (id, exam_kinds, attendance_statuses, grade_bands,
@@ -153,25 +183,25 @@ where
                      meal_slots AS "meal_slots: Json<Vec<MealSlotDef>>",
                      dietary_tags,
                      meal_cancel_cutoff_minutes"#,
-        settings.exam_kinds,
-        settings.attendance_statuses,
-        settings.grade_bands,
+        exam_kinds,
+        settings.attendance_statuses.as_slice(),
+        grade_bands,
         settings.max_file_bytes,
         settings.chatbot_history_turns,
         settings.max_chatbot_message_len,
         settings.max_chatbot_threads,
-        settings.meal_slots,
-        settings.dietary_tags,
+        meal_slots,
+        settings.dietary_tags.as_deref(),
         settings.meal_cancel_cutoff_minutes,
-        expected.exam_kinds,
-        expected.attendance_statuses,
-        expected.grade_bands,
+        expected_exam_kinds,
+        expected.attendance_statuses.as_slice(),
+        expected_grade_bands,
         expected.max_file_bytes,
         expected.chatbot_history_turns,
         expected.max_chatbot_message_len,
         expected.max_chatbot_threads,
-        expected.meal_slots,
-        expected.dietary_tags,
+        expected_meal_slots,
+        expected.dietary_tags.as_deref(),
         expected.meal_cancel_cutoff_minutes,
     )
     .fetch_optional(db)

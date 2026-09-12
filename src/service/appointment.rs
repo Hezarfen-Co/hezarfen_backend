@@ -175,7 +175,10 @@ async fn approve_inner(
     decided_by: &UserId,
     accepting: Option<(Timestamp, Timestamp)>,
 ) -> Result<Appointment, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let id = id.clone();
+    let decided_by = *decided_by;
+    tx_with_retry(db, false, async move |tx| {
         // Serializable for the overlap decision below (module doc). `SET
         // TRANSACTION` is legal only before the first query, so it goes
         // first; a `40001` from SSI is re-sent by the retry loop, and the
@@ -183,7 +186,7 @@ async fn approve_inner(
         sqlx::query!("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             .execute(&mut *tx)
             .await?;
-        let expected = appointment::read_pending_on(&mut *tx, id).await?;
+        let expected = appointment::read_pending_on(&mut *tx, &id).await?;
         match accepting {
             None if expected.has_proposal() => {
                 return Err(AppError::Conflict(
@@ -226,7 +229,7 @@ async fn approve_inner(
             expected.get_requester(),
             starts_at,
             ends_at,
-            Some(id),
+            Some(&id),
         )
         .await?
         {
@@ -236,7 +239,7 @@ async fn approve_inner(
         }
         let mut approved = expected.clone();
         approved.status = AppointmentStatus::Approved;
-        approved.decided_by = Some(decided_by.clone());
+        approved.decided_by = Some(decided_by);
         match appointment::decision_cas(&mut *tx, &expected, approved).await? {
             Some(saved) => Ok(saved),
             // Unreachable under the row lock this transaction holds — kept

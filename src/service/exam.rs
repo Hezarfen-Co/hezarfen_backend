@@ -8,6 +8,7 @@
 use crate::constant::CAS_UPDATE_RETRIES;
 use crate::database::Database;
 use crate::db::exam;
+use crate::db::exam_attempt::any_for_exam;
 use crate::db::exam_result;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
@@ -18,6 +19,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::service::course::require_open;
+use crate::service::exam_attempt::course_of;
 
 #[expect(
     clippy::too_many_arguments,

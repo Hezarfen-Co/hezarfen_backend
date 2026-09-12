@@ -32,7 +32,7 @@ pub async fn create(
     let menu_key = menu.key().to_string();
     let id = MenuDishId::generate();
     let created_at = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // The lock first: every later statement in this transaction then
         // sees the committed state of whoever queued ahead of it.
         let locked = sqlx::query!(
@@ -55,14 +55,14 @@ pub async fn create(
             "INSERT INTO menu_dish (id, menu, name, description, price_minor, tags, created_at)
              SELECT $1, $2, $3, $4, $5, $6, $7
              WHERE (SELECT count(*) FROM menu_dish WHERE menu = $2) < $8
-             RETURNING id, menu, name, description, price_minor, tags, created_at",
-            id,
+             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
+            id.uuid(),
             menu_key,
-            name,
-            description,
-            price_minor,
-            tags,
-            created_at,
+            name.as_str(),
+            description.as_ref().map(|d| d.as_str()),
+            price_minor.as_minor(),
+            tags.as_slice(),
+            created_at.as_millis(),
             cap,
         )
         .fetch_optional(&mut *tx)
@@ -81,9 +81,9 @@ pub async fn create(
 pub async fn read(db: &Database, id: &MenuDishId) -> Result<Option<MenuDish>, AppError> {
     let row = sqlx::query_as!(
         MenuDish,
-        "SELECT id, menu, name, description, price_minor, tags, created_at
+        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"
          FROM menu_dish WHERE id = $1",
-        id.key(),
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -104,9 +104,9 @@ pub async fn list_for_menus(db: &Database, menus: &[MenuId]) -> Result<Vec<MenuD
     let keys: Vec<String> = menus.iter().map(|m| m.key().to_string()).collect();
     let rows = sqlx::query_as!(
         MenuDish,
-        "SELECT id, menu, name, description, price_minor, tags, created_at
+        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"
          FROM menu_dish WHERE menu = ANY($1) ORDER BY id ASC",
-        keys,
+        &keys,
     )
     .fetch_all(db)
     .await?;
@@ -131,9 +131,9 @@ pub async fn update(
     price_minor: Option<DishPrice>,
     tags: Option<DishTags>,
 ) -> Result<MenuDish, AppError> {
-    let dish_key = dish.id.key();
+    let dish_key = dish.id.uuid();
     let menu_key = dish.menu.key().to_string();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let bumped = sqlx::query!(
             "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1
              RETURNING 1 AS bumped",
@@ -152,16 +152,13 @@ pub async fn update(
                  price_minor = COALESCE($5, price_minor),
                  tags = COALESCE($6, tags)
              WHERE id = $1
-             RETURNING id, menu, name, description, price_minor, tags, created_at",
+             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
             dish_key,
-            name.map(|n| n.as_str().to_string()),
+            name.as_ref().map(|n| n.as_str()),
             description.is_some(),
-            description
-                .clone()
-                .flatten()
-                .map(|d| d.as_str().to_string()),
+            description.as_ref().and_then(|d| d.as_ref()).map(|d| d.as_str()),
             price_minor.map(DishPrice::as_minor),
-            tags.map(|t| t.as_slice().to_vec()),
+            tags.as_ref().map(|t| t.as_slice()),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -171,9 +168,9 @@ pub async fn update(
 }
 
 pub async fn delete(db: &Database, dish: MenuDish) -> Result<MenuDish, AppError> {
-    let dish_key = dish.id.key();
+    let dish_key = dish.id.uuid();
     let menu_key = dish.menu.key().to_string();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let bumped = sqlx::query!(
             "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1
              RETURNING 1 AS bumped",
@@ -187,7 +184,7 @@ pub async fn delete(db: &Database, dish: MenuDish) -> Result<MenuDish, AppError>
         let row = sqlx::query_as!(
             MenuDish,
             "DELETE FROM menu_dish WHERE id = $1
-             RETURNING id, menu, name, description, price_minor, tags, created_at",
+             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
             dish_key,
         )
         .fetch_optional(&mut *tx)

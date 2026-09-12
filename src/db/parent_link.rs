@@ -38,7 +38,7 @@ pub async fn link(
 /// role) is [`crate::service::parent_link::links_live`].
 pub async fn exists(db: &Database, parent: &UserId, student: &UserId) -> Result<bool, AppError> {
     let row = sqlx::query!(
-        "SELECT EXISTS(SELECT 1 FROM parent_link WHERE parent = $1 AND student = $2) AS present",
+        "SELECT EXISTS(SELECT 1 FROM parent_link WHERE parent = $1 AND student = $2) AS \"present!\"",
         parent.uuid(),
         student.uuid()
     )

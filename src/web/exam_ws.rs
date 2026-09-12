@@ -166,7 +166,12 @@ async fn room(
     let attempt_id = attempt.get_id().clone();
     // The exam, not the attempt: an attempt names one student, and telemetry
     // never names a person.
-    let _connected = room::Connected::open(&st.metrics, "exam_room", slug.as_str(), exam_id.key());
+    let _connected = room::Connected::open(
+        &st.metrics,
+        "exam_room",
+        slug.as_str(),
+        exam_id.key().as_str(),
+    );
     // Join: this socket counts as presence in the sitting's room until it
     // closes, and joining clears the walk-out marker — the clear is one
     // unconditional statement against the sitting's row, so it always
@@ -174,7 +179,7 @@ async fn room(
     // predate a stamp that raced the upgrade; clearing regardless is what
     // keeps a reconnecting student unmarked. Best-effort — a failed clear
     // leaves the stamp for the next join or the teacher's door.
-    st.exam_presence.enter(&slug, attempt_id.key());
+    st.exam_presence.enter(&slug, attempt_id.key().as_str());
     if let Err(err) = set_left(&st.db, attempt, None).await {
         tracing::warn!("exam room could not clear left_at on join: {err}");
     }
@@ -211,7 +216,7 @@ async fn room(
     // stamped. With `allow_rejoin` off this is what locks further
     // answering. Best-effort: a failed stamp only means it goes
     // unrecorded.
-    if st.exam_presence.leave(&slug, attempt_id.key()) {
+    if st.exam_presence.leave(&slug, attempt_id.key().as_str()) {
         crate::db::exam_attempt::stamp_left_if_running(&st.db, &attempt_id, Timestamp::now())
             .await
             .unwrap_or_else(|err| {
@@ -233,7 +238,7 @@ async fn writable_room_attempt(
     db: &Database,
 ) -> Result<ExamAttempt, AppError> {
     let attempt = writable_attempt(exam, user, db).await?;
-    if attempt.get_id() != attempt_id {
+    if &attempt.get_id() != attempt_id {
         return Err(AppError::Conflict(
             "this room's sitting is over — reconnect to continue in the new attempt",
         ));

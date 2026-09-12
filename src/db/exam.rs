@@ -44,23 +44,23 @@ pub async fn create(
            RETURNING id AS "id: ExamId", creator AS "creator: UserId",
                      course AS "course: CourseId", title AS "title: ExamTitle",
                      description AS "description: ExamDescription",
-                     kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                     starts_at AS "starts_at: Option<Timestamp>",
-                     ends_at AS "ends_at: Option<Timestamp>",
-                     duration_ms AS "duration_ms: Option<ExamDuration>",
+                     kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                     starts_at AS "starts_at: Timestamp",
+                     ends_at AS "ends_at: Timestamp",
+                     duration_ms AS "duration_ms: ExamDuration",
                      max_attempts AS "max_attempts: ExamAttemptLimit",
                      allow_rejoin, allow_review, draft"#,
-        ExamId::generate(),
-        creator as &UserId,
-        course as &CourseId,
-        title,
-        description,
-        kind,
-        schedule.mode,
-        schedule.starts_at,
-        schedule.ends_at,
-        schedule.duration_ms,
-        max_attempts,
+        ExamId::generate().uuid(),
+        creator.uuid(),
+        course.uuid(),
+        title.as_str(),
+        description.as_str(),
+        kind.as_str(),
+        schedule.mode.as_ref().map(ExamMode::as_str),
+        schedule.starts_at.map(|at| at.as_millis()),
+        schedule.ends_at.map(|at| at.as_millis()),
+        schedule.duration_ms.map(|duration| duration.as_millis()),
+        max_attempts.as_i64(),
         allow_rejoin,
         allow_review,
         draft,
@@ -79,14 +79,14 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
         Exam,
         r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                  starts_at AS "starts_at: Option<Timestamp>",
-                  ends_at AS "ends_at: Option<Timestamp>",
-                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                  starts_at AS "starts_at: Timestamp",
+                  ends_at AS "ends_at: Timestamp",
+                  duration_ms AS "duration_ms: ExamDuration",
                   max_attempts AS "max_attempts: ExamAttemptLimit",
                   allow_rejoin, allow_review, draft
            FROM exam WHERE id = $1"#,
-        id as &ExamId,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?)
@@ -99,10 +99,10 @@ pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
         Exam,
         r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                  starts_at AS "starts_at: Option<Timestamp>",
-                  ends_at AS "ends_at: Option<Timestamp>",
-                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                  starts_at AS "starts_at: Timestamp",
+                  ends_at AS "ends_at: Timestamp",
+                  duration_ms AS "duration_ms: ExamDuration",
                   max_attempts AS "max_attempts: ExamAttemptLimit",
                   allow_rejoin, allow_review, draft
            FROM exam ORDER BY id DESC"#,
@@ -116,14 +116,14 @@ pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Exa
         Exam,
         r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                  starts_at AS "starts_at: Option<Timestamp>",
-                  ends_at AS "ends_at: Option<Timestamp>",
-                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                  starts_at AS "starts_at: Timestamp",
+                  ends_at AS "ends_at: Timestamp",
+                  duration_ms AS "duration_ms: ExamDuration",
                   max_attempts AS "max_attempts: ExamAttemptLimit",
                   allow_rejoin, allow_review, draft
            FROM exam WHERE course = $1 ORDER BY id DESC"#,
-        course as &CourseId,
+        course.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -140,14 +140,14 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
         Exam,
         r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                  starts_at AS "starts_at: Option<Timestamp>",
-                  ends_at AS "ends_at: Option<Timestamp>",
-                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                  starts_at AS "starts_at: Timestamp",
+                  ends_at AS "ends_at: Timestamp",
+                  duration_ms AS "duration_ms: ExamDuration",
                   max_attempts AS "max_attempts: ExamAttemptLimit",
                   allow_rejoin, allow_review, draft
            FROM exam WHERE course = ANY($1) ORDER BY id DESC"#,
-        courses,
+        &courses,
     )
     .fetch_all(db)
     .await?)
@@ -160,7 +160,7 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
 pub async fn result_count(db: &Database, id: &ExamId) -> Result<i64, AppError> {
     let row = sqlx::query!(
         r#"SELECT result_count AS "result_count: i64" FROM exam WHERE id = $1"#,
-        id as &ExamId,
+        id.uuid(),
     )
     .fetch_one(db)
     .await?;
@@ -240,17 +240,17 @@ pub async fn update_if_unchanged(
             let gates = sqlx::query!(
                 r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat,
                           EXISTS(SELECT 1 FROM exam_result WHERE exam = $1) AS graded"#,
-                expected.id as &ExamId,
+                expected.id.uuid(),
             )
             .fetch_one(&mut *conn)
             .await?;
-            if gates.sat || gates.graded {
+            if gates.sat.unwrap_or(false) || gates.graded.unwrap_or(false) {
                 return Err(redraft_error());
             }
         }
         let was_results = sqlx::query!(
             r#"SELECT result_count AS "result_count: i64" FROM exam WHERE id = $1"#,
-            expected.id as &ExamId,
+            expected.id.uuid(),
         )
         .fetch_optional(&mut *conn)
         .await?
@@ -274,32 +274,32 @@ pub async fn update_if_unchanged(
                RETURNING id AS "id: ExamId", creator AS "creator: UserId",
                          course AS "course: CourseId", title AS "title: ExamTitle",
                          description AS "description: ExamDescription",
-                         kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                         starts_at AS "starts_at: Option<Timestamp>",
-                         ends_at AS "ends_at: Option<Timestamp>",
-                         duration_ms AS "duration_ms: Option<ExamDuration>",
+                         kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                         starts_at AS "starts_at: Timestamp",
+                         ends_at AS "ends_at: Timestamp",
+                         duration_ms AS "duration_ms: ExamDuration",
                          max_attempts AS "max_attempts: ExamAttemptLimit",
                          allow_rejoin, allow_review, draft"#,
-            expected.id as &ExamId,
-            expected.title,
-            expected.description,
-            expected.kind,
-            expected.mode,
-            expected.starts_at,
-            expected.ends_at,
-            expected.duration_ms,
-            expected.max_attempts,
+            expected.id.uuid(),
+            expected.title.as_str(),
+            expected.description.as_str(),
+            expected.kind.as_str(),
+            expected.mode.as_ref().map(ExamMode::as_str),
+            expected.starts_at.map(|at| at.as_millis()),
+            expected.ends_at.map(|at| at.as_millis()),
+            expected.duration_ms.map(|duration| duration.as_millis()),
+            expected.max_attempts.as_i64(),
             expected.allow_rejoin,
             expected.allow_review,
             expected.draft,
-            was.0,
-            was.1,
-            was.2,
-            was.3,
-            was.4,
-            was.5,
-            was.6,
-            was.7,
+            was.0.as_str(),
+            was.1.as_str(),
+            was.2.as_str(),
+            was.3.as_ref().map(ExamMode::as_str),
+            was.4.map(|at| at.as_millis()),
+            was.5.map(|at| at.as_millis()),
+            was.6.map(|duration| duration.as_millis()),
+            was.7.as_i64(),
             was.8,
             was.9,
             was.10,
@@ -358,7 +358,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             // The row lock every other exam-child writer contends on.
             let locked = sqlx::query!(
                 r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .fetch_optional(&mut *conn)
             .await?;
@@ -371,7 +371,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             // refused.
             let image_files = sqlx::query!(
                 r#"SELECT file FROM question_image WHERE exam = $1"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .fetch_all(&mut *conn)
             .await?
@@ -380,7 +380,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             .collect();
             let answer_image_files = sqlx::query!(
                 r#"SELECT file FROM answer_image WHERE exam = $1"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .fetch_all(&mut *conn)
             .await?
@@ -399,23 +399,23 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
                        GROUP BY e.kind)
                    UPDATE kind_ref k SET count = GREATEST(k.count - c.n, 0)
                    FROM kinds c WHERE k.name = c.kind"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .execute(&mut *conn)
             .await?;
-            sqlx::query!(r#"DELETE FROM exam_result WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM exam_result WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
-            sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
-            sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
-            sqlx::query!(r#"DELETE FROM answer_image WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM answer_image WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
-            sqlx::query!(r#"DELETE FROM question_image WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM question_image WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
             // The cascaded questions give their subject references back,
@@ -428,16 +428,16 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
                        GROUP BY subject)
                    UPDATE subject s SET exam_question_count = GREATEST(s.exam_question_count - c.n, 0)
                    FROM subs c WHERE s.id = c.subject"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .execute(&mut *conn)
             .await?;
-            sqlx::query!(r#"DELETE FROM exam_question WHERE exam = $1"#, target.id as &ExamId)
+            sqlx::query!(r#"DELETE FROM exam_question WHERE exam = $1"#, target.id.uuid())
                 .execute(&mut *conn)
                 .await?;
             sqlx::query!(
                 r#"UPDATE bank_question SET source_exam = NULL WHERE source_exam = $1"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .execute(&mut *conn)
             .await?;
@@ -447,13 +447,13 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
                    RETURNING id AS "id: ExamId", creator AS "creator: UserId",
                              course AS "course: CourseId", title AS "title: ExamTitle",
                              description AS "description: ExamDescription",
-                             kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
-                             starts_at AS "starts_at: Option<Timestamp>",
-                             ends_at AS "ends_at: Option<Timestamp>",
-                             duration_ms AS "duration_ms: Option<ExamDuration>",
+                             kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                             starts_at AS "starts_at: Timestamp",
+                             ends_at AS "ends_at: Timestamp",
+                             duration_ms AS "duration_ms: ExamDuration",
                              max_attempts AS "max_attempts: ExamAttemptLimit",
                              allow_rejoin, allow_review, draft"#,
-                target.id as &ExamId,
+                target.id.uuid(),
             )
             .fetch_optional(&mut *conn)
             .await?;

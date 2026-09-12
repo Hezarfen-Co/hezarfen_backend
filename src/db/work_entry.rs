@@ -47,10 +47,10 @@ pub async fn check_in(db: &Database, user: &UserId) -> Result<WorkEntry, AppErro
     let inserted = sqlx::query_as!(
         WorkEntryRow,
         "INSERT INTO work_entry (id, app_user, check_in) VALUES ($1, $2, $3) \
-         RETURNING id, app_user, check_in, check_out",
-        id,
-        user,
-        check_in,
+         RETURNING id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\"",
+        id.uuid(),
+        user.uuid(),
+        check_in.as_millis(),
     )
     .fetch_one(db)
     .await;
@@ -75,9 +75,9 @@ pub async fn check_out(db: &Database, user: &UserId) -> Result<WorkEntry, AppErr
         WorkEntryRow,
         "UPDATE work_entry SET check_out = $2 \
          WHERE app_user = $1 AND check_out IS NULL \
-         RETURNING id, app_user, check_in, check_out",
-        user,
-        out,
+         RETURNING id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\"",
+        user.uuid(),
+        out.as_millis(),
     )
     .fetch_optional(db)
     .await?;
@@ -89,8 +89,8 @@ pub async fn check_out(db: &Database, user: &UserId) -> Result<WorkEntry, AppErr
 pub async fn read(db: &Database, id: &WorkEntryId) -> Result<Option<WorkEntry>, AppError> {
     let row = sqlx::query_as!(
         WorkEntryRow,
-        "SELECT id, app_user, check_in, check_out FROM work_entry WHERE id = $1",
-        id,
+        "SELECT id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\" FROM work_entry WHERE id = $1",
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -111,10 +111,10 @@ pub async fn list_for_user(
         Some(limit) => {
             sqlx::query_as!(
                 WorkEntryRow,
-                "SELECT id, app_user, check_in, check_out FROM work_entry \
+                "SELECT id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\" FROM work_entry \
              WHERE app_user = $1 ORDER BY check_in DESC, id DESC \
              LIMIT $2 OFFSET $3",
-                user,
+                user.uuid(),
                 limit,
                 offset,
             )
@@ -124,10 +124,10 @@ pub async fn list_for_user(
         None if offset > 0 => {
             sqlx::query_as!(
                 WorkEntryRow,
-                "SELECT id, app_user, check_in, check_out FROM work_entry \
+                "SELECT id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\" FROM work_entry \
                  WHERE app_user = $1 ORDER BY check_in DESC, id DESC \
                  OFFSET $2",
-                user,
+                user.uuid(),
                 offset,
             )
             .fetch_all(db)
@@ -136,9 +136,9 @@ pub async fn list_for_user(
         None => {
             sqlx::query_as!(
                 WorkEntryRow,
-                "SELECT id, app_user, check_in, check_out FROM work_entry \
+                "SELECT id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\" FROM work_entry \
                  WHERE app_user = $1 ORDER BY check_in DESC, id DESC",
-                user,
+                user.uuid(),
             )
             .fetch_all(db)
             .await?
@@ -147,10 +147,10 @@ pub async fn list_for_user(
     // A window that can hide rows needs the count over the same WHERE;
     // an unpaged read from row zero already holds every row.
     let total = if limit.is_some() || offset > 0 {
-        sqlx::query!("SELECT count(*) FROM work_entry WHERE app_user = $1", user)
+        sqlx::query_scalar!("SELECT count(*) FROM work_entry WHERE app_user = $1", user.uuid())
             .fetch_one(db)
             .await?
-            .0
+            .unwrap_or(0)
     } else {
         rows.len() as i64
     };
@@ -185,8 +185,8 @@ pub async fn remove(db: &Database, id: &WorkEntryId) -> Result<Option<WorkEntry>
     let row = sqlx::query_as!(
         WorkEntryRow,
         "DELETE FROM work_entry WHERE id = $1 \
-         RETURNING id, app_user, check_in, check_out",
-        id,
+         RETURNING id AS \"id: WorkEntryId\", app_user AS \"app_user: UserId\", check_in AS \"check_in: Timestamp\", check_out AS \"check_out: Timestamp\"",
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;

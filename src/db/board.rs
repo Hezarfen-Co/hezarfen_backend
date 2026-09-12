@@ -41,14 +41,23 @@ pub async fn create(
                               epoch, closed_at, created_at)
            SELECT $3, $1, $4, $5, false, NULL, NULL, 0, NULL, $6
            WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.creator,
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.creator.uuid(),
         MAX_BOARDS_PER_CREATOR,
-        board.id,
-        board.title,
-        &board.participants,
-        board.created_at
+        board.id.uuid(),
+        board.title.as_str(),
+        &board
+            .participants
+            .iter()
+            .map(UserId::uuid)
+            .collect::<Vec<uuid::Uuid>>(),
+        board.created_at.as_millis()
     )
     .fetch_optional(db)
     .await;
@@ -71,10 +80,15 @@ pub async fn create(
 pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError> {
     let board = sqlx::query_as!(
         Board,
-        r#"SELECT id, creator, title, participants, locked, locked_by, locked_at,
-                  epoch, closed_at, created_at
+        r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp"
            FROM board WHERE id = $1"#,
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -122,10 +136,18 @@ pub async fn set_participants(
     let updated = sqlx::query_as!(
         Board,
         r#"UPDATE board SET participants = $2 WHERE id = $1
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.id,
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.id.uuid(),
         &participants
+            .iter()
+            .map(UserId::uuid)
+            .collect::<Vec<uuid::Uuid>>()
     )
     .fetch_optional(db)
     .await?;
@@ -136,10 +158,15 @@ pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Resul
     let updated = sqlx::query_as!(
         Board,
         r#"UPDATE board SET title = $2 WHERE id = $1
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.id,
-        title
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.id.uuid(),
+        title.as_str()
     )
     .fetch_optional(db)
     .await?;
@@ -158,12 +185,17 @@ pub async fn set_locked(
     let updated = sqlx::query_as!(
         Board,
         r#"UPDATE board SET locked = $2, locked_by = $3, locked_at = $4 WHERE id = $1
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.id,
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.id.uuid(),
         locked,
-        locked.then(|| by.clone()),
-        locked.then(|| now)
+        locked.then(|| by.uuid()),
+        locked.then(|| now.as_millis())
     )
     .fetch_optional(db)
     .await?;
@@ -193,10 +225,18 @@ pub(crate) async fn invite_group(
            WHERE id = $1
              AND cardinality((SELECT coalesce(array_agg(DISTINCT x), '{}')
                               FROM unnest(participants || $2::uuid[]) AS x)) <= $3
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.clone(),
-        &invited,
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.uuid(),
+        &invited
+            .iter()
+            .map(UserId::uuid)
+            .collect::<Vec<uuid::Uuid>>(),
         MAX_BOARD_PARTICIPANTS as i64
     )
     .fetch_optional(db)
@@ -216,10 +256,15 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
     let closed = sqlx::query_as!(
         Board,
         r#"UPDATE board SET closed_at = $2 WHERE id = $1 AND closed_at IS NULL
-           RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                     epoch, closed_at, created_at"#,
-        board.id,
-        Timestamp::now()
+           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+        board.id.uuid(),
+        Timestamp::now().as_millis()
     )
     .fetch_optional(db)
     .await?;
@@ -241,15 +286,20 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
 /// under a record that no longer exists.
 pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
     tx_with_retry(db, true, async |conn| {
-        sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id)
+        sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id.uuid())
             .execute(&mut *conn)
             .await?;
         let gone = sqlx::query_as!(
             Board,
             r#"DELETE FROM board WHERE id = $1
-               RETURNING id, creator, title, participants, locked, locked_by, locked_at,
-                         epoch, closed_at, created_at"#,
-            board.id
+               RETURNING id AS "id: BoardId", creator AS "creator: UserId",
+               title AS "title: BoardTitle",
+               participants AS "participants: Vec<UserId>", locked,
+               locked_by AS "locked_by: Option<UserId>",
+               locked_at AS "locked_at: Option<Timestamp>", epoch,
+               closed_at AS "closed_at: Option<Timestamp>",
+               created_at AS "created_at: Timestamp""#,
+            board.id.uuid()
         )
         .fetch_optional(&mut *conn)
         .await?;
@@ -259,7 +309,7 @@ pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
         // the limit shut.
         sqlx::query!(
             "UPDATE app_user SET board_count = GREATEST(board_count - 1, 0) WHERE id = $1",
-            board.creator
+            board.creator.uuid()
         )
         .execute(&mut *conn)
         .await?;

@@ -7,6 +7,7 @@
 use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::attendance::AttendanceStatus;
+use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
 use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::timestamp::Timestamp;
@@ -93,7 +94,7 @@ pub async fn mark(
         let sess = sqlx::query!(
             r#"SELECT teacher, starts_at, held_counted_at
                FROM course_session WHERE id = $1 FOR NO KEY UPDATE"#,
-            session.id,
+            session.id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -105,8 +106,8 @@ pub async fn mark(
         let was = sqlx::query!(
             r#"SELECT status FROM session_attendance
                WHERE session = $1 AND app_user = $2"#,
-            session.id,
-            user,
+            session.id.uuid(),
+            user.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -115,8 +116,8 @@ pub async fn mark(
         // non-student — no badge to move; the service gate has already
         // refused a vanished target before this write ran).
         let is_student = sqlx::query!(
-            r#"SELECT role = 'student' AS "is_student" FROM app_user WHERE id = $1"#,
-            user,
+            r#"SELECT role = 'student' AS "is_student!: bool" FROM app_user WHERE id = $1"#,
+            user.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -128,12 +129,14 @@ pub async fn mark(
                VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (session, app_user) DO UPDATE
                  SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by
-               RETURNING session, app_user AS "user", course, status, marked_by"#,
-            session.id,
-            user,
-            session.course,
-            status,
-            marked_by,
+               RETURNING session AS "session: CourseSessionId", app_user AS "user: UserId",
+                         course AS "course: CourseId", status AS "status: AttendanceStatus",
+                         marked_by AS "marked_by: UserId""#,
+            session.id.uuid(),
+            user.uuid(),
+            session.course.uuid(),
+            status.as_str(),
+            marked_by.uuid(),
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -146,7 +149,7 @@ pub async fn mark(
                 r#"UPDATE app_user
                      SET lessons_attended_total = GREATEST(lessons_attended_total + $2, 0)
                    WHERE id = $1"#,
-                user,
+                user.uuid(),
                 delta,
             )
             .execute(&mut *tx)
@@ -156,7 +159,7 @@ pub async fn mark(
         if sess.held_counted_at.is_none() && sess.starts_at <= now.as_millis() {
             sqlx::query!(
                 r#"UPDATE course_session SET held_counted_at = $2 WHERE id = $1"#,
-                session.id,
+                session.id.uuid(),
                 now.as_millis(),
             )
             .execute(&mut *tx)
@@ -202,10 +205,12 @@ pub async fn list_for_user(
 ) -> Result<Vec<SessionAttendance>, AppError> {
     let rows = sqlx::query_as!(
         SessionAttendance,
-        r#"SELECT session, app_user AS "user", course, status, marked_by
+        r#"SELECT session AS "session: CourseSessionId", app_user AS "user: UserId",
+                  course AS "course: CourseId", status AS "status: AttendanceStatus",
+                  marked_by AS "marked_by: UserId"
            FROM session_attendance WHERE app_user = $1
            ORDER BY session DESC, app_user DESC"#,
-        user,
+        user.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -235,12 +240,14 @@ pub async fn remove(
         // transaction, and `None` here is simply "nothing to remove".
         let Some(gone) = sqlx::query_as!(
             SessionAttendance,
-            r#"SELECT session, app_user AS "user", course, status, marked_by
+            r#"SELECT session AS "session: CourseSessionId", app_user AS "user: UserId",
+               course AS "course: CourseId", status AS "status: AttendanceStatus",
+               marked_by AS "marked_by: UserId"
                FROM session_attendance
                WHERE session = $1 AND app_user = $2
                FOR UPDATE"#,
-            session,
-            user,
+            session.uuid(),
+            user.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -250,8 +257,8 @@ pub async fn remove(
         if crate::domain::session_attendance::counts_as_attended(&gone.status) {
             // Student-only, live role: the same rule the mark pays.
             let student = sqlx::query!(
-                r#"SELECT role = 'student' AS "is_student" FROM app_user WHERE id = $1"#,
-                user,
+                r#"SELECT role = 'student' AS "is_student!: bool" FROM app_user WHERE id = $1"#,
+                user.uuid(),
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -262,7 +269,7 @@ pub async fn remove(
                     r#"UPDATE app_user
                          SET lessons_attended_total = GREATEST(lessons_attended_total - 1, 0)
                        WHERE id = $1"#,
-                    user,
+                    user.uuid(),
                 )
                 .execute(&mut *tx)
                 .await?;
@@ -270,8 +277,8 @@ pub async fn remove(
         }
         sqlx::query!(
             r#"DELETE FROM session_attendance WHERE session = $1 AND app_user = $2"#,
-            session,
-            user,
+            session.uuid(),
+            user.uuid(),
         )
         .execute(&mut *tx)
         .await?;

@@ -15,7 +15,7 @@ pub struct RegistrationId {
 impl RegistrationId {
     pub fn composite(event: &EventId, user: &UserId) -> Self {
         Self {
-            event: *event,
+            event: event.clone(),
             user: *user,
         }
     }
@@ -38,7 +38,7 @@ impl RegistrationId {
     }
 
     pub fn event(&self) -> EventId {
-        self.event
+        self.event.clone()
     }
 
     pub fn user(&self) -> UserId {

@@ -5,7 +5,7 @@ use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
-use crate::domain::note_file::NoteFile;
+use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -26,11 +26,12 @@ pub async fn create(
         Note,
         r#"INSERT INTO note (id, app_user, title, content)
            VALUES ($1, $2, $3, $4)
-           RETURNING id, app_user AS "user", title, content"#,
-        note.id,
-        note.user,
-        note.title,
-        note.content
+           RETURNING id AS "id: NoteId", app_user AS "user: UserId",
+               title AS "title: NoteTitle", content AS "content: NoteContent""#,
+        note.id.uuid(),
+        note.user.uuid(),
+        note.title.as_str(),
+        note.content.as_str()
     )
     .fetch_one(db)
     .await?;
@@ -45,9 +46,10 @@ pub async fn read_owned(
 ) -> Result<Option<Note>, AppError> {
     let note = sqlx::query_as!(
         Note,
-        r#"SELECT id, app_user AS "user", title, content FROM note WHERE id = $1 AND app_user = $2"#,
-        id,
-        owner
+        r#"SELECT id AS "id: NoteId", app_user AS "user: UserId",
+               title AS "title: NoteTitle", content AS "content: NoteContent" FROM note WHERE id = $1 AND app_user = $2"#,
+        id.uuid(),
+        owner.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -106,20 +108,23 @@ pub async fn update(
 /// separate `delete_for_note` call stays, as a harmless idempotent repeat.
 pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), AppError> {
     tx_with_retry(db, true, async |conn| {
-        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id)
+        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id.uuid())
             .execute(&mut *conn)
             .await?;
         let files = sqlx::query_as!(
             NoteFile,
-            r#"DELETE FROM note_file WHERE note = $1 RETURNING id, note, name, content_type, size"#,
-            note.id
+            r#"DELETE FROM note_file WHERE note = $1
+               RETURNING id AS "id: NoteFileId", note AS "note: NoteId", name AS "name: FileName",
+                     content_type AS "content_type: FileContentType", size"#,
+            note.id.uuid()
         )
         .fetch_all(&mut *conn)
         .await?;
         let gone = sqlx::query_as!(
             Note,
-            r#"DELETE FROM note WHERE id = $1 RETURNING id, app_user AS "user", title, content"#,
-            note.id
+            r#"DELETE FROM note WHERE id = $1 RETURNING id AS "id: NoteId", app_user AS "user: UserId",
+               title AS "title: NoteTitle", content AS "content: NoteContent""#,
+            note.id.uuid()
         )
         .fetch_optional(&mut *conn)
         .await?;

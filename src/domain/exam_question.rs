@@ -1,5 +1,4 @@
 use sqlx::types::Json;
-use uuid::Uuid;
 
 use crate::constant::{
     MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN, MIN_QUESTION_CHOICES,

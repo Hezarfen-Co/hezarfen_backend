@@ -4,7 +4,6 @@
 //! [`crate::db::chatbot_message`], and deleting a thread cascades them; the
 //! threads' own persistence lives in [`crate::db::chatbot_thread`].
 
-use uuid::Uuid;
 use crate::constant::{MAX_CHATBOT_THREAD_TITLE_LEN};
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;

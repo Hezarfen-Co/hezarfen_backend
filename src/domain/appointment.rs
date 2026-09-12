@@ -25,7 +25,6 @@
 //! ([`crate::db::appointment::save_if_unchanged`]), decided by a conditional
 //! `UPDATE`.
 
-use uuid::Uuid;
 use crate::constant::{MAX_APPOINTMENT_REASON_LEN};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
 use crate::domain::monotonic_id::next_uuid;

@@ -7,7 +7,6 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
@@ -160,8 +159,8 @@ impl EventAudience {
         Self {
             kind: event.get_audience_kind(),
             role: event.get_audience_role(),
-            course: event.get_audience_course().copied(),
-            class: event.get_audience_class().copied(),
+            course: event.get_audience_course().cloned(),
+            class: event.get_audience_class().cloned(),
             capacity: event.get_audience_capacity(),
         }
     }

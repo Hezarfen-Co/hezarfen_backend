@@ -75,7 +75,7 @@ pub async fn create_with_role(
         id.uuid(),
         username.as_str(),
         password_hash.as_str(),
-        role,
+        role.as_str(),
     )
     .fetch_one(db)
     .await
@@ -153,7 +153,7 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   avatar_size
            FROM app_user WHERE id = ANY($1)"#,
-        ids
+        &ids
     )
     .fetch_all(db)
     .await?;
@@ -184,7 +184,7 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   avatar_size
            FROM app_user WHERE role = $1 ORDER BY id DESC"#,
-        role
+        role.as_str()
     )
     .fetch_all(db)
     .await?;
@@ -344,7 +344,10 @@ pub async fn set_role_cascade(
     // One wall-clock read for the whole cascade, bound by every stamping
     // statement — the old batch's single `$now`.
     let now = Timestamp::now().as_millis();
-    tx_with_retry(db, true, async |tx| {
+    // Owned capture: an `async move` closure holding a `&UserId` fails the
+    // higher-ranked `Send` check `tx_with_retry`'s future must pass.
+    let target = *target;
+    tx_with_retry(db, true, async move |tx| {
         // The role write, floor guard included. `$2 <> 'admin'` arms the
         // guard only for a demotion: a promotion or a same-role rewrite can
         // never orphan the admins.
@@ -374,7 +377,7 @@ pub async fn set_role_cascade(
                          avatar_content_type AS "avatar_content_type: FileContentType",
                          avatar_size"#,
             target.uuid(),
-            role,
+            role.as_str(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -591,13 +594,13 @@ pub async fn set_profile(
         value.map(|inner| Param::OptText(inner.map(str::to_string)))
     }
     FieldUpdate::new("app_user", id.uuid())
-        .set("name", text(name.map(|n| n.as_str())))
-        .set("surname", text(surname.map(|n| n.as_str())))
-        .set("email", text(email.map(|n| n.as_str())))
-        .set("phone", text(phone.map(|n| n.as_str())))
-        .set("birth_date", text(birth_date.map(|n| n.as_str())))
-        .set("display_name", text(display_name.map(|n| n.as_str())))
-        .set("bio", text(bio.map(|n| n.as_str())))
+        .set("name", text(name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("surname", text(surname.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("email", text(email.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("phone", text(phone.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("birth_date", text(birth_date.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("display_name", text(display_name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("bio", text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
         .run(db)
         .await
 }
@@ -622,7 +625,11 @@ pub async fn set_avatar(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<User>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures, same `Send` rule as every `tx_with_retry` closure.
+    let id = *id;
+    let file = file.to_string();
+    let content_type = content_type.clone();
+    tx_with_retry(db, false, async move |tx| {
         let before = sqlx::query_as!(
             User,
             r#"SELECT id AS "id: UserId",
@@ -655,7 +662,7 @@ pub async fn set_avatar(
                SET avatar_file = $2, avatar_content_type = $3, avatar_size = $4
                WHERE id = $1"#,
             id.uuid(),
-            file,
+            file.as_str(),
             content_type.as_str(),
             size,
         )
@@ -669,7 +676,8 @@ pub async fn set_avatar(
 /// Drop the avatar, returning the row as it was so the caller can delete
 /// the blob. Same pre-image contract as [`set_avatar`].
 pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    let id = *id;
+    tx_with_retry(db, false, async move |tx| {
         let before = sqlx::query_as!(
             User,
             r#"SELECT id AS "id: UserId",

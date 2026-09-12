@@ -103,7 +103,10 @@ pub async fn remove(
     user: &UserId,
 ) -> Result<Option<Registration>, AppError> {
     // The seat comes back in the same transaction as the row that held it.
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let event = event.clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |tx| {
         let gone = query_as!(
             Registration,
             "DELETE FROM registration WHERE event = $1 AND app_user = $2

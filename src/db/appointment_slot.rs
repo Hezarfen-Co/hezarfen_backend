@@ -47,7 +47,12 @@ pub async fn insert_claimed(
     rows: Vec<AppointmentSlot>,
     overlap_refusal: AppError,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // `Option::take` makes the FnMut move legal: a refusal is terminal
+    // (never retried), so the value is taken at most once.
+    let mut overlap_refusal = Some(overlap_refusal);
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let teacher = *teacher;
+    tx_with_retry(db, false, async move |tx| {
         // The role handshake. The bar is read off the hierarchy rather than
         // spelled out, so a new role cannot drift out of it.
         let held = sqlx::query!(
@@ -69,7 +74,7 @@ pub async fn insert_claimed(
             ));
         }
         let mut saved = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in &rows {
             match query_as!(
                 AppointmentSlot,
                 "INSERT INTO appointment_slot (id, teacher, starts_at, ends_at, note, series, created_at)
@@ -92,7 +97,9 @@ pub async fn insert_claimed(
                 // A teacher cannot publish two overlapping windows: the
                 // exclusion constraint, answering the caller's overlap 409.
                 Err(err) if unique_violation(&err) == Some("appointment_slot_teacher_span") => {
-                    return Err(overlap_refusal);
+                    return Err(overlap_refusal.take().unwrap_or_else(|| {
+                        AppError::Internal("overlap refusal re-raised".into())
+                    }));
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -246,21 +253,22 @@ pub async fn list_for_series(
 /// occupied rows are still there, a vanished one is not — which is the
 /// 409/404 the caller expects.
 pub async fn delete_free(db: &Database, ids: &[AppointmentSlotId]) -> Result<(), AppError> {
-    tx_with_retry(db, false, async |tx| {
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.uuid()).collect();
+    tx_with_retry(db, false, async move |tx| {
         // The settled bookings of the *free* slots go first; a booked slot's
         // rows survive (its occupied counter excludes it from both sweeps).
         sqlx::query!(
             "DELETE FROM appointment a
              USING appointment_slot s
              WHERE a.slot = s.id AND s.id = ANY($1) AND s.occupied < 1",
-            ids
+            &ids
         )
         .execute(&mut *tx)
         .await?;
-        let gone: Vec<AppointmentSlotId> = query_as!(
-            AppointmentSlotId,
-            "DELETE FROM appointment_slot WHERE id = ANY($1) AND occupied < 1 RETURNING id",
-            ids
+        let gone: Vec<AppointmentSlotId> = sqlx::query_scalar!(
+            "DELETE FROM appointment_slot WHERE id = ANY($1) AND occupied < 1 \
+             RETURNING id AS \"id: AppointmentSlotId\"",
+            &ids
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -270,8 +278,8 @@ pub async fn delete_free(db: &Database, ids: &[AppointmentSlotId]) -> Result<(),
         // Shortfall: distinguish "a live booking holds one" from "one was
         // never there" off what still exists.
         let remaining = sqlx::query!(
-            "SELECT count(*) AS standing FROM appointment_slot WHERE id = ANY($1)",
-            ids
+            "SELECT count(*) AS \"standing!\" FROM appointment_slot WHERE id = ANY($1)",
+            &ids
         )
         .fetch_one(&mut *tx)
         .await?

@@ -40,14 +40,20 @@ pub async fn create(
         RagOutput,
         r#"INSERT INTO rag_output (id, course_note, course, sources, payload, generated_at)
            VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id, course_note, course, sources,
-                     payload AS "payload: Json<Value>", generated_at"#,
-        row.id,
-        row.course_note,
-        row.course,
-        &row.sources,
-        &row.payload,
-        row.generated_at
+           RETURNING id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                     course AS "course: CourseId",
+                     sources AS "sources: Vec<CourseNoteFileId>",
+                     payload AS "payload: Json<Value>",
+                     generated_at AS "generated_at: Timestamp""#,
+        row.id.uuid(),
+        row.course_note.uuid(),
+        row.course.uuid(),
+        &row.sources
+            .iter()
+            .map(CourseNoteFileId::uuid)
+            .collect::<Vec<uuid::Uuid>>(),
+        row.payload.0,
+        row.generated_at.as_millis()
     )
     .fetch_one(db)
     .await?;
@@ -57,10 +63,13 @@ pub async fn create(
 pub async fn read(db: &Database, id: &RagOutputId) -> Result<Option<RagOutput>, AppError> {
     let row = sqlx::query_as!(
         RagOutput,
-        r#"SELECT id, course_note, course, sources,
-                  payload AS "payload: Json<Value>", generated_at
+        r#"SELECT id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                  course AS "course: CourseId",
+                  sources AS "sources: Vec<CourseNoteFileId>",
+                  payload AS "payload: Json<Value>",
+                  generated_at AS "generated_at: Timestamp"
            FROM rag_output WHERE id = $1"#,
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -84,9 +93,12 @@ pub async fn delete(db: &Database, id: &RagOutputId) -> Result<RagOutput, AppErr
     let deleted = sqlx::query_as!(
         RagOutput,
         r#"DELETE FROM rag_output WHERE id = $1
-           RETURNING id, course_note, course, sources,
-                     payload AS "payload: Json<Value>", generated_at"#,
-        id
+           RETURNING id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                     course AS "course: CourseId",
+                     sources AS "sources: Vec<CourseNoteFileId>",
+                     payload AS "payload: Json<Value>",
+                     generated_at AS "generated_at: Timestamp""#,
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -96,7 +108,7 @@ pub async fn delete(db: &Database, id: &RagOutputId) -> Result<RagOutput, AppErr
 /// Cascade: every output of `note`. Deleting none is a success — a note
 /// no service ever indexed has nothing to drop.
 pub async fn delete_for_note(db: &Database, note: &CourseNoteId) -> Result<(), AppError> {
-    sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note)
+    sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.uuid())
         .execute(db)
         .await?;
     Ok(())
@@ -119,8 +131,8 @@ pub async fn replace_for_note(
     let created = create(db, note, course, sources, payload).await?;
     sqlx::query!(
         "DELETE FROM rag_output WHERE course_note = $1 AND id < $2",
-        note,
-        created.id
+        note.uuid(),
+        created.id.uuid()
     )
     .execute(db)
     .await?;
@@ -132,9 +144,12 @@ pub async fn replace_for_note(
 /// source. The GIN index on `sources` turns the containment test into a
 /// lookup.
 pub async fn delete_with_source(db: &Database, file: &CourseNoteFileId) -> Result<(), AppError> {
-    sqlx::query!("DELETE FROM rag_output WHERE $1 = ANY(sources)", file)
-        .execute(db)
-        .await?;
+    sqlx::query!(
+        "DELETE FROM rag_output WHERE $1 = ANY(sources)",
+        file.uuid()
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 

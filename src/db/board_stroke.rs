@@ -56,16 +56,18 @@ pub async fn append(
            INSERT INTO board_stroke (id, board, author, kind, payload, count, epoch, created_at)
            SELECT $5, $1, $6, $7, $8, NULL, $3, $9
            WHERE EXISTS (SELECT 1 FROM bump)
-           RETURNING id, board, author, kind, payload, count, epoch, created_at"#,
-        board.clone(),
+           RETURNING id AS "id: BoardStrokeId", board AS "board: BoardId",
+               author AS "author: UserId", kind, payload, count, epoch,
+               created_at AS "created_at: Timestamp""#,
+        board.uuid(),
         MAX_BOARD_STROKES,
         epoch,
         MAX_EPOCH_STROKES,
-        BoardStrokeId::generate(),
-        author.clone(),
+        BoardStrokeId::generate().uuid(),
+        author.uuid(),
         KIND_STROKE,
         payload,
-        Timestamp::now()
+        Timestamp::now().as_millis()
     )
     .fetch_optional(db)
     .await?;
@@ -169,8 +171,13 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
         // guarded bump below.
         let live = sqlx::query_as!(
             Board,
-            r#"SELECT id, creator, title, participants, locked, locked_by, locked_at,
-                      epoch, closed_at, created_at
+            r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
+                      title AS "title: BoardTitle",
+                      participants AS "participants: Vec<UserId>", locked,
+                      locked_by AS "locked_by: Option<UserId>",
+                      locked_at AS "locked_at: Option<Timestamp>", epoch,
+                      closed_at AS "closed_at: Option<Timestamp>",
+                      created_at AS "created_at: Timestamp"
                FROM board WHERE id = $1 FOR UPDATE"#,
             board.uuid()
         )
@@ -224,14 +231,16 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
             BoardStroke,
             r#"INSERT INTO board_stroke (id, board, author, kind, payload, count, epoch, created_at)
                VALUES ($1, $2, $3, $4, NULL, $5, $6, $7)
-               RETURNING id, board, author, kind, payload, count, epoch, created_at"#,
-            BoardStrokeId::generate(),
-            board.clone(),
-            by.clone(),
+               RETURNING id AS "id: BoardStrokeId", board AS "board: BoardId",
+               author AS "author: UserId", kind, payload, count, epoch,
+               created_at AS "created_at: Timestamp""#,
+            BoardStrokeId::generate().uuid(),
+            board.uuid(),
+            by.uuid(),
             KIND_CLEAR,
             epoch_count,
             epoch,
-            Timestamp::now()
+            Timestamp::now().as_millis()
         )
         .fetch_one(&mut *conn)
         .await?;
@@ -258,25 +267,29 @@ pub async fn replay_current(
     match after.map(BoardStrokeId::from_key) {
         Some(after) => Ok(sqlx::query_as!(
             BoardStroke,
-            r#"SELECT id, board, author, kind, payload, count, epoch, created_at
+            r#"SELECT id AS "id: BoardStrokeId", board AS "board: BoardId",
+               author AS "author: UserId", kind, payload, count, epoch,
+               created_at AS "created_at: Timestamp"
                FROM board_stroke
                WHERE board = $1 AND epoch = $2 AND kind = $3 AND id > $4
                ORDER BY id LIMIT $5"#,
-            board.clone(),
+            board.uuid(),
             epoch,
             KIND_STROKE,
-            after,
+            after.uuid(),
             chunk
         )
         .fetch_all(db)
         .await?),
         None => Ok(sqlx::query_as!(
             BoardStroke,
-            r#"SELECT id, board, author, kind, payload, count, epoch, created_at
+            r#"SELECT id AS "id: BoardStrokeId", board AS "board: BoardId",
+               author AS "author: UserId", kind, payload, count, epoch,
+               created_at AS "created_at: Timestamp"
                FROM board_stroke
                WHERE board = $1 AND epoch = $2 AND kind = $3
                ORDER BY id LIMIT $4"#,
-            board.clone(),
+            board.uuid(),
             epoch,
             KIND_STROKE,
             chunk
@@ -332,9 +345,11 @@ pub async fn history(
 pub async fn epochs(db: &Database, board: &BoardId) -> Result<Vec<BoardStroke>, AppError> {
     Ok(sqlx::query_as!(
         BoardStroke,
-        r#"SELECT id, board, author, kind, payload, count, epoch, created_at
+        r#"SELECT id AS "id: BoardStrokeId", board AS "board: BoardId",
+               author AS "author: UserId", kind, payload, count, epoch,
+               created_at AS "created_at: Timestamp"
            FROM board_stroke WHERE board = $1 AND kind = $2 ORDER BY id"#,
-        board.clone(),
+        board.uuid(),
         KIND_CLEAR
     )
     .fetch_all(db)

@@ -7,7 +7,7 @@ use sqlx::PgConnection;
 
 use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::cap::Claimed;
-use crate::domain::exam::ExamId;
+use crate::domain::exam::{ExamId, ExamMode};
 use crate::domain::exam_attempt::{ExamAttempt, ExamAttemptId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -37,7 +37,7 @@ fn frozen_error() -> AppError {
 pub(crate) async fn freeze_gate(conn: &mut PgConnection, exam: &ExamId) -> Result<(), AppError> {
     let row = sqlx::query!(
         r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -46,11 +46,11 @@ pub(crate) async fn freeze_gate(conn: &mut PgConnection, exam: &ExamId) -> Resul
     }
     let sat = sqlx::query!(
         r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_one(&mut *conn)
     .await?;
-    if sat.sat {
+    if sat.sat.unwrap_or(false) {
         return Err(frozen_error());
     }
     Ok(())
@@ -73,11 +73,11 @@ pub async fn finish(db: &Database, attempt: ExamAttempt) -> Result<ExamAttempt, 
            WHERE exam = $2 AND app_user = $3 AND seq = $4
            RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                      started_at AS "started_at: Timestamp",
-                     finished_at AS "finished_at: Option<Timestamp>",
-                     left_at AS "left_at: Option<Timestamp>""#,
-        Timestamp::now(),
-        id.exam,
-        id.user,
+                     finished_at AS "finished_at: Timestamp",
+                     left_at AS "left_at: Timestamp""#,
+        Timestamp::now().as_millis(),
+        id.exam.uuid(),
+        id.user.uuid(),
         id.seq,
     )
     .fetch_optional(db)
@@ -106,11 +106,11 @@ pub async fn set_left(
            WHERE exam = $2 AND app_user = $3 AND seq = $4
            RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                      started_at AS "started_at: Timestamp",
-                     finished_at AS "finished_at: Option<Timestamp>",
-                     left_at AS "left_at: Option<Timestamp>""#,
-        left_at,
-        id.exam,
-        id.user,
+                     finished_at AS "finished_at: Timestamp",
+                     left_at AS "left_at: Timestamp""#,
+        left_at.map(|at| at.as_millis()),
+        id.exam.uuid(),
+        id.user.uuid(),
         id.seq,
     )
     .fetch_optional(db)
@@ -139,10 +139,10 @@ pub async fn stamp_left_if_running(
              AND a.left_at IS NULL AND a.finished_at IS NULL
              AND (e.duration_ms IS NULL OR $4 < a.started_at + e.duration_ms)
              AND (e.duration_ms IS NOT NULL OR e.ends_at IS NULL OR $4 < e.ends_at)"#,
-        attempt_id.exam,
-        attempt_id.user,
+        attempt_id.exam.uuid(),
+        attempt_id.user.uuid(),
         attempt_id.seq,
-        now,
+        now.as_millis(),
     )
     .execute(db)
     .await?;
@@ -156,12 +156,12 @@ pub async fn read(db: &Database, id: &ExamAttemptId) -> Result<Option<ExamAttemp
         ExamAttempt,
         r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                   started_at AS "started_at: Timestamp",
-                  finished_at AS "finished_at: Option<Timestamp>",
-                  left_at AS "left_at: Option<Timestamp>"
+                  finished_at AS "finished_at: Timestamp",
+                  left_at AS "left_at: Timestamp"
            FROM exam_attempt
            WHERE exam = $1 AND app_user = $2 AND seq = $3"#,
-        id.exam,
-        id.user,
+        id.exam.uuid(),
+        id.user.uuid(),
         id.seq,
     )
     .fetch_optional(db)
@@ -179,14 +179,14 @@ pub async fn read_latest_for_user(
         ExamAttempt,
         r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                   started_at AS "started_at: Timestamp",
-                  finished_at AS "finished_at: Option<Timestamp>",
-                  left_at AS "left_at: Option<Timestamp>"
+                  finished_at AS "finished_at: Timestamp",
+                  left_at AS "left_at: Timestamp"
            FROM exam_attempt
            WHERE exam = $1 AND app_user = $2
            ORDER BY seq DESC
            LIMIT 1"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_optional(db)
     .await?)
@@ -202,13 +202,13 @@ pub async fn list_for_user(
         ExamAttempt,
         r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                   started_at AS "started_at: Timestamp",
-                  finished_at AS "finished_at: Option<Timestamp>",
-                  left_at AS "left_at: Option<Timestamp>"
+                  finished_at AS "finished_at: Timestamp",
+                  left_at AS "left_at: Timestamp"
            FROM exam_attempt
            WHERE exam = $1 AND app_user = $2
            ORDER BY seq DESC"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -226,12 +226,12 @@ pub async fn list_unfinished_for_user(
         ExamAttempt,
         r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                   started_at AS "started_at: Timestamp",
-                  finished_at AS "finished_at: Option<Timestamp>",
-                  left_at AS "left_at: Option<Timestamp>"
+                  finished_at AS "finished_at: Timestamp",
+                  left_at AS "left_at: Timestamp"
            FROM exam_attempt
            WHERE app_user = $1 AND finished_at IS NULL
            ORDER BY started_at, exam"#,
-        user as &UserId,
+        user.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -242,12 +242,12 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamAttem
         ExamAttempt,
         r#"SELECT exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                   started_at AS "started_at: Timestamp",
-                  finished_at AS "finished_at: Option<Timestamp>",
-                  left_at AS "left_at: Option<Timestamp>"
+                  finished_at AS "finished_at: Timestamp",
+                  left_at AS "left_at: Timestamp"
            FROM exam_attempt
            WHERE exam = $1
            ORDER BY started_at DESC, seq DESC"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -258,11 +258,11 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamAttem
 pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError> {
     let row = sqlx::query!(
         r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_one(db)
     .await?;
-    Ok(row.sat)
+    Ok(row.sat.unwrap_or(false))
 }
 
 /// The sitting-create guard: the exam row locked `FOR UPDATE` and
@@ -280,11 +280,11 @@ pub(crate) async fn guard_start(
     now: Timestamp,
 ) -> Result<(), AppError> {
     let row = sqlx::query!(
-        r#"SELECT draft AS "draft: bool", mode AS "mode: Option<ExamMode>",
-                  starts_at AS "starts_at: Option<Timestamp>",
-                  ends_at AS "ends_at: Option<Timestamp>"
+        r#"SELECT draft AS "draft: bool", mode AS "mode: ExamMode",
+                  starts_at AS "starts_at: Timestamp",
+                  ends_at AS "ends_at: Timestamp"
            FROM exam WHERE id = $1 FOR UPDATE"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -336,13 +336,13 @@ pub(crate) async fn create_in(
            SELECT $1, $2, $3, $5, NULL, NULL WHERE EXISTS (SELECT 1 FROM seat)
            RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                      started_at AS "started_at: Timestamp",
-                     finished_at AS "finished_at: Option<Timestamp>",
-                     left_at AS "left_at: Option<Timestamp>""#,
-        attempt.exam,
-        attempt.user,
+                     finished_at AS "finished_at: Timestamp",
+                     left_at AS "left_at: Timestamp""#,
+        attempt.exam.uuid(),
+        attempt.user.uuid(),
         attempt.seq,
         bump,
-        attempt.started_at,
+        attempt.started_at.as_millis(),
     )
     .fetch_optional(&mut *conn)
     .await;

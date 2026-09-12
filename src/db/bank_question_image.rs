@@ -7,6 +7,7 @@ use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam_question::ChoiceId;
+use crate::domain::note_file::FileContentType;
 use crate::error::AppError;
 
 /// Create or replace the slot's image row — the table's `NULLS NOT DISTINCT`
@@ -33,8 +34,8 @@ pub async fn upsert(
             r#"SELECT file FROM bank_question_image
                WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
                FOR UPDATE"#,
-            image.bank_question.clone(),
-            image.slot.clone(),
+            image.bank_question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
         )
         .fetch_optional(tx)
         .await?
@@ -46,11 +47,13 @@ pub async fn upsert(
                VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (bank_question, slot) DO UPDATE
                SET file = $3, content_type = $4, size = $5
-               RETURNING *"#,
-            image.bank_question.clone(),
-            image.slot.clone(),
+               RETURNING bank_question AS "bank_question: BankQuestionId",
+                   slot AS "slot: Option<ChoiceId>", file,
+                   content_type AS "content_type: FileContentType", size"#,
+            image.bank_question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
             image.file.clone(),
-            image.content_type,
+            image.content_type.as_str(),
             image.size,
         )
         .fetch_one(tx)
@@ -73,10 +76,13 @@ pub async fn read_slot(
 ) -> Result<Option<BankQuestionImage>, AppError> {
     let row = sqlx::query_as!(
         BankQuestionImage,
-        r#"SELECT * FROM bank_question_image
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: Option<ChoiceId>", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image
            WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2"#,
-        question,
-        slot.cloned(),
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
     )
     .fetch_optional(db)
     .await?;
@@ -89,8 +95,11 @@ pub async fn list_for_question(
 ) -> Result<Vec<BankQuestionImage>, AppError> {
     let rows = sqlx::query_as!(
         BankQuestionImage,
-        "SELECT * FROM bank_question_image WHERE bank_question = $1",
-        question
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: Option<ChoiceId>", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image WHERE bank_question = $1"#,
+        question.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -106,10 +115,13 @@ pub async fn list_for_questions(
     if questions.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<BankQuestionId> = questions.iter().map(|q| (*q).clone()).collect();
+    let ids: Vec<uuid::Uuid> = questions.iter().map(|q| q.uuid()).collect();
     let rows = sqlx::query_as!(
         BankQuestionImage,
-        "SELECT * FROM bank_question_image WHERE bank_question = ANY($1)",
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: Option<ChoiceId>", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image WHERE bank_question = ANY($1)"#,
         ids
     )
     .fetch_all(db)
@@ -138,8 +150,10 @@ pub async fn delete_choices_not_in(
            WHERE bank_question = $1
              AND slot IS NOT NULL
              AND NOT (slot = ANY($2))
-           RETURNING *"#,
-        question,
+           RETURNING bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: Option<ChoiceId>", file,
+               content_type AS "content_type: FileContentType", size"#,
+        question.uuid(),
         keep
     )
     .fetch_all(db)
@@ -155,9 +169,11 @@ pub async fn delete(
         BankQuestionImage,
         r#"DELETE FROM bank_question_image
            WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
-           RETURNING *"#,
-        image.bank_question,
-        image.slot
+           RETURNING bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: Option<ChoiceId>", file,
+               content_type AS "content_type: FileContentType", size"#,
+        image.bank_question.uuid(),
+        image.slot.as_ref().map(ChoiceId::as_str)
     )
     .fetch_optional(db)
     .await?;

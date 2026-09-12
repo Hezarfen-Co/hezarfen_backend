@@ -59,7 +59,7 @@ impl Scheduled for Exam {
         self.get_ends_at().map(|at| at.as_millis())
     }
 
-    fn order_key(&self) -> &str {
+    fn order_key(&self) -> String {
         self.get_id().key()
     }
 }
@@ -268,7 +268,7 @@ async fn list_exams(
         let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
         // Drafts show only where the caller manages the course (as its
         // creator — the manager+ path above already saw everything).
-        let managed: Vec<&str> = courses
+        let managed: Vec<String> = courses
             .iter()
             .filter(|c| can_manage_course(c, &user))
             .map(|c| c.get_id().key())

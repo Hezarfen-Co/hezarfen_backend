@@ -301,7 +301,7 @@ async fn classes_page(
     db: &Database,
 ) -> Result<Page<ClassResponse>, AppError> {
     let classes = class_group::list_by_ids(db, ids).await?;
-    let by_id: std::collections::HashMap<&str, &ClassGroup> = classes
+    let by_id: std::collections::HashMap<String, &ClassGroup> = classes
         .iter()
         .map(|class| (class.get_id().key(), class))
         .collect();
@@ -314,7 +314,7 @@ async fn classes_page(
     .await?;
     let items = ids
         .iter()
-        .filter_map(|id| by_id.get(id.key()))
+        .filter_map(|id| by_id.get(id.key().as_str()))
         .map(|class| ClassResponse::new(class, &people, with_creator))
         .collect();
     Ok(Page::new(items, total, limit, offset))

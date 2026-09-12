@@ -178,7 +178,6 @@ pub async fn start(
         }
     };
     let attempt = ExamAttempt {
-        id: ExamAttemptId::composite(exam.get_id(), user, next_seq),
         exam: exam.get_id().clone(),
         user: user.clone(),
         seq: next_seq,

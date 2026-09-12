@@ -32,7 +32,7 @@ pub async fn mark(
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
          RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
-                  status, marked_by AS \"marked_by: UserId\"",
+                  status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
         event.uuid(),
         user.uuid(),
         status.as_str(),

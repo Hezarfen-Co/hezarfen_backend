@@ -14,7 +14,8 @@ use crate::db::page::{PagedList, Param};
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{
-    Choice, ExamQuestion, ExamQuestionId, QuestionPoints, QuestionSpec, QuestionText,
+    Choice, ChoiceId, ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec,
+    QuestionText,
 };
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
@@ -27,6 +28,13 @@ fn dead_subject() -> AppError {
         field: "subject_id",
         reason: "subject does not exist",
     })
+}
+
+/// The `choices` JSONB bind as the macros type the parameter — a
+/// `serde_json::Value`. A `Choice` is two plain strings: serializing one
+/// cannot fail.
+fn choices_as_value(choices: &[Choice]) -> serde_json::Value {
+    serde_json::to_value(choices).expect("Choice serialization cannot fail")
 }
 
 pub async fn create(
@@ -71,7 +79,7 @@ async fn insert(
         text,
         points,
         kind: spec.kind,
-        choices: spec.choices,
+        choices: spec.choices.map(Json),
         correct: spec.correct,
         from_bank,
         // An insert never banks anything: only a to-bank save writes this.
@@ -115,19 +123,22 @@ async fn claim_subject_and_insert(
            RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
                      subject AS "subject: SubjectId", text AS "text: QuestionText",
                      kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
-                     choices AS "choices: Option<Json<Vec<Choice>>>",
-                     correct AS "correct: Option<ChoiceId>",
-                     from_bank AS "from_bank: Option<BankQuestionId>",
-                     banked_as AS "banked_as: Option<BankQuestionId>""#,
-        question.subject,
-        question.id,
-        question.exam,
-        question.text,
-        question.kind,
-        question.points,
-        question.choices,
-        question.correct,
-        question.from_bank,
+                     choices AS "choices: Json<Vec<Choice>>",
+                     correct AS "correct: ChoiceId",
+                     from_bank AS "from_bank: BankQuestionId",
+                     banked_as AS "banked_as: BankQuestionId""#,
+        question.subject.uuid(),
+        question.id.uuid(),
+        question.exam.uuid(),
+        question.text.as_str(),
+        question.kind.as_str(),
+        question.points.as_i64(),
+        question
+            .choices
+            .as_ref()
+            .map(|json| choices_as_value(&json.0)),
+        question.correct.as_ref().map(ChoiceId::as_str),
+        question.from_bank.as_ref().map(BankQuestionId::uuid),
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -140,12 +151,12 @@ pub async fn read(db: &Database, id: &ExamQuestionId) -> Result<Option<ExamQuest
         r#"SELECT id AS "id: ExamQuestionId", exam AS "exam: ExamId",
                   subject AS "subject: SubjectId", text AS "text: QuestionText",
                   kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
-                  choices AS "choices: Option<Json<Vec<Choice>>>",
-                  correct AS "correct: Option<ChoiceId>",
-                  from_bank AS "from_bank: Option<BankQuestionId>",
-                  banked_as AS "banked_as: Option<BankQuestionId>"
+                  choices AS "choices: Json<Vec<Choice>>",
+                  correct AS "correct: ChoiceId",
+                  from_bank AS "from_bank: BankQuestionId",
+                  banked_as AS "banked_as: BankQuestionId"
            FROM exam_question WHERE id = $1"#,
-        id as &ExamQuestionId,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?)
@@ -204,8 +215,8 @@ pub async fn list_shared_with(
            WHERE q.exam = $2
              AND (q.from_bank IN (SELECT t FROM shared)
                   OR q.banked_as IN (SELECT t FROM shared))"#,
-        live,
-        exam as &ExamId,
+        &live,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -256,14 +267,14 @@ pub async fn update(
                 r#"UPDATE subject SET exam_question_count =
                        GREATEST(exam_question_count - 1, 0)
                    WHERE id = $1"#,
-                previous as &SubjectId,
+                previous.uuid(),
             )
             .execute(&mut *conn)
             .await?;
             let claimed = sqlx::query!(
                 r#"UPDATE subject SET exam_question_count = subject.exam_question_count + 1
-                   WHERE id = $1 RETURNING 1"#,
-                next as &SubjectId,
+                   WHERE id = $1 RETURNING 1 AS n"#,
+                next.uuid(),
             )
             .fetch_optional(&mut *conn)
             .await?;
@@ -285,18 +296,18 @@ pub async fn update(
                RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
                          subject AS "subject: SubjectId", text AS "text: QuestionText",
                          kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
-                         choices AS "choices: Option<Json<Vec<Choice>>>",
-                         correct AS "correct: Option<ChoiceId>",
-                         from_bank AS "from_bank: Option<BankQuestionId>",
-                         banked_as AS "banked_as: Option<BankQuestionId>""#,
-            question.id as &ExamQuestionId,
-            subject,
-            text,
-            points,
-            spec.kind,
-            spec.choices,
-            spec.correct,
-            question.subject as &SubjectId,
+                         choices AS "choices: Json<Vec<Choice>>",
+                         correct AS "correct: ChoiceId",
+                         from_bank AS "from_bank: BankQuestionId",
+                         banked_as AS "banked_as: BankQuestionId""#,
+            question.id.uuid(),
+            subject.uuid(),
+            text.as_str(),
+            points.as_i64(),
+            spec.kind.as_str(),
+            spec.choices.as_deref().map(choices_as_value),
+            spec.correct.as_ref().map(ChoiceId::as_str),
+            question.subject.uuid(),
         )
         .fetch_optional(&mut *conn)
         .await?;
@@ -307,11 +318,11 @@ pub async fn update(
             // which is the 409.
             let live = sqlx::query!(
                 r#"SELECT EXISTS(SELECT 1 FROM exam_question WHERE id = $1) AS live"#,
-                question.id as &ExamQuestionId,
+                question.id.uuid(),
             )
             .fetch_one(&mut *conn)
             .await?;
-            if !live.live {
+            if !live.live.unwrap_or(false) {
                 return Err(AppError::NotFound);
             }
             return Err(AppError::Conflict(
@@ -346,12 +357,12 @@ pub async fn link_banked_as(
            RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
                      subject AS "subject: SubjectId", text AS "text: QuestionText",
                      kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
-                     choices AS "choices: Option<Json<Vec<Choice>>>",
-                     correct AS "correct: Option<ChoiceId>",
-                     from_bank AS "from_bank: Option<BankQuestionId>",
-                     banked_as AS "banked_as: Option<BankQuestionId>""#,
-        question.id as &ExamQuestionId,
-        template as &BankQuestionId,
+                     choices AS "choices: Json<Vec<Choice>>",
+                     correct AS "correct: ChoiceId",
+                     from_bank AS "from_bank: BankQuestionId",
+                     banked_as AS "banked_as: BankQuestionId""#,
+        question.id.uuid(),
+        template.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -369,13 +380,13 @@ pub async fn delete(db: &Database, question: ExamQuestion) -> Result<ExamQuestio
         freeze_gate(conn, &question.exam).await?;
         sqlx::query!(
             r#"DELETE FROM exam_answer WHERE question = $1"#,
-            question.id as &ExamQuestionId,
+            question.id.uuid(),
         )
         .execute(&mut *conn)
         .await?;
         sqlx::query!(
             r#"DELETE FROM question_image WHERE question = $1"#,
-            question.id as &ExamQuestionId,
+            question.id.uuid(),
         )
         .execute(&mut *conn)
         .await?;
@@ -385,11 +396,11 @@ pub async fn delete(db: &Database, question: ExamQuestion) -> Result<ExamQuestio
                RETURNING id AS "id: ExamQuestionId", exam AS "exam: ExamId",
                          subject AS "subject: SubjectId", text AS "text: QuestionText",
                          kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
-                         choices AS "choices: Option<Json<Vec<Choice>>>",
-                         correct AS "correct: Option<ChoiceId>",
-                         from_bank AS "from_bank: Option<BankQuestionId>",
-                         banked_as AS "banked_as: Option<BankQuestionId>""#,
-            question.id as &ExamQuestionId,
+                         choices AS "choices: Json<Vec<Choice>>",
+                         correct AS "correct: ChoiceId",
+                         from_bank AS "from_bank: BankQuestionId",
+                         banked_as AS "banked_as: BankQuestionId""#,
+            question.id.uuid(),
         )
         .fetch_optional(&mut *conn)
         .await?;
@@ -401,7 +412,7 @@ pub async fn delete(db: &Database, question: ExamQuestion) -> Result<ExamQuestio
                 r#"UPDATE subject SET exam_question_count =
                        GREATEST(exam_question_count - 1, 0)
                    WHERE id = $1"#,
-                deleted.subject as &SubjectId,
+                deleted.subject.uuid(),
             )
             .execute(&mut *conn)
             .await?;

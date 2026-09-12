@@ -14,7 +14,10 @@ use crate::db::page::{PagedList, Param};
 use crate::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam::ExamId;
-use crate::domain::exam_question::{QuestionPoints, QuestionSpec, QuestionText};
+use crate::domain::exam_question::{
+    Choice, ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+};
+use crate::domain::note_file::FileContentType;
 use crate::domain::subject::SubjectId;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
@@ -76,18 +79,25 @@ async fn insert(
                (id, owner, subject, text, kind, points, choices, correct,
                 source_exam, visibility, created_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-           RETURNING *"#,
-        question.id,
-        question.owner,
-        question.subject,
-        question.text,
-        question.kind,
-        question.points,
+           RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+               subject AS "subject: Option<SubjectId>", text AS "text: QuestionText",
+               kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+               choices AS "choices: Option<Json<Vec<Choice>>>",
+               correct AS "correct: Option<ChoiceId>",
+               source_exam AS "source_exam: Option<ExamId>",
+               visibility AS "visibility: BankVisibility",
+               created_at AS "created_at: Timestamp""#,
+        question.id.uuid(),
+        question.owner.uuid(),
+        question.subject.as_ref().map(SubjectId::uuid),
+        question.text.as_str(),
+        question.kind.as_str(),
+        question.points.as_i64(),
         question.choices,
-        question.correct,
-        question.source_exam,
-        question.visibility,
-        question.created_at,
+        question.correct.as_ref().map(ChoiceId::as_str),
+        question.source_exam.as_ref().map(ExamId::uuid),
+        question.visibility.as_str(),
+        question.created_at.as_millis(),
     )
     .fetch_one(db)
     .await?;
@@ -97,8 +107,16 @@ async fn insert(
 pub async fn read(db: &Database, id: &BankQuestionId) -> Result<Option<BankQuestion>, AppError> {
     let row = sqlx::query_as!(
         BankQuestion,
-        "SELECT * FROM bank_question WHERE id = $1",
-        id
+        r#"SELECT id AS "id: BankQuestionId", owner AS "owner: UserId",
+                  subject AS "subject: Option<SubjectId>", text AS "text: QuestionText",
+                  kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                  choices AS "choices: Option<Json<Vec<Choice>>>",
+                  correct AS "correct: Option<ChoiceId>",
+                  source_exam AS "source_exam: Option<ExamId>",
+                  visibility AS "visibility: BankVisibility",
+                  created_at AS "created_at: Timestamp"
+           FROM bank_question WHERE id = $1"#,
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -205,7 +223,7 @@ pub async fn usage_counts(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let ids: Vec<BankQuestionId> = ids.iter().map(|id| (*id).clone()).collect();
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.uuid()).collect();
     let rows = sqlx::query!(
         r#"SELECT from_bank AS "from_bank: BankQuestionId", count(*) AS n
            FROM exam_question
@@ -263,22 +281,29 @@ pub async fn update_if_unchanged(
              AND choices IS NOT DISTINCT FROM $13
              AND correct IS NOT DISTINCT FROM $14
              AND visibility = $15
-           RETURNING *"#,
-        expected.id,
-        subject,
-        text,
-        points,
-        kind,
+           RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+               subject AS "subject: Option<SubjectId>", text AS "text: QuestionText",
+               kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+               choices AS "choices: Option<Json<Vec<Choice>>>",
+               correct AS "correct: Option<ChoiceId>",
+               source_exam AS "source_exam: Option<ExamId>",
+               visibility AS "visibility: BankVisibility",
+               created_at AS "created_at: Timestamp""#,
+        expected.id.uuid(),
+        subject.as_ref().map(SubjectId::uuid),
+        text.as_str(),
+        points.as_i64(),
+        kind.as_str(),
         choices,
-        correct,
-        visibility,
-        expected.subject,
-        expected.text,
-        expected.points,
-        expected.kind,
+        correct.as_ref().map(ChoiceId::as_str),
+        visibility.as_str(),
+        expected.subject.as_ref().map(SubjectId::uuid),
+        expected.text.as_str(),
+        expected.points.as_i64(),
+        expected.kind.as_str(),
         expected.choices,
-        expected.correct,
-        expected.visibility,
+        expected.correct.as_ref().map(ChoiceId::as_str),
+        expected.visibility.as_str(),
     )
     .fetch_optional(db)
     .await?;
@@ -309,27 +334,39 @@ pub async fn delete(
         let id = target.id.clone();
         sqlx::query!(
             "UPDATE exam_question SET from_bank = NULL WHERE from_bank = $1",
-            id
+            id.uuid()
         )
         .execute(tx)
         .await?;
         sqlx::query!(
             "UPDATE exam_question SET banked_as = NULL WHERE banked_as = $1",
-            id
+            id.uuid()
         )
         .execute(tx)
         .await?;
         let images = sqlx::query_as!(
             BankQuestionImage,
-            "DELETE FROM bank_question_image WHERE bank_question = $1 RETURNING *",
-            id
+            r#"DELETE FROM bank_question_image WHERE bank_question = $1
+               RETURNING bank_question AS "bank_question: BankQuestionId",
+                     slot AS "slot: Option<ChoiceId>", file,
+                     content_type AS "content_type: FileContentType", size"#,
+            id.uuid()
         )
         .fetch_all(tx)
         .await?;
         let question = sqlx::query_as!(
             BankQuestion,
-            "DELETE FROM bank_question WHERE id = $1 RETURNING *",
-            id
+            r#"DELETE FROM bank_question WHERE id = $1
+               RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+                     subject AS "subject: Option<SubjectId>",
+                     text AS "text: QuestionText", kind AS "kind: QuestionKind",
+                     points AS "points: QuestionPoints",
+                     choices AS "choices: Option<Json<Vec<Choice>>>",
+                     correct AS "correct: Option<ChoiceId>",
+                     source_exam AS "source_exam: Option<ExamId>",
+                     visibility AS "visibility: BankVisibility",
+                     created_at AS "created_at: Timestamp""#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?

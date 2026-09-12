@@ -439,7 +439,7 @@ async fn list_slots(
             .filter(|teacher| teacher.get_role().at_least(Role::Teacher))
             .map(|teacher| (teacher.get_id().key().to_string(), PersonRef::new(teacher)))
             .collect();
-        slots.retain(|slot| people.contains_key(slot.get_teacher().key()));
+        slots.retain(|slot| people.contains_key(slot.get_teacher().key().as_str()));
         (slots, people)
     };
     let total = slots.len() as i64;

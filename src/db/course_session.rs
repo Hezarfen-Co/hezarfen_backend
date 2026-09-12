@@ -41,13 +41,15 @@ pub async fn create(
         CourseSession,
         r#"INSERT INTO course_session (id, course, teacher, topic, starts_at, ends_at)
            VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id, course, teacher, topic, starts_at, ends_at"#,
-        session.id,
-        session.course,
-        session.teacher,
-        session.topic,
-        session.starts_at,
-        session.ends_at,
+           RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+                     teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
+        session.id.uuid(),
+        session.course.uuid(),
+        session.teacher.uuid(),
+        session.topic.as_str(),
+        session.starts_at.as_millis(),
+        session.ends_at.map(|at| at.as_millis()),
     )
     .fetch_one(db)
     .await;
@@ -61,9 +63,11 @@ pub async fn create(
 pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSession>, AppError> {
     let session = sqlx::query_as!(
         CourseSession,
-        r#"SELECT id, course, teacher, topic, starts_at, ends_at
+        r#"SELECT id AS "id: CourseSessionId", course AS "course: CourseId",
+                  teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                  starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp"
            FROM course_session WHERE id = $1"#,
-        id,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -132,15 +136,17 @@ pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSessi
         // session may simply have had none.
         sqlx::query!(
             r#"DELETE FROM session_attendance WHERE session = $1"#,
-            session.id,
+            session.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         let deleted = sqlx::query_as!(
             CourseSession,
             r#"DELETE FROM course_session WHERE id = $1
-               RETURNING id, course, teacher, topic, starts_at, ends_at"#,
-            session.id,
+               RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+                     teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
+            session.id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;

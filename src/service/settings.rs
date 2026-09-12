@@ -172,7 +172,7 @@ pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, App
         // Guards + save, one transaction. The removal refusals are the same
         // 409s as ever; a stale save is the `STALE_SAVE` marker, answered by
         // another loop turn below; everything else surfaces.
-        let attempted = tx_with_retry(db, false, async |tx| {
+        let attempted = tx_with_retry(db, false, async move |tx| {
             // A name leaves a list by being *retired* on its reference
             // counter — one row-locked switch, which lands only while
             // nothing references the name and refuses every claim from that
@@ -239,7 +239,7 @@ async fn retire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
         r#"SELECT retired AS "retired!: bool" FROM kind_ref WHERE name = $1 FOR UPDATE"#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?
     .map(|row| row.retired)
     .unwrap_or(false);
@@ -250,7 +250,7 @@ async fn retire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
            RETURNING 1 AS "landed!: i64""#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?
     .is_some();
     match (landed, was) {
@@ -270,7 +270,7 @@ async fn retire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
         r#"SELECT retired AS "retired!: bool" FROM slot_ref WHERE name = $1 FOR UPDATE"#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?
     .map(|row| row.retired)
     .unwrap_or(false);
@@ -281,7 +281,7 @@ async fn retire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), AppE
            RETURNING 1 AS "landed!: i64""#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?
     .is_some();
     match (landed, was) {
@@ -305,7 +305,7 @@ async fn unretire_kind(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), Ap
            RETURNING 1 AS "landed!: i64""#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?;
     Ok(())
 }
@@ -319,7 +319,7 @@ async fn unretire_slot(tx: &mut sqlx::PgConnection, name: &str) -> Result<(), Ap
            RETURNING 1 AS "landed!: i64""#,
         name
     )
-    .fetch_optional(tx)
+    .fetch_optional(&mut *tx)
     .await?;
     Ok(())
 }

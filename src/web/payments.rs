@@ -546,7 +546,8 @@ async fn appended(
 }
 
 async fn require_line(id: &str, db: &Database) -> Result<PaymentLedger, AppError> {
-    service::payment_ledger::read(db, &PaymentLedgerId::from_key(id))
+    let id = PaymentLedgerId::from_key(id);
+    service::payment_ledger::read(db, &id)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -877,10 +878,10 @@ async fn statement_response(
     let (assignments, _) =
         service::fee_plan_assignment::list_for_student(db, student, None, 0).await?;
     let mut plan_names: HashMap<String, Option<String>> = HashMap::new();
-    let mut plan_of: HashMap<&str, &FeePlanId> = HashMap::new();
+    let mut plan_of: HashMap<String, &FeePlanId> = HashMap::new();
     for assignment in &assignments {
         let plan = assignment.get_plan();
-        if !plan_names.contains_key(plan.key()) {
+        if !plan_names.contains_key(plan.key().as_str()) {
             let name = service::fee_plan::read(db, plan)
                 .await?
                 .map(|plan| plan.get_name().as_str().to_string());
@@ -935,7 +936,7 @@ async fn statement_response(
             StatementEntry {
                 charge_id: charge.get_id().key().to_string(),
                 plan: plan.map(|plan| plan.key().to_string()),
-                plan_name: plan.and_then(|plan| plan_names.get(plan.key()).cloned().flatten()),
+                plan_name: plan.and_then(|plan| plan_names.get(plan.key().as_str()).cloned().flatten()),
                 amount_minor: charge.get_amount_minor().as_minor(),
                 due_at,
                 credited_minor: credited,

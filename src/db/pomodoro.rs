@@ -126,7 +126,10 @@ pub async fn start(
 pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, AppError> {
     let done = Timestamp::now();
     let day = done.day_number();
-    let saved = tx_with_retry(db, false, async |tx| {
+    // Owned capture: an `async move` closure holding a `&UserId` fails the
+    // higher-ranked `Send` check `tx_with_retry`'s future must pass.
+    let user = *user;
+    let saved = tx_with_retry(db, false, async move |tx| {
         // Take the open row. Empty means nothing is running.
         let open = sqlx::query!(
             "DELETE FROM pomodoro_session
@@ -222,7 +225,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
     // A badge is a decoration on top of the stint: losing one to a
     // transient database error must never fail the finish, and the next
     // counter move re-runs this and heals it.
-    if let Err(err) = crate::db::badge::sync(db, user).await {
+    if let Err(err) = crate::db::badge::sync(db, &user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
     }
     Ok(saved)

@@ -27,13 +27,16 @@ pub async fn create(
             Course,
             r#"INSERT INTO course (id, creator, teachers, title, description, kind, term, capacity)
                VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)
-               RETURNING id, creator, teachers, title, description, kind, term, capacity"#,
-            id,
-            creator,
-            Vec::<UserId>::new(),
-            title,
-            description,
-            kind,
+               RETURNING id AS "id: CourseId", creator AS "creator: UserId",
+                     teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                     description AS "description: CourseDescription",
+                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
+            id.uuid(),
+            creator.uuid(),
+            &Vec::<uuid::Uuid>::new(),
+            title.as_str(),
+            description.as_str(),
+            kind.as_str(),
             capacity,
         )
         .fetch_one(db)
@@ -55,15 +58,18 @@ pub async fn create(
               RETURNING 1)
            INSERT INTO course (id, creator, teachers, title, description, kind, term, capacity)
            SELECT $1, $2, $3, $4, $5, $6, $8, $7 WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id, creator, teachers, title, description, kind, term, capacity"#,
-        id,
-        creator,
-        Vec::<UserId>::new(),
-        title,
-        description,
-        kind,
+           RETURNING id AS "id: CourseId", creator AS "creator: UserId",
+                     teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                     description AS "description: CourseDescription",
+                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
+        id.uuid(),
+        creator.uuid(),
+        &Vec::<uuid::Uuid>::new(),
+        title.as_str(),
+        description.as_str(),
+        kind.as_str(),
         capacity,
-        term,
+        term.uuid(),
         cap::UNLIMITED,
     )
     .fetch_one(db)
@@ -84,9 +90,12 @@ pub async fn create(
 pub async fn read(db: &Database, id: &CourseId) -> Result<Option<Course>, AppError> {
     let course = sqlx::query_as!(
         Course,
-        r#"SELECT id, creator, teachers, title, description, kind, term, capacity
+        r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
+                  teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                  description AS "description: CourseDescription",
+                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
            FROM course WHERE id = $1"#,
-        id,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -96,7 +105,10 @@ pub async fn read(db: &Database, id: &CourseId) -> Result<Option<Course>, AppErr
 pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
     let rows = sqlx::query_as!(
         Course,
-        r#"SELECT id, creator, teachers, title, description, kind, term, capacity
+        r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
+                  teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                  description AS "description: CourseDescription",
+                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
            FROM course ORDER BY id DESC"#,
     )
     .fetch_all(db)
@@ -137,10 +149,13 @@ pub async fn list_enrolled(
 pub async fn list_for_teacher(db: &Database, user: &UserId) -> Result<Vec<Course>, AppError> {
     let rows = sqlx::query_as!(
         Course,
-        r#"SELECT id, creator, teachers, title, description, kind, term, capacity
+        r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
+                  teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                  description AS "description: CourseDescription",
+                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
            FROM course WHERE creator = $1 OR $2 = ANY(teachers) ORDER BY id DESC"#,
-        user,
-        user,
+        user.uuid(),
+        user.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -153,12 +168,15 @@ pub async fn list_by_ids(db: &Database, ids: &[CourseId]) -> Result<Vec<Course>,
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let keys: Vec<CourseId> = ids.to_vec();
+    let keys: Vec<uuid::Uuid> = ids.iter().map(CourseId::uuid).collect();
     let rows = sqlx::query_as!(
         Course,
-        r#"SELECT id, creator, teachers, title, description, kind, term, capacity
+        r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
+                  teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                  description AS "description: CourseDescription",
+                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
            FROM course WHERE id = ANY($1)"#,
-        keys,
+        &keys,
     )
     .fetch_all(db)
     .await?;
@@ -235,11 +253,14 @@ pub async fn assign_teacher(
         Course,
         r#"UPDATE course
              SET teachers = (SELECT array_agg(DISTINCT x)
-                               FROM unnest(course.teachers || $2) AS x)
+                               FROM unnest(course.teachers || $2::uuid) AS x)
            WHERE id = $1
-           RETURNING id, creator, teachers, title, description, kind, term, capacity"#,
-        course.id,
-        teacher,
+           RETURNING id AS "id: CourseId", creator AS "creator: UserId",
+                     teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                     description AS "description: CourseDescription",
+                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
+        course.id.uuid(),
+        teacher.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -263,9 +284,12 @@ pub async fn unassign_teacher(
         Course,
         r#"UPDATE course SET teachers = array_remove(teachers, $2)
            WHERE id = $1
-           RETURNING id, creator, teachers, title, description, kind, term, capacity"#,
-        course.id,
-        teacher,
+           RETURNING id AS "id: CourseId", creator AS "creator: UserId",
+                     teachers AS "teachers: Vec<UserId>", title AS "title: CourseTitle",
+                     description AS "description: CourseDescription",
+                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
+        course.id.uuid(),
+        teacher.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -278,7 +302,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
     sqlx::query!(
         r#"UPDATE course SET teachers = array_remove(teachers, $1)
            WHERE $1 = ANY(teachers)"#,
-        user,
+        user.uuid(),
     )
     .execute(db)
     .await?;
@@ -352,7 +376,7 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         // this very row, so check and cascade are one decision.
         let guard = sqlx::query!(
             r#"SELECT enrollment_count, term FROM course WHERE id = $1 FOR UPDATE"#,
-            course.id,
+            course.id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -366,7 +390,7 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         // source_exam clear — and must be collected before the sweeps take
         // the rows they name.
         let exams: Vec<uuid::Uuid> =
-            sqlx::query!(r#"SELECT id FROM exam WHERE course = $1"#, course.id,)
+            sqlx::query!(r#"SELECT id FROM exam WHERE course = $1"#, course.id.uuid(),)
                 .fetch_all(&mut *tx)
                 .await?
                 .into_iter()
@@ -382,7 +406,7 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
                         JOIN exam e ON r.exam = e.id
                         WHERE r.exam = ANY($1) GROUP BY e.kind) s
                 WHERE k.name = s.kind"#,
-            exams,
+            &exams,
         )
         .execute(&mut *tx)
         .await?;
@@ -399,27 +423,27 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         // Events aimed at this course keep standing, audience cleared.
         sqlx::query!(
             r#"UPDATE event SET audience_course = NULL WHERE audience_course = $1"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         // The exam subtree, deepest children first.
-        sqlx::query!(r#"DELETE FROM exam_result WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM exam_result WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM answer_image WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM answer_image WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM question_image WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM question_image WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM exam_question WHERE exam = ANY($1)"#, exams)
+        sqlx::query!(r#"DELETE FROM exam_question WHERE exam = ANY($1)"#, &exams)
             .execute(&mut *tx)
             .await?;
         // The homework subtree: files, then submissions (whose graded_by
@@ -428,39 +452,45 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
             r#"DELETE FROM homework_file WHERE submission IN (
                  SELECT id FROM homework_submission
                   WHERE homework IN (SELECT id FROM homework WHERE course = $1))"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             r#"DELETE FROM homework_submission WHERE homework IN (
                  SELECT id FROM homework WHERE course = $1)"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             r#"DELETE FROM homework_result WHERE homework IN (
                  SELECT id FROM homework WHERE course = $1)"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         // Derived AI rows for this course's notes.
-        sqlx::query!(r#"DELETE FROM rag_output WHERE course = $1"#, course.id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            r#"DELETE FROM rag_output WHERE course = $1"#,
+            course.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         // Notes: files before their notes.
         sqlx::query!(
             r#"DELETE FROM course_note_file WHERE course_note IN (
                  SELECT id FROM course_note WHERE course = $1)"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(r#"DELETE FROM course_note WHERE course = $1"#, course.id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            r#"DELETE FROM course_note WHERE course = $1"#,
+            course.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         // Class attachments: detach and hand each class its count back in
         // one statement, then strike the course out of every blueprint.
         sqlx::query!(
@@ -469,58 +499,67 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
                UPDATE class_group g
                   SET class_course_count = GREATEST(g.class_course_count - 1, 0)
                  FROM detached WHERE g.id = detached.class"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             r#"UPDATE class_blueprint SET courses = array_remove(courses, $1)
                WHERE $1 = ANY(courses)"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         // Sessions with their roll call, then the roster itself.
         sqlx::query!(
             r#"DELETE FROM session_attendance WHERE course = $1"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!(r#"DELETE FROM course_session WHERE course = $1"#, course.id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM enrollment WHERE course = $1"#, course.id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query!(
+            r#"DELETE FROM course_session WHERE course = $1"#,
+            course.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"DELETE FROM enrollment WHERE course = $1"#,
+            course.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         // The bank keeps its templates; their links to this course's
         // content go first, so the subject/exam deletes below cannot trip
         // a foreign key behind them.
         sqlx::query!(
             r#"UPDATE bank_question SET subject = NULL
                WHERE subject IN (SELECT id FROM subject WHERE course = $1)"#,
-            course.id,
+            course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             r#"UPDATE bank_question SET source_exam = NULL WHERE source_exam = ANY($1)"#,
-            exams,
+            &exams,
         )
         .execute(&mut *tx)
         .await?;
         // Subjects before exams would trip `exam.subject` — exams go first.
-        sqlx::query!(r#"DELETE FROM exam WHERE course = $1"#, course.id)
+        sqlx::query!(r#"DELETE FROM exam WHERE course = $1"#, course.id.uuid())
             .execute(&mut *tx)
             .await?;
-        sqlx::query!(r#"DELETE FROM homework WHERE course = $1"#, course.id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM subject WHERE course = $1"#, course.id)
+        sqlx::query!(
+            r#"DELETE FROM homework WHERE course = $1"#,
+            course.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(r#"DELETE FROM subject WHERE course = $1"#, course.id.uuid())
             .execute(&mut *tx)
             .await?;
         // Last: the course itself, now FK-silent.
-        sqlx::query!(r#"DELETE FROM course WHERE id = $1"#, course.id)
+        sqlx::query!(r#"DELETE FROM course WHERE id = $1"#, course.id.uuid())
             .execute(&mut *tx)
             .await?;
         Ok(true)

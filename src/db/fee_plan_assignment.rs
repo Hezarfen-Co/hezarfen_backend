@@ -18,10 +18,10 @@ pub async fn read(
 ) -> Result<Option<FeePlanAssignment>, AppError> {
     sqlx::query_as!(
         FeePlanAssignment,
-        "SELECT plan, student, assigned_by, created_at \
+        "SELECT plan AS \"plan: FeePlanId\", student AS \"student: UserId\", assigned_by AS \"assigned_by: UserId\", created_at AS \"created_at: Timestamp\"
          FROM fee_plan_assignment WHERE plan = $1 AND student = $2",
-        id.plan,
-        id.student,
+        id.plan.uuid(),
+        id.student.uuid(),
     )
     .fetch_optional(db)
     .await
@@ -58,13 +58,13 @@ pub async fn create(
                RETURNING 1)
            INSERT INTO fee_plan_assignment (plan, student, assigned_by, created_at)
            SELECT $3, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING plan, student, assigned_by, created_at"#,
-        plan,
+           RETURNING plan AS "plan: FeePlanId", student AS "student: UserId", assigned_by AS "assigned_by: UserId", created_at AS "created_at: Timestamp""#,
+        plan.uuid(),
         cap::UNLIMITED,
-        plan,
-        student,
-        assigned_by,
-        created_at,
+        plan.uuid(),
+        student.uuid(),
+        assigned_by.uuid(),
+        created_at.as_millis(),
     )
     .fetch_optional(db)
     .await;
@@ -101,13 +101,13 @@ pub async fn list_for_plan(
 /// can be behind. Kept because a *test* asserting the rows and the counter
 /// agree is the only thing that would catch the counter drifting.
 pub async fn exists_for_plan(db: &Database, plan: &FeePlanId) -> Result<bool, AppError> {
-    let (exists,) = sqlx::query!(
-        "SELECT EXISTS (SELECT 1 FROM fee_plan_assignment WHERE plan = $1)",
-        plan
+    let row = sqlx::query!(
+        "SELECT EXISTS (SELECT 1 FROM fee_plan_assignment WHERE plan = $1) AS \"exists!\"",
+        plan.uuid()
     )
     .fetch_one(db)
     .await?;
-    Ok(exists)
+    Ok(row.exists)
 }
 
 /// Which plans a student is on — one student may hold several.

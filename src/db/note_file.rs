@@ -6,7 +6,7 @@ use crate::constant::MAX_NOTE_FILES;
 use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::page::PagedList;
 use crate::domain::note::NoteId;
-use crate::domain::note_file::{NoteFile, NoteFileId};
+use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
 use crate::error::AppError;
 
 /// Persist the row assembled by [`NoteFile::new`], refusing once its note
@@ -28,12 +28,13 @@ pub async fn insert(db: &Database, file: NoteFile) -> Result<NoteFile, AppError>
                RETURNING 1)
            INSERT INTO note_file (id, note, name, content_type, size)
            SELECT $3, $1, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id, note, name, content_type, size"#,
-        file.note,
+           RETURNING id AS "id: NoteFileId", note AS "note: NoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size"#,
+        file.note.uuid(),
         MAX_NOTE_FILES as i64,
-        file.id,
-        file.name,
-        file.content_type,
+        file.id.uuid(),
+        file.name.as_str(),
+        file.content_type.as_str(),
         file.size
     )
     .fetch_optional(db)
@@ -62,9 +63,10 @@ pub async fn read_for(
 ) -> Result<Option<NoteFile>, AppError> {
     let file = sqlx::query_as!(
         NoteFile,
-        r#"SELECT id, note, name, content_type, size FROM note_file WHERE id = $1 AND note = $2"#,
-        id,
-        note
+        r#"SELECT id AS "id: NoteFileId", note AS "note: NoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size FROM note_file WHERE id = $1 AND note = $2"#,
+        id.uuid(),
+        note.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -91,15 +93,16 @@ pub async fn delete(db: &Database, file: NoteFile) -> Result<NoteFile, AppError>
     tx_with_retry(db, true, async |conn| {
         let gone = sqlx::query_as!(
             NoteFile,
-            r#"DELETE FROM note_file WHERE id = $1 RETURNING id, note, name, content_type, size"#,
-            file.id
+            r#"DELETE FROM note_file WHERE id = $1 RETURNING id AS "id: NoteFileId", note AS "note: NoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size"#,
+            file.id.uuid()
         )
         .fetch_optional(&mut *conn)
         .await?;
         let file = gone.ok_or(AppError::NotFound)?;
         sqlx::query!(
             "UPDATE note SET file_count = GREATEST(file_count - 1, 0) WHERE id = $1",
-            file.note
+            file.note.uuid()
         )
         .execute(&mut *conn)
         .await?;

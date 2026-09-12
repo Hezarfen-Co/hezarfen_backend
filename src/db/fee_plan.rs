@@ -28,18 +28,20 @@ pub async fn create(
     created_by: &UserId,
 ) -> Result<FeePlan, AppError> {
     validate_installments(&installments)?;
+    let installments = serde_json::to_value(&installments)
+        .map_err(|e| AppError::Internal(format!("fee plan encode: {e}")))?;
     let id = FeePlanId::generate();
     let created_at = Timestamp::now();
     sqlx::query_as!(
         FeePlan,
         "INSERT INTO fee_plan (id, name, installments, created_by, created_at) \
          VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, name, installments, created_by, created_at",
-        id,
-        name,
-        sqlx::types::Json(installments),
-        created_by,
-        created_at,
+         RETURNING id AS \"id: FeePlanId\", name AS \"name: FeePlanName\", installments AS \"installments: sqlx::types::Json<Vec<Installment>>\", created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
+        id.uuid(),
+        name.as_str(),
+        installments,
+        created_by.uuid(),
+        created_at.as_millis(),
     )
     .fetch_one(db)
     .await
@@ -49,9 +51,9 @@ pub async fn create(
 pub async fn read(db: &Database, id: &FeePlanId) -> Result<Option<FeePlan>, AppError> {
     sqlx::query_as!(
         FeePlan,
-        "SELECT id, name, installments, created_by, created_at \
+        "SELECT id AS \"id: FeePlanId\", name AS \"name: FeePlanName\", installments AS \"installments: sqlx::types::Json<Vec<Installment>>\", created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"
          FROM fee_plan WHERE id = $1",
-        id,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await
@@ -103,15 +105,20 @@ pub async fn update(
         // is the whole answer, assigned or not.
         return read(db, &plan.id).await?.ok_or(AppError::NotFound);
     }
+    let installments = installments
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("fee plan encode: {e}")))?;
     let edited = sqlx::query_as!(
         FeePlan,
         "UPDATE fee_plan \
          SET name = COALESCE($2, name), installments = COALESCE($3, installments) \
          WHERE id = $1 AND assignment_count = 0 \
-         RETURNING id, name, installments, created_by, created_at",
-        plan.id,
+         RETURNING id AS \"id: FeePlanId\", name AS \"name: FeePlanName\", installments AS \"installments: sqlx::types::Json<Vec<Installment>>\", created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
+        plan.id.uuid(),
         name.map(|n| n.as_str().to_string()),
-        installments.map(sqlx::types::Json),
+        installments,
     )
     .fetch_optional(db)
     .await?;
@@ -143,7 +150,7 @@ pub async fn update(
 pub async fn delete(db: &Database, plan: FeePlan) -> Result<bool, AppError> {
     let deleted = sqlx::query!(
         "DELETE FROM fee_plan WHERE id = $1 AND assignment_count = 0 RETURNING id",
-        plan.id,
+        plan.id.uuid(),
     )
     .fetch_optional(db)
     .await?;

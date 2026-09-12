@@ -4,6 +4,8 @@
 //! those are is [`crate::domain::badge::earned`] — pure, no I/O — and the
 //! service wrappers the web layer calls live in [`crate::service::badge`].
 
+use sqlx::AssertSqlSafe;
+
 use crate::constant::{BADGE_AWARD_TABLE, BADGES};
 use crate::database::Database;
 use crate::domain::badge::{BadgeAward, BadgeStats};
@@ -55,17 +57,17 @@ pub async fn load(db: &Database, user: &UserId) -> Result<BadgeStats, AppError> 
 /// but spelled as the projected column on purpose, because it is the
 /// *served* order, not an internal one.
 pub async fn list_for(db: &Database, user: &UserId) -> Result<Vec<BadgeAward>, AppError> {
-    let ids: Vec<&str> = BADGES.iter().map(|(id, ..)| *id).collect();
+    let ids: Vec<String> = BADGES.iter().map(|(id, ..)| (*id).to_string()).collect();
     let awards = sqlx::query_as!(
         BadgeAward,
         r#"SELECT badge,
-                  earned_at AS "earned_at: Timestamp"
+                  earned_at AS "earned_at!: Timestamp"
            FROM badge_award
            WHERE app_user = $1 AND badge = ANY($2)
            ORDER BY earned_at ASC, badge ASC
            LIMIT $3"#,
         user.uuid(),
-        ids,
+        &ids,
         BADGES.len() as i64,
     )
     .fetch_all(db)
@@ -102,13 +104,13 @@ pub async fn sync(db: &Database, user: &UserId) -> Result<(), AppError> {
     }
     let now = Timestamp::now().as_millis();
     for badge in earned {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {BADGE_AWARD_TABLE} (app_user, badge, earned_at) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (app_user, badge) DO UPDATE \
                  SET earned_at = badge_award.earned_at \
                WHERE badge_award.earned_at IS NULL"
-        ))
+        )))
         .bind(user.uuid())
         .bind(badge)
         .bind(now)

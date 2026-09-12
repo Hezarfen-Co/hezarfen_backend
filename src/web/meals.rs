@@ -20,7 +20,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::dietary_profile::{DietaryNote, DietaryTags, conflicts};
-use crate::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
+use crate::domain::meal_attendance::{MealAttendance, MealAttendanceId, MealAttendanceStatus};
 use crate::domain::meal_booking::{MealBooking, MealBookingId, MealCutoff};
 use crate::domain::meal_ledger::{LedgerAmount, LedgerMethod, LedgerNote, MealLedger};
 use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot, validate_capacity};
@@ -726,7 +726,7 @@ struct BookingResponse {
 impl BookingResponse {
     fn new(booking: &MealBooking, people: &std::collections::HashMap<String, PersonRef>) -> Self {
         Self {
-            id: booking.get_id().key().to_string(),
+            id: booking.id().key(),
             menu_id: booking.get_menu().key().to_string(),
             student: PersonRef::resolve(people, booking.get_student()),
             booked_by: PersonRef::resolve(people, booking.get_booked_by()),
@@ -1005,10 +1005,8 @@ async fn cancel_booking(
         // gets the same 403 either way, and learns nothing.
         //
         // Same door as booking: whoever may take the seat may give it back.
-        let student = id
-            .student()
-            .ok_or(AppError::Forbidden("not your booking"))?;
-        let target = booking_target(&user, Some(student.key()), &st.db).await?;
+        let student = id.student();
+        let target = booking_target(&user, Some(student.key().as_str()), &st.db).await?;
         if target != student {
             return Err(AppError::Forbidden("not your booking"));
         }
@@ -1067,7 +1065,7 @@ struct MealAttendanceResponse {
 impl MealAttendanceResponse {
     fn new(row: &MealAttendance, people: &std::collections::HashMap<String, PersonRef>) -> Self {
         Self {
-            id: row.get_id().key().to_string(),
+            id: MealAttendanceId::composite(row.get_menu(), &row.get_student()).key(),
             menu_id: row.get_menu().key().to_string(),
             student: PersonRef::resolve(people, row.get_student()),
             status: row.get_status().as_str().to_string(),

@@ -177,7 +177,8 @@ pub async fn list_for_teacher(
             )
             .fetch_all(db)
             .await?;
-            Ok((rows, rows.len() as i64))
+            let total = rows.len() as i64;
+            Ok((rows, total))
         }
         Some(limit) => {
             let rows = query_as!(
@@ -208,7 +209,8 @@ pub async fn list_for_teacher(
             )
             .fetch_one(db)
             .await?
-            .total;
+            .total
+            .unwrap_or(0);
             Ok((rows, total))
         }
     }
@@ -313,8 +315,10 @@ pub async fn save_if_unchanged(
     expected: &Appointment,
     new: Appointment,
 ) -> Result<Option<Appointment>, AppError> {
-    tx_with_retry(db, false, async |tx| {
-        decision_cas(&mut *tx, expected, new.clone()).await
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let expected = expected.clone();
+    tx_with_retry(db, false, async move |tx| {
+        decision_cas(&mut *tx, &expected, new.clone()).await
     })
     .await
 }

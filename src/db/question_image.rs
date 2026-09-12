@@ -31,7 +31,7 @@ pub async fn upsert(
     db: &Database,
     image: QuestionImage,
 ) -> Result<(QuestionImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| upsert_in(conn, image).await).await
+    tx_with_retry(db, false, async |conn| upsert_in(conn, image.clone()).await).await
 }
 
 /// The gated read-and-replace, on one connection.
@@ -49,13 +49,13 @@ pub(crate) async fn upsert_in(
                SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,
                    size = EXCLUDED.size
            RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                     slot AS "slot: Option<ChoiceId>", file,
+                     slot AS "slot: ChoiceId", file,
                      content_type AS "content_type: FileContentType", size"#,
-        image.exam as &ExamId,
-        image.question as &ExamQuestionId,
-        image.slot,
+        image.exam.uuid(),
+        image.question.uuid(),
+        image.slot.as_ref().map(ChoiceId::as_str),
         image.file,
-        image.content_type,
+        image.content_type.as_str(),
         image.size,
     )
     .fetch_one(&mut *conn)
@@ -74,8 +74,8 @@ pub(crate) async fn replaced_file(
     let row = sqlx::query!(
         r#"SELECT file FROM question_image
            WHERE question = $1 AND slot IS NOT DISTINCT FROM $2"#,
-        question as &ExamQuestionId,
-        slot.map(ChoiceId::clone),
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
     )
     .fetch_optional(conn)
     .await?;
@@ -90,12 +90,12 @@ pub async fn read_slot(
     Ok(sqlx::query_as!(
         QuestionImage,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                  slot AS "slot: Option<ChoiceId>", file,
+                  slot AS "slot: ChoiceId", file,
                   content_type AS "content_type: FileContentType", size
            FROM question_image
            WHERE question = $1 AND slot IS NOT DISTINCT FROM $2"#,
-        question as &ExamQuestionId,
-        slot.map(ChoiceId::clone),
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
     )
     .fetch_optional(db)
     .await?)
@@ -106,10 +106,10 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<QuestionI
     Ok(sqlx::query_as!(
         QuestionImage,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                  slot AS "slot: Option<ChoiceId>", file,
+                  slot AS "slot: ChoiceId", file,
                   content_type AS "content_type: FileContentType", size
            FROM question_image WHERE exam = $1"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -122,10 +122,10 @@ pub async fn list_for_question(
     Ok(sqlx::query_as!(
         QuestionImage,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                  slot AS "slot: Option<ChoiceId>", file,
+                  slot AS "slot: ChoiceId", file,
                   content_type AS "content_type: FileContentType", size
            FROM question_image WHERE question = $1"#,
-        question as &ExamQuestionId,
+        question.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -145,16 +145,19 @@ pub async fn delete_choices_not_in(
     question: &ExamQuestionId,
     keep: &[ChoiceId],
 ) -> Result<Vec<QuestionImage>, AppError> {
-    let keep = keep.iter().map(ChoiceId::as_str).collect::<Vec<_>>();
+    let keep = keep
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>();
     Ok(sqlx::query_as!(
         QuestionImage,
         r#"DELETE FROM question_image
            WHERE question = $1 AND slot IS NOT NULL AND NOT (slot = ANY($2))
            RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                     slot AS "slot: Option<ChoiceId>", file,
+                     slot AS "slot: ChoiceId", file,
                      content_type AS "content_type: FileContentType", size"#,
-        question as &ExamQuestionId,
-        keep,
+        question.uuid(),
+        &keep,
     )
     .fetch_all(db)
     .await?)
@@ -169,7 +172,7 @@ pub async fn file_keys_for_course(
     let rows = sqlx::query!(
         r#"SELECT qi.file FROM question_image qi
            JOIN exam e ON e.id = qi.exam WHERE e.course = $1"#,
-        course as &CourseId,
+        course.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -186,10 +189,10 @@ pub async fn delete(db: &Database, image: QuestionImage) -> Result<QuestionImage
             r#"DELETE FROM question_image
                WHERE question = $1 AND slot IS NOT DISTINCT FROM $2
                RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
-                         slot AS "slot: Option<ChoiceId>", file,
+                         slot AS "slot: ChoiceId", file,
                          content_type AS "content_type: FileContentType", size"#,
-            image.question as &ExamQuestionId,
-            image.slot,
+            image.question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
         )
         .fetch_optional(&mut *conn)
         .await?;

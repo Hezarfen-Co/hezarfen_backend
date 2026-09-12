@@ -9,7 +9,6 @@
 //! ([`ChatbotMessage::projected`]) — the durable repair for a dead process
 //! happens once, at mint, in `database.rs`'s school migration sweep.
 
-use uuid::Uuid;
 use crate::constant::{
     CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, STALE_ERROR_CODE,
 };

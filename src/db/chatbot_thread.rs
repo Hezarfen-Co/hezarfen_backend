@@ -45,7 +45,7 @@ pub async fn create_capped(
                      (SELECT max_chatbot_threads FROM settings WHERE id = 'school'),
                      $2)
              RETURNING 1)
-         INSERT INTO chatbot_thread (id, user_id, title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\")
+         INSERT INTO chatbot_thread (id, user_id, title, created_at, updated_at)
          SELECT $3, $1, $4, $5, $5
          WHERE EXISTS (SELECT 1 FROM seat)
          RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
@@ -105,8 +105,8 @@ pub async fn read_for(
 ) -> Result<Option<ChatbotThread>, AppError> {
     let thread = query_as!(
         ChatbotThread,
-        "SELECT id, user_id, title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM chatbot_thread WHERE id = $1",
-        id
+        "SELECT id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM chatbot_thread WHERE id = $1",
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -159,7 +159,7 @@ pub async fn rename(
 /// thread. On a re-sent round the thread is already gone, so the caller
 /// gets the `404` that is the truth.
 pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThread, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // Children first: the foreign key would refuse the parent while a
         // turn still names it.
         sqlx::query!(
@@ -171,7 +171,7 @@ pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThrea
         let gone = query_as!(
             ChatbotThread,
             "DELETE FROM chatbot_thread WHERE id = $1 \
-             RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title, \
+             RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
                        created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
             thread.get_id().uuid()
         )
@@ -181,7 +181,7 @@ pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThrea
             sqlx::query!(
                 "UPDATE app_user SET chatbot_thread_count = GREATEST(chatbot_thread_count - 1, 0) \
                  WHERE id = $1",
-                gone.get_user_id()
+                gone.get_user_id().uuid()
             )
             .execute(&mut *tx)
             .await?;

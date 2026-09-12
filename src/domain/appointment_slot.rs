@@ -19,7 +19,6 @@
 //! live in [`crate::db::appointment_slot`]; the publish and delete workflows
 //! in [`crate::service::appointment_slot`].
 
-use uuid::Uuid;
 use crate::constant::{
     MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
 };

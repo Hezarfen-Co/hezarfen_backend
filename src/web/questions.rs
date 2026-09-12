@@ -232,7 +232,7 @@ async fn question_responses(
     Ok(questions
         .iter()
         .map(|question| {
-            let count = counts.get(question.get_id().key()).copied().unwrap_or(0);
+            let count = counts.get(&question.get_id().key()).copied().unwrap_or(0);
             PoolQuestionResponse::new(question, &people, count)
         })
         .collect())

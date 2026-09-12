@@ -44,7 +44,7 @@ pub async fn upsert(
     db: &Database,
     image: AnswerImage,
 ) -> Result<(AnswerImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| upsert_in(conn, image).await).await
+    tx_with_retry(db, false, async |conn| upsert_in(conn, &image).await).await
 }
 
 /// The locked exam-row probe plus the upsert, on one connection.
@@ -54,7 +54,7 @@ pub(crate) async fn upsert_in(
 ) -> Result<(AnswerImage, Option<String>), AppError> {
     let touched = sqlx::query!(
         r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
-        image.exam as &ExamId,
+        image.exam.uuid(),
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -64,8 +64,8 @@ pub(crate) async fn upsert_in(
     let replaced = sqlx::query!(
         r#"SELECT file FROM answer_image
            WHERE question = $1 AND app_user = $2 AND seq = $3"#,
-        image.question as &ExamQuestionId,
-        image.user as &UserId,
+        image.question.uuid(),
+        image.user.uuid(),
         image.seq,
     )
     .fetch_optional(&mut *conn)
@@ -81,11 +81,11 @@ pub(crate) async fn upsert_in(
            RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                      app_user AS "user: UserId", seq, file,
                      content_type AS "content_type: FileContentType", size"#,
-        image.exam as &ExamId,
-        image.question as &ExamQuestionId,
-        image.user as &UserId,
+        image.exam.uuid(),
+        image.question.uuid(),
+        image.user.uuid(),
         image.file,
-        image.content_type,
+        image.content_type.as_str(),
         image.size,
         image.seq,
     )
@@ -108,8 +108,8 @@ pub async fn read(
                   content_type AS "content_type: FileContentType", size
            FROM answer_image
            WHERE question = $1 AND app_user = $2 AND seq = $3"#,
-        question as &ExamQuestionId,
-        user as &UserId,
+        question.uuid(),
+        user.uuid(),
         seq,
     )
     .fetch_optional(db)
@@ -124,7 +124,7 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<AnswerIma
                   app_user AS "user: UserId", seq, file,
                   content_type AS "content_type: FileContentType", size
            FROM answer_image WHERE exam = $1"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -145,8 +145,8 @@ pub async fn list_for_exam_user(
                   app_user AS "user: UserId", seq, file,
                   content_type AS "content_type: FileContentType", size
            FROM answer_image WHERE exam = $1 AND app_user = $2 AND seq = $3"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
         seq,
     )
     .fetch_all(db)
@@ -163,8 +163,8 @@ pub async fn list_seqs_for_user(
     let rows = sqlx::query!(
         r#"SELECT DISTINCT seq FROM answer_image
            WHERE exam = $1 AND app_user = $2 ORDER BY seq ASC"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -180,7 +180,7 @@ pub async fn file_keys_for_course(
     let rows = sqlx::query!(
         r#"SELECT ai.file FROM answer_image ai
            JOIN exam e ON e.id = ai.exam WHERE e.course = $1"#,
-        course as &CourseId,
+        course.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -194,8 +194,8 @@ pub async fn delete(db: &Database, image: AnswerImage) -> Result<AnswerImage, Ap
            RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                      app_user AS "user: UserId", seq, file,
                      content_type AS "content_type: FileContentType", size"#,
-        image.question as &ExamQuestionId,
-        image.user as &UserId,
+        image.question.uuid(),
+        image.user.uuid(),
         image.seq,
     )
     .fetch_optional(db)
@@ -215,8 +215,8 @@ pub async fn delete_for_exam_user(
 ) -> Result<(), AppError> {
     sqlx::query!(
         r#"DELETE FROM answer_image WHERE exam = $1 AND app_user = $2"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .execute(db)
     .await?;

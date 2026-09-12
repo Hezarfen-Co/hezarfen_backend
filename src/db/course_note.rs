@@ -6,7 +6,9 @@ use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
 use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, CourseNoteTitle};
-use crate::domain::course_note_file::CourseNoteFile;
+use crate::domain::course_note_file::{
+    CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
+};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -34,12 +36,14 @@ pub async fn create(
         CourseNote,
         r#"INSERT INTO course_note (id, course, author, title, content)
            VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, course, author, title, content"#,
-        note.id,
-        note.course,
-        note.author,
-        note.title,
-        note.content
+           RETURNING id AS "id: CourseNoteId", course AS "course: CourseId",
+               author AS "author: UserId", title AS "title: CourseNoteTitle",
+               content AS "content: CourseNoteContent""#,
+        note.id.uuid(),
+        note.course.uuid(),
+        note.author.uuid(),
+        note.title.as_str(),
+        note.content.as_str()
     )
     .fetch_one(db)
     .await;
@@ -53,8 +57,10 @@ pub async fn create(
 pub async fn read(db: &Database, id: &CourseNoteId) -> Result<Option<CourseNote>, AppError> {
     let note = sqlx::query_as!(
         CourseNote,
-        r#"SELECT id, course, author, title, content FROM course_note WHERE id = $1"#,
-        id
+        r#"SELECT id AS "id: CourseNoteId", course AS "course: CourseId",
+               author AS "author: UserId", title AS "title: CourseNoteTitle",
+               content AS "content: CourseNoteContent" FROM course_note WHERE id = $1"#,
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -112,21 +118,25 @@ pub async fn delete(
     note: CourseNote,
 ) -> Result<(CourseNote, Vec<CourseNoteFile>), AppError> {
     tx_with_retry(db, true, async |conn| {
-        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id)
+        sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id.uuid())
             .execute(&mut *conn)
             .await?;
         let files = sqlx::query_as!(
             CourseNoteFile,
             r#"DELETE FROM course_note_file WHERE course_note = $1
-               RETURNING id, course_note, name, content_type, size"#,
-            note.id
+               RETURNING id AS "id: CourseNoteFileId",
+                     course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+                     content_type AS "content_type: FileContentType", size"#,
+            note.id.uuid()
         )
         .fetch_all(&mut *conn)
         .await?;
         let gone = sqlx::query_as!(
             CourseNote,
-            r#"DELETE FROM course_note WHERE id = $1 RETURNING id, course, author, title, content"#,
-            note.id
+            r#"DELETE FROM course_note WHERE id = $1 RETURNING id AS "id: CourseNoteId", course AS "course: CourseId",
+               author AS "author: UserId", title AS "title: CourseNoteTitle",
+               content AS "content: CourseNoteContent""#,
+            note.id.uuid()
         )
         .fetch_optional(&mut *conn)
         .await?;

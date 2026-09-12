@@ -39,13 +39,15 @@ pub async fn mark(
     marked_by: &UserId,
 ) -> Result<MealAttendance, AppError> {
     let marked_at = Timestamp::now();
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let menu_key = menu.key().to_string();
     let student = *student;
     let marked_by = *marked_by;
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let bumped = sqlx::query!(
             "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1
              RETURNING 1 AS bumped",
-            menu.key(),
+            menu_key,
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -60,12 +62,14 @@ pub async fn mark(
              SET status = EXCLUDED.status,
                  marked_by = EXCLUDED.marked_by,
                  marked_at = EXCLUDED.marked_at
-             RETURNING menu, student, status, marked_by, marked_at",
-            menu.key(),
-            student,
-            status,
-            marked_by,
-            marked_at,
+             RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\",
+                       status AS \"status: MealAttendanceStatus\", marked_by AS \"marked_by: UserId\",
+                       marked_at AS \"marked_at: Timestamp\"",
+            menu_key,
+            student.uuid(),
+            status.as_str(),
+            marked_by.uuid(),
+            marked_at.as_millis(),
         )
         .fetch_one(&mut *tx)
         .await?;

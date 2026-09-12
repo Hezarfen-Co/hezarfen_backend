@@ -11,6 +11,7 @@ use crate::db::page::PagedList;
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
+use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 
 /// Offer the solution. `NotFound` = the question is gone, and nothing was
@@ -29,12 +30,16 @@ pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppEr
         Solution,
         r#"INSERT INTO solution (id, question, author, body, offered_at)
            VALUES ($1, $2, $3, $4, $5)
-           RETURNING *"#,
-        solution.id,
-        solution.question,
-        solution.author,
-        solution.body,
-        solution.offered_at,
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+        solution.id.uuid(),
+        solution.question.uuid(),
+        solution.author.uuid(),
+        solution.body.as_str(),
+        solution.offered_at.as_millis(),
     )
     .fetch_one(db)
     .await
@@ -60,9 +65,14 @@ pub async fn read_for(
 ) -> Result<Option<Solution>, AppError> {
     let row = sqlx::query_as!(
         Solution,
-        "SELECT * FROM solution WHERE id = $1 AND question = $2",
-        id,
-        question
+        r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size
+           FROM solution WHERE id = $1 AND question = $2"#,
+        id.uuid(),
+        question.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -100,7 +110,7 @@ pub async fn counts_for(
     if questions.is_empty() {
         return Ok(HashMap::new());
     }
-    let ids: Vec<PoolQuestionId> = questions.iter().copied().collect();
+    let ids: Vec<uuid::Uuid> = questions.iter().map(|id| id.uuid()).collect();
     let rows = sqlx::query!(
         r#"SELECT question AS "question: PoolQuestionId", count(*) AS n
            FROM solution
@@ -126,9 +136,14 @@ pub async fn set_body(
 ) -> Result<Option<Solution>, AppError> {
     let row = sqlx::query_as!(
         Solution,
-        "UPDATE solution SET body = $2 WHERE id = $1 RETURNING *",
-        id,
-        body
+        r#"UPDATE solution SET body = $2 WHERE id = $1
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+        id.uuid(),
+        body.as_str()
     )
     .fetch_optional(db)
     .await?;
@@ -153,8 +168,13 @@ pub async fn set_image(
     tx_with_retry(db, false, async |tx| {
         let before = sqlx::query_as!(
             Solution,
-            "SELECT * FROM solution WHERE id = $1 FOR UPDATE",
-            *id
+            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp", image_file,
+                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_size
+                   FROM solution WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?;
@@ -165,9 +185,9 @@ pub async fn set_image(
             r#"UPDATE solution
                SET image_file = $2, image_content_type = $3, image_size = $4
                WHERE id = $1"#,
-            *id,
+            id.uuid(),
             file,
-            content_type,
+            content_type.as_str(),
             size,
         )
         .execute(tx)
@@ -183,8 +203,13 @@ pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Soluti
     tx_with_retry(db, false, async |tx| {
         let before = sqlx::query_as!(
             Solution,
-            "SELECT * FROM solution WHERE id = $1 FOR UPDATE",
-            *id
+            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp", image_file,
+                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_size
+                   FROM solution WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?;
@@ -195,7 +220,7 @@ pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Soluti
             r#"UPDATE solution
                SET image_file = NULL, image_content_type = NULL, image_size = NULL
                WHERE id = $1"#,
-            *id,
+            id.uuid(),
         )
         .execute(tx)
         .await?;
@@ -207,8 +232,13 @@ pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Soluti
 pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppError> {
     let deleted = sqlx::query_as!(
         Solution,
-        "DELETE FROM solution WHERE id = $1 RETURNING *",
-        solution.id
+        r#"DELETE FROM solution WHERE id = $1
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+        solution.id.uuid()
     )
     .fetch_optional(db)
     .await?;

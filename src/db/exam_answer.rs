@@ -76,7 +76,7 @@ pub async fn save(
     // child insert whose parent is gone refuses itself — which is what
     // retired the bump-and-restore this used to ride on.
     tx_with_retry(db, false, async |conn| {
-        save_in(conn, question, user, seq, selected, text).await
+        save_in(conn, question, user, seq, selected.clone(), text.clone()).await
     })
     .await
 }
@@ -93,7 +93,7 @@ pub(crate) async fn save_in(
 ) -> Result<ExamAnswer, AppError> {
     let touched = sqlx::query!(
         r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
-        question.get_exam() as &ExamId,
+        question.get_exam().uuid(),
     )
     .fetch_optional(&mut *conn)
     .await?;
@@ -110,16 +110,16 @@ pub(crate) async fn save_in(
                    updated_at = EXCLUDED.updated_at
            RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                      app_user AS "user: UserId", seq,
-                     selected AS "selected: Option<ChoiceId>",
-                     text AS "text: Option<AnswerText>",
+                     selected AS "selected: ChoiceId",
+                     text AS "text: AnswerText",
                      updated_at AS "updated_at: Timestamp""#,
-        question.get_exam() as &ExamId,
-        question.get_id() as &ExamQuestionId,
-        user as &UserId,
+        question.get_exam().uuid(),
+        question.get_id().uuid(),
+        user.uuid(),
+        selected.as_ref().map(ChoiceId::as_str),
+        text.as_ref().map(AnswerText::as_str),
+        now.as_millis(),
         seq,
-        selected,
-        text,
-        now,
     )
     .fetch_one(&mut *conn)
     .await
@@ -136,13 +136,13 @@ pub async fn read(
         ExamAnswer,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                   app_user AS "user: UserId", seq,
-                  selected AS "selected: Option<ChoiceId>",
-                  text AS "text: Option<AnswerText>",
+                  selected AS "selected: ChoiceId",
+                  text AS "text: AnswerText",
                   updated_at AS "updated_at: Timestamp"
            FROM exam_answer
            WHERE question = $1 AND app_user = $2 AND seq = $3"#,
-        question as &ExamQuestionId,
-        user as &UserId,
+        question.uuid(),
+        user.uuid(),
         seq,
     )
     .fetch_optional(db)
@@ -158,8 +158,8 @@ pub async fn delete(
 ) -> Result<(), AppError> {
     sqlx::query!(
         r#"DELETE FROM exam_answer WHERE question = $1 AND app_user = $2 AND seq = $3"#,
-        question as &ExamQuestionId,
-        user as &UserId,
+        question.uuid(),
+        user.uuid(),
         seq,
     )
     .execute(db)
@@ -180,14 +180,14 @@ pub async fn list_for_exam_user(
         ExamAnswer,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                   app_user AS "user: UserId", seq,
-                  selected AS "selected: Option<ChoiceId>",
-                  text AS "text: Option<AnswerText>",
+                  selected AS "selected: ChoiceId",
+                  text AS "text: AnswerText",
                   updated_at AS "updated_at: Timestamp"
            FROM exam_answer
            WHERE exam = $1 AND app_user = $2 AND seq = $3
            ORDER BY question ASC"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
         seq,
     )
     .fetch_all(db)
@@ -204,8 +204,8 @@ pub async fn list_seqs_for_user(
     let rows = sqlx::query!(
         r#"SELECT DISTINCT seq FROM exam_answer
            WHERE exam = $1 AND app_user = $2 ORDER BY seq ASC"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -218,11 +218,11 @@ pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamAnswe
         ExamAnswer,
         r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
                   app_user AS "user: UserId", seq,
-                  selected AS "selected: Option<ChoiceId>",
-                  text AS "text: Option<AnswerText>",
+                  selected AS "selected: ChoiceId",
+                  text AS "text: AnswerText",
                   updated_at AS "updated_at: Timestamp"
            FROM exam_answer WHERE exam = $1 ORDER BY question ASC"#,
-        exam as &ExamId,
+        exam.uuid(),
     )
     .fetch_all(db)
     .await?)
@@ -237,8 +237,8 @@ pub async fn delete_for_exam_user(
 ) -> Result<(), AppError> {
     sqlx::query!(
         r#"DELETE FROM exam_answer WHERE exam = $1 AND app_user = $2"#,
-        exam as &ExamId,
-        user as &UserId,
+        exam.uuid(),
+        user.uuid(),
     )
     .execute(db)
     .await?;

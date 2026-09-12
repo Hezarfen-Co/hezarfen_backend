@@ -27,7 +27,7 @@ pub async fn send(
                              sender_folder, recipient_folder, sender_origin, recipient_origin)
          VALUES ($1, $2, $3, $4, $5, $6, $7, false, 'sent', 'inbox', NULL, NULL)
          RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
@@ -83,7 +83,7 @@ pub async fn list_folder(
     if read.is_some() {
         from.push_str(&format!(" AND read = ${}", if home_arm { 3 } else { 2 }));
     }
-    let mut builder = PagedList::new(from, "ORDER BY id DESC").bind(user);
+    let mut builder = PagedList::new(from, "ORDER BY id DESC").bind(user.uuid());
     if home_arm {
         builder = builder.bind(folder.as_str().to_string());
     }
@@ -103,7 +103,7 @@ pub async fn read_for(
     let message = query_as!(
         Message,
         "SELECT id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                subject, body, label AS \"label: MessageLabel\", \
+                subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                 sent_at AS \"sent_at: Timestamp\", read, \
                 sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                 sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\" \
@@ -125,12 +125,12 @@ pub async fn set_read(db: &Database, message: Message, read: bool) -> Result<Mes
         Message,
         "UPDATE message SET read = $1 WHERE id = $2 \
          RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
         read,
-        message.get_id(),
+        message.get_id().uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -169,7 +169,7 @@ pub async fn move_to(
             Message,
             "UPDATE message SET sender_folder = $1, sender_origin = $2 WHERE id = $3 \
              RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
@@ -184,7 +184,7 @@ pub async fn move_to(
             Message,
             "UPDATE message SET recipient_folder = $1, recipient_origin = $2 WHERE id = $3 \
              RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
@@ -211,7 +211,7 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
             "UPDATE message SET sender_folder = 'deleted', sender_origin = NULL \
              WHERE id = $1 AND sender_folder = 'trash' \
              RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
@@ -225,7 +225,7 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
             "UPDATE message SET recipient_folder = 'deleted', recipient_origin = NULL \
              WHERE id = $1 AND recipient_folder = 'trash' \
              RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",
@@ -244,7 +244,7 @@ pub async fn delete_for(db: &Database, message: Message, user: &UserId) -> Resul
             Message,
             "DELETE FROM message WHERE id = $1 \
              RETURNING id AS \"id: MessageId\", sender AS \"sender: UserId\", recipient AS \"recipient: UserId\", \
-                   subject, body, label AS \"label: MessageLabel\", \
+                   subject AS \"subject: MessageSubject\", body AS \"body: MessageBody\", label AS \"label: MessageLabel\", \
                    sent_at AS \"sent_at: Timestamp\", read, \
                    sender_folder AS \"sender_folder: Folder\", recipient_folder AS \"recipient_folder: Folder\", \
                    sender_origin AS \"sender_origin: Folder\", recipient_origin AS \"recipient_origin: Folder\"",

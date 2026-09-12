@@ -7,8 +7,11 @@
 use crate::constant::{STATUS_APPROVED, STATUS_PENDING};
 use crate::database::{Database, tx_with_retry};
 use crate::domain::note_file::FileContentType;
-use crate::domain::pool_question::{PoolQuestion, PoolQuestionId};
-use crate::domain::solution::Solution;
+use crate::domain::pool_question::{
+    PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
+};
+use crate::domain::solution::{Solution, SolutionBody, SolutionId};
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -17,13 +20,18 @@ pub async fn insert(db: &Database, question: PoolQuestion) -> Result<PoolQuestio
         PoolQuestion,
         r#"INSERT INTO pool_question (id, asker, title, body, status, asked_at)
            VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING *"#,
-        question.id,
-        question.asker,
-        question.title,
-        question.body,
+           RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: Option<UserId>", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+        question.id.uuid(),
+        question.asker.uuid(),
+        question.title.as_str(),
+        question.body.as_str(),
         question.status,
-        question.asked_at,
+        question.asked_at.as_millis(),
     )
     .fetch_one(db)
     .await?;
@@ -33,8 +41,14 @@ pub async fn insert(db: &Database, question: PoolQuestion) -> Result<PoolQuestio
 pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuestion>, AppError> {
     let row = sqlx::query_as!(
         PoolQuestion,
-        "SELECT * FROM pool_question WHERE id = $1",
-        id
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: Option<UserId>", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size
+           FROM pool_question WHERE id = $1"#,
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -46,7 +60,13 @@ pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuest
 pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
     let rows = sqlx::query_as!(
         PoolQuestion,
-        "SELECT * FROM pool_question ORDER BY asked_at DESC, id DESC",
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: Option<UserId>", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size
+           FROM pool_question ORDER BY asked_at DESC, id DESC"#,
     )
     .fetch_all(db)
     .await?;
@@ -58,11 +78,17 @@ pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
 pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQuestion>, AppError> {
     let rows = sqlx::query_as!(
         PoolQuestion,
-        r#"SELECT * FROM pool_question
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: Option<UserId>", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size
+           FROM pool_question
            WHERE status = $1 OR asker = $2
            ORDER BY asked_at DESC, id DESC"#,
         STATUS_APPROVED,
-        user
+        user.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -111,10 +137,15 @@ pub async fn approve(
             PoolQuestion,
             r#"UPDATE pool_question SET status = $2, approved_by = $3
                WHERE id = $1 AND status = $4
-               RETURNING *"#,
-            *id,
+               RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: Option<UserId>", image_file,
+                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_size"#,
+            id.uuid(),
             STATUS_APPROVED,
-            approver,
+            approver.uuid(),
             STATUS_PENDING,
         )
         .fetch_optional(tx)
@@ -126,14 +157,14 @@ pub async fn approve(
                 sqlx::query!(
                     "UPDATE app_user SET pool_approved_total = pool_approved_total + 1
                      WHERE id = $1",
-                    approver
+                    approver.uuid()
                 )
                 .execute(tx)
                 .await?;
                 sqlx::query!(
                     "UPDATE app_user SET pool_published_total = pool_published_total + 1
                      WHERE id = $1",
-                    question.asker
+                    question.asker.uuid()
                 )
                 .execute(tx)
                 .await?;
@@ -164,8 +195,14 @@ pub async fn set_image(
     tx_with_retry(db, false, async |tx| {
         let before = sqlx::query_as!(
             PoolQuestion,
-            "SELECT * FROM pool_question WHERE id = $1 FOR UPDATE",
-            *id
+            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: Option<UserId>", image_file,
+                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_size
+                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?;
@@ -176,9 +213,9 @@ pub async fn set_image(
             r#"UPDATE pool_question
                SET image_file = $2, image_content_type = $3, image_size = $4
                WHERE id = $1 AND status = $5"#,
-            *id,
+            id.uuid(),
             file,
-            content_type,
+            content_type.as_str(),
             size,
             STATUS_PENDING,
         )
@@ -201,8 +238,14 @@ pub async fn clear_image(
     tx_with_retry(db, false, async |tx| {
         let before = sqlx::query_as!(
             PoolQuestion,
-            "SELECT * FROM pool_question WHERE id = $1 FOR UPDATE",
-            *id
+            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: Option<UserId>", image_file,
+                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_size
+                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?;
@@ -213,7 +256,7 @@ pub async fn clear_image(
             r#"UPDATE pool_question
                SET image_file = NULL, image_content_type = NULL, image_size = NULL
                WHERE id = $1 AND status = $2"#,
-            *id,
+            id.uuid(),
             STATUS_PENDING,
         )
         .execute(tx)
@@ -244,15 +287,26 @@ pub async fn delete(
     tx_with_retry(db, true, async |tx| {
         let solutions = sqlx::query_as!(
             Solution,
-            "DELETE FROM solution WHERE question = $1 RETURNING *",
-            *id
+            r#"DELETE FROM solution WHERE question = $1
+               RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+            id.uuid()
         )
         .fetch_all(tx)
         .await?;
         let question = sqlx::query_as!(
             PoolQuestion,
-            "DELETE FROM pool_question WHERE id = $1 RETURNING *",
-            *id
+            r#"DELETE FROM pool_question WHERE id = $1
+               RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: Option<UserId>", image_file,
+               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_size"#,
+            id.uuid()
         )
         .fetch_optional(tx)
         .await?;

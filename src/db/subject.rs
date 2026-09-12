@@ -33,11 +33,14 @@ pub async fn create(
         Subject,
         r#"INSERT INTO subject (id, course, name, description, exam_question_count, homework_count)
            VALUES ($1, $2, $3, $4, 0, 0)
-           RETURNING id, course, name, description"#,
-        subject.id,
-        subject.course,
-        subject.name,
-        subject.description,
+           RETURNING id AS "id: SubjectId",
+                     course AS "course: CourseId",
+                     name AS "name: SubjectName",
+                     description AS "description: SubjectDescription""#,
+        subject.id.uuid(),
+        subject.course.uuid(),
+        subject.name.as_str(),
+        subject.description.as_str(),
     )
     .fetch_one(db)
     .await;
@@ -51,8 +54,8 @@ pub async fn create(
 pub async fn read(db: &Database, id: &SubjectId) -> Result<Option<Subject>, AppError> {
     let subject = sqlx::query_as!(
         Subject,
-        r#"SELECT id, course, name, description FROM subject WHERE id = $1"#,
-        id,
+        r#"SELECT id AS "id: SubjectId", course AS "course: CourseId", name AS "name: SubjectName", description AS "description: SubjectDescription" FROM subject WHERE id = $1"#,
+        id.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -65,11 +68,11 @@ pub async fn list_by_ids(db: &Database, ids: &[&SubjectId]) -> Result<Vec<Subjec
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let keys: Vec<SubjectId> = ids.iter().map(|id| **id).collect();
+    let keys: Vec<uuid::Uuid> = ids.iter().map(|id| id.uuid()).collect();
     let rows = sqlx::query_as!(
         Subject,
-        r#"SELECT id, course, name, description FROM subject WHERE id = ANY($1)"#,
-        keys,
+        r#"SELECT id AS "id: SubjectId", course AS "course: CourseId", name AS "name: SubjectName", description AS "description: SubjectDescription" FROM subject WHERE id = ANY($1)"#,
+        &keys,
     )
     .fetch_all(db)
     .await?;
@@ -139,7 +142,7 @@ pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError
         let held = sqlx::query!(
             r#"SELECT exam_question_count, homework_count
                FROM subject WHERE id = $1 FOR UPDATE"#,
-            subject.id,
+            subject.id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -157,14 +160,17 @@ pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError
         let deleted = sqlx::query_as!(
             Subject,
             r#"DELETE FROM subject WHERE id = $1
-               RETURNING id, course, name, description"#,
-            subject.id,
+               RETURNING id AS "id: SubjectId",
+                     course AS "course: CourseId",
+                     name AS "name: SubjectName",
+                     description AS "description: SubjectDescription""#,
+            subject.id.uuid(),
         )
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query!(
             r#"UPDATE bank_question SET subject = NULL WHERE subject = $1"#,
-            subject.id,
+            subject.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;

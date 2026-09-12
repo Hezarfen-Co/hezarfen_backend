@@ -5,7 +5,10 @@
 
 use crate::database::Database;
 use crate::db::page::PagedList;
-use crate::domain::meal_ledger::{LedgerAmount, MealLedger, MealLedgerId};
+use crate::domain::meal_ledger::{
+    LedgerAmount, LedgerMethod, LedgerNote, MealLedger, MealLedgerId, MealLedgerKind,
+};
+use crate::domain::timestamp::Timestamp;
 use crate::domain::menu::MenuId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -31,16 +34,16 @@ pub(crate) async fn append(db: &Database, row: MealLedger) -> Result<MealLedger,
              (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (id) DO NOTHING
-         RETURNING id, student, kind, amount_minor, source, method, note, recorded_by, created_at",
+         RETURNING id AS \"id: MealLedgerId\", student AS \"student: UserId\", kind AS \"kind: MealLedgerKind\", amount_minor AS \"amount_minor: LedgerAmount\", source, method AS \"method: LedgerMethod\", note AS \"note: LedgerNote\", recorded_by AS \"recorded_by: UserId\", created_at AS \"created_at: Timestamp\"",
         row.id.key(),
-        row.student,
-        row.kind,
-        row.amount_minor,
+        row.student.uuid(),
+        row.kind.as_str(),
+        row.amount_minor.as_minor(),
         row.source,
-        row.method,
-        row.note,
-        row.recorded_by,
-        row.created_at,
+        row.method.as_ref().map(|m| m.as_str()),
+        row.note.as_ref().map(|n| n.as_str()),
+        row.recorded_by.uuid(),
+        row.created_at.as_millis(),
     )
     .fetch_optional(db)
     .await?;
@@ -57,7 +60,7 @@ pub(crate) async fn append(db: &Database, row: MealLedger) -> Result<MealLedger,
 pub async fn read(db: &Database, id: &MealLedgerId) -> Result<Option<MealLedger>, AppError> {
     let row = sqlx::query_as!(
         MealLedger,
-        "SELECT id, student, kind, amount_minor, source, method, note, recorded_by, created_at
+        "SELECT id AS \"id: MealLedgerId\", student AS \"student: UserId\", kind AS \"kind: MealLedgerKind\", amount_minor AS \"amount_minor: LedgerAmount\", source, method AS \"method: LedgerMethod\", note AS \"note: LedgerNote\", recorded_by AS \"recorded_by: UserId\", created_at AS \"created_at: Timestamp\"
          FROM meal_ledger WHERE id = $1",
         id.key(),
     )
@@ -77,7 +80,7 @@ pub async fn price_snapshot(
     menu: &MenuId,
 ) -> Result<Option<LedgerAmount>, AppError> {
     let row =
-        sqlx::query!("SELECT CAST(COALESCE(sum(price_minor), 0) AS BIGINT) AS total FROM menu_dish WHERE menu = $1", menu.key())
+        sqlx::query!("SELECT CAST(COALESCE(sum(price_minor), 0) AS BIGINT) AS \"total!\" FROM menu_dish WHERE menu = $1", menu.key())
             .fetch_one(db)
             .await?;
     let total = row.total;
@@ -98,7 +101,7 @@ pub async fn list_for_student(
         "meal_ledger WHERE student = $1",
         "ORDER BY created_at DESC, id DESC",
     )
-    .bind(student.key())
+    .bind(student.uuid())
     .run(limit, offset, db)
     .await
 }
@@ -127,9 +130,9 @@ pub async fn list_for_student(
 pub async fn balance_of(db: &Database, student: &UserId) -> Result<i64, AppError> {
     let totals = sqlx::query!(
         r#"SELECT kind AS "kind: crate::domain::meal_ledger::MealLedgerKind",
-                  CAST(sum(amount_minor) AS BIGINT) AS total
+                  CAST(sum(amount_minor) AS BIGINT) AS "total!"
            FROM meal_ledger WHERE student = $1 GROUP BY kind"#,
-        *student,
+        student.uuid(),
     )
     .fetch_all(db)
     .await?;

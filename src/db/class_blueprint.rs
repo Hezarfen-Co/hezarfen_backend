@@ -94,7 +94,7 @@ pub async fn create(
         .execute(&mut *tx)
         .await;
         match inserted {
-            Ok(_) => Ok(blueprint),
+            Ok(_) => Ok(blueprint.clone()),
             Err(e) if unique_violation(&e) == Some("class_blueprint_pkey") => Err(
                 AppError::Conflict("a blueprint already exists for that grade"),
             ),
@@ -166,7 +166,7 @@ pub async fn set_courses_if_unchanged(
         Ok(updated.map(|row| ClassBlueprint {
             id: id.clone(),
             grade: row.grade,
-            courses: wanted,
+            courses: wanted.clone(),
             creator: row.creator,
         }))
     })

@@ -16,7 +16,7 @@ pub struct SessionAttendanceId {
 impl SessionAttendanceId {
     pub fn composite(session: &CourseSessionId, user: &UserId) -> Self {
         Self {
-            session: *session,
+            session: session.clone(),
             user: *user,
         }
     }
@@ -39,7 +39,7 @@ impl SessionAttendanceId {
     }
 
     pub fn session(&self) -> CourseSessionId {
-        self.session
+        self.session.clone()
     }
 
     pub fn user(&self) -> UserId {

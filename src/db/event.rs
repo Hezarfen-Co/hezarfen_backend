@@ -40,7 +40,7 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
             Some(class) => {
                 let row = sqlx::query!(
                     "SELECT EXISTS(SELECT 1 FROM class_member WHERE class = $1 AND app_user = $2)
-                     AS present",
+                     AS \"present!\"",
                     class.uuid(),
                     user.get_id().uuid()
                 )
@@ -120,7 +120,7 @@ pub async fn create(
     // bundle guarantees only the matching payload is ever non-NULL.
     let created = query_as!(
         Event,
-        "INSERT INTO event (id, creator, title AS \"title: EventTitle\", description AS \"description: EventDescription\", audience_kind, audience_role, \
+        "INSERT INTO event (id, creator, title, description, audience_kind, audience_role, \
                             audience_course, audience_class, audience_capacity, starts_at, ends_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
@@ -134,7 +134,7 @@ pub async fn create(
         creator.uuid(),
         title.as_str(),
         description.as_str(),
-        audience.kind,
+        audience.kind.as_str(),
         audience.role.map(|r| r.as_str().to_string()),
         audience.course.map(|c| c.uuid()),
         audience.class.map(|c| c.uuid()),
@@ -225,11 +225,11 @@ pub async fn update(
         )
         .set(
             "audience_course",
-            audience.as_ref().map(|a| Param::OptUuid(a.course.map(|c| c.uuid()))),
+            audience.as_ref().map(|a| Param::OptUuid(a.course.as_ref().map(|c| c.uuid()))),
         )
         .set(
             "audience_class",
-            audience.as_ref().map(|a| Param::OptUuid(a.class.map(|c| c.uuid()))),
+            audience.as_ref().map(|a| Param::OptUuid(a.class.as_ref().map(|c| c.uuid()))),
         )
         .set(
             "audience_capacity",
@@ -259,7 +259,7 @@ pub async fn update(
 /// for the event row (its insert's foreign key proves the event the moment
 /// it lands), so a lost round re-sends instead of answering 500.
 pub async fn delete(db: &Database, event: Event) -> Result<Event, AppError> {
-    tx_with_retry(db, true, async |tx| {
+    tx_with_retry(db, true, async move |tx| {
         sqlx::query!("DELETE FROM attendance WHERE event = $1", event.get_id().uuid())
             .execute(&mut *tx)
             .await?;

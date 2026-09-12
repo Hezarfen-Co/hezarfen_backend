@@ -277,7 +277,7 @@ async fn early_verdicts(
             class as _,
             user as _
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some(),
         Pivot::Course(course) => sqlx::query_scalar!(
@@ -285,7 +285,7 @@ async fn early_verdicts(
             class as _,
             course as _
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some(),
     };
@@ -297,7 +297,7 @@ async fn early_verdicts(
             r#"SELECT 1 AS "one" FROM class_blueprint WHERE grade = $1 FOR KEY SHARE"#,
             source as _
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some();
         if !alive {
@@ -310,7 +310,7 @@ async fn early_verdicts(
                 r#"SELECT role AS "role: Role" FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
                 user as _
             )
-            .fetch_optional(tx)
+            .fetch_optional(&mut *tx)
             .await?;
             if row.map(|row| row.role) != Some(Role::Student) {
                 return Ok(Some(Early::PivotGone));
@@ -321,7 +321,7 @@ async fn early_verdicts(
                 r#"SELECT 1 AS "one" FROM course WHERE id = $1 FOR KEY SHARE"#,
                 course as _
             )
-            .fetch_optional(tx)
+            .fetch_optional(&mut *tx)
             .await?
             .is_some();
             if !alive {
@@ -338,7 +338,7 @@ async fn early_verdicts(
             class as _,
             Axis::Member.cap(),
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some(),
         Axis::Course => sqlx::query_scalar!(
@@ -347,7 +347,7 @@ async fn early_verdicts(
             class as _,
             Axis::Course.cap(),
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some(),
     };
@@ -386,7 +386,7 @@ pub(crate) async fn add_member(
         // The claim and the link are one statement (the cap recipe's CTE): the
         // conditional `UPDATE` on the class row gates the `INSERT`, so a full
         // or gone class writes nothing at all.
-        let inserted = match sqlx::query_scalar!(
+        let inserted = match sqlx::query!(
             r#"WITH seat AS (
                    UPDATE class_group SET class_member_count = class_member_count + 1
                     WHERE id = $1 AND class_member_count < $2
@@ -400,7 +400,7 @@ pub(crate) async fn add_member(
             by as _,
             added_at as _
         )
-        .execute(tx)
+        .execute(&mut *tx)
         .await
         {
             Ok(result) => result,
@@ -435,10 +435,7 @@ pub(crate) async fn add_member(
             class as _
         )
         .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|row| row.course)
-        .collect();
+        .await?;
         let pairs = courses.into_iter().map(|course| (course, user.uuid()));
         match enroll_pairs(tx, class, pairs, by).await? {
             Sweep::Done => {}
@@ -481,7 +478,7 @@ pub(crate) async fn attach_course(
         {
             return Ok(refusal_of(early));
         }
-        let inserted = match sqlx::query_scalar!(
+        let inserted = match sqlx::query!(
             r#"WITH seat AS (
                    UPDATE class_group SET class_course_count = class_course_count + 1
                     WHERE id = $1 AND class_course_count < $2
@@ -496,7 +493,7 @@ pub(crate) async fn attach_course(
             attached_at as _,
             source as _
         )
-        .execute(tx)
+        .execute(&mut *tx)
         .await
         {
             Ok(result) => result,
@@ -525,10 +522,7 @@ pub(crate) async fn attach_course(
             class as _
         )
         .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|row| row.app_user)
-        .collect();
+        .await?;
         let pairs = members.into_iter().map(|user| (course.uuid(), user));
         match enroll_pairs(tx, class, pairs, by).await? {
             Sweep::Done => {}
@@ -707,7 +701,7 @@ pub(crate) async fn remove_member(
             class as _,
             user as _
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(_) = gone else {
             return Ok(0);
@@ -720,22 +714,18 @@ pub(crate) async fn remove_member(
         )
         .execute(&mut *tx)
         .await?;
-        sweep_enrollments(
-            tx,
-            class,
-            sqlx::query!(
-                r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
-                   FROM enrollment WHERE app_user = $1 AND source = $2"#,
-                user as _,
-                class as _
-            )
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(|row| (row.course, row.app_user))
-            .collect::<Vec<_>>(),
+        let rows = sqlx::query!(
+            r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
+               FROM enrollment WHERE app_user = $1 AND source = $2"#,
+            user as _,
+            class as _
         )
-        .await?;
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| (row.course, row.app_user))
+        .collect::<Vec<_>>();
+        sweep_enrollments(tx, class, rows).await?;
         Ok(1)
     })
     .await
@@ -763,7 +753,7 @@ pub(crate) async fn detach_course(
                     course as _,
                     source as _
                 )
-                .fetch_optional(tx)
+                .fetch_optional(&mut *tx)
                 .await?
             }
             None => {
@@ -773,7 +763,7 @@ pub(crate) async fn detach_course(
                     class as _,
                     course as _
                 )
-                .fetch_optional(tx)
+                .fetch_optional(&mut *tx)
                 .await?
             }
         };
@@ -788,22 +778,18 @@ pub(crate) async fn detach_course(
         )
         .execute(&mut *tx)
         .await?;
-        sweep_enrollments(
-            tx,
-            class,
-            sqlx::query!(
-                r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
-                   FROM enrollment WHERE course = $1 AND source = $2"#,
-                course as _,
-                class as _
-            )
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(|row| (row.course, row.app_user))
-            .collect::<Vec<_>>(),
+        let rows = sqlx::query!(
+            r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
+               FROM enrollment WHERE course = $1 AND source = $2"#,
+            course as _,
+            class as _
         )
-        .await?;
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| (row.course, row.app_user))
+        .collect::<Vec<_>>();
+        sweep_enrollments(tx, class, rows).await?;
         Ok(1)
     })
     .await
@@ -838,8 +824,7 @@ async fn sweep_enrollments(
             class as _
         )
         .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| row.class);
+        .await?;
         let Some(heir) = heir else {
             release(tx, course, user).await?;
             continue;

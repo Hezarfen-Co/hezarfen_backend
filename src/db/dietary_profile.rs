@@ -16,9 +16,9 @@ use crate::error::AppError;
 pub async fn read(db: &Database, student: &UserId) -> Result<Option<DietaryProfile>, AppError> {
     let row = sqlx::query_as!(
         DietaryProfile,
-        "SELECT student, tags, note, updated_by, updated_at
+        "SELECT student AS \"student: UserId\", tags AS \"tags: DietaryTags\", note AS \"note: DietaryNote\", updated_by AS \"updated_by: UserId\", updated_at AS \"updated_at: Timestamp\"
          FROM dietary_profile WHERE student = $1",
-        *student,
+        student.uuid(),
     )
     .fetch_optional(db)
     .await?;
@@ -62,12 +62,12 @@ pub async fn save(
              note = CASE WHEN $6 THEN $3 ELSE dietary_profile.note END,
              updated_by = $4,
              updated_at = $5
-         RETURNING student, tags, note, updated_by, updated_at",
-        *student,
-        tags.map(|t| t.as_slice().to_vec()),
-        note.clone().flatten().map(|n| n.as_str().to_string()),
-        *by,
-        Timestamp::now(),
+         RETURNING student AS \"student: UserId\", tags AS \"tags: DietaryTags\", note AS \"note: DietaryNote\", updated_by AS \"updated_by: UserId\", updated_at AS \"updated_at: Timestamp\"",
+        student.uuid(),
+        tags.as_ref().map(|t| t.as_slice()),
+        note.as_ref().and_then(|n| n.as_ref()).map(|n| n.as_str()),
+        by.uuid(),
+        Timestamp::now().as_millis(),
         note.is_some(),
     )
     .fetch_one(db)

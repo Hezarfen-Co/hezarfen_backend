@@ -41,7 +41,7 @@ pub async fn create(
     let slot_s = slot.as_str().to_string();
     let created_by = *created_by;
     let created_at = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // Duplicate gate ahead of the retired check: "already published"
         // outranks "slot retired", on the very path a rival publish races.
         let exists = sqlx::query!("SELECT 1 AS taken FROM menu WHERE id = $1", id_key,)
@@ -62,15 +62,15 @@ pub async fn create(
              )
              INSERT INTO menu (id, date, slot, capacity, version, created_by, created_at)
              SELECT $1, $3, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM ref)
-             RETURNING id, date, slot, capacity, version, created_by, created_at",
+             RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
             id_key,
             counter,
             date_s,
             slot_s,
             capacity,
             Some(0i64),
-            created_by,
-            created_at,
+            created_by.uuid(),
+            created_at.as_millis(),
         )
         .fetch_optional(&mut *tx)
         .await
@@ -102,7 +102,7 @@ pub async fn create(
 pub async fn read(db: &Database, id: &MenuId) -> Result<Option<Menu>, AppError> {
     let row = sqlx::query_as!(
         Menu,
-        "SELECT id, date, slot, capacity, version, created_by, created_at
+        "SELECT id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"
          FROM menu WHERE id = $1",
         id.key(),
     )
@@ -119,7 +119,7 @@ pub async fn find(
 ) -> Result<Option<Menu>, AppError> {
     let row = sqlx::query_as!(
         Menu,
-        "SELECT id, date, slot, capacity, version, created_by, created_at
+        "SELECT id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"
          FROM menu WHERE date = $1 AND slot = $2 LIMIT 1",
         date.as_str(),
         slot.as_str(),
@@ -174,7 +174,7 @@ pub async fn update(
         Menu,
         "UPDATE menu SET capacity = $2, version = COALESCE(version, 0) + 1
          WHERE id = $1
-         RETURNING id, date, slot, capacity, version, created_by, created_at",
+         RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
         menu.id.key(),
         capacity,
     )
@@ -217,11 +217,11 @@ pub async fn update(
 pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
     let key = menu.id.key().to_string();
     let counter = slot_ref(menu.slot.as_str());
-    let deleted = tx_with_retry(db, true, async |tx| {
+    let deleted = tx_with_retry(db, true, async move |tx| {
         let deleted = sqlx::query_as!(
             Menu,
             "DELETE FROM menu WHERE id = $1 AND seats_booked = 0
-             RETURNING id, date, slot, capacity, version, created_by, created_at",
+             RETURNING id AS \"id: MenuId\", date AS \"date: MenuDate\", slot AS \"slot: MenuSlot\", capacity, version, created_by AS \"created_by: UserId\", created_at AS \"created_at: Timestamp\"",
             key,
         )
         .fetch_optional(&mut *tx)

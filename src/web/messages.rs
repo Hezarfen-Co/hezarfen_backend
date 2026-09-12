@@ -127,7 +127,7 @@ async fn load_people(messages: &[Message], db: &Database) -> Result<People, AppE
 
 impl MessageResponse {
     fn new(message: &Message, caller: &UserId, people: &People) -> Self {
-        let resolve = |id: &UserId| match people.get(id.key()) {
+        let resolve = |id: &UserId| match people.get(id.key().as_str()) {
             Some((person, role)) => (person.clone(), Some(*role)),
             None => (
                 PersonRef {

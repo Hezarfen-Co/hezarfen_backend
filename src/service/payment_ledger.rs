@@ -170,14 +170,23 @@ async fn against(
         }
         .into());
     }
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures: a closure holding a `&T` fails the higher-ranked
+    // `Send` check `tx_with_retry`'s future must pass.
+    let target = target.clone();
+    let recorded_by = *recorded_by;
+    tx_with_retry(db, false, async move |tx| {
         // Every writer that can move this target's arithmetic holds some row
         // on this chain; holding the whole walk to the root is what makes
         // the fold below and the append it authorizes one decision.
         payment_ledger::lock_for_cap(&mut *tx, &target.id).await?;
-        if let Some(id) = keyed.clone()
-            && let Some(existing) = payment_ledger::read(&mut *tx, &id).await?
-        {
+        // Awaits sit in match arms, never in a `let`-chain condition: an
+        // awaited condition poisons the closure future's higher-ranked
+        // `Send` that `tx_with_retry` requires.
+        let replay = match keyed.clone() {
+            Some(id) => payment_ledger::read(&mut *tx, &id).await?,
+            None => None,
+        };
+        if let Some(existing) = replay {
             // A replay is answered from the stored line — but only if it is
             // the same money. The same key for a different amount or a
             // different target is a client bug, and handing back the old
@@ -201,27 +210,29 @@ async fn against(
             // bursar money had arrived when none ever did. The reversal's
             // id is derived from its target's, so telling the two apart is
             // one read, taken only on the refusal path.
-            if let Some(reversed) = reversed
-                && payment_ledger::read(&mut *tx, &PaymentLedgerId::for_reversal(&target.id))
-                    .await?
-                    .is_some()
-            {
-                return Err(AppError::Conflict(reversed));
+            if let Some(text) = reversed {
+                let reversed_there =
+                    payment_ledger::read(&mut *tx, &PaymentLedgerId::for_reversal(&target.id))
+                        .await?
+                        .is_some();
+                if reversed_there {
+                    return Err(AppError::Conflict(text));
+                }
             }
             return Err(AppError::Conflict(over));
         }
         payment_ledger::append(
             &mut *tx,
             PaymentLedger {
-                id: keyed.unwrap_or_else(PaymentLedgerId::generate),
+                id: keyed.clone().unwrap_or_else(PaymentLedgerId::generate),
                 student: target.student.clone(),
                 kind,
                 amount_minor,
-                source: Some(target.id.key()),
+                source: Some(target.id.key().to_string()),
                 due_at: None,
-                method,
-                note,
-                recorded_by: recorded_by.clone(),
+                method: method.clone(),
+                note: note.clone(),
+                recorded_by,
                 created_at: Timestamp::now(),
             },
         )
@@ -262,7 +273,10 @@ pub async fn reversal(
         }
         .into());
     }
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let line = line.clone();
+    let recorded_by = *recorded_by;
+    tx_with_retry(db, false, async move |tx| {
         payment_ledger::lock_for_cap(&mut *tx, line.get_id()).await?;
         payment_ledger::append(
             &mut *tx,
@@ -271,11 +285,11 @@ pub async fn reversal(
                 student: line.student.clone(),
                 kind: PaymentLedgerKind::Reversal,
                 amount_minor: line.amount_minor,
-                source: Some(line.id.key()),
+                source: Some(line.id.key().to_string()),
                 due_at: None,
                 method: None,
-                note,
-                recorded_by: recorded_by.clone(),
+                note: note.clone(),
+                recorded_by,
                 created_at: Timestamp::now(),
             },
         )

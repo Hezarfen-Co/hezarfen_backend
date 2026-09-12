@@ -122,7 +122,6 @@ pub async fn book(
         // booked-but-unbilled row behind.
         let price = meal_ledger::price_snapshot(db, menu).await?;
         let fresh_row = MealBooking {
-            id: id.clone(),
             menu: menu.clone(),
             student: student.clone(),
             booked_by: booked_by.clone(),
@@ -227,7 +226,7 @@ pub async fn cancel(
     cutoff: &MealCutoff,
     recorded_by: &UserId,
 ) -> Result<MealBooking, AppError> {
-    let fresh = meal_booking::read(db, &cancelled.id)
+    let fresh = meal_booking::read(db, &cancelled.id())
         .await?
         .ok_or(AppError::NotFound)?;
     if fresh.status == MealBookingStatus::Cancelled {
@@ -245,7 +244,7 @@ pub async fn cancel(
     let saved = match meal_booking::release_seat(db, &fresh, recorded_by).await? {
         Some(cancelled) => cancelled,
         None => {
-            let live = meal_booking::read(db, &cancelled.id)
+            let live = meal_booking::read(db, &cancelled.id())
                 .await?
                 .ok_or(AppError::NotFound)?;
             if !refundable_after_lost_flip(&fresh, &live)? {

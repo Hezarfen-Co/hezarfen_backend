@@ -7,7 +7,9 @@ use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
 use crate::domain::course_note::CourseNoteId;
-use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
+use crate::domain::course_note_file::{
+    CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
+};
 use crate::error::AppError;
 
 /// Persist the row assembled by [`CourseNoteFile::new`], refusing once its
@@ -26,12 +28,14 @@ pub async fn insert(db: &Database, file: CourseNoteFile) -> Result<CourseNoteFil
                RETURNING 1)
            INSERT INTO course_note_file (id, course_note, name, content_type, size)
            SELECT $3, $1, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id, course_note, name, content_type, size"#,
-        file.course_note,
+           RETURNING id AS "id: CourseNoteFileId",
+               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size"#,
+        file.course_note.uuid(),
         MAX_COURSE_NOTE_FILES as i64,
-        file.id,
-        file.name,
-        file.content_type,
+        file.id.uuid(),
+        file.name.as_str(),
+        file.content_type.as_str(),
         file.size
     )
     .fetch_optional(db)
@@ -61,8 +65,10 @@ pub async fn read(
 ) -> Result<Option<CourseNoteFile>, AppError> {
     let file = sqlx::query_as!(
         CourseNoteFile,
-        r#"SELECT id, course_note, name, content_type, size FROM course_note_file WHERE id = $1"#,
-        id
+        r#"SELECT id AS "id: CourseNoteFileId",
+               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size FROM course_note_file WHERE id = $1"#,
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -78,10 +84,12 @@ pub async fn read_for(
 ) -> Result<Option<CourseNoteFile>, AppError> {
     let file = sqlx::query_as!(
         CourseNoteFile,
-        r#"SELECT id, course_note, name, content_type, size FROM course_note_file
+        r#"SELECT id AS "id: CourseNoteFileId",
+               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size FROM course_note_file
            WHERE id = $1 AND course_note = $2"#,
-        id,
-        note
+        id.uuid(),
+        note.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -114,7 +122,7 @@ pub async fn file_keys_for_course(
     let rows = sqlx::query!(
         r#"SELECT course_note_file.id AS "id: CourseNoteFileId" FROM course_note_file
            WHERE course_note IN (SELECT id FROM course_note WHERE course = $1)"#,
-        course.0
+        course.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -129,15 +137,17 @@ pub async fn delete(db: &Database, file: CourseNoteFile) -> Result<CourseNoteFil
         let gone = sqlx::query_as!(
             CourseNoteFile,
             r#"DELETE FROM course_note_file WHERE id = $1
-               RETURNING id, course_note, name, content_type, size"#,
-            file.id
+               RETURNING id AS "id: CourseNoteFileId",
+               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size"#,
+            file.id.uuid()
         )
         .fetch_optional(&mut *conn)
         .await?;
         let file = gone.ok_or(AppError::NotFound)?;
         sqlx::query!(
             "UPDATE course_note SET file_count = GREATEST(file_count - 1, 0) WHERE id = $1",
-            file.course_note
+            file.course_note.uuid()
         )
         .execute(&mut *conn)
         .await?;
