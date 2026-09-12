@@ -3,29 +3,14 @@
 //! convention live in [`crate::domain::meal_ledger`]; the charge/reversal
 //! and credit workflows that sequence these in [`crate::service::meal_ledger`].
 
-use surrealdb::types::{AlreadyExistsError, SurrealValue};
-
-use crate::constant::{CAS_UPDATE_RETRIES, MEAL_LEDGER_TABLE};
-use crate::database::{Database, lost_the_race};
-use crate::db::menu_dish;
+use crate::database::Database;
 use crate::db::page::PagedList;
-use crate::domain::meal_ledger::{LedgerAmount, MealLedger, MealLedgerId, MealLedgerKind};
+use crate::domain::meal_ledger::{LedgerAmount, MealLedger, MealLedgerId};
 use crate::domain::menu::MenuId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Did this `CREATE` fail *only* because the row is already there? Matched on
-/// the SDK's typed `AlreadyExists`/`Record` detail — never on the message text
-/// and never on "any database error", because swallowing a real fault in money
-/// code would be far worse than the 500 it saves.
-fn is_duplicate_record(error: &surrealdb::Error) -> bool {
-    matches!(
-        error.already_exists_details(),
-        Some(AlreadyExistsError::Record { .. })
-    )
-}
-
-/// The only writer: one `CREATE`, no update path anywhere in this module.
+/// The only writer: one `INSERT`, no update path anywhere in this module.
 ///
 /// A line whose id already exists is left exactly as it is — the row wins,
 /// the write is dropped. That is what makes a deterministic id (see
@@ -33,38 +18,52 @@ fn is_duplicate_record(error: &surrealdb::Error) -> bool {
 /// append is a no-op, never a second line and never an edit of the first.
 /// The point read is on the id itself, so unlike a scan it cannot miss a
 /// row a concurrent writer just made — but it is only a fast path. The
-/// guarantee is `CREATE`'s own: on an existing id it *errors* and leaves
-/// the row untouched, so the writer that lost the race reads back the
-/// winner's line instead of failing the request with a 500.
-///
-/// A *write conflict* is the same race decided one layer down — two
-/// appends of one id arriving together are no longer serialized by a
-/// process-wide lock, so the store aborts one as retryable instead of
-/// answering it "already exists". Both are read back the same way, and a
-/// conflict that turns out to have written nothing is simply tried again;
-/// no path here can write a second line, since the id is the key.
+/// guarantee is the insert's own `ON CONFLICT (id) DO NOTHING`: on an
+/// existing id nothing is written, so the writer that lost the race reads
+/// back the winner's line instead of failing the request with a 500.
 pub(crate) async fn append(db: &Database, row: MealLedger) -> Result<MealLedger, AppError> {
     if let Some(existing) = read(db, &row.id).await? {
         return Ok(existing);
     }
-    let id = row.id.clone();
-    for _ in 0..CAS_UPDATE_RETRIES {
-        match db.create(id.record()).content(row.clone()).await {
-            Ok(Some(created)) => return Ok(created),
-            Ok(None) => break,
-            Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
-                if let Some(existing) = read(db, &id).await? {
-                    return Ok(existing);
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+    let inserted = sqlx::query_as!(
+        MealLedger,
+        "INSERT INTO meal_ledger
+             (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING id, student, kind, amount_minor, source, method, note, recorded_by, created_at",
+        row.id.key(),
+        row.student,
+        row.kind,
+        row.amount_minor,
+        row.source,
+        row.method,
+        row.note,
+        row.recorded_by,
+        row.created_at,
+    )
+    .fetch_optional(db)
+    .await?;
+    match inserted {
+        Some(created) => Ok(created),
+        // Lost the id to a concurrent append of the same line: the stored
+        // row is the answer, never a second line.
+        None => read(db, &row.id)
+            .await?
+            .ok_or_else(|| AppError::Internal("failed to write the ledger line".into())),
     }
-    Err(AppError::Internal("failed to write the ledger line".into()))
 }
 
 pub async fn read(db: &Database, id: &MealLedgerId) -> Result<Option<MealLedger>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        MealLedger,
+        "SELECT id, student, kind, amount_minor, source, method, note, recorded_by, created_at
+         FROM meal_ledger WHERE id = $1",
+        id.key(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// What a seat on `menu` costs *right now*: the sum of its dishes. `None`
@@ -77,12 +76,11 @@ pub async fn price_snapshot(
     db: &Database,
     menu: &MenuId,
 ) -> Result<Option<LedgerAmount>, AppError> {
-    let total = menu_dish::list_for_menu(db, menu)
-        .await?
-        .iter()
-        .fold(0i64, |sum, dish| {
-            sum.saturating_add(dish.get_price_minor().as_minor())
-        });
+    let row =
+        sqlx::query!("SELECT CAST(COALESCE(sum(price_minor), 0) AS BIGINT) AS total FROM menu_dish WHERE menu = $1", menu.key())
+            .fetch_one(db)
+            .await?;
+    let total = row.total;
     if total == 0 {
         return Ok(None);
     }
@@ -97,10 +95,10 @@ pub async fn list_for_student(
     offset: i64,
 ) -> Result<(Vec<MealLedger>, i64), AppError> {
     PagedList::new(
-        "meal_ledger WHERE student = $student",
+        "meal_ledger WHERE student = $1",
         "ORDER BY created_at DESC, id DESC",
     )
-    .bind("student", student.record())
+    .bind(student.key())
     .run(limit, offset, db)
     .await
 }
@@ -118,38 +116,27 @@ pub async fn list_for_student(
 /// every later `GET /meals/balance/*`.
 ///
 /// **The signs stay on the kind**, applied by the very
-/// [`MealLedgerKind::sign`]
-/// the documented formula is spelled in. Summing `IF kind = 'charge' THEN
-/// -amount …` in SQL would have folded the whole balance in one statement
-/// and forked the one rule that decides what money means into a second
-/// language, where nothing would fail the day the two disagreed. Grouping
-/// instead keeps the aggregate ignorant of signs: it counts kinds, and
-/// Rust still says what a kind does. A stored running total was the third
-/// option and is a counter that can drift — a bug class this repo closes,
-/// not one it opens.
+/// [`MealLedgerKind::sign`](crate::domain::meal_ledger::MealLedgerKind::sign)
+/// the documented formula is spelled in. Summing a signed CASE in SQL would
+/// have folded the whole balance in one statement and forked the one rule
+/// that decides what money means into a second language, where nothing
+/// would fail the day the two disagreed. Grouping instead keeps the
+/// aggregate ignorant of signs: it counts kinds, and Rust still says what a
+/// kind does. A stored running total was the third option and is a counter
+/// that can drift — a bug class this repo closes, not one it opens.
 pub async fn balance_of(db: &Database, student: &UserId) -> Result<i64, AppError> {
-    let totals: Vec<KindTotal> = db
-        .query(format!(
-            "SELECT kind, math::sum(amount_minor) AS total \
-             FROM {MEAL_LEDGER_TABLE} WHERE student = $student GROUP BY kind"
-        ))
-        .bind(("student", student.record()))
-        .await?
-        .check()?
-        .take(0)?;
+    let totals = sqlx::query!(
+        r#"SELECT kind AS "kind: crate::domain::meal_ledger::MealLedgerKind",
+                  CAST(sum(amount_minor) AS BIGINT) AS total
+           FROM meal_ledger WHERE student = $1 GROUP BY kind"#,
+        *student,
+    )
+    .fetch_all(db)
+    .await?;
     Ok(totals
         .iter()
         .fold(0i64, |sum, row| sum + row.kind.sign() * row.total))
 }
-
-/// One kind's whole sum, as the `GROUP BY` in [`balance_of`] hands
-/// it back — at most three rows, never the lines behind them.
-#[derive(Debug, SurrealValue)]
-struct KindTotal {
-    kind: MealLedgerKind,
-    total: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,24 +1,16 @@
 //! The kitchen's workflows: publishing and unpublishing menus, and every
-//! dish write — which all hold [`MENU_LOCK`], the lock that makes the
-//! per-menu dish cap (`MAX_DISHES_PER_MENU`, a count-then-write SurrealDB
-//! does not conflict-check) more than a wish. The queries live in
-//! [`crate::db::menu`] and [`crate::db::menu_dish`]; the row shapes and the
-//! date/slot/capacity rules in [`crate::domain::menu`] and
-//! [`crate::domain::menu_dish`].
+//! dish write. The queries live in [`crate::db::menu`] and
+//! [`crate::db::menu_dish`]; the row shapes and the date/slot/capacity
+//! rules in [`crate::domain::menu`] and [`crate::domain::menu_dish`].
 //!
-//! [`MENU_LOCK`] spans a **multi-call** sequence (read the menu, count the
-//! dishes, write the dish), which is why it lives here and not in the db
-//! layer: a single-call atomicity lock would be the store's to own, but
-//! count-then-write is write-skew only this process can serialize.
-//!
-//! **A leaf**: every dish write held under it moves the menu's revision
-//! inside its *own* transaction ([`crate::db::menu::bump_menu_and_write`]),
-//! so no path under this lock reaches `cap`'s counter lock any more. Should
-//! one ever need both, the order is `MENU_LOCK` → `CLAIM_LOCK` and nothing
-//! may take this lock while holding a counter lock: that is the invariant a
-//! new caller must keep, and it is what would keep the pair deadlock-free.
-
-use tokio::sync::Mutex;
+//! **No process-wide lock guards this domain.** The dish cap
+//! (`MAX_DISHES_PER_MENU`) used to be a count-then-write pair only a
+//! process mutex could make safe; it is now one guarded statement — the
+//! menu row is taken `FOR NO KEY UPDATE` inside the dish write's own
+//! transaction and the `INSERT … WHERE count(*) < cap` runs behind that
+//! lock, so two racing writers serialize on the row the database owns.
+//! Every dish write moves the menu's revision in that same transaction, and
+//! a booking claims its seat at the revision it priced itself against.
 
 use crate::constant::MAX_DISHES_PER_MENU;
 use crate::database::Database;
@@ -29,20 +21,6 @@ use crate::domain::menu_dish::{
 };
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// Serializes what is left that counts rows against one menu: the dish cap
-/// (`MAX_DISHES_PER_MENU`, a count-then-write SurrealDB does not
-/// conflict-check). Publishing no longer needs it — the day+slot *is* the
-/// record id — and neither does a booking, a menu delete, or the settings
-/// slot-removal guard: those went to conditional single-record writes
-/// ([`crate::db::cap`]), which the store decides as this lock cannot.
-//
-// corner-cut: the dish cap therefore rests on this lock alone — a dish write
-// added without taking it reopens the count-then-write hole silently. Closing
-// it properly is another `cap` counter (`dish_count` on the menu row) plus its
-// backfill; the ceiling is 51 dishes on a menu, not money or a seat, so it was
-// not worth the column here.
-pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Publish a menu for one day and meal slot. The caller has validated the
 /// date (a real calendar day, not already over), the slot (one the school
@@ -92,18 +70,15 @@ pub async fn delete(db: &Database, menu_row: Menu) -> Result<Menu, AppError> {
 
 /// Add a dish to a menu, under the dish cap.
 ///
-/// [`MENU_LOCK`] is taken for the dish cap alone: count-then-write
-/// is write-skew, so the count and the insert have to be one step. The
-/// *price* no longer needs it — a dish write moves the menu's revision, and
-/// a booking claims its seat at the revision it priced itself against.
-/// The lock is a leaf again: the revision bump rides the dish write's own
-/// transaction now, so nothing held under it takes `cap`'s counter lock. It
-/// stays a leaf only while that holds — see [`MENU_LOCK`] for the order a
-/// caller that changes it must keep.
+/// The cap is the database's to enforce, not this process's: the write
+/// locks the menu row `FOR NO KEY UPDATE` and its `INSERT` carries a
+/// `count(*) < cap` guard, so a writer that queued behind a concurrent one
+/// re-counts after the lock and is refused (`409`) instead of overfilling
+/// — the count and the insert are one decision, with no window a second
+/// writer can slip through.
 ///
-/// The menu is read *inside* the lock: read before it, a `DELETE /menus/{id}`
-/// running in the gap takes its cascade with it and this dish lands on a menu
-/// that no longer exists.
+/// The *price* needs no lock — a dish write moves the menu's revision, and
+/// a booking claims its seat at the revision it priced itself against.
 pub async fn add_dish(
     db: &Database,
     menu_id: &MenuId,
@@ -112,14 +87,16 @@ pub async fn add_dish(
     price_minor: DishPrice,
     tags: DishTags,
 ) -> Result<MenuDish, AppError> {
-    let _guard = MENU_LOCK.lock().await;
-    let menu = menu::read(db, menu_id).await?.ok_or(AppError::NotFound)?;
-    if menu_dish::count_for_menu(db, menu.get_id()).await? >= MAX_DISHES_PER_MENU {
-        return Err(AppError::Conflict(
-            "the menu already carries the maximum number of dishes",
-        ));
-    }
-    menu_dish::create(db, menu.get_id(), name, description, price_minor, tags).await
+    menu_dish::create(
+        db,
+        menu_id,
+        name,
+        description,
+        price_minor,
+        tags,
+        MAX_DISHES_PER_MENU as i64,
+    )
+    .await
 }
 
 /// One dish, for callers that only inspect it.
@@ -140,8 +117,7 @@ pub async fn list_dishes_for_menus(
     menu_dish::list_for_menus(db, menus).await
 }
 
-/// Edit a dish. Under [`MENU_LOCK`] like every dish write — see
-/// [`add_dish`]. Only what the request carried is written.
+/// Edit a dish. Only what the request carried is written.
 pub async fn update_dish(
     db: &Database,
     dish: MenuDish,
@@ -150,12 +126,10 @@ pub async fn update_dish(
     price_minor: Option<DishPrice>,
     tags: Option<DishTags>,
 ) -> Result<MenuDish, AppError> {
-    let _guard = MENU_LOCK.lock().await;
     menu_dish::update(db, dish, name, description, price_minor, tags).await
 }
 
-/// Remove a dish from its menu. Under [`MENU_LOCK`] like every dish write.
+/// Remove a dish from its menu.
 pub async fn delete_dish(db: &Database, dish: MenuDish) -> Result<MenuDish, AppError> {
-    let _guard = MENU_LOCK.lock().await;
     menu_dish::delete(db, dish).await
 }
