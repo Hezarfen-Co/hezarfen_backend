@@ -12,11 +12,9 @@
 //! "has this been billed yet?" — a scan can be slipped past by a concurrent
 //! writer, and the cost of that mistake here is a double-billed family.
 
-use crate::constant::{
-    FEE_PLAN_ASSIGNMENT_COUNT_FIELD, MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES,
-};
+use crate::constant::{MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES};
 use crate::database::Database;
-use crate::db::cap::{self, Claimed};
+use crate::db::cap::Claimed;
 use crate::db::{fee_plan, fee_plan_assignment, payment_ledger};
 use crate::domain::fee_plan::FeePlan;
 use crate::domain::fee_plan_assignment::{FeePlanAssignment, FeePlanAssignmentId};
@@ -29,8 +27,9 @@ use crate::error::{AppError, ValidationError};
 /// whether it was *already* there, so the web layer can answer a replay
 /// honestly instead of pretending it just happened.
 ///
-/// The row and the plan's assignment refcount are written in **one**
-/// transaction ([`cap::claim_and_create`]): that increment is what makes the
+/// The row and the plan's assignment refcount are written in **one
+/// statement** ([`fee_plan_assignment::create`]'s claim): that increment is
+/// what makes the
 /// plan un-editable and un-deletable, and it has to be indivisible from the
 /// row it counts, or an edit could slip between the two. A plan the counter
 /// cannot be claimed on is one a concurrent delete already removed, which is
@@ -54,22 +53,9 @@ pub async fn assign(
     assigned_by: &UserId,
 ) -> Result<(FeePlanAssignment, bool), AppError> {
     let id = FeePlanAssignmentId::composite(plan.get_id(), student);
-    let row = FeePlanAssignment {
-        id: id.clone(),
-        plan: plan.get_id().clone(),
-        student: student.clone(),
-        assigned_by: assigned_by.clone(),
-        created_at: Timestamp::now(),
-    };
-    let claimed = cap::claim_and_create(
-        &plan.get_id().record(),
-        FEE_PLAN_ASSIGNMENT_COUNT_FIELD,
-        cap::UNLIMITED,
-        &id.record(),
-        &row,
-        db,
-    )
-    .await?;
+    let claimed =
+        fee_plan_assignment::create(db, plan.get_id(), student, assigned_by, Timestamp::now())
+            .await?;
     let (assignment, existed) = match claimed {
         Claimed::Made(created) => (created, false),
         // Someone assigned this pair first — their row is the answer, and

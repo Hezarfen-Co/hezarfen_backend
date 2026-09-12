@@ -13,6 +13,7 @@
 //! apply here.
 
 use sqlx::types::Json;
+use uuid::Uuid;
 
 use crate::constant::{MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN};
 use crate::domain::monotonic_id::next_uuid;

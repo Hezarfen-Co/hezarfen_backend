@@ -1,117 +1,160 @@
 //! The `work_entry` table: the open-slot check-in/check-out pair, the
 //! newest-first log, and manager corrections guarded by the stored order.
+//!
+//! "At most one open stint per staff member" is the database's own rule here:
+//! the partial unique index `work_entry_open` covers only rows whose
+//! `check_out` is NULL, so a second check-in is a 23505 (mapped to the
+//! check-in conflict below) and a check-out is one conditional `UPDATE` —
+//! zero rows means there was no open stint to close. The old
+//! take-and-re-file dance existed only to free the deterministic open id;
+//! with the index, closing the stint *is* freeing the slot.
 
-use surrealdb::types::SurrealValue;
-
-use crate::database::{Database, transaction_with_retry};
+use crate::database::Database;
 use crate::db::field_update::FieldUpdate;
-use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::domain::work_entry::{WorkEntry, WorkEntryId, out_before_in_error};
 use crate::error::AppError;
 
-/// Open a stint for `user`, stamped with the server clock. `INSERT IGNORE`
-/// on the deterministic open id makes this atomic: if an open entry
-/// already exists the insert is skipped (empty result) and the caller gets
-/// a conflict — two racing check-ins can never create two open rows or
-/// reset a running clock.
-pub async fn check_in(db: &Database, user: &UserId) -> Result<WorkEntry, AppError> {
-    let entry = WorkEntry {
-        id: WorkEntryId::open_for(user),
-        user: user.clone(),
-        check_in: Timestamp::now(),
-        check_out: None,
-    };
-    let mut result = db
-        .query("INSERT IGNORE INTO work_entry $entry")
-        .bind(("entry", entry))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<WorkEntry>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::Conflict("already checked in — check out first"))
+/// The row as the table spells it (`app_user` column), one step from the
+/// domain struct (whose field is `user`).
+struct WorkEntryRow {
+    id: WorkEntryId,
+    app_user: UserId,
+    check_in: Timestamp,
+    check_out: Option<Timestamp>,
 }
 
-/// Close `user`'s open stint: atomically take the open row and re-file it
-/// under a ULID id, freeing the open slot for the next check-in. Take and
-/// re-file share one transaction — a failed re-file rolls the take back,
-/// so a stint can never vanish half-closed. Of two racing check-outs
-/// exactly one receives the row (the other gets the conflict).
-///
-/// A lost round is re-sent rather than reported (`transaction_with_retry`):
-/// the abort wrote nothing, so the whole cascade is safe to repeat, and the
-/// `CREATE` cannot answer "already exists" on the way back — the table
-/// carries no `UNIQUE` index and `$closed` is one freshly minted ULID.
-/// Only the guard's own `THROW` is a decision, and it stays a 409.
-pub async fn check_out(db: &Database, user: &UserId) -> Result<WorkEntry, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             LET $before = (DELETE $open RETURN BEFORE);
-             IF array::len($before) = 0 { THROW 'not_checked_in' };
-             CREATE $closed CONTENT {
-                 user: $before[0].user,
-                 check_in: $before[0].check_in,
-                 check_out: $out,
-             };
-             COMMIT TRANSACTION;",
-        &[
-            (
-                "open".into(),
-                WorkEntryId::open_for(user).record().into_value(),
-            ),
-            (
-                "closed".into(),
-                WorkEntryId::generate().record().into_value(),
-            ),
-            ("out".into(), Timestamp::now().into_value()),
-        ],
-        &["not_checked_in"],
+impl From<WorkEntryRow> for WorkEntry {
+    fn from(row: WorkEntryRow) -> Self {
+        Self {
+            id: row.id,
+            user: row.app_user,
+            check_in: row.check_in,
+            check_out: row.check_out,
+        }
+    }
+}
+
+/// Open a stint for `user`, stamped with the server clock. The
+/// `work_entry_open` partial unique index makes this atomic: if an open
+/// entry already exists the insert is refused and the caller gets the
+/// conflict — two racing check-ins can never create two open rows or reset
+/// a running clock. One statement, one verdict, no retry loop.
+pub async fn check_in(db: &Database, user: &UserId) -> Result<WorkEntry, AppError> {
+    let id = WorkEntryId::generate();
+    let check_in = Timestamp::now();
+    let inserted = sqlx::query_as!(
+        WorkEntryRow,
+        "INSERT INTO work_entry (id, app_user, check_in) VALUES ($1, $2, $3) \
+         RETURNING id, app_user, check_in, check_out",
+        id,
+        user,
+        check_in,
     )
+    .fetch_one(db)
+    .await;
+    match inserted {
+        Ok(row) => Ok(row.into()),
+        Err(e) if crate::database::unique_violation(&e) == Some("work_entry_open") => {
+            Err(AppError::Conflict("already checked in — check out first"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Close `user`'s open stint: one conditional `UPDATE` takes it and stamps
+/// `check_out`, which also frees the open slot for the next check-in (the
+/// partial unique index only covers rows with a NULL `check_out`). Zero
+/// rows = no open stint, the caller's conflict. Of two racing check-outs
+/// exactly one receives the row — the statement takes the row's lock and
+/// the loser re-evaluates against the winner's committed state.
+pub async fn check_out(db: &Database, user: &UserId) -> Result<WorkEntry, AppError> {
+    let out = Timestamp::now();
+    let closed = sqlx::query_as!(
+        WorkEntryRow,
+        "UPDATE work_entry SET check_out = $2 \
+         WHERE app_user = $1 AND check_out IS NULL \
+         RETURNING id, app_user, check_in, check_out",
+        user,
+        out,
+    )
+    .fetch_optional(db)
     .await?;
-    // An aborted transaction errors *every* slot, most with a generic
-    // "not executed" — only the THROW's own slot names the reason, so scan
-    // them all for the marker instead of trusting the first.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("not_checked_in"))
-    {
-        return Err(AppError::Conflict("not checked in"));
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Statement slots count BEGIN, the LET, and the IF: the CREATE is slot 3.
-    let saved: Option<WorkEntry> = result.take::<Vec<WorkEntry>>(3)?.into_iter().next();
-    saved.ok_or_else(|| AppError::Internal("failed to close work entry".into()))
+    closed
+        .map(WorkEntry::from)
+        .ok_or(AppError::Conflict("not checked in"))
 }
 
 pub async fn read(db: &Database, id: &WorkEntryId) -> Result<Option<WorkEntry>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        WorkEntryRow,
+        "SELECT id, app_user, check_in, check_out FROM work_entry WHERE id = $1",
+        id,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(WorkEntry::from))
 }
 
 /// Every stint of `user`, newest first — the open one (if any) included.
-/// Ordered by `check_in`, never by id alone: the open entry's `open_` key
-/// doesn't sort with the ULIDs, so id order would misplace it. The `id`
-/// tie-break behind it only ever separates two *closed* stints sharing a
-/// `check_in` — there is one open row per user, so it can never tie with
-/// itself — and that is what keeps offset paging from skipping a row.
+/// Ordered by `check_in DESC`; the minted `id` breaks ties between two
+/// stints sharing a `check_in` (uuid v7 sorts in mint order, which is what
+/// keeps offset paging from skipping a row).
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<WorkEntry>, i64), AppError> {
-    PagedList::new(
-        "work_entry WHERE user = $usr",
-        "ORDER BY check_in DESC, id DESC",
-    )
-    .bind("usr", user.record())
-    .run(limit, offset, db)
-    .await
+    let rows = match limit {
+        Some(limit) => {
+            sqlx::query_as!(
+                WorkEntryRow,
+                "SELECT id, app_user, check_in, check_out FROM work_entry \
+             WHERE app_user = $1 ORDER BY check_in DESC, id DESC \
+             LIMIT $2 OFFSET $3",
+                user,
+                limit,
+                offset,
+            )
+            .fetch_all(db)
+            .await?
+        }
+        None if offset > 0 => {
+            sqlx::query_as!(
+                WorkEntryRow,
+                "SELECT id, app_user, check_in, check_out FROM work_entry \
+                 WHERE app_user = $1 ORDER BY check_in DESC, id DESC \
+                 OFFSET $2",
+                user,
+                offset,
+            )
+            .fetch_all(db)
+            .await?
+        }
+        None => {
+            sqlx::query_as!(
+                WorkEntryRow,
+                "SELECT id, app_user, check_in, check_out FROM work_entry \
+                 WHERE app_user = $1 ORDER BY check_in DESC, id DESC",
+                user,
+            )
+            .fetch_all(db)
+            .await?
+        }
+    };
+    // A window that can hide rows needs the count over the same WHERE;
+    // an unpaged read from row zero already holds every row.
+    let total = if limit.is_some() || offset > 0 {
+        sqlx::query!("SELECT count(*) FROM work_entry WHERE app_user = $1", user)
+            .fetch_one(db)
+            .await?
+            .0
+    } else {
+        rows.len() as i64
+    };
+    Ok((rows.into_iter().map(WorkEntry::from).collect(), total))
 }
 
 /// Persist corrected instants (manager fix-ups on closed entries; the web
@@ -127,9 +170,9 @@ pub async fn update(
     check_in: Option<Timestamp>,
     check_out: Option<Timestamp>,
 ) -> Result<WorkEntry, AppError> {
-    FieldUpdate::new(entry.get_id().record())
-        .set("check_in", check_in)
-        .set("check_out", check_out)
+    FieldUpdate::new("work_entry", entry.id.uuid())
+        .set("check_in", check_in.map(|t| t.as_millis()))
+        .set("check_out", check_out.map(|t| t.as_millis()))
         // Same race closer as the schedule ranges, with this table's own
         // field names and message: a correction of one instant is only
         // written while it still orders against the other as *stored*.
@@ -139,7 +182,15 @@ pub async fn update(
 }
 
 pub async fn remove(db: &Database, id: &WorkEntryId) -> Result<Option<WorkEntry>, AppError> {
-    Ok(db.delete(id.record()).await?)
+    let row = sqlx::query_as!(
+        WorkEntryRow,
+        "DELETE FROM work_entry WHERE id = $1 \
+         RETURNING id, app_user, check_in, check_out",
+        id,
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(WorkEntry::from))
 }
 
 #[cfg(test)]
