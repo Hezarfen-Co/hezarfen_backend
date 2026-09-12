@@ -62,6 +62,11 @@ pub(crate) enum Param {
     /// still named, so `IS NOT DISTINCT FROM $n` compares an absent link
     /// truthfully.
     OptUuid(Option<Uuid>),
+    /// Nullable TEXT column clear/set — same NULL-with-type rationale as
+    /// OptUuid.
+    OptText(Option<String>),
+    /// Nullable BIGINT column clear/set.
+    OptI64(Option<i64>),
 }
 
 impl Param {
@@ -73,6 +78,8 @@ impl Param {
             Param::Text(value) => args.add(value),
             Param::Uuid(value) => args.add(value),
             Param::OptUuid(value) => args.add(value),
+            Param::OptText(value) => args.add(value),
+            Param::OptI64(value) => args.add(value),
         };
     }
 }
