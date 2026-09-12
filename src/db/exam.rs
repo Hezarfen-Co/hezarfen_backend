@@ -1,18 +1,14 @@
-//! The `exam` table: row reads and listings, the count-and-create that pins
-//! the exam to a live course row, the compare-and-set every PATCH writes
-//! through, and the cascading delete. The PATCH re-derive and the delete's
-//! blob-key collection live in [`crate::service::exam`].
+//! The `exam` table: row reads and listings, the gated create that refuses a
+//! course that is gone, the compare-and-set every PATCH writes through, and
+//! the cascading delete. The PATCH re-derive lives in [`crate::service::exam`].
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::ENROLLMENT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamId, ExamKind, ExamSchedule, ExamTitle,
     redraft_error,
 };
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -33,58 +29,104 @@ pub async fn create(
     allow_review: bool,
     draft: bool,
 ) -> Result<Exam, AppError> {
-    let exam = Exam {
-        id: ExamId::generate(),
-        creator: creator.clone(),
-        course: course.clone(),
+    // A missing parent is refused by the real foreign keys: a course or a
+    // creator that is gone is `SQLSTATE 23503`, and this call site's
+    // parent-gone answer is the same `NotFound` the old existence-proof
+    // touch (`cap::touch_and_create`, deleted) answered with. The bump that
+    // touch made and unmade is gone with it — an exam was never counted
+    // anywhere.
+    let created = sqlx::query_as!(
+        Exam,
+        r#"INSERT INTO exam (id, creator, course, title, description, kind, mode,
+                             starts_at, ends_at, duration_ms, max_attempts,
+                             allow_rejoin, allow_review, draft)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           RETURNING id AS "id: ExamId", creator AS "creator: UserId",
+                     course AS "course: CourseId", title AS "title: ExamTitle",
+                     description AS "description: ExamDescription",
+                     kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                     starts_at AS "starts_at: Option<Timestamp>",
+                     ends_at AS "ends_at: Option<Timestamp>",
+                     duration_ms AS "duration_ms: Option<ExamDuration>",
+                     max_attempts AS "max_attempts: ExamAttemptLimit",
+                     allow_rejoin, allow_review, draft"#,
+        ExamId::generate(),
+        creator as &UserId,
+        course as &CourseId,
         title,
         description,
         kind,
-        mode: schedule.mode,
-        starts_at: schedule.starts_at,
-        ends_at: schedule.ends_at,
-        duration_ms: schedule.duration_ms,
+        schedule.mode,
+        schedule.starts_at,
+        schedule.ends_at,
+        schedule.duration_ms,
         max_attempts,
         allow_rejoin,
         allow_review,
         draft,
-        result_count: None,
-    };
-    // The course row is *written* (bumped and put back), not read: a plain
-    // read does not survive `Course::delete`'s window, and an exam that
-    // outlives its course is unreachable for good — every route to one goes
-    // through `course_of`, which answers a 500 no delete can clear, while
-    // `GET /exams` still lists it. See [`cap::touch_and_create`].
-    cap::touch_and_create(
-        &course.record(),
-        ENROLLMENT_COUNT_FIELD,
-        &exam.id.record(),
-        &exam,
-        db,
     )
-    .await?
-    .ok_or(AppError::NotFound)
+    .fetch_one(db)
+    .await;
+    match created {
+        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+        Ok(exam) => Ok(exam),
+    }
 }
 
 pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> {
-    Ok(db.select(id.record()).await?)
+    Ok(sqlx::query_as!(
+        Exam,
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+                  title AS "title: ExamTitle", description AS "description: ExamDescription",
+                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                  starts_at AS "starts_at: Option<Timestamp>",
+                  ends_at AS "ends_at: Option<Timestamp>",
+                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  max_attempts AS "max_attempts: ExamAttemptLimit",
+                  allow_rejoin, allow_review, draft
+           FROM exam WHERE id = $1"#,
+        id as &ExamId,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
+/// The exams, newest first — `ORDER BY id` on a UUIDv7 column is creation
+/// order, the sort the old record ids gave for free.
 pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM exam ORDER BY id DESC")
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Exam>>(0)?)
+    Ok(sqlx::query_as!(
+        Exam,
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+                  title AS "title: ExamTitle", description AS "description: ExamDescription",
+                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                  starts_at AS "starts_at: Option<Timestamp>",
+                  ends_at AS "ends_at: Option<Timestamp>",
+                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  max_attempts AS "max_attempts: ExamAttemptLimit",
+                  allow_rejoin, allow_review, draft
+           FROM exam ORDER BY id DESC"#,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Exam>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM exam WHERE course = $course ORDER BY id DESC")
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Exam>>(0)?)
+    Ok(sqlx::query_as!(
+        Exam,
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+                  title AS "title: ExamTitle", description AS "description: ExamDescription",
+                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                  starts_at AS "starts_at: Option<Timestamp>",
+                  ends_at AS "ends_at: Option<Timestamp>",
+                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  max_attempts AS "max_attempts: ExamAttemptLimit",
+                  allow_rejoin, allow_review, draft
+           FROM exam WHERE course = $1 ORDER BY id DESC"#,
+        course as &CourseId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Every exam of every course in `courses` (one query) — the catalog as one
@@ -93,13 +135,36 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
     if courses.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = courses.iter().map(CourseId::record).collect();
-    let mut result = db
-        .query("SELECT * FROM exam WHERE course IN $courses ORDER BY id DESC")
-        .bind(("courses", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Exam>>(0)?)
+    let courses = courses.iter().map(CourseId::uuid).collect::<Vec<_>>();
+    Ok(sqlx::query_as!(
+        Exam,
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+                  title AS "title: ExamTitle", description AS "description: ExamDescription",
+                  kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                  starts_at AS "starts_at: Option<Timestamp>",
+                  ends_at AS "ends_at: Option<Timestamp>",
+                  duration_ms AS "duration_ms: Option<ExamDuration>",
+                  max_attempts AS "max_attempts: ExamAttemptLimit",
+                  allow_rejoin, allow_review, draft
+           FROM exam WHERE course = ANY($1) ORDER BY id DESC"#,
+        courses,
+    )
+    .fetch_all(db)
+    .await?)
+}
+
+/// The exam's mark counter, read on its own — the one column no struct
+/// carries and no whole-row rewrite touches. The kind-change gate reads it
+/// here (pre-flight) and `update_if_unchanged` pins it inside its own
+/// transaction (write time).
+pub async fn result_count(db: &Database, id: &ExamId) -> Result<i64, AppError> {
+    let row = sqlx::query!(
+        r#"SELECT result_count AS "result_count: i64" FROM exam WHERE id = $1"#,
+        id as &ExamId,
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.result_count)
 }
 
 // `course` is deliberately not updatable — moving an exam between courses
@@ -113,11 +178,23 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
 /// landed in between and nothing was written: re-read, re-merge, retry.
 ///
 /// Every column this write replaces is in the guard, which is what makes
-/// the whole-row `CONTENT` save safe without a lock held across the
-/// handler's read: the compare-and-set refuses precisely when that save
-/// would have reverted somebody. `course`/`creator` are not editable and
-/// ride along unchanged. Same shape as
-/// [`crate::db::settings::save_if_unchanged`].
+/// the whole-row save safe without a lock held across the handler's read:
+/// the compare-and-set refuses precisely when that save would have
+/// reverted somebody. `course`/`creator` are not editable and ride along
+/// unchanged. Same shape as [`crate::db::settings::save_if_unchanged`].
+///
+/// The mark counter is pinned too, read *inside* this transaction rather
+/// than carried on the snapshot: a grade increments it, so pinning it is
+/// what makes "this exam had no marks" — the gate the handler refuses a
+/// kind change on — true at *write* time and not merely at read time. A
+/// mark landing between the read and the guarded write makes the UPDATE
+/// re-check its `WHERE` against the new row version, find the counter
+/// moved, and refuse the save — the same answer the old pinned snapshot
+/// gave, without a stale snapshot able to pin a counter it cannot see.
+///
+/// The re-draft gate rides in the same transaction, as before: re-drafting
+/// hides an exam, so it must be refused while any sitting or mark exists,
+/// and the check has to see the write's own moment, not the handler's.
 pub async fn update_if_unchanged(
     db: &Database,
     mut expected: Exam,
@@ -130,11 +207,6 @@ pub async fn update_if_unchanged(
     allow_review: bool,
     draft: bool,
 ) -> Result<Option<Exam>, AppError> {
-    // Re-drafting hides an exam: it must be refused while any sitting or
-    // mark exists, and that check has to be *in this transaction*. Holding
-    // it under a lock outside would only order the two writers inside one
-    // process — and it did not even do that, since grading takes the reader
-    // lease this write does.
     let redraft = draft && !expected.draft;
     let was = (
         expected.title.clone(),
@@ -160,92 +232,114 @@ pub async fn update_if_unchanged(
     expected.allow_rejoin = allow_rejoin;
     expected.allow_review = allow_review;
     expected.draft = draft;
-    // whole-row-save-ok: the WHERE below pins every column this replaces to
-    // the caller's snapshot, so no concurrent write can be reverted
-    //
-    // Sent through the retry loop, not a bare `query`: this row now has a
-    // hot writer. Every answer save touches it to tie itself to the exam
-    // ([`crate::db::exam_answer::save`]), so a teacher
-    // flipping `allow_rejoin` mid-exam can lose a round to a student
-    // typing — and a lost round is a re-send, never the 500 a bare `?` on
-    // the conflict would have answered. Re-sending is sound because the
-    // statement is a compare-and-set: the second pass carries the same
-    // pinned snapshot, so it lands only if the row is still what the caller
-    // read, and a rival that really moved it is refused as it was before.
-    // Admissible for the loop — an `UPDATE`, an `IF`/`THROW` and a `SELECT`
-    // can never answer "already exists".
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-                 IF $redraft AND (
-                     array::len((SELECT VALUE id FROM exam_attempt WHERE exam = $id LIMIT 1)) > 0
-                     OR array::len((SELECT VALUE id FROM exam_result WHERE exam = $id LIMIT 1)) > 0
-                 ) { THROW 'exam_redraft' };
-                 UPDATE $id CONTENT $new
-                 WHERE title = $was_title AND description = $was_description
-                   AND kind = $was_kind AND mode = $was_mode
-                   AND starts_at = $was_starts AND ends_at = $was_ends
-                   AND duration_ms = $was_duration
-                   AND max_attempts = $was_max_attempts
-                   AND allow_rejoin = $was_allow_rejoin
-                   AND allow_review = $was_allow_review
-                   AND draft = $was_draft
-                   AND (result_count ?? 0) = $was_results
-                 RETURN AFTER;
-                 COMMIT TRANSACTION;",
-        &[
-            ("redraft".into(), redraft.into_value()),
-            ("id".into(), expected.id.record().into_value()),
-            ("was_title".into(), was.0.into_value()),
-            ("was_description".into(), was.1.into_value()),
-            ("was_kind".into(), was.2.into_value()),
-            ("was_mode".into(), was.3.into_value()),
-            ("was_starts".into(), was.4.into_value()),
-            ("was_ends".into(), was.5.into_value()),
-            ("was_duration".into(), was.6.into_value()),
-            ("was_max_attempts".into(), was.7.into_value()),
-            ("was_allow_rejoin".into(), was.8.into_value()),
-            ("was_allow_review".into(), was.9.into_value()),
-            ("was_draft".into(), was.10.into_value()),
-            // The mark counter is pinned like every other column this write
-            // replaces, and for a sharper reason: a grade increments it, so
-            // pinning it is what makes "this exam had no marks" — the gate
-            // the handler refuses a kind change on — true at *write* time
-            // and not merely at read time. A mark landing in between
-            // refuses the save.
-            (
-                "was_results".into(),
-                expected.result_count.unwrap_or(0).into_value(),
-            ),
-            ("new".into(), expected.into_value()),
-        ],
-        &["exam_redraft"],
-    )
+    let saved = tx_with_retry(db, false, async |conn| {
+        if redraft {
+            // `exam_redraft`: the same refusal the handler's pre-flight
+            // answers, re-made at write time. A sitting or a mark existing
+            // hides nothing.
+            let gates = sqlx::query!(
+                r#"SELECT EXISTS(SELECT 1 FROM exam_attempt WHERE exam = $1) AS sat,
+                          EXISTS(SELECT 1 FROM exam_result WHERE exam = $1) AS graded"#,
+                expected.id as &ExamId,
+            )
+            .fetch_one(&mut *conn)
+            .await?;
+            if gates.sat || gates.graded {
+                return Err(redraft_error());
+            }
+        }
+        let was_results = sqlx::query!(
+            r#"SELECT result_count AS "result_count: i64" FROM exam WHERE id = $1"#,
+            expected.id as &ExamId,
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|row| row.result_count)
+        .unwrap_or(0);
+        let written = sqlx::query_as!(
+            Exam,
+            r#"UPDATE exam SET title = $2, description = $3, kind = $4, mode = $5,
+                                starts_at = $6, ends_at = $7, duration_ms = $8,
+                                max_attempts = $9, allow_rejoin = $10, allow_review = $11,
+                                draft = $12
+               WHERE id = $1
+                 AND title = $13 AND description = $14 AND kind = $15
+                 AND mode IS NOT DISTINCT FROM $16
+                 AND starts_at IS NOT DISTINCT FROM $17
+                 AND ends_at IS NOT DISTINCT FROM $18
+                 AND duration_ms IS NOT DISTINCT FROM $19
+                 AND max_attempts = $20 AND allow_rejoin = $21 AND allow_review = $22
+                 AND draft = $23
+                 AND result_count = $24
+               RETURNING id AS "id: ExamId", creator AS "creator: UserId",
+                         course AS "course: CourseId", title AS "title: ExamTitle",
+                         description AS "description: ExamDescription",
+                         kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                         starts_at AS "starts_at: Option<Timestamp>",
+                         ends_at AS "ends_at: Option<Timestamp>",
+                         duration_ms AS "duration_ms: Option<ExamDuration>",
+                         max_attempts AS "max_attempts: ExamAttemptLimit",
+                         allow_rejoin, allow_review, draft"#,
+            expected.id as &ExamId,
+            expected.title,
+            expected.description,
+            expected.kind,
+            expected.mode,
+            expected.starts_at,
+            expected.ends_at,
+            expected.duration_ms,
+            expected.max_attempts,
+            expected.allow_rejoin,
+            expected.allow_review,
+            expected.draft,
+            was.0,
+            was.1,
+            was.2,
+            was.3,
+            was.4,
+            was.5,
+            was.6,
+            was.7,
+            was.8,
+            was.9,
+            was.10,
+            was_results,
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(written)
+    })
     .await?;
-    // An aborted transaction errors every slot; only the THROW's names the
-    // marker (the [`crate::db::exam_attempt::write_unfrozen`] treatment).
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("exam_redraft"))
-    {
-        return Err(redraft_error());
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // BEGIN and the IF take a slot each.
-    Ok(result.take::<Vec<Exam>>(2)?.into_iter().next())
+    Ok(saved)
+}
+
+/// What [`delete`] collects on its way through: the deleted row plus the
+/// blob keys of the image rows its cascade removed — exactly whose files
+/// the web layer may unlink.
+pub struct Deleted {
+    pub exam: Exam,
+    pub question_image_files: Vec<String>,
+    pub answer_image_files: Vec<String>,
 }
 
 /// Delete the exam and cascade-remove its result, attempt, question,
 /// answer, question-image, and answer-image rows — all in one transaction,
 /// so a failure can't leave an emptied-out exam shell behind. The image
-/// *blobs* (question and answer) are the web layer's to remove — it collects
-/// their names before calling this.
+/// *blobs* are the caller's to remove — this returns the names, collected
+/// inside the same transaction that removes the rows.
+///
+/// The transaction opens by taking the exam row `FOR UPDATE` — the store
+/// replacement of the writer lease the delete used to hold. Every child
+/// writer that matters locks the same row first (a sitting create's guard,
+/// the freeze gate, an answer save ahead of its upsert), so a start or a
+/// save either finished before the sweep (which then takes its row) or
+/// finds no exam and is a `404`. Left orphaned, an attempt kept a sitting
+/// on the student's lifetime counter and could mint a badge — awards are
+/// add-only and never revoked — for an exam that never existed.
 ///
 /// Bank templates saved out of this exam survive it — they are a separate,
-/// reusable library — so only their `source_exam` provenance link is cleared,
-/// in the same transaction, never left pointing at a dead exam.
+/// reusable library — so only their `source_exam` provenance link is
+/// cleared, in the same transaction, never left pointing at a dead exam.
 ///
 /// The questions about to be cascaded each hold a reference on their
 /// subject, which is what keeps that subject from being deleted under them.
@@ -256,52 +350,156 @@ pub async fn update_if_unchanged(
 /// concurrent `remove_result` in the gap would be released twice — once by
 /// each — which on a kind another exam still uses reads as one mark too
 /// few, and that is a kind wrongly free to leave the settings.
-pub async fn delete(db: &Database, target: Exam) -> Result<Exam, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
+pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
+    tx_with_retry(
         db,
-        "BEGIN TRANSACTION;
-                 FOR $row IN ((SELECT exam.kind AS kind, count() AS n FROM exam_result
-                     WHERE exam = $ex GROUP BY kind) ?? []) {
-                     UPDATE type::record('kind_ref', $row.kind) SET count =
-                         math::max([(count ?? 0) - $row.n, 0])
-                 };
-                 DELETE exam_result WHERE exam = $ex;
-                 DELETE exam_attempt WHERE exam = $ex;
-                 DELETE exam_answer WHERE exam = $ex;
-                 DELETE answer_image WHERE exam = $ex;
-                 DELETE question_image WHERE exam = $ex;
-                 FOR $row IN ((SELECT subject, count() AS n FROM exam_question
-                     WHERE exam = $ex GROUP BY subject) ?? []) {
-                     UPDATE $row.subject SET exam_question_count =
-                         math::max([(exam_question_count ?? 0) - $row.n, 0])
-                 };
-                 DELETE exam_question WHERE exam = $ex;
-                 UPDATE bank_question SET source_exam = NONE WHERE source_exam = $ex;
-                 LET $before = (DELETE $ex RETURN BEFORE);
-                 RETURN $before;
-                 COMMIT TRANSACTION;",
-        &[("ex".into(), target.id.record().into_value())],
-        // No THROW of its own: an unconditional cascade, so the only error
-        // worth telling apart is a lost round, and `check()` — which took
-        // the *first* error in the batch — could not. It reported a
-        // sibling's "not executed" and made a retryable round a 500.
-        &[],
+        true,
+        async |conn| {
+            // The row lock every other exam-child writer contends on.
+            let locked = sqlx::query!(
+                r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
+                target.id as &ExamId,
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
+            if locked.is_none() {
+                return Err(AppError::NotFound);
+            }
+            // The blob names, collected *before* the rows go — inside the
+            // lock, so an image row written after this snapshot cannot
+            // strand its bytes on disk even though the row itself would be
+            // refused.
+            let image_files = sqlx::query!(
+                r#"SELECT file FROM question_image WHERE exam = $1"#,
+                target.id as &ExamId,
+            )
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|row| row.file)
+            .collect();
+            let answer_image_files = sqlx::query!(
+                r#"SELECT file FROM answer_image WHERE exam = $1"#,
+                target.id as &ExamId,
+            )
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|row| row.file)
+            .collect();
+            // The marks give their kind references back, counted per kind
+            // off the results this exam still has. The ref row always
+            // exists here: a mark's own claim creates it before any result
+            // can land.
+            sqlx::query!(
+                r#"WITH kinds AS (
+                       SELECT e.kind AS kind, count(*) AS n
+                       FROM exam_result r JOIN exam e ON e.id = r.exam
+                       WHERE r.exam = $1
+                       GROUP BY e.kind)
+                   UPDATE kind_ref k SET count = GREATEST(k.count - c.n, 0)
+                   FROM kinds c WHERE k.name = c.kind"#,
+                target.id as &ExamId,
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query!(r#"DELETE FROM exam_result WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query!(r#"DELETE FROM answer_image WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query!(r#"DELETE FROM question_image WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            // The cascaded questions give their subject references back,
+            // counted per subject off the rows still present — before the
+            // questions themselves go.
+            sqlx::query!(
+                r#"WITH subs AS (
+                       SELECT subject, count(*) AS n
+                       FROM exam_question WHERE exam = $1
+                       GROUP BY subject)
+                   UPDATE subject s SET exam_question_count = GREATEST(s.exam_question_count - c.n, 0)
+                   FROM subs c WHERE s.id = c.subject"#,
+                target.id as &ExamId,
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query!(r#"DELETE FROM exam_question WHERE exam = $1"#, target.id as &ExamId)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query!(
+                r#"UPDATE bank_question SET source_exam = NULL WHERE source_exam = $1"#,
+                target.id as &ExamId,
+            )
+            .execute(&mut *conn)
+            .await?;
+            let deleted = sqlx::query_as!(
+                Exam,
+                r#"DELETE FROM exam WHERE id = $1
+                   RETURNING id AS "id: ExamId", creator AS "creator: UserId",
+                             course AS "course: CourseId", title AS "title: ExamTitle",
+                             description AS "description: ExamDescription",
+                             kind AS "kind: ExamKind", mode AS "mode: Option<ExamMode>",
+                             starts_at AS "starts_at: Option<Timestamp>",
+                             ends_at AS "ends_at: Option<Timestamp>",
+                             duration_ms AS "duration_ms: Option<ExamDuration>",
+                             max_attempts AS "max_attempts: ExamAttemptLimit",
+                             allow_rejoin, allow_review, draft"#,
+                target.id as &ExamId,
+            )
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(exam) = deleted else {
+                return Err(AppError::NotFound);
+            };
+            Ok(Deleted {
+                exam,
+                question_image_files: image_files,
+                answer_image_files,
+            })
+        },
     )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The deleted row comes back through the transaction's trailing
-    // `RETURN`, never a hand-counted slot: the old `take(8)` turned a
-    // successful delete into a 404 the moment a cascade statement was
-    // inserted above it (it already had to be bumped once). `RETURN` is
-    // always the last statement before `COMMIT`, so its slot is derived
-    // from the statement count and every insertion above it shifts it
-    // along. `num_statements` counts BEGIN and COMMIT too, hence -2.
-    let slot = result.num_statements().saturating_sub(2);
-    let deleted: Option<Exam> = result.take::<Vec<Exam>>(slot)?.into_iter().next();
-    deleted.ok_or(AppError::NotFound)
+    .await
 }
+
+#[cfg(test)]
+use crate::domain::settings::ExamKindDef;
+
+/// An unscheduled published exam — the minimum any test that writes a *child*
+/// of an exam needs, in any module: every such write moves the exam row (see
+/// [`crate::db::exam_attempt::write_unfrozen_with`]
+/// and [`crate::db::exam_answer::save`]), so a minted id whose
+/// row was never created is a 404 rather than a silent orphan.
+#[cfg(test)]
+pub(crate) async fn published_exam(db: &Database) -> Exam {
+    let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
+        .get_exam_kinds()
+        .to_vec();
+    create(
+        db,
+        &UserId::generate(),
+        &crate::db::course::a_test_course(db).await,
+        ExamTitle::try_new("midterm").unwrap(),
+        ExamDescription::try_new("").unwrap(),
+        ExamKind::try_new("midterm", &allowed).unwrap(),
+        ExamSchedule::try_new(None, None, None, None).unwrap(),
+        ExamAttemptLimit::try_new(1).unwrap(),
+        true,
+        false,
+        false,
+    )
+    .await
+    .unwrap()
+}
+
 #[cfg(test)]
 use crate::domain::settings::ExamKindDef;
 

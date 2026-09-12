@@ -3,13 +3,12 @@
 //! retake and the cascades use. The sitting key shape and the payload
 //! validation's pure half live in [`crate::domain::exam_answer`].
 
-use surrealdb::types::SurrealValue;
+use sqlx::PgConnection;
 
-use crate::constant::EXAM_RESULT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::domain::exam::ExamId;
-use crate::domain::exam_answer::{AnswerText, ExamAnswer, ExamAnswerId};
-use crate::domain::exam_question::{ExamQuestion, ExamQuestionId};
+use crate::domain::exam_answer::{AnswerText, ExamAnswer};
+use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -64,92 +63,66 @@ pub async fn save(
             (None, Some(AnswerText::try_new(&text)?))
         }
     };
-    let answer = ExamAnswer {
-        id: ExamAnswerId::composite(question.get_id(), user, seq),
-        exam: question.get_exam().clone(),
-        question: question.get_id().clone(),
-        user: user.clone(),
+    // The save locks the *exam row* before upserting the answer, in one
+    // transaction, and that is what ties the answer's fate to its exam:
+    // reading the exam does not survive
+    // [`crate::db::exam::delete`]'s window — a save landing after its
+    // cascade swept the answers but before it committed would have read an
+    // exam that was still there and written an orphan no sweep would ever
+    // visit. Locking the key the delete removes first makes the two
+    // serialize: the save either lands before the sweep (which then takes
+    // the row too) or finds no exam and answers the same `404` the old
+    // `no_exam` THROW did. Real foreign keys stand behind the lock — a
+    // child insert whose parent is gone refuses itself — which is what
+    // retired the bump-and-restore this used to ride on.
+    tx_with_retry(db, false, async |conn| {
+        save_in(conn, question, user, seq, selected, text).await
+    })
+    .await
+}
+
+/// The locked exam-row probe plus the upsert, on one connection — split out
+/// so the exam room's room-bound save shares the exact statements.
+pub(crate) async fn save_in(
+    conn: &mut PgConnection,
+    question: &ExamQuestion,
+    user: &UserId,
+    seq: i64,
+    selected: Option<ChoiceId>,
+    text: Option<AnswerText>,
+) -> Result<ExamAnswer, AppError> {
+    let touched = sqlx::query!(
+        r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
+        question.get_exam() as &ExamId,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if touched.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let now = Timestamp::now();
+    sqlx::query_as!(
+        ExamAnswer,
+        r#"INSERT INTO exam_answer (exam, question, app_user, selected, text, updated_at, seq)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (question, app_user, seq) DO UPDATE
+               SET selected = EXCLUDED.selected, text = EXCLUDED.text,
+                   updated_at = EXCLUDED.updated_at
+           RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                     app_user AS "user: UserId", seq,
+                     selected AS "selected: Option<ChoiceId>",
+                     text AS "text: Option<AnswerText>",
+                     updated_at AS "updated_at: Timestamp""#,
+        question.get_exam() as &ExamId,
+        question.get_id() as &ExamQuestionId,
+        user as &UserId,
         seq,
         selected,
         text,
-        updated_at: Timestamp::now(),
-    };
-    // The save writes the *exam row* as well as the answer, in one
-    // transaction, and that is what ties the answer's fate to its exam:
-    // reading the exam does not survive [`crate::db::exam::delete`]'s
-    // window — a save landing after its `DELETE exam_answer WHERE exam = $ex`
-    // but before the commit reads an exam that is still there (uncommitted)
-    // while the sweep ran on a snapshot predating this row, so both commit
-    // and the answer outlives the exam (measured 4 of 4 raced rounds).
-    // Writing the key the delete removes makes the two collide, and the
-    // store refuses one of them. It is the shape
-    // [`crate::domain::menu::bump_menu_and_write`] uses, and the one a mark
-    // already uses on this very row
-    // ([`crate::db::exam_result::grade`]).
-    //
-    // The bump-and-restore is not a flourish, it is the whole instrument.
-    // The exam carries no revision to bump and must not grow one — its save
-    // is a whole-row `CONTENT` write, so a column this struct did not know
-    // about would be wiped by the next PATCH — so this touches the one
-    // counter it already has and puts it back. Writing the *same* value is
-    // not enough: an `UPDATE` that leaves the document unchanged is elided
-    // and never reaches the store's write set, which the race test proved
-    // (green on the raced delete, red the moment the value moves for real).
-    // The restore is by captured value, `NONE` included, so the row is
-    // byte-identical afterwards: the boot backfill still finds the rows it
-    // keys on (`WHERE result_count = NONE`), the PATCH's
-    // `(result_count ?? 0) = $was_results` still passes, and no teacher's
-    // edit is refused because a student typed. Both statements are inside
-    // the transaction, so a crash between them cannot leave the counter up.
-    // No `cap::counter_lock` either: no counter moves here, and the hottest
-    // write path in the app should not queue behind one.
-    //
-    // Admissible for `transaction_with_retry`: the `UPDATE`s, `SELECT`,
-    // `IF`/`THROW` and `RETURN` can never answer "already exists", and the
-    // `UPSERT`'s id is bijective with the (question, user, seq) triple
-    // `exam_answer` keys — a lost round wrote nothing, and re-sending
-    // resolves onto the same row rather than colliding with it.
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was = (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $ex);
-             LET $touched = (UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = \
-                 ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($touched) = 0 {{ THROW 'no_exam' }};
-             UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = $was;
-             LET $row = (UPSERT $id CONTENT $answer RETURN AFTER);
-             RETURN $row[0];
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("ex".into(), answer.exam.record().into_value()),
-            ("id".into(), answer.id.record().into_value()),
-            ("answer".into(), answer.into_value()),
-        ],
-        &["no_exam"],
+        now,
     )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_exam"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number (the
-    // `db::exam::delete` treatment); `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<ExamAnswer>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to save exam answer".into()))
+    .fetch_one(&mut *conn)
+    .await
 }
 
 /// One student's stored answer for a question in sitting `seq`, if any.
@@ -159,9 +132,21 @@ pub async fn read(
     user: &UserId,
     seq: i64,
 ) -> Result<Option<ExamAnswer>, AppError> {
-    Ok(db
-        .select(ExamAnswerId::composite(question, user, seq).record())
-        .await?)
+    Ok(sqlx::query_as!(
+        ExamAnswer,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq,
+                  selected AS "selected: Option<ChoiceId>",
+                  text AS "text: Option<AnswerText>",
+                  updated_at AS "updated_at: Timestamp"
+           FROM exam_answer
+           WHERE question = $1 AND app_user = $2 AND seq = $3"#,
+        question as &ExamQuestionId,
+        user as &UserId,
+        seq,
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Drop one student's answer to a single question in sitting `seq`.
@@ -171,14 +156,19 @@ pub async fn delete(
     user: &UserId,
     seq: i64,
 ) -> Result<(), AppError> {
-    let _: Option<ExamAnswer> = db
-        .delete(ExamAnswerId::composite(question, user, seq).record())
-        .await?;
+    sqlx::query!(
+        r#"DELETE FROM exam_answer WHERE question = $1 AND app_user = $2 AND seq = $3"#,
+        question as &ExamQuestionId,
+        user as &UserId,
+        seq,
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
 /// One student's answers for a single sitting (`seq`) across an exam, in
-/// question (ULID) order — the live-sitting read-back and, for a past
+/// question (id) order — the live-sitting read-back and, for a past
 /// `seq`, that attempt's answer sheet.
 pub async fn list_for_exam_user(
     db: &Database,
@@ -186,17 +176,22 @@ pub async fn list_for_exam_user(
     user: &UserId,
     seq: i64,
 ) -> Result<Vec<ExamAnswer>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM exam_answer WHERE exam = $ex AND user = $usr AND seq = $seq
-             ORDER BY question ASC",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .bind(("seq", seq))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAnswer>>(0)?)
+    Ok(sqlx::query_as!(
+        ExamAnswer,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq,
+                  selected AS "selected: Option<ChoiceId>",
+                  text AS "text: Option<AnswerText>",
+                  updated_at AS "updated_at: Timestamp"
+           FROM exam_answer
+           WHERE exam = $1 AND app_user = $2 AND seq = $3
+           ORDER BY question ASC"#,
+        exam as &ExamId,
+        user as &UserId,
+        seq,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// The distinct sittings a student has any answer for at `exam`, ascending
@@ -206,28 +201,31 @@ pub async fn list_seqs_for_user(
     exam: &ExamId,
     user: &UserId,
 ) -> Result<Vec<i64>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE seq FROM exam_answer WHERE exam = $ex AND user = $usr
-             ORDER BY seq ASC",
-        )
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    let mut seqs = result.take::<Vec<i64>>(0)?;
-    seqs.dedup();
-    Ok(seqs)
+    let rows = sqlx::query!(
+        r#"SELECT DISTINCT seq FROM exam_answer
+           WHERE exam = $1 AND app_user = $2 ORDER BY seq ASC"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.seq).collect())
 }
 
 /// Every answer of an exam — the live monitor aggregates these per student.
 pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamAnswer>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM exam_answer WHERE exam = $ex ORDER BY question ASC")
-        .bind(("ex", exam.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ExamAnswer>>(0)?)
+    Ok(sqlx::query_as!(
+        ExamAnswer,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  app_user AS "user: UserId", seq,
+                  selected AS "selected: Option<ChoiceId>",
+                  text AS "text: Option<AnswerText>",
+                  updated_at AS "updated_at: Timestamp"
+           FROM exam_answer WHERE exam = $1 ORDER BY question ASC"#,
+        exam as &ExamId,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Drop one student's answers across an exam — a retake starts from a
@@ -237,11 +235,13 @@ pub async fn delete_for_exam_user(
     exam: &ExamId,
     user: &UserId,
 ) -> Result<(), AppError> {
-    db.query("DELETE exam_answer WHERE exam = $ex AND user = $usr")
-        .bind(("ex", exam.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        r#"DELETE FROM exam_answer WHERE exam = $1 AND app_user = $2"#,
+        exam as &ExamId,
+        user as &UserId,
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
