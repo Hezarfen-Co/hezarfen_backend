@@ -6,8 +6,11 @@ use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
 use hezarfen_backend::{build_router, database};
+mod common;
+
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 /// Start the server on a random port. Returns its base URL (e.g.
 /// `http://127.0.0.1:54321`) plus a handle to its database, so a test can grant
@@ -18,9 +21,7 @@ async fn spawn_server() -> (String, Database) {
 
 /// [`spawn_server`], with the AI bridge the chatbot relays through wired in.
 async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (String, Database) {
-    let tenants = database::init_mem_tenants()
-        .await
-        .expect("in-memory deployment");
+    let tenants = database::init_test_tenants().await;
     let db = tenants
         .get(&Slug::try_new(DEMO_SLUG).unwrap())
         .await
@@ -48,7 +49,6 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
@@ -69,12 +69,11 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
 
 /// Grant `user` a role directly (the manual bootstrap path).
 async fn promote(db: &Database, user: &str, role: &str) {
-    db.query("UPDATE user SET role = $r WHERE username = $u")
-        .bind(("r", role.to_string()))
-        .bind(("u", user.to_string()))
+    sqlx::query("UPDATE app_user SET role = $1 WHERE username = $2")
+        .bind(role)
+        .bind(user)
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 }
 
@@ -2201,41 +2200,34 @@ async fn board_frame_of_type(ws: &mut WsStream, kind: &str) -> Value {
     }
 }
 
-fn board_record(board: &str) -> surrealdb::types::RecordId {
-    surrealdb::types::RecordId::new("board", board.to_string())
-}
-
 /// The stored stroke ids of one epoch, in mint order, read straight out of the
 /// database — the only proof that survives a lying frame.
 async fn stored_stroke_ids(db: &Database, board: &str, epoch: i64) -> Vec<String> {
-    let mut result = db
-        .query(
-            "SELECT VALUE record::id(id) FROM board_stroke \
-             WHERE board = $b AND epoch = $e AND kind = 'stroke' ORDER BY id",
-        )
-        .bind(("b", board_record(board)))
-        .bind(("e", epoch))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM board_stroke \
+         WHERE board = $1 AND epoch = $2 AND kind = 'stroke' ORDER BY id",
+    )
+    .bind(Uuid::parse_str(board).unwrap())
+    .bind(epoch)
+    .fetch_all(db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|id| id.to_string())
+    .collect()
 }
 
 /// The stored payloads of one epoch, in mint order.
 async fn stored_payloads(db: &Database, board: &str, epoch: i64) -> Vec<String> {
-    let mut result = db
-        .query(
-            "SELECT VALUE payload FROM board_stroke \
-             WHERE board = $b AND epoch = $e AND kind = 'stroke' ORDER BY id",
-        )
-        .bind(("b", board_record(board)))
-        .bind(("e", epoch))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
+    sqlx::query_scalar::<_, String>(
+        "SELECT payload FROM board_stroke \
+         WHERE board = $1 AND epoch = $2 AND kind = 'stroke' ORDER BY id",
+    )
+    .bind(Uuid::parse_str(board).unwrap())
+    .bind(epoch)
+    .fetch_all(db)
+    .await
+    .unwrap()
 }
 
 /// Draw one mark and wait for its ack, ignoring the fan-out of everyone else's
@@ -2332,28 +2324,17 @@ async fn a_participants_clear_is_refused_and_the_socket_keeps_drawing() {
         vec!["before".to_string(), "after".to_string()]
     );
     // The refusal wrote nothing: no clear marker, and the epoch never moved.
-    let mut result = room
-        .db
-        .query("SELECT VALUE epoch FROM $b")
-        .bind(("b", board_record(board)))
+    let epochs = sqlx::query_scalar::<_, i64>("SELECT epoch FROM board WHERE id = $1")
+        .bind(Uuid::parse_str(board).unwrap())
+        .fetch_all(&room.db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
-    assert_eq!(result.take::<Vec<i64>>(0).unwrap(), vec![0]);
-    let mut result = room
-        .db
-        .query("SELECT VALUE id FROM board_stroke WHERE kind = 'clear'")
+    assert_eq!(epochs, vec![0]);
+    let clears = sqlx::query_scalar::<_, Uuid>("SELECT id FROM board_stroke WHERE kind = 'clear'")
+        .fetch_all(&room.db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
-    assert!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(clears.is_empty());
 
     // A lock is creator-only on the same terms, and equally non-fatal.
     ws_send(&mut veli, json!({ "type": "lock", "locked": true })).await;
@@ -2563,13 +2544,9 @@ async fn the_door_is_a_404_for_an_outsider_and_an_unknown_board() {
         "a non-participant must not learn the board exists"
     );
     assert_eq!(
-        board_open(
-            base,
-            "01JZZZZZZZZZZZZZZZZZZZZZZZ",
-            Some(&room.creator_cookie)
-        )
-        .await
-        .err(),
+        board_open(base, common::ABSENT_ID, Some(&room.creator_cookie))
+            .await
+            .err(),
         Some(404),
         "indistinguishable from an unknown board"
     );
@@ -2614,20 +2591,14 @@ async fn a_parent_cannot_enter_the_room_or_draw() {
         .unwrap();
     // Beside `veli`, who stays: the two differ only by role, so the refusal
     // below cannot be blamed on the roster.
-    room.db
-        .query("UPDATE $b SET participants = [$v, $u]")
-        .bind(("b", board_record(board)))
-        .bind((
-            "v",
-            surrealdb::types::RecordId::new("user", room.veli_id.clone()),
-        ))
-        .bind((
-            "u",
-            surrealdb::types::RecordId::new("user", me["id"].as_str().unwrap().to_string()),
-        ))
+    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
+        .bind(vec![
+            Uuid::parse_str(&room.veli_id).unwrap(),
+            Uuid::parse_str(me["id"].as_str().unwrap()).unwrap(),
+        ])
+        .bind(Uuid::parse_str(board).unwrap())
+        .execute(&room.db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
     assert_eq!(
@@ -2637,7 +2608,7 @@ async fn a_parent_cannot_enter_the_room_or_draw() {
     );
     // Not a 403 anywhere: identical to a board that was never minted.
     assert_eq!(
-        board_open(base, "01JZZZZZZZZZZZZZZZZZZZZZZZ", Some(&cookie))
+        board_open(base, common::ABSENT_ID, Some(&cookie))
             .await
             .err(),
         Some(404)
@@ -2671,12 +2642,11 @@ async fn a_removed_participant_can_no_longer_draw() {
 
     // The silent removal first: write the roster straight into the database,
     // so no frame is published and only the per-stroke gate can catch it.
-    room.db
-        .query("UPDATE $b SET participants = []")
-        .bind(("b", board_record(board)))
+    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
+        .bind(Vec::<Uuid>::new())
+        .bind(Uuid::parse_str(board).unwrap())
+        .execute(&room.db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     ws_send(
         &mut veli,
@@ -3856,9 +3826,7 @@ async fn probe_a_suspended_school_refuses_websocket_upgrades() {
     );
     // So is the exam room, on any id.
     assert_eq!(
-        ws_open(&base, "01J8XZ0K3Q8G7X2M4N5P6R7S8T", Some(&cookie))
-            .await
-            .err(),
+        ws_open(&base, common::ABSENT_ID, Some(&cookie)).await.err(),
         Some(403),
         "the exam socket opened for a suspended school"
     );

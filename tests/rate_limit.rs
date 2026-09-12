@@ -16,11 +16,9 @@ use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-/// App with the given limits, backed by a fresh in-memory database.
+/// App with the given limits, backed by a fresh per-test Postgres deployment.
 async fn app_with(rate_limit: RateLimitConfig) -> Router {
-    let tenants = database::init_mem_tenants()
-        .await
-        .expect("in-memory deployment");
+    let tenants = database::init_test_tenants().await;
     build_router(AppState {
         db: tenants.control().clone(),
         tenants,
@@ -30,7 +28,6 @@ async fn app_with(rate_limit: RateLimitConfig) -> Router {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     })
@@ -383,29 +380,31 @@ async fn keyless_clients_share_one_budget_once_the_map_is_saturated() {
 
 // --- the window outlives the process ------------------------------------
 //
-// Two `UserRateLimiter`s over one database stand in for the process before and
-// after a restart: two separate sets of in-memory buckets sharing only the
-// `rate_limit` table, which is what stops a restart mid-window from handing
-// every client a fresh budget. Time is paused, so a round of the sync task is
-// driven by advancing past `RATE_SYNC_INTERVAL_SECS` — and because the task
-// blocks on the database (not on time) mid-round, the short sleep afterwards
-// cannot resolve until the round has finished. Assertions are on admissions,
-// never on which limiter won a race: the embedded engine can drop one of two
-// concurrent writes and still answer `Ok`.
+// Two `UserRateLimiter`s over one control database stand in for the process
+// before and after a restart: two separate sets of in-memory buckets sharing
+// only the `rate_limit` table, which is what stops a restart mid-window from
+// handing every client a fresh budget. Time is paused, so a round of the sync
+// task is driven by advancing past `RATE_SYNC_INTERVAL_SECS` — and because the
+// task blocks on the database (not on time) mid-round, the short sleep
+// afterwards cannot resolve until the round has finished. Assertions stay on
+// admissions and on the rows the fold wrote: which limiter's statement lands
+// first cannot matter, a round is one atomic statement per limiter.
 
 use hezarfen_backend::constant::RATE_SYNC_INTERVAL_SECS;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::UserRateLimiter;
-use hezarfen_backend::state::DbHealth;
+use hezarfen_backend::tenant::Tenants;
 use std::time::Duration;
 
-/// A migrated in-memory database, with the clock frozen only afterwards: the
-/// embedded engine has internal deadlines of its own and cannot start up under
-/// a paused clock ("Insert node failed after 5 attempts due to timeout").
-async fn shared_db() -> Database {
-    let db = database::init_mem().await.expect("in-memory db");
+/// A fresh per-test deployment — the trio shares its **control** database,
+/// where the `rate_limit` table lives — with the clock frozen only afterwards:
+/// every pool dials on the real clock, since a paused clock never fires a
+/// connect deadline and a stalled dial would hang the test.
+async fn shared_db() -> (Tenants, Database) {
+    let tenants = database::init_test_tenants().await;
+    let db = tenants.control().clone();
     tokio::time::pause();
-    db
+    (tenants, db)
 }
 
 /// Let the sync task run one round: fire its timer, then hand it *real* time
@@ -419,8 +418,22 @@ async fn sync_round() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(RATE_SYNC_INTERVAL_SECS)).await;
     tokio::time::resume();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
     tokio::time::pause();
+}
+
+/// The `rate_limit` rows, read in a resumed window: a pool statement run
+/// directly under the paused clock cannot dial — auto-advance fires the
+/// connect deadline the instant the runtime idles — so every direct
+/// statement here hands the clock back first.
+async fn read_shared_hits(db: &Database) -> Vec<i64> {
+    tokio::time::resume();
+    let rows = sqlx::query_scalar::<_, i64>("SELECT hits FROM rate_limit")
+        .fetch_all(db)
+        .await
+        .expect("read shared counters");
+    tokio::time::pause();
+    rows
 }
 
 /// One fixed wall window for every round below. The sync task reads the real
@@ -435,15 +448,14 @@ const PINNED_WINDOW: i64 = 60_000;
 /// Two limiters of one tier, sharing `db` and one wall window — the process
 /// before a restart and the process after, which is the only way one deployment
 /// runs two sets of buckets over one `rate_limit` row.
-fn two_processes(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
-    let health = DbHealth::default();
+fn two_processes(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter) {
     let (a, b) = (
         UserRateLimiter::per_user_minute(max),
         UserRateLimiter::per_user_minute(max),
     );
-    a.share_pinned("test", db.clone(), health.clone(), PINNED_WINDOW);
-    b.share_pinned("test", db.clone(), health.clone(), PINNED_WINDOW);
-    (a, b, health)
+    a.share_pinned("test", db.clone(), PINNED_WINDOW);
+    b.share_pinned("test", db.clone(), PINNED_WINDOW);
+    (a, b)
 }
 
 /// How many of `tries` requests a limiter admits for `user`.
@@ -455,8 +467,8 @@ fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
 
 #[tokio::test]
 async fn a_restarted_process_inherits_the_windows_spend() {
-    let db = shared_db().await;
-    let (a, b, _health) = two_processes(6, &db);
+    let (_tenants, db) = shared_db().await;
+    let (a, b) = two_processes(6, &db);
 
     // Each spends freely until its first sync — the accepted one-interval
     // overshoot, and the whole reason the shared row exists at all.
@@ -473,17 +485,14 @@ async fn a_restarted_process_inherits_the_windows_spend() {
     );
 
     // And the shared row agrees with what was actually admitted.
-    let mut rows = db
-        .query("SELECT VALUE hits FROM rate_limit")
-        .await
-        .expect("read shared counters");
-    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), vec![spent as i64]);
+    let rows = read_shared_hits(&db).await;
+    assert_eq!(rows, vec![spent as i64]);
 }
 
 #[tokio::test]
 async fn a_process_that_never_admitted_still_learns_the_budget_is_gone() {
-    let db = shared_db().await;
-    let (a, b, _health) = two_processes(4, &db);
+    let (_tenants, db) = shared_db().await;
+    let (a, b) = two_processes(4, &db);
 
     // b spends one request, so it has a bucket to sync; a spends the rest.
     assert_eq!(admits(&b, "user:a", 1), 1);
@@ -501,9 +510,18 @@ async fn a_process_that_never_admitted_still_learns_the_budget_is_gone() {
 
 #[tokio::test]
 async fn a_down_database_leaves_each_process_on_its_local_budget() {
-    let db = shared_db().await;
-    let (a, b, health) = two_processes(3, &db);
-    health.set(false);
+    let (_tenants, db) = shared_db().await;
+    let (a, b) = two_processes(3, &db);
+
+    // The shared store goes down: the fold's table is taken away — the one
+    // statement a round needs fails outright — and comes back without either
+    // limiter being restarted.
+    tokio::time::resume();
+    sqlx::query("ALTER TABLE rate_limit RENAME TO rate_limit_out")
+        .execute(&db)
+        .await
+        .expect("take the shared table away");
+    tokio::time::pause();
 
     // Nothing is shared while the database is down — and nothing stalls: both
     // limiters keep serving their own budgets at full speed.
@@ -515,28 +533,28 @@ async fn a_down_database_leaves_each_process_on_its_local_budget() {
     assert_eq!(admits(&a, "user:a", 1), 0, "the local budget still binds");
     assert_eq!(admits(&b, "user:a", 1), 0);
 
-    // Nothing was written, so the row the sync would have made does not exist.
-    let mut rows = db
-        .query("SELECT VALUE hits FROM rate_limit")
+    // The table comes back before the read, so the assertion reads the state
+    // the outage left: no round landed, so there is no row at all — and the
+    // unreported deltas are still sitting in the buckets.
+    tokio::time::resume();
+    sqlx::query("ALTER TABLE rate_limit_out RENAME TO rate_limit")
+        .execute(&db)
         .await
-        .expect("read shared counters");
-    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), Vec::<i64>::new());
+        .expect("give the shared table back");
+    tokio::time::pause();
+    let rows = read_shared_hits(&db).await;
+    assert_eq!(rows, Vec::<i64>::new());
 
-    // Recovery needs no restart: the next round shares again.
-    health.set(true);
+    // Recovery needs no restart: the next round carries the deltas, and the
+    // shared row holds everything both processes admitted while it was down.
     sync_round().await;
-    let mut rows = db
-        .query("SELECT VALUE hits FROM rate_limit")
-        .await
-        .expect("read shared counters");
-    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), vec![6]);
+    let rows = read_shared_hits(&db).await;
+    assert_eq!(rows, vec![6]);
 }
 
 /// Boot the app on a real TCP port, `ConnectInfo` wired exactly like `main`.
 async fn spawn_server(rate_limit: RateLimitConfig) -> String {
-    let tenants = database::init_mem_tenants()
-        .await
-        .expect("in-memory deployment");
+    let tenants = database::init_test_tenants().await;
     let app = build_router(AppState {
         db: tenants.control().clone(),
         tenants,
@@ -546,7 +564,6 @@ async fn spawn_server(rate_limit: RateLimitConfig) -> String {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });

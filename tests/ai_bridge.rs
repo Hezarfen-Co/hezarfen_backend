@@ -865,7 +865,6 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
@@ -985,7 +984,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN};
 use hezarfen_backend::database::Database;
-use surrealdb::types::RecordId;
+use uuid::Uuid;
 
 /// A router wired to `bridge`, plus a handle to its in-memory database.
 async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
@@ -999,7 +998,6 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: Some(bridge.clone()),
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
@@ -1119,15 +1117,18 @@ async fn the_history_a_service_receives_is_oldest_first_without_the_new_turn() {
         "complete"
     );
 
-    db.query(
-        "CREATE chatbot_message:h3 SET thread_id = $conv, user_id = $usr, role = 'assistant',
-             content = '', status = 'pending', created_at = 1002;",
+    // History is ordered by `created_at`, so this seeded row's 1002 timestamp
+    // sorts it before everything the turns above minted — the never-answered
+    // prior turn the new prompt must not duplicate into.
+    sqlx::query(
+        "INSERT INTO chatbot_message (id, thread_id, user_id, role, content, status, created_at) \
+         VALUES ($1, $2, $3, 'assistant', '', 'pending', 1002)",
     )
-    .bind(("conv", RecordId::new("chatbot_thread", thread.as_str())))
-    .bind(("usr", RecordId::new("user", user.as_str())))
+    .bind(Uuid::now_v7())
+    .bind(Uuid::parse_str(&thread).expect("thread id"))
+    .bind(Uuid::parse_str(&user).expect("user id"))
+    .execute(&db)
     .await
-    .expect("seed history")
-    .check()
     .expect("seed history");
 
     let mid = ask(&app, &cookie, &thread, "ikinci soru").await;
@@ -1559,10 +1560,11 @@ async fn a_router_status_rides_back_as_an_ok_answer_not_a_refusal() {
 
 #[tokio::test]
 async fn a_down_database_socket_is_refused_as_unavailable_rather_than_parked() {
-    // This path skips the HTTP layers, the db guard among them, so it re-checks
-    // liveness itself: a query issued while the socket is down does not fail,
-    // it parks until the socket returns. A service has to be told to retry
-    // instead of waiting out its own deadline on a read nobody is running.
+    // This path skips the HTTP layers, so the bridge resolves the school's
+    // registry row itself, on the control database, before every read. Take
+    // that table away and the read is refused as `unavailable` — promptly,
+    // never parked waiting on a store nobody is running — instead of hanging
+    // out the service's own deadline.
     let bridge = bridge().await;
     let service = connect_service(
         &bridge,
@@ -1571,10 +1573,13 @@ async fn a_down_database_socket_is_refused_as_unavailable_rather_than_parked() {
     )
     .await;
     await_workers(&bridge, 1).await;
-    let health = hezarfen_backend::state::DbHealth::default();
-    let (_app, _db) = common::app_with_ai_health(Some(bridge.clone()), health.clone()).await;
+    let (_app, _db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let control = tenants.control();
 
-    health.set(false);
+    sqlx::query("ALTER TABLE school RENAME TO school_out")
+        .execute(control)
+        .await
+        .expect("take the registry away");
     match api_read(&service.conn, read_of("/notes", None)).await {
         ApiResponse::Err { code, id, .. } => {
             assert_eq!(code, "unavailable");
@@ -1583,9 +1588,12 @@ async fn a_down_database_socket_is_refused_as_unavailable_rather_than_parked() {
         other => panic!("a read against a down database must be refused: {other:?}"),
     }
 
-    // And that refusal is the flag's doing, not a broken bridge: the same read
-    // on the same stream-opening service answers once the socket is back.
-    health.set(true);
+    // And that refusal is the outage's doing, not a broken bridge: the same
+    // read on the same stream-opening service answers once the store is back.
+    sqlx::query("ALTER TABLE school_out RENAME TO school")
+        .execute(control)
+        .await
+        .expect("give the registry back");
     let (status, _) = ok_answer(api_read(&service.conn, read_of("/notes", None)).await);
     assert_eq!(status, 200);
 }

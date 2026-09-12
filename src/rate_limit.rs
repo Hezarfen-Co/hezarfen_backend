@@ -938,4 +938,61 @@ mod tests {
             );
         }
     }
+
+    /// How many of `tries` requests the limiter admits for `user`.
+    fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
+        (0..tries)
+            .filter(|_| limiter.enforce_user(user).is_ok())
+            .count()
+    }
+
+    /// A wall-window roll must not bill one request to two shared rows: the
+    /// fold reports only a bucket's *unreported* delta, so when the wall
+    /// window rolls under a still-live local window, the new row receives
+    /// nothing the old row had already taken. (Rebuilt over the control
+    /// database — `rate_limit` is a control table — after the SurrealDB port
+    /// dropped it along with the embedded engine.)
+    #[tokio::test]
+    async fn a_wall_epoch_roll_charges_no_request_twice() {
+        const MAX: u32 = 5;
+        let tenants = crate::database::init_test_tenants().await;
+        let db = tenants.control().clone();
+        let limiter = UserRateLimiter::per_user_minute(MAX);
+        let window = Duration::from_secs(60);
+        let epoch = current_epoch(window);
+        assert_eq!(window.as_millis() as i64, 60_000, "epochs are 60s apart");
+
+        // A burst early in the client's local window, folded into row `epoch`.
+        for _ in 0..MAX {
+            assert!(limiter.enforce_user("user:a").is_ok());
+        }
+        sync_once("test", &limiter.buckets, window, epoch, &db).await;
+
+        // The wall clock rolls while that local window is still running.
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        // The local window lapses, so the client opens a fresh one — inside
+        // the *same* new wall window — and spends one request in it.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        assert_eq!(admits(&limiter, "user:a", 1), 1, "a fresh local window");
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        let rows =
+            sqlx::query_scalar::<_, i64>("SELECT hits FROM rate_limit ORDER BY window_start")
+                .fetch_all(&db)
+                .await
+                .expect("read shared counters");
+        assert_eq!(
+            rows,
+            vec![i64::from(MAX), 1],
+            "the new wall row may hold only what was admitted inside it"
+        );
+        assert_eq!(
+            admits(&limiter, "user:a", 4),
+            4,
+            "the client spent 1 of {MAX} in this window and must keep the rest"
+        );
+    }
 }
