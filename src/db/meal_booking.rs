@@ -185,6 +185,22 @@ pub(crate) async fn claim_and_place(
         .fetch_optional(&mut *tx)
         .await?;
         if seat.is_none() {
+            // A racer whose held-check ran before the winner's row landed and
+            // then queued on the menu row lock wakes to a full menu with its
+            // own booking already placed — that is the replay, not a refusal.
+            // (Each statement sees a fresh committed snapshot, so this read
+            // observes the winner's row.)
+            let won_elsewhere = sqlx::query!(
+                "SELECT 1 AS held FROM meal_booking
+                 WHERE menu = $1 AND student = $2 AND status = 'booked'",
+                menu_key,
+                student,
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if won_elsewhere.is_some() {
+                return Ok(Claimed::Duplicate);
+            }
             return Ok(Claimed::Full);
         }
         // Revive a cancelled row only while it still stands at the attempt
