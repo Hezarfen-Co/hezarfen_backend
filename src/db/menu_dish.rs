@@ -1,14 +1,9 @@
-//! The `menu_dish` table: the dishes on a menu — the insert and the field
-//! PATCH riding the menu's revision bump ([`bump_menu_and_write`]), the
-//! reads and listings, and the delete. The dish-cap gate and the
-//! [`MENU_LOCK`](crate::service::menu::MENU_LOCK) leases live in
-//! [`crate::service::menu`].
+//! The `menu_dish` table: the dishes on a menu — the guarded insert (the
+//! dish cap, enforced by the menu row's own lock), the field PATCH riding
+//! the menu's revision bump, the reads and listings, and the delete. The
+//! kitchen workflows live in [`crate::service::menu`].
 
-use surrealdb::types::{SurrealValue, Value};
-
-use crate::constant::MENU_VERSION_FIELD;
-use crate::database::{Database, transaction_with_retry};
-use crate::db::menu::bump_menu_and_write;
+use crate::database::{Database, tx_with_retry};
 use crate::domain::menu::MenuId;
 use crate::domain::menu_dish::{
     DishDescription, DishName, DishPrice, DishTags, MenuDish, MenuDishId,
@@ -16,7 +11,15 @@ use crate::domain::menu_dish::{
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 
-/// Add a dish. Moves the menu's revision *first* — see [`bump_menu_and_write`].
+/// Add a dish. The dish cap is one guarded decision, not a count a caller
+/// took a moment earlier: the menu row is locked `FOR NO KEY UPDATE` in
+/// this write's own transaction and the `INSERT` runs with a
+/// `count(*) < $cap` guard — a writer that queued on the lock behind a
+/// concurrent one re-counts after it and is refused (`409`) instead of
+/// overfilling. The revision bump rides the same transaction, and the
+/// lock's `SELECT` is what makes the menu's **existence** part of the
+/// write: it matches nothing once the menu row is deleted, so `NotFound`
+/// means the dish was not written.
 pub async fn create(
     db: &Database,
     menu: &MenuId,
@@ -24,67 +27,67 @@ pub async fn create(
     description: Option<DishDescription>,
     price_minor: DishPrice,
     tags: DishTags,
+    cap: i64,
 ) -> Result<MenuDish, AppError> {
-    let dish = MenuDish {
-        id: MenuDishId::generate(),
-        menu: menu.clone(),
-        name,
-        description,
-        price_minor,
-        tags,
-        created_at: Timestamp::now(),
-    };
-    // The revision bump and the insert are one transaction, and the bump is
-    // what makes the menu's existence part of it: the `UPDATE` matches
-    // nothing once the menu row is deleted, and a delete racing this one
-    // touches the very key this transaction writes, so the two cannot both
-    // commit. Without that, a dish landing just after `DELETE /menus/{id}`
-    // removed the row but before its cascade ran outlived its menu.
-    // Every other dish write bumps the same version key, so a lost round is
-    // ordinary here; it is re-sent rather than reported. Re-sending is sound
-    // even with the `CREATE` in the batch — the abort wrote nothing, the id
-    // is a ULID freshly generated above and never seen by a rival, and
-    // `menu_dish` carries no UNIQUE index — so the retry cannot answer
-    // "already exists" (see [`transaction_with_retry`]).
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
-                 ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
-             CREATE $id CONTENT $dish;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("menu".into(), menu.record().into_value()),
-            ("id".into(), dish.id.record().into_value()),
-            ("dish".into(), dish.into_value()),
-        ],
-        &["no_menu"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_menu"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, the LET and the IF: the CREATE is slot 3.
-    result
-        .take::<Vec<MenuDish>>(3)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to add the dish".into()))
+    let menu_key = menu.key().to_string();
+    let id = MenuDishId::generate();
+    let created_at = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        // The lock first: every later statement in this transaction then
+        // sees the committed state of whoever queued ahead of it.
+        let locked = sqlx::query!(
+            "SELECT 1 AS locked FROM menu WHERE id = $1 FOR NO KEY UPDATE",
+            menu_key,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked.is_none() {
+            return Err(AppError::NotFound);
+        }
+        sqlx::query!(
+            "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1",
+            menu_key,
+        )
+        .execute(&mut *tx)
+        .await?;
+        let placed = sqlx::query_as!(
+            MenuDish,
+            "INSERT INTO menu_dish (id, menu, name, description, price_minor, tags, created_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7
+             WHERE (SELECT count(*) FROM menu_dish WHERE menu = $2) < $8
+             RETURNING id, menu, name, description, price_minor, tags, created_at",
+            id,
+            menu_key,
+            name,
+            description,
+            price_minor,
+            tags,
+            created_at,
+            cap,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        match placed {
+            Some(dish) => Ok(dish),
+            // The menu exists (locked above), so an empty result is the cap.
+            None => Err(AppError::Conflict(
+                "the menu already carries the maximum number of dishes",
+            )),
+        }
+    })
+    .await
 }
 
 pub async fn read(db: &Database, id: &MenuDishId) -> Result<Option<MenuDish>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        MenuDish,
+        "SELECT id, menu, name, description, price_minor, tags, created_at
+         FROM menu_dish WHERE id = $1",
+        id.key(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Every dish on one menu, in the order they were added.
@@ -98,31 +101,28 @@ pub async fn list_for_menus(db: &Database, menus: &[MenuId]) -> Result<Vec<MenuD
     if menus.is_empty() {
         return Ok(Vec::new());
     }
-    let mut result = db
-        .query("SELECT * FROM menu_dish WHERE menu IN $menus ORDER BY id ASC")
-        .bind((
-            "menus",
-            menus.iter().map(MenuId::record).collect::<Vec<_>>(),
-        ))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<MenuDish>>(0)?)
-}
-
-/// How many dishes the menu already carries — the `MAX_DISHES_PER_MENU` gate.
-pub async fn count_for_menu(db: &Database, menu: &MenuId) -> Result<usize, AppError> {
-    Ok(list_for_menu(db, menu).await?.len())
+    let keys: Vec<String> = menus.iter().map(|m| m.key().to_string()).collect();
+    let rows = sqlx::query_as!(
+        MenuDish,
+        "SELECT id, menu, name, description, price_minor, tags, created_at
+         FROM menu_dish WHERE menu = ANY($1) ORDER BY id ASC",
+        keys,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// Write only the fields the PATCH carried. `description` is nullable, so
 /// it takes the three-way shape: absent = keep, `Some(None)` = clear.
+/// Each field is spelled with a "was it on the request?" flag and its
+/// nullable value, so an omitted field is never written and a concurrent
+/// PATCH of another one is not reverted.
 ///
-/// The `SET` is built here rather than by
-/// [`FieldUpdate`](crate::db::field_update::FieldUpdate) because the
-/// revision bump lands on *another* row and has to share this write's
-/// transaction; the field-by-field scoping — an omitted field is never
-/// written, so a concurrent PATCH of another one is not reverted — is the
-/// same rule, spelled out.
+/// The revision bump lands in the same transaction — "every dish write
+/// bumps" is the rule a caller can rely on without knowing which fields
+/// were on the wire. A PATCH that carried nothing still bumps and reads
+/// the row back.
 pub async fn update(
     db: &Database,
     dish: MenuDish,
@@ -131,45 +131,68 @@ pub async fn update(
     price_minor: Option<DishPrice>,
     tags: Option<DishTags>,
 ) -> Result<MenuDish, AppError> {
-    let mut sets: Vec<&str> = Vec::new();
-    let mut bindings: Vec<(String, Value)> = vec![("id".into(), dish.id.record().into_value())];
-    let mut set = |field: &'static str, value: Option<Value>| {
-        if let Some(value) = value {
-            sets.push(field);
-            bindings.push((field.into(), value));
-        }
-    };
-    set("name", name.map(SurrealValue::into_value));
-    set("description", description.map(SurrealValue::into_value));
-    set("price_minor", price_minor.map(SurrealValue::into_value));
-    set("tags", tags.map(SurrealValue::into_value));
-    // A PATCH that carried nothing writes nothing and reads the row back,
-    // exactly as `FieldUpdate` answers one — but it still moves the
-    // revision, because "every dish write bumps" is the rule a caller can
-    // rely on without knowing which fields were on the wire.
-    let statement = if sets.is_empty() {
-        "SELECT * FROM $id".to_string()
-    } else {
-        format!(
-            "UPDATE $id SET {} RETURN AFTER",
-            sets.iter()
-                .map(|field| format!("{field} = ${field}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+    let dish_key = dish.id.key();
+    let menu_key = dish.menu.key().to_string();
+    tx_with_retry(db, false, async |tx| {
+        let bumped = sqlx::query!(
+            "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1
+             RETURNING 1 AS bumped",
+            menu_key,
         )
-    };
-    bump_menu_and_write(&dish.menu, &statement, bindings, db)
-        .await?
-        .ok_or(AppError::NotFound)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if bumped.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let row = sqlx::query_as!(
+            MenuDish,
+            "UPDATE menu_dish SET
+                 name = COALESCE($2, name),
+                 description = CASE WHEN $3 THEN $4 ELSE description END,
+                 price_minor = COALESCE($5, price_minor),
+                 tags = COALESCE($6, tags)
+             WHERE id = $1
+             RETURNING id, menu, name, description, price_minor, tags, created_at",
+            dish_key,
+            name.map(|n| n.as_str().to_string()),
+            description.is_some(),
+            description
+                .clone()
+                .flatten()
+                .map(|d| d.as_str().to_string()),
+            price_minor.map(DishPrice::as_minor),
+            tags.map(|t| t.as_slice().to_vec()),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn delete(db: &Database, dish: MenuDish) -> Result<MenuDish, AppError> {
-    bump_menu_and_write(
-        &dish.menu,
-        "DELETE $id RETURN BEFORE",
-        vec![("id".into(), dish.id.record().into_value())],
-        db,
-    )
-    .await?
-    .ok_or(AppError::NotFound)
+    let dish_key = dish.id.key();
+    let menu_key = dish.menu.key().to_string();
+    tx_with_retry(db, false, async |tx| {
+        let bumped = sqlx::query!(
+            "UPDATE menu SET version = COALESCE(version, 0) + 1 WHERE id = $1
+             RETURNING 1 AS bumped",
+            menu_key,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if bumped.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let row = sqlx::query_as!(
+            MenuDish,
+            "DELETE FROM menu_dish WHERE id = $1
+             RETURNING id, menu, name, description, price_minor, tags, created_at",
+            dish_key,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.ok_or(AppError::NotFound)
+    })
+    .await
 }

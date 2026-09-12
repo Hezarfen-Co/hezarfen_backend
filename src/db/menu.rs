@@ -1,100 +1,33 @@
 //! The `menu` table: publishing (the slot reference claimed inside the
 //! write's own transaction), row reads and listings, the compare-and-set
-//! every cap PATCH writes through, the cascading delete, and
-//! [`bump_menu_and_write`] — the shared "write the menu row too" shape every
-//! child write (a dish, an attendance mark) uses so nothing can outlive its
-//! menu. The kitchen workflows — the dish cap under
-//! [`MENU_LOCK`](crate::service::menu::MENU_LOCK) — live in
+//! every cap PATCH writes through, and the cascading delete. The kitchen
+//! workflows — the guarded dish-cap insert — live in
 //! [`crate::service::menu`].
 
-use surrealdb::types::{SurrealValue, Value};
-
-use crate::constant::{
-    MEAL_ATTENDANCE_TABLE, MENU_DISH_TABLE, MENU_SEAT_COUNT_FIELD, MENU_VERSION_FIELD,
-    REF_COUNT_FIELD,
-};
-use crate::database::{Database, transaction_with_retry, write_with_retry};
-use crate::db::cap;
-use crate::db::page::PagedList;
+use crate::database::{Database, tx_with_retry, unique_violation};
+use crate::db::page::{PagedList, Param};
 use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot, slot_ref};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Move the menu's revision **and** run `statement` — a write to something
-/// hanging off a menu — in one transaction, handing back the row it returned.
-///
-/// What a seat on that menu costs, or who is recorded against it, is about to
-/// change, so any booking that priced itself against the old revision has to
-/// re-read. The bump cannot be a query of its own: in the gap the menu row
-/// carries the *new* revision with the *old* price, and a booking reading there
-/// passes the very CAS that exists to refuse it — a seat billed a price the
-/// menu had already left, or admitted past a capacity that had already shrunk.
-///
-/// The bump is also what makes the menu's **existence** part of the write
-/// ([`crate::db::menu_dish::create`] leans on
-/// the same thing): the `UPDATE` matches nothing once the menu row is deleted,
-/// and a delete racing this one touches the very key this transaction writes,
-/// so the two cannot both commit. Reading the menu instead — even as the write
-/// statement's own target — does not survive that race: the read sees a row the
-/// delete has not committed yet, and [`delete`]'s sweep ran on a snapshot
-/// predating this insert, so both commit and the child outlives its menu
-/// (measured 378 of 3600 raced rounds before this shape was shared).
-///
-/// Deliberately on every such write, not only the ones that move
-/// `price_minor`: a re-tagged dish is cheap to re-read, and a rule that applies
-/// to every write cannot be forgotten by the next one added.
-///
-/// Admissible for [`transaction_with_retry`] as long as `statement` is: an
-/// `UPDATE`, a `DELETE`, a `SELECT`, an `IF`/`THROW` or a `RETURN` can never
-/// answer "already exists", and neither can an `UPSERT` whose id is bijective
-/// with every unique tuple its table indexes — a lost round wrote nothing, so
-/// re-sending it is the recovery.
-pub(crate) async fn bump_menu_and_write<T: SurrealValue>(
-    menu: &MenuId,
-    statement: &str,
-    mut bindings: Vec<(String, Value)>,
-    db: &Database,
-) -> Result<Option<T>, AppError> {
-    bindings.push(("menu".into(), menu.record().into_value()));
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
-                 ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
-             LET $row = ({statement});
-             RETURN $row;
-             COMMIT TRANSACTION;"
-        ),
-        &bindings,
-        &["no_menu"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_menu"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, the LET, the IF and the second LET: the RETURN is 4.
-    Ok(result.take::<Vec<T>>(4)?.into_iter().next())
-}
-
 /// Publish a menu. Refused (409) when the day+slot already carries one.
 ///
-/// The day and slot *are* the record id ([`MenuId::for_slot`]), so the
-/// refusal is decided by the store rather than by a check a concurrent
-/// publish can outrun: two publishes of the same meal write one id, and the loser's
-/// "already exists" becomes the same 409. The pre-check stays for the
-/// ordinary case — and for menus published before ids were derived, whose
-/// ULID key no new publish can collide with.
+/// The day and slot *are* the row's primary key ([`MenuId::for_slot`]), so
+/// the refusal is decided by the store rather than by a check a concurrent
+/// publish can outrun: two publishes of the same meal write one row, and
+/// the loser's unique violation on `menu_pkey` becomes the same 409. The
+/// in-transaction pre-check stays for the ordinary case.
+///
+/// The menu takes a reference on its slot, which is what stops the slot
+/// being dropped from the settings while this menu (whose slot is only
+/// snapshotted text) still points at it. Claimed *inside* the write's own
+/// transaction, with the duplicate gate ahead of the retired check so
+/// "you already published this" still outranks "the slot is retired" (the
+/// [`crate::db::cap`] reference-claim recipe): the counted row and the
+/// count commit together or not at all, so no crash window is small enough
+/// to leave a slot counted by a menu that does not exist — a slot nobody
+/// could ever retire.
 pub async fn create(
     db: &Database,
     date: MenuDate,
@@ -102,39 +35,80 @@ pub async fn create(
     capacity: Option<i64>,
     created_by: &UserId,
 ) -> Result<Menu, AppError> {
-    let taken = AppError::Conflict("a menu is already published for that date and slot");
-    if find(db, &date, &slot).await?.is_some() {
-        return Err(taken);
-    }
-    // The menu takes a reference on its slot, which is what stops the slot
-    // being dropped from the settings while this menu (whose slot is only
-    // snapshotted text) still points at it. Claimed *inside* the write's own
-    // transaction: a claim of its own could land and the row then fail to,
-    // leaving the slot counted by a menu that does not exist — a slot
-    // nobody can ever retire, and no crash window is small enough for that.
+    let id_key = MenuId::for_slot(&date, &slot).key().to_string();
     let counter = slot_ref(slot.as_str());
-    let menu = Menu {
-        id: MenuId::for_slot(&date, &slot),
-        date,
-        slot,
-        capacity,
-        version: Some(0),
-        created_by: created_by.clone(),
-        created_at: Timestamp::now(),
-    };
-    let id = menu.id.record();
-    match cap::claim_ref_and_create(&counter, 1, &id, &menu, db).await? {
-        cap::ClaimedRef::Made(created) => Ok(created),
-        cap::ClaimedRef::Duplicate => Err(taken),
-        cap::ClaimedRef::Retired => Err(AppError::ConflictOwned(format!(
-            "the '{}' meal slot has been removed from the school's settings",
-            menu.slot.as_str()
-        ))),
-    }
+    let date_s = date.as_str().to_string();
+    let slot_s = slot.as_str().to_string();
+    let created_by = *created_by;
+    let created_at = Timestamp::now();
+    tx_with_retry(db, false, async |tx| {
+        // Duplicate gate ahead of the retired check: "already published"
+        // outranks "slot retired", on the very path a rival publish races.
+        let exists = sqlx::query!("SELECT 1 AS taken FROM menu WHERE id = $1", id_key,)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_some() {
+            return Err(AppError::Conflict(
+                "a menu is already published for that date and slot",
+            ));
+        }
+        let inserted = match sqlx::query_as!(
+            Menu,
+            "WITH ref AS (
+                 INSERT INTO slot_ref (name, count) VALUES ($2, 1)
+                 ON CONFLICT (name) DO UPDATE SET count = slot_ref.count + 1
+                 WHERE slot_ref.retired = false
+                 RETURNING 1 AS ref
+             )
+             INSERT INTO menu (id, date, slot, capacity, version, created_by, created_at)
+             SELECT $1, $3, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM ref)
+             RETURNING id, date, slot, capacity, version, created_by, created_at",
+            id_key,
+            counter,
+            date_s,
+            slot_s,
+            capacity,
+            Some(0i64),
+            created_by,
+            created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(err) => {
+                // A rival published the same meal after the pre-check: its
+                // row owns the key, and its publish is the answer.
+                if unique_violation(&err) == Some("menu_pkey") {
+                    return Err(AppError::Conflict(
+                        "a menu is already published for that date and slot",
+                    ));
+                }
+                return Err(err.into());
+            }
+        };
+        match inserted {
+            Some(menu) => Ok(menu),
+            // The slot's ref row is retired — nothing was written.
+            None => Err(AppError::ConflictOwned(format!(
+                "the '{}' meal slot has been removed from the school's settings",
+                slot_s,
+            ))),
+        }
+    })
+    .await
 }
 
 pub async fn read(db: &Database, id: &MenuId) -> Result<Option<Menu>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        Menu,
+        "SELECT id, date, slot, capacity, version, created_by, created_at
+         FROM menu WHERE id = $1",
+        id.key(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// The menu for one day and slot, if any — the uniqueness check.
@@ -143,18 +117,21 @@ pub async fn find(
     date: &MenuDate,
     slot: &MenuSlot,
 ) -> Result<Option<Menu>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM menu WHERE date = $date AND slot = $slot LIMIT 1")
-        .bind(("date", date.as_str().to_string()))
-        .bind(("slot", slot.as_str().to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Menu>>(0)?.into_iter().next())
+    let row = sqlx::query_as!(
+        Menu,
+        "SELECT id, date, slot, capacity, version, created_by, created_at
+         FROM menu WHERE date = $1 AND slot = $2 LIMIT 1",
+        date.as_str(),
+        slot.as_str(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Menus, newest day first. `from`/`to` are inclusive `YYYY-MM-DD` bounds;
-/// either may be omitted. The comparison is lexical, which is chronological
-/// for this format.
+/// either may be omitted (`NULL` bound). The comparison is lexical, which
+/// is chronological for this format.
 pub async fn list(
     db: &Database,
     from: Option<&MenuDate>,
@@ -163,25 +140,26 @@ pub async fn list(
     offset: i64,
 ) -> Result<(Vec<Menu>, i64), AppError> {
     PagedList::new(
-        "menu WHERE ($from = NONE OR date >= $from) AND ($to = NONE OR date <= $to)",
+        "menu WHERE ($1::text IS NULL OR date >= $1::text) \
+         AND ($2::text IS NULL OR date <= $2::text)",
         "ORDER BY date DESC, slot ASC, id DESC",
     )
-    .bind("from", from.map(|date| date.as_str().to_string()))
-    .bind("to", to.map(|date| date.as_str().to_string()))
+    .bind(Param::OptText(from.map(|date| date.as_str().to_string())))
+    .bind(Param::OptText(to.map(|date| date.as_str().to_string())))
     .run(limit, offset, db)
     .await
 }
 
-/// Only `capacity` is writable: `date` and `slot` are `READONLY` columns,
+/// Only `capacity` is writable: `date` and `slot` are fixed at publish,
 /// because moving a published menu to another day is a different menu.
 /// `None` keeps the stored cap, `Some(None)` clears it back to uncapped.
 ///
 /// The revision moves **in the same statement** as the cap, indivisibly: a
-/// booking claims its seat against the revision
-/// it read the cap at, so a shrink that bumped in a query of its own left a
-/// window where the row carried the *new* revision and the *old* cap — and
-/// a booking arriving there passes a CAS meant to refuse it, over-admitting
-/// by exactly the seats in flight.
+/// booking claims its seat against the revision it read the cap at, so a
+/// shrink that bumped in a query of its own left a window where the row
+/// carried the *new* revision and the *old* cap — and a booking arriving
+/// there passes a CAS meant to refuse it, over-admitting by exactly the
+/// seats in flight.
 pub async fn update(
     db: &Database,
     menu: Menu,
@@ -192,99 +170,89 @@ pub async fn update(
         // booking's price or cap has moved, so none owes a re-read.
         return read(db, &menu.id).await?.ok_or(AppError::NotFound);
     };
-    let sql = format!(
-        "UPDATE $id SET capacity = $capacity, \
-         {MENU_VERSION_FIELD} = ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN AFTER"
-    );
-    // One counter write in flight at a time, like every other one.
-    let _guard = cap::counter_lock().await;
-    write_with_retry::<Menu>(
-        db,
-        &sql,
-        &[
-            ("id".into(), menu.id.record().into_value()),
-            ("capacity".into(), capacity.into_value()),
-        ],
+    let row = sqlx::query_as!(
+        Menu,
+        "UPDATE menu SET capacity = $2, version = COALESCE(version, 0) + 1
+         WHERE id = $1
+         RETURNING id, date, slot, capacity, version, created_by, created_at",
+        menu.id.key(),
+        capacity,
     )
-    .await?
-    .into_iter()
-    .next()
-    .ok_or(AppError::NotFound)
+    .fetch_optional(db)
+    .await?;
+    row.ok_or(AppError::NotFound)
 }
 
-/// Delete the menu and the dishes on it — a dish has no meaning without
-/// its menu, and the `menu` link is `READONLY`, so it cannot be re-homed.
+/// Delete the menu and the dishes and marks on it — a dish or a mark has
+/// no meaning without its menu, and the menu key cannot be re-homed.
 ///
 /// Refused (409) while a seat is still held, and the *row itself* decides
 /// that: the delete carries the seat counter in its `WHERE`, so a booking
-/// landing at that instant either takes its seat before
-/// the delete (which then finds a non-zero counter and refuses) or after it
-/// (and finds no menu). A read-then-delete pair had a window where both
-/// happened — a paid seat on a menu that no longer exists.
+/// landing at that instant either takes its seat before the delete (which
+/// then finds a non-zero counter and refuses) or after it (and finds no
+/// menu). A read-then-delete pair had a window where both happened — a
+/// paid seat on a menu that no longer exists.
 ///
 /// The slot gets its reference back in that same transaction — a slot no
-/// menu is published for any more may leave the settings again, and the
-/// `FOR` runs only over a row the guard actually took. Released afterwards
-/// in a query of its own, a crash between the two left the slot counted by
-/// a menu that no longer exists: a slot nobody can retire.
+/// menu is published for any more may leave the settings again. Released
+/// afterwards in a statement of its own, a crash between the two left the
+/// slot counted by a menu that no longer exists: a slot nobody can retire.
 ///
-/// The marks go in that same `FOR`, for a sharper reason than tidiness:
+/// The marks go in that same sweep, for a sharper reason than tidiness:
 /// [`MenuId::for_slot`] is deterministic, so republishing the same day and
-/// slot mints the *same* record id. A mark left behind would come back as a
+/// slot mints the *same* row key. A mark left behind would come back as a
 /// mark on the new menu — the kitchen reading "served" for a student who
 /// never came — and until then the student's own report cites a menu that
 /// is gone. Attendance carries no money and no counter, so it is safe to
-/// drop; cancelled *bookings* deliberately stay, because their `attempt`
-/// counter is what keeps the ledger's `(booking, attempt)` keys unique. Cut
+/// drop; cancelled *bookings* deliberately stay (no foreign key ties them
+/// to the menu), because their `attempt` counter is what keeps the
+/// ledger's `(booking, attempt)` keys unique across the republish. Cut
 /// those and a re-book on a republished menu would reuse a charge id the
 /// ledger already holds, and the append (idempotent by design) would bill
 /// the seat nothing.
 ///
-/// The dishes ride in that `FOR` too, and for the same reason as the marks:
-/// run after the transaction committed, a crash between the two orphaned
-/// them on a record id republishing the day and slot mints again — a new
-/// menu serving (and pricing) the old one's food.
+/// The dishes ride in the same sweep: run after the commit, a crash
+/// between the two would orphan them on the row key a republish mints
+/// again — a new menu serving (and pricing) the old one's food.
 pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $gone = (DELETE $id WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
-         FOR $row IN ($gone ?? []) {{
-             UPSERT $counter SET {REF_COUNT_FIELD} = \
-                 math::max([({REF_COUNT_FIELD} ?? 0) - 1, 0]);
-             DELETE {MEAL_ATTENDANCE_TABLE} WHERE menu = $id;
-             DELETE {MENU_DISH_TABLE} WHERE menu = $id;
-         }};
-         RETURN $gone;
-         COMMIT TRANSACTION;"
-    );
-    // `slot` is a `READONLY` column, so this counter is the one the deleted
-    // row carries. Nothing here can answer "already exists" — the `UPSERT`
-    // is keyed by a slot name on a table with no `UNIQUE` index, so it
-    // resolves onto the row it names ([`transaction_with_retry`]).
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[
-            ("id".into(), menu.id.record().into_value()),
-            ("counter".into(), slot_ref(menu.slot.as_str()).into_value()),
-        ],
-        &[],
-    )
+    let key = menu.id.key().to_string();
+    let counter = slot_ref(menu.slot.as_str());
+    let deleted = tx_with_retry(db, true, async |tx| {
+        let deleted = sqlx::query_as!(
+            Menu,
+            "DELETE FROM menu WHERE id = $1 AND seats_booked = 0
+             RETURNING id, date, slot, capacity, version, created_by, created_at",
+            key,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = deleted else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            "UPDATE slot_ref SET count = GREATEST(count - 1, 0) WHERE name = $1",
+            counter,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!("DELETE FROM meal_attendance WHERE menu = $1", key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM menu_dish WHERE menu = $1", key)
+            .execute(&mut *tx)
+            .await?;
+        Ok(Some(row))
+    })
     .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // BEGIN, the LET and the FOR take a slot each.
-    let Some(deleted) = result.take::<Vec<Menu>>(3)?.into_iter().next() else {
+    match deleted {
+        Some(menu) => Ok(menu),
         // Nothing back: either seats are held, or the menu is already gone.
-        return Err(match read(db, &menu.id).await? {
-            Some(_) => AppError::Conflict("the menu still has live bookings"),
-            None => AppError::NotFound,
-        });
-    };
-    Ok(deleted)
+        None => match read(db, &menu.id).await? {
+            Some(_) => Err(AppError::Conflict("the menu still has live bookings")),
+            None => Err(AppError::NotFound),
+        },
+    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
