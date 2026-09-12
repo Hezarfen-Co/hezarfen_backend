@@ -4,15 +4,12 @@
 //! itself lives in [`crate::db::class_pump`]; the table reads in
 //! [`crate::db::class_member`].
 
-use surrealdb::types::SurrealValue;
-
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::db::class_member;
 use crate::db::class_pump::{self, Axis};
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::class_member::{ClassMember, ClassMemberId};
-use crate::domain::timestamp::Timestamp;
+use crate::domain::class_member::ClassMember;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -29,26 +26,10 @@ pub async fn add(
     user: &UserId,
     added_by: &UserId,
 ) -> Result<ClassMember, AppError> {
-    let member = ClassMember {
-        id: ClassMemberId::composite(class, user),
-        class: class.clone(),
-        user: user.clone(),
-        added_by: added_by.clone(),
-        added_at: Some(Timestamp::now()),
-    };
-    let landed = class_pump::attach(
-        db,
-        class,
-        Axis::Member,
-        (&member.id.record(), &member),
-        user.record(),
-        added_by.record(),
-        None,
-    )
-    .await?;
     // Read off the refusal, never respelled here: this route and a
     // blueprint pump answer one vocabulary. `Made` is the only `None`, and
     // it takes the `Ok` arm below.
+    let landed = class_pump::add_member(db, class, user, added_by).await?;
     let code = landed.refusal_code(&Axis::Member).unwrap_or_default();
     match landed {
         class_pump::Attached::Made(saved) => Ok(saved),
@@ -103,18 +84,9 @@ pub async fn add(
 /// re-derive from a boolean.
 ///
 /// An enrollment another attached class still claims is re-tagged to that
-/// class instead of deleted (see [`crate::db::class_pump::detach`]).
+/// class instead of deleted (see [`class_pump::remove_member`]).
 pub async fn remove(db: &Database, class: &ClassGroupId, user: &UserId) -> Result<(), AppError> {
-    let gone = class_pump::detach(
-        db,
-        "$link",
-        Axis::Member,
-        &[(
-            "link".into(),
-            ClassMemberId::composite(class, user).record().into_value(),
-        )],
-    )
-    .await?;
+    let gone = class_pump::remove_member(db, class, user).await?;
     (gone > 0).then_some(()).ok_or(AppError::NotFound)
 }
 

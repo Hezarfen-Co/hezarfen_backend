@@ -1,17 +1,16 @@
-//! The `class_course` table: the course-axis attach transaction and the
+//! The `class_course` table: the course-axis attach entry point and the
 //! attachment listing. The refusals-to-errors policy and the detach that turns
 //! a zero-row sweep into a 404 live in [`crate::service::class_course`]; the
 //! transaction itself is the pump's, [`crate::db::class_pump`].
 
 use crate::constant::CLASS_COURSE_TABLE;
 use crate::database::Database;
-use crate::db::class_pump::{Attached, Axis};
+use crate::db::class_pump::Attached;
 use crate::db::page::PagedList;
 use crate::domain::class_blueprint::ClassBlueprintId;
-use crate::domain::class_course::{ClassCourse, ClassCourseId};
+use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
-use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -37,30 +36,13 @@ pub(crate) async fn attach_sourced(
     attached_by: &UserId,
     source: Option<&ClassBlueprintId>,
 ) -> Result<Attached<ClassCourse>, AppError> {
-    let link = ClassCourse {
-        id: ClassCourseId::composite(class, course),
-        class: class.clone(),
-        course: course.clone(),
-        attached_by: attached_by.clone(),
-        source: source.cloned(),
-        attached_at: Some(Timestamp::now()),
-    };
-    crate::db::class_pump::attach(
-        db,
-        class,
-        Axis::Course,
-        (&link.id.record(), &link),
-        course.record(),
-        attached_by.record(),
-        source.map(ClassBlueprintId::record),
-    )
-    .await
+    crate::db::class_pump::attach_course(db, class, course, attached_by, source).await
 }
 
 /// The courses a class is attached to, newest first — by when they were
-/// attached, not by the course's own id, which is what the composite record
-/// id sorts on. A row older than the column carries no stamp at all, and
-/// NONE sorts last under DESC — the honest place for a row of unknown age.
+/// attached. The composite primary key is the tiebreaker (class, then course:
+/// the two halves of the id this order used to sort), which makes the order
+/// total.
 pub async fn list_for_class(
     db: &Database,
     class: &ClassGroupId,
@@ -68,10 +50,10 @@ pub async fn list_for_class(
     offset: i64,
 ) -> Result<(Vec<ClassCourse>, i64), AppError> {
     PagedList::new(
-        format!("{CLASS_COURSE_TABLE} WHERE class = $class"),
-        "ORDER BY attached_at DESC, id DESC",
+        format!("{CLASS_COURSE_TABLE} WHERE class = $1"),
+        "ORDER BY attached_at DESC, class DESC, course DESC",
     )
-    .bind("class", class.record())
+    .bind(class.uuid())
     .run(limit, offset, db)
     .await
 }
