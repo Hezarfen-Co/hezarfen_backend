@@ -70,6 +70,8 @@ pub(crate) enum Param {
     /// A TEXT-array predicate value (`col = ANY($n)`): the closed role set a
     /// visibility filter allows, the tag list a search narrows to.
     Texts(Vec<String>),
+    /// BOOLEAN filter (e.g. folder read/unread).
+    Bool(bool),
 }
 
 impl Param {
@@ -84,6 +86,7 @@ impl Param {
             Param::OptText(value) => args.add(value),
             Param::OptI64(value) => args.add(value),
             Param::Texts(value) => args.add(value),
+            Param::Bool(value) => args.add(value),
         };
     }
 }
