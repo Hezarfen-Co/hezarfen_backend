@@ -1,8 +1,8 @@
 use sqlx::types::Json;
+use uuid::Uuid;
 
 use crate::constant::{
-    MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN,
-    MIN_QUESTION_CHOICES,
+    MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN, MIN_QUESTION_CHOICES,
 };
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
@@ -420,9 +420,7 @@ mod tests {
     /// same-tick burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {
-        let ids: Vec<String> = (0..500)
-            .map(|_| ExamQuestionId::generate().key())
-            .collect();
+        let ids: Vec<String> = (0..500).map(|_| ExamQuestionId::generate().key()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);

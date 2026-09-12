@@ -11,6 +11,7 @@ use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::ExamQuestionId;
+use crate::domain::note_file::FileContentType;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -43,10 +44,7 @@ pub async fn upsert(
     db: &Database,
     image: AnswerImage,
 ) -> Result<(AnswerImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| {
-        upsert_in(conn, image).await
-    })
-    .await
+    tx_with_retry(db, false, async |conn| upsert_in(conn, image).await).await
 }
 
 /// The locked exam-row probe plus the upsert, on one connection.

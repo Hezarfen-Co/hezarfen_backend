@@ -5,8 +5,8 @@
 use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
-    Exam, ExamAttemptLimit, ExamDescription, ExamId, ExamKind, ExamSchedule, ExamTitle,
-    redraft_error,
+    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
+    ExamSchedule, ExamTitle, redraft_error,
 };
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

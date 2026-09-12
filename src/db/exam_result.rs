@@ -325,7 +325,10 @@ pub async fn remove(
         )
         .execute(&mut *conn)
         .await?;
-        let high = gone.iter().filter(|row| row.mark.as_i64() >= HIGH_MARK_MIN).count() as i64;
+        let high = gone
+            .iter()
+            .filter(|row| row.mark.as_i64() >= HIGH_MARK_MIN)
+            .count() as i64;
         if high > 0 {
             sqlx::query!(
                 r#"UPDATE app_user SET high_mark_total =
@@ -341,8 +344,9 @@ pub async fn remove(
         // sittings of the same pair.
         let mut per_grader: Vec<(UserId, i64)> = Vec::new();
         for row in &gone {
-            if let Some((_, n)) =
-                per_grader.iter_mut().find(|(grader, _)| grader == &row.graded_by)
+            if let Some((_, n)) = per_grader
+                .iter_mut()
+                .find(|(grader, _)| grader == &row.graded_by)
             {
                 *n += 1;
             } else {

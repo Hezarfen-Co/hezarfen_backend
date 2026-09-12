@@ -259,7 +259,7 @@ pub(crate) async fn reviewable_exam(
 /// ([`crate::service::exam_question::list_shared_with`]).
 ///
 /// The open sittings are read whole and judged here rather than filtered in
-/// SurrealQL, because "in progress" is [`ExamAttempt::status`]'s call off the
+/// SQL, because "in progress" is [`ExamAttempt::status`]'s call off the
 /// exam's *live* schedule and that rule lives in one place. One exam read per
 /// unsubmitted sitting — a student has at most a handful, and none of it scales
 /// with the page being read.

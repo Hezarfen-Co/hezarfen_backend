@@ -71,8 +71,8 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::service::exam_attempt::{
-    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student, finish,
-    read, save_answer_in, set_left, writable_attempt,
+    check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student, finish, read,
+    save_answer_in, set_left, writable_attempt,
 };
 use crate::state::AppState;
 use crate::tenant::Slug;
@@ -83,21 +83,16 @@ use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
 /// How this room names itself in the logs [`room::public_message`] writes.
 const ROOM: &str = "exam room";
 
-/// Serializes every presence transition with its matching `left_at` write:
-/// `enter` + clear at room start and `leave` + maybe-stamp at room teardown
-/// are each one critical section, so any join and any teardown run wholly
-/// before or wholly after each other. Teardown first: its stamp lands, then
-/// the join's clear overwrites it — the student is present and unmarked.
-/// Join first: the teardown's `leave` sees the joiner's socket still counted,
-/// so it never stamps. No ordering leaves a present student stamped as left —
-/// the reconnect-vs-teardown race that used to lock students out with
-/// `allow_rejoin` off (cleared at the door, stamped after, present forever
-/// refused). The count this pairs with lives in *this* process's memory
-/// ([`crate::state::ExamPresence`]), so process-wide is exactly the right
-/// scope: there is no room state anywhere else to serialize against.
-// corner-cut: global lock, per-attempt locks if room churn ever shows up in a
-// profile.
-static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Presence counting is in-process memory
+/// ([`crate::state::ExamPresence`], keyed per sitting), and the `left_at`
+/// writes are idempotent single statements against the sitting's own row:
+/// joining counts the socket and unconditionally clears the marker; the
+/// last socket out stamps it, but only while the row still reads
+/// not-stamped, not-submitted, and not-past-deadline — so concurrent
+/// last-outs are harmless (only the first finds `left_at IS NULL`) and a
+/// stamp can never erase a join's clear of a marker it did not make. The
+/// join's clear lands milliseconds after the door's read-only rejoin
+/// check, which no HTTP caller can observe.
 
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
@@ -130,11 +125,11 @@ enum ClientMessage {
 /// is read-only, and the room's whole purpose is writing).
 ///
 /// The rejoin gate here is a read-only fast-fail for a proper 409; the
-/// authoritative clear of `left_at` happens inside the room task, under
-/// [`PRESENCE_LOCK`], atomically with the presence count — milliseconds after
-/// this gate, which no HTTP caller can observe. Clearing it here instead
-/// (before the socket counts as present) is exactly the ordering that let a
-/// dying socket's teardown stamp a student who was already reconnecting.
+/// authoritative clear of `left_at` happens inside the room task, paired
+/// with the presence count — milliseconds after this gate, which no HTTP
+/// caller can observe. Clearing it here instead (before the socket counts
+/// as present) is exactly the ordering that let a dying socket's teardown
+/// stamp a student who was already reconnecting.
 pub async fn attempt_ws(
     State(st): State<AppState>,
     SchoolSlug(slug): SchoolSlug,
@@ -172,19 +167,16 @@ async fn room(
     // The exam, not the attempt: an attempt names one student, and telemetry
     // never names a person.
     let _connected = room::Connected::open(&st.metrics, "exam_room", slug.as_str(), exam_id.key());
-    // Join critical section: this socket counts as presence in the sitting's
-    // room until it closes, and joining clears the walk-out marker — one
-    // atomic step under PRESENCE_LOCK, so a dying socket's teardown either
-    // stamps before this (and the clear overwrites it) or sees this socket
-    // counted (and never stamps). The clear is unconditional: the door's
-    // snapshot may predate a stamp that raced the upgrade. Best-effort — a
-    // failed clear leaves the stamp for the next join or the teacher's door.
-    {
-        let _guard = PRESENCE_LOCK.lock().await;
-        st.exam_presence.enter(&slug, attempt_id.key());
-        if let Err(err) = set_left(&st.db, attempt, None).await {
-            tracing::warn!("exam room could not clear left_at on join: {err}");
-        }
+    // Join: this socket counts as presence in the sitting's room until it
+    // closes, and joining clears the walk-out marker — the clear is one
+    // unconditional statement against the sitting's row, so it always
+    // overwrites any stamp that landed before it. The door's snapshot may
+    // predate a stamp that raced the upgrade; clearing regardless is what
+    // keeps a reconnecting student unmarked. Best-effort — a failed clear
+    // leaves the stamp for the next join or the teacher's door.
+    st.exam_presence.enter(&slug, attempt_id.key());
+    if let Err(err) = set_left(&st.db, attempt, None).await {
+        tracing::warn!("exam room could not clear left_at on join: {err}");
     }
     let mut tick = tokio::time::interval(Duration::from_secs(EXAM_WS_TICK_SECS));
     loop {
@@ -211,49 +203,20 @@ async fn room(
         }
     }
     room::close(&mut socket).await;
-    // Leave critical section: only the last socket out means the student
-    // actually left the room, and the count-down and its stamp are one atomic
-    // step under PRESENCE_LOCK (a join racing this either lands wholly before
-    // — its socket keeps the count up, no stamp — or wholly after, clearing
-    // whatever this stamps). If this sitting is still running, stamp the
-    // walk-out — with `allow_rejoin` off this is what locks further
-    // answering. Terminal exits (finished or expired, and any sitting
-    // superseded by a retake is terminal) need no stamp. Best-effort: a
-    // failed stamp only means it goes unrecorded.
-    let _guard = PRESENCE_LOCK.lock().await;
+    // Leave: only the last socket out means the student actually left the
+    // room. The stamp is one conditional statement — it lands only while
+    // the row still reads unstamped, unsubmitted, and not past the exam's
+    // live deadline — so concurrent last-outs are harmless and a finished
+    // or expired sitting (and any sitting a retake superseded) is never
+    // stamped. With `allow_rejoin` off this is what locks further
+    // answering. Best-effort: a failed stamp only means it goes
+    // unrecorded.
     if st.exam_presence.leave(&slug, attempt_id.key()) {
-        stamp_left(&exam_id, &attempt_id, &st.db).await;
-    }
-}
-
-/// Stamp `left_at` on the room's own sitting if it is still in progress —
-/// re-reading both rows so a finish or expiry that raced the socket close
-/// wins. Targeting the sitting by id (never "the latest") means a retake
-/// started elsewhere can't be marked as left by an old room's teardown.
-async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database) {
-    let attempt = match crate::service::exam::read(db, exam_id).await {
-        Ok(Some(exam)) => match read(db, attempt_id).await {
-            Ok(Some(attempt))
-                if attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress =>
-            {
-                Some(attempt)
-            }
-            Ok(_) => None,
-            Err(err) => {
-                tracing::warn!("exam room could not read the attempt to stamp left_at: {err}");
-                None
-            }
-        },
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!("exam room could not read the exam to stamp left_at: {err}");
-            None
-        }
-    };
-    if let Some(attempt) = attempt
-        && let Err(err) = set_left(db, attempt, Some(Timestamp::now())).await
-    {
-        tracing::warn!("exam room could not stamp left_at: {err}");
+        crate::db::exam_attempt::stamp_left_if_running(&st.db, &attempt_id, Timestamp::now())
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!("exam room could not stamp left_at: {err}");
+            });
     }
 }
 
@@ -398,19 +361,18 @@ async fn handle_message(
             }
             // Re-read the exam so the save is judged against the *current*
             // schedule, exactly like the REST path it shares — but write into
-            // the room's own sitting, never whatever is latest. Reader lease
-            // of [`EXAM_LOCK`] from the gates through the upsert, exactly
-            // like `save_answer_checked` — and dropped before the socket
-            // sends, so a slow client never stalls a writer.
+            // the room's own sitting, never whatever is latest. No process
+            // lease is needed around the gates and the upsert: the save is
+            // one guarded statement keyed to the sitting's own seq, and a
+            // retake writes fresh rows at a higher seq, so nothing can wipe
+            // the sheet under this save.
             //
-            // corner-cut (accepted race, reviewed): the room's sitting was
-            // chosen at join, before any lease, so no lock scope can help — a
-            // save can land on it just after a retake made it terminal. It
-            // writes a history row for the old seq; the grade of record (latest
-            // seq) is untouched. The fix is a `current_seq` claim on every save
-            // — the hottest path here — so the cost beats the damage and it
-            // stays.
-            let guard = EXAM_LOCK.read().await;
+            // corner-cut (accepted race, reviewed, unchanged): the room's
+            // sitting was chosen at join, so a save can land on it just
+            // after a retake made it terminal. It writes a history row for
+            // the old seq; the grade of record (latest seq) is untouched.
+            // The fix is a `current_seq` claim on every save — the hottest
+            // path here — so the cost beats the damage and it stays.
             // Tracks how far the gates got: only once the sitting resolved can
             // a failure possibly be about this one question rather than about
             // the room. See [`error_frame_for`].
@@ -426,7 +388,6 @@ async fn handle_message(
                 Ok(None) => Err(AppError::NotFound),
                 Err(err) => Err(err),
             };
-            drop(guard);
             match saved {
                 Ok(answer) => {
                     let mut frame = json!({

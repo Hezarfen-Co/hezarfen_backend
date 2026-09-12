@@ -11,6 +11,7 @@ use crate::db::exam_attempt::freeze_gate;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestionId};
+use crate::domain::note_file::FileContentType;
 use crate::domain::question_image::QuestionImage;
 use crate::error::AppError;
 
@@ -30,10 +31,7 @@ pub async fn upsert(
     db: &Database,
     image: QuestionImage,
 ) -> Result<(QuestionImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| {
-        upsert_in(conn, image).await
-    })
-    .await
+    tx_with_retry(db, false, async |conn| upsert_in(conn, image).await).await
 }
 
 /// The gated read-and-replace, on one connection.

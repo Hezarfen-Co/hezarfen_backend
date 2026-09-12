@@ -6,7 +6,7 @@
 use sqlx::PgConnection;
 
 use crate::database::{Database, tx_with_retry, unique_violation};
-use crate::db::cap::{self, Claimed};
+use crate::db::cap::Claimed;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_attempt::{ExamAttempt, ExamAttemptId};
 use crate::domain::timestamp::Timestamp;

@@ -476,8 +476,8 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
-    // The workflow — the archived-term gate, the *writer* lease of
-    // [`EXAM_LOCK`] across the cascade, blob-key collection, the delete — is
+    // The workflow — the archived-term gate, the exam-row lock and the
+    // cascade with its in-transaction blob-key collection, the delete — is
     // [`crate::service::exam::delete`]'s. Blob unlinking stays here because
     // only the web layer knows `files_path`.
     let outcome = service::exam::delete(&st.db, &exam).await?;
@@ -532,9 +532,9 @@ async fn grade(
         ));
     }
     let target = UserId::from_key(&req.user_id);
-    // The workflow — the *reader* lease of [`EXAM_LOCK`] from the exam read
-    // through the result write (so a concurrent re-draft cannot slip a mark
-    // onto a hidden exam), the draft and kind pre-flights, the
+    // The workflow — the draft and kind pre-flights (the draft one re-made
+    // on the locked exam row inside the mark's own transaction, so a
+    // concurrent re-draft cannot slip a mark onto a hidden exam), the
     // grader/target walls, the sitting resolution, the mark's own
     // transaction, and the badge sync — is
     // [`crate::service::exam_result::grade`]'s.

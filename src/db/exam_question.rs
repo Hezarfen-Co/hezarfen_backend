@@ -209,10 +209,7 @@ pub async fn list_shared_with(
     )
     .fetch_all(db)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| row.id.key())
-        .collect())
+    Ok(rows.into_iter().map(|row| row.id.key()).collect())
 }
 
 /// Write the editable fields, refused outright once the exam has an

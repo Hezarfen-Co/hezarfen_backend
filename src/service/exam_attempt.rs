@@ -16,7 +16,6 @@
 /// those invariants is a guarded statement or a row lock on the exam row
 /// itself. The subject delete's conditional reference-counter statement
 /// ([`crate::db::subject::delete`]) needs no partner lock at all.
-
 use crate::database::Database;
 use crate::db::cap;
 use crate::domain::course::Course;

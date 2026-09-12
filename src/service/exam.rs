@@ -1,17 +1,14 @@
 //! Exam workflows: the PATCH re-derive — the merge (set / clear / keep per
 //! field) re-judged against a fresh read every retry round, and the
 //! mode-freeze, re-draft, and kind gates that guard it — and the delete that
-//! collects the image blob keys under the writer lease before the cascade.
-//! The queries live in [`crate::db::exam`]; the sitting workflows next door
-//! in [`crate::service::exam_attempt`], whose [`EXAM_LOCK`] every path here
-//! leases.
+//! collects the image blob keys inside the cascade's own transaction. The
+//! queries live in [`crate::db::exam`]; the sitting workflows next door in
+//! [`crate::service::exam_attempt`].
 
 use crate::constant::CAS_UPDATE_RETRIES;
 use crate::database::Database;
-use crate::db::answer_image;
 use crate::db::exam;
 use crate::db::exam_result;
-use crate::db::question_image;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
@@ -21,7 +18,6 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::service::course::require_open;
-use crate::service::exam_attempt::{EXAM_LOCK, any_for_exam, course_of};
 
 #[expect(
     clippy::too_many_arguments,
@@ -104,10 +100,11 @@ pub struct ExamPatch {
 /// and land the whole merge with the compare-and-set — retried while the row
 /// keeps moving under the snapshot.
 ///
-/// *Reader* lease of [`EXAM_LOCK`] for exactly one pairing: the mode gate
-/// below reads `exam_attempt`, and an attempt start takes the *writer*
-/// lease, so a first sitting still cannot land between that gate and the
-/// write, as it always did.
+/// The mode gate below reads `exam_attempt`, and the sitting create's
+/// transaction re-judges the sittable gates on the locked exam row
+/// ([`crate::db::exam_attempt::guard_start`]), so a first sitting still
+/// cannot land on an exam whose mode this PATCH is flipping — the store
+/// decides, not a process lock.
 ///
 /// It buys nothing against grading, which is a reader too: the re-draft gate
 /// is therefore enforced inside the update's own transaction
@@ -116,7 +113,6 @@ pub struct ExamPatch {
 /// Concurrent PATCHes of this exam no longer queue behind each other either:
 /// the lost update they used to cause is refused by the compare-and-set.
 pub async fn update(db: &Database, id: &ExamId, patch: &ExamPatch) -> Result<Exam, AppError> {
-    let _guard = EXAM_LOCK.read().await;
     let mut left = CAS_UPDATE_RETRIES;
     loop {
         let current = exam::read(db, id).await?.ok_or(AppError::NotFound)?;
@@ -172,9 +168,10 @@ pub async fn update(db: &Database, id: &ExamId, patch: &ExamPatch) -> Result<Exa
         // Switching sync <-> async <-> open (or back to unscheduled) would
         // silently rewrite the deadline rules under students who already sat
         // down; extending times, the attempt limit, and the rejoin door are the
-        // supported live adjustments instead. Gate read and write share the
-        // call-wide reader lease of [`EXAM_LOCK`], so a first attempt can't
-        // land in the gap and leave a sat exam's mode flipped under it.
+        // supported live adjustments instead. The sitting create's own
+        // transaction re-judges the mode gate on the locked row, so a first
+        // attempt can't land in the gap and leave a sat exam's mode flipped
+        // under it.
         let mode_changed =
             schedule.get_mode().map(ExamMode::as_str) != current.get_mode().map(ExamMode::as_str);
         if mode_changed && any_for_exam(db, current.get_id()).await? {
@@ -200,10 +197,13 @@ pub async fn update(db: &Database, id: &ExamId, patch: &ExamPatch) -> Result<Exa
         // already carries — the same silent re-weighting the settings' removal
         // guard refuses — and it would strand those marks' references on the
         // kind they were counted under, freeing the kind the exam now claims to
-        // be. Marks are counted on the exam row, and the save below *pins* that
-        // counter, so a grade landing between this read and the write refuses
-        // the save (the loop then re-reads and answers the 409 below).
-        if kind.as_str() != current.get_kind().as_str() && current.get_result_count() > 0 {
+        // be. Marks are counted on the exam row, and the save below pins
+        // that counter — reading it inside its own transaction — so a grade
+        // landing between this read and the write refuses the save (the
+        // loop then re-reads and answers the 409 below).
+        if kind.as_str() != current.get_kind().as_str()
+            && exam::result_count(db, current.get_id()).await? > 0
+        {
             return Err(AppError::Conflict(
                 "cannot change the kind of an exam that already has marks",
             ));
@@ -247,45 +247,27 @@ pub struct DeleteOutcome {
 /// Delete the exam: collect the question/answer image blob keys, then run the
 /// cascading delete.
 ///
-/// Writer lease of [`EXAM_LOCK`] across the whole cascade, blob names
-/// included — the lease `delete_homework` has always held, and its absence
-/// here is what made a sitting able to start inside this delete. Every other
-/// child of an exam now writes the exam row in its own transaction, so the
-/// store refuses the pair; an attempt cannot, because its claim lands on the
-/// *student's* row (`exam_sat_total`) and touches nothing this delete
-/// writes. `start_attempt` already takes the writer lease from its exam read
-/// through the insert, so this one lease is the whole ordering: a start
-/// either finishes before the sweep (which then takes its row) or reads no
-/// exam at all and is a 404. Left orphaned, that attempt kept a sitting on
-/// the student's lifetime counter and could mint a badge — awards are
-/// add-only and never revoked — for an exam that never existed.
+/// The store replaced the writer lease this delete used to hold across the
+/// whole cascade, blob names included: the delete's transaction takes the
+/// exam row `FOR UPDATE` first, and every child writer that matters locks
+/// the same row first (a sitting create's guard, the freeze gate, an answer
+/// save ahead of its upsert). So a start or a save either finishes before
+/// the sweep — which then takes its row too — or finds no exam and is a
+/// `404`. Left orphaned, an attempt kept a sitting on the student's
+/// lifetime counter and could mint a badge — awards are add-only and never
+/// revoked — for an exam that never existed.
 ///
-/// It spans the blob names too: they are collected *before* the rows go, so
-/// an image row written after that snapshot would strand its bytes on disk
-/// even though the row itself is now refused.
-///
-/// corner-cut: process-local, so it holds because the deployment runs one
-/// process by contract with stop-the-world deploys (two overlapping
-/// binaries would
-/// reopen it). Closing it in the store means the `cap` shape the counter
-/// work already sketched: `claim_and_create` gaining a second record to
-/// touch, so the attempt writes the exam key as every other child does.
+/// It spans the blob names too: they are collected *inside* the deleting
+/// transaction, under the lock, so an image row written after an
+/// out-of-transaction snapshot cannot strand its bytes on disk even though
+/// the row itself is now refused.
 pub async fn delete(db: &Database, target: &Exam) -> Result<DeleteOutcome, AppError> {
     require_open(db, &course_of(target, db).await?).await?;
-    let _guard = EXAM_LOCK.write().await;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
-    let images = question_image::list_for_exam(db, target.get_id()).await?;
-    let answer_images = answer_image::list_for_exam(db, target.get_id()).await?;
-    exam::delete(db, target.clone()).await?;
+    let deleted = exam::delete(db, target.clone()).await?;
     Ok(DeleteOutcome {
-        image_files: images
-            .iter()
-            .map(|image| image.get_file().to_string())
-            .collect(),
-        answer_image_files: answer_images
-            .iter()
-            .map(|image| image.get_file().to_string())
-            .collect(),
+        image_files: deleted.question_image_files,
+        answer_image_files: deleted.answer_image_files,
     })
 }
