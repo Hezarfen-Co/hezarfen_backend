@@ -13,6 +13,9 @@ COPY src ./src
 # so the build must never reach for a live database.
 ENV SQLX_OFFLINE=true
 COPY .sqlx ./.sqlx
+# The migrators read these at boot/mint (control set on the control pool,
+# school set for the template + every school database).
+COPY migrations ./migrations
 
 # Cache mounts keep the registry and incremental build artifacts between
 # builds. The binary must be copied out of /app/target inside the same RUN,
@@ -32,6 +35,7 @@ RUN apt-get update && \
     mkdir /data && chown hezarfen:hezarfen /data
 
 COPY --from=builder /usr/local/bin/hezarfen_backend /usr/local/bin/hezarfen_backend
+COPY --from=builder /app/migrations /app/migrations
 
 USER hezarfen
 

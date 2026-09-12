@@ -61,7 +61,7 @@ pub async fn list_for_event(db: &Database, event: &EventId) -> Result<Vec<Regist
 /// `registration_event_user`); `Full` — the event is at its capacity, was
 /// deleted, or the holder fell to `parent` (all one marker; the caller
 /// re-reads to pick the message).
-pub async fn claim_seat(
+pub(crate) async fn claim_seat(
     db: &Database,
     event: &EventId,
     user: &UserId,

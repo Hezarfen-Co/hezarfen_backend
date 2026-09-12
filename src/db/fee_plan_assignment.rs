@@ -41,7 +41,7 @@ pub async fn read(
 /// pair first; their row is the answer); zero rows → [`Claimed::Full`] (the
 /// counter is uncapped, so the only miss is a plan a concurrent delete
 /// already removed); one row → [`Claimed::Made`].
-pub async fn create(
+pub(crate) async fn create(
     db: &Database,
     plan: &FeePlanId,
     student: &UserId,

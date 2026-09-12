@@ -360,7 +360,7 @@ pub(crate) async fn create_in(
 /// [`create_in`]. Retried while Postgres answers "contended"; a duplicate
 /// or a missing student row is a verdict, not a conflict, and is never
 /// re-sent.
-pub async fn create(
+pub(crate) async fn create(
     db: &Database,
     attempt: &ExamAttempt,
     count_sitting: bool,

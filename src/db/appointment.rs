@@ -245,7 +245,7 @@ pub async fn list_for_slot(
 /// bump back with it. Zero rows means "full, or the slot was deleted since
 /// the caller read it": the marker is one, and the caller re-reads to pick
 /// the 404/409.
-pub async fn claim_slot_and_create(
+pub(crate) async fn claim_slot_and_create(
     db: &Database,
     appointment: Appointment,
 ) -> Result<Claimed<Appointment>, AppError> {

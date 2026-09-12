@@ -1,6 +1,6 @@
 # hezarfen_backend
 
-Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · SurrealDB 3 (server, WebSocket) · tokio.**
+Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · PostgreSQL (sqlx) · tokio.**
 
 Session-cookie auth with five hierarchical roles (`parent < student < teacher
 < manager < admin`). A **`parent`** observes and changes nothing: admins tie
@@ -201,24 +201,31 @@ represented. Those restrictions are published rather than left to be guessed:
 **`GET /limits`** (no auth) serves every fixed bound and closed value set the
 API enforces, read straight from the constants the newtypes use, so a frontend
 validates against the server's own rules instead of a hand-kept copy (see
-"Validation limits"). Those same types derive `surrealdb::types::SurrealValue`, so one
-typed value flows from HTTP request into the `SCHEMAFULL` database. Record ids
-are ULIDs (time-sortable).
+"Validation limits"). Persistence is PostgreSQL through sqlx: every statement
+is checked at compile time against the schema (see `## Run`), and a row is a
+plain typed struct in `src/db/`. Ids are UUIDv7s (time-sortable), served in
+the hyphenated wire form.
 
 ## Run
 
 ```sh
-surreal start --user root --pass root surrealkv:./data/hezarfen.db   # the DB server
-cp .env.example .env      # optional
+podman compose up -d postgres   # PostgreSQL 18 on 127.0.0.1:5432 (hezarfen/hezarfen)
+cp .env.example .env      # recommended: DATABASE_URL feeds the build too
 cargo run
 ```
 
-Boots on `http://127.0.0.1:8080`, talking to the SurrealDB server at
-`DB_URL` (default `ws://127.0.0.1:8000`, root credentials via
-`DB_USER`/`DB_PASS`) and storing uploaded note files in
-`./data/files/` (`FILES_PATH`, created at startup). Interactive API docs
-(Swagger UI) are served at `/swagger`, the raw OpenAPI spec at
-`/api-docs/openapi.json`.
+Boots on `http://127.0.0.1:8080`, talking to PostgreSQL at `DATABASE_URL`
+(default `postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control` —
+the control database) and storing uploaded note files in `./data/files/`
+(`FILES_PATH`, created at startup). `DATABASE_URL` is also read by sqlx's
+compile-time query macros, so `cargo check` prepares every query against a
+live database; `scripts/prepare_db.sh` refreshes the one union-schema
+prepare database those checks run against, and the committed `.sqlx` cache
+lets a build run with `SQLX_OFFLINE=true` and no database at all. On boot
+the sqlx migrator applies `migrations/control` to the control database and
+ensures the school template; each school database runs `migrations/school`
+the same way at mint. Interactive API docs (Swagger UI) are served at
+`/swagger`, the raw OpenAPI spec at `/api-docs/openapi.json`.
 
 ## Run in a container (podman)
 
@@ -229,11 +236,15 @@ podman compose down            # stop (data survives in the volume)
 ```
 
 The `Containerfile` is a two-stage build (Rust builder with cargo cache
-mounts, `debian:trixie-slim` runtime, non-root user). Two services: the
-`surrealdb` server (official image, surrealkv storage) and the backend, which
-waits for the server's healthcheck and connects over `ws://surrealdb:8000`.
-Each has its own named volume — `surreal-data` holds the database,
-`hezarfen-data` the uploaded note files (`/data/files`). `HOST` is forced to `0.0.0.0` inside the
+mounts, `debian:trixie-slim` runtime, non-root user, `SQLX_OFFLINE=true`
+so the build never touches a database — the macros read the committed
+`.sqlx` cache). Two primary services: `postgres` (the official
+`postgres:18-alpine` image, `max_connections=500` so the test suite's
+parallel control+school pools fit) and the backend, which waits for the
+database's healthcheck and connects over `DATABASE_URL`
+(`postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control`). Each has
+its own named volume — `pgdata` holds the database, `hezarfen-data` the
+uploaded note files (`/data/files`). `HOST` is forced to `0.0.0.0` inside the
 container so the published port works. Production knobs (`COOKIE_SECURE`,
 `CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) are commented in
 `compose.yaml` — uncomment as needed. Leaving `CORS_ALLOWED_ORIGINS` unset
@@ -257,27 +268,20 @@ http/protobuf` instead.
 
 The backend survives the database going away, at boot and at runtime.
 
-At boot it retries the connection (1s doubling to 5s) until the server
-answers, rather than exiting. Exiting looks tidier but is worse: the container
-runtime restarts the process, it fails again in milliseconds, and a few
-seconds of startup skew burns the whole restart budget and leaves the backend
-down for good.
+At boot it retries the connection (a one-second cadence, indefinitely)
+until the server answers, rather than exiting. Exiting looks tidier but is
+worse: the container runtime restarts the process, it fails again in
+milliseconds, and a few seconds of startup skew burns the whole restart
+budget and leaves the backend down for good.
 
-At runtime a keepalive query every 5s doubles as a liveness probe. This
-matters more than it sounds: a query issued while the socket is down does
-*not* fail — the SDK's reconnect loop stops draining its request queue, so the
-query parks until the database returns and only *then* runs. Left alone, a
-request waits out the entire outage and any write it carries lands long after
-the caller gave up.
-
-So while the probe says the socket is down, requests are refused at the edge
-with `503` and `Retry-After: 1`, before they can reach the database. Nothing
-is queued, which is what makes that retry safe. Requests that slip through in
-the window between the socket dying and the probe noticing are capped at 30s
-and answer `503` *without* `Retry-After`, with a message saying the write may
-or may not have applied — they were already queued, so retrying them could
-apply the same write twice. WebSocket and SSE routes are unaffected: both
-return their response immediately and stream afterwards.
+At runtime nothing queues behind a dead server: a request that cannot get
+a connection is refused with `503`. The two flavors are distinguished
+honestly — an acquire that times out means nothing executed, so the
+answer is retry-safe; a request whose connection died mid-flight may have
+applied server-side (the commit can race the connection dropping), so its
+503 says the write may or may not have landed and must not be blindly
+retried. When the database comes back the pool dials again on the next
+request; there is nothing to re-arm.
 
 Without compose:
 
@@ -288,13 +292,13 @@ podman run -d --name hezarfen -p 8080:8080 -v hezarfen-data:/data hezarfen-backe
 
 ## Multi-school (SaaS)
 
-One deployment serves many schools. Every school gets a SurrealDB **database**
-of its own inside the one namespace (`DB_NAMESPACE`, default `hezarfen`),
-named by its slug, next to a **control** database (`DB_DATABASE`, default
-`control`) that holds the school registry, the builder accounts and the shared
-rate-limit window. Isolation is the store's, not the handlers': a school
-database sees only its own rows, so no query carries a `WHERE school = ...`
-somebody could forget.
+One deployment serves many schools. Every school gets a PostgreSQL
+**database** of its own, named `{control}_school_{slug}` after the
+**control** database `DATABASE_URL` points at (`hezarfen_control` by
+default), which holds the school registry, the builder accounts and the
+shared rate-limit window. Isolation is the store's, not the handlers': a
+school database sees only its own rows, so no query carries a
+`WHERE school = ...` somebody could forget.
 
 **Slugs.** 2-32 characters of `a-z`, `0-9` and `-`, starting with a letter or
 digit (`MIN_SLUG_LEN`/`MAX_SLUG_LEN`); `builder` and `control` are reserved and
@@ -916,21 +920,22 @@ That admin can then promote everyone else through `PATCH /users/{id}/role`.
 The admin set cannot be emptied through the API: an admin never changes their
 own role, and a `PATCH /users/{id}/role` that would demote the last admin
 answers `409` — including when two admins demote each other at the same
-instant, since that guard is serialized school-wide rather than left to the
-database (which conflict-checks neither a cross-record count nor a read).
+instant, since the guard is a predicate on the role write itself: the
+`UPDATE` that lowers the row counts the remaining admins in the same
+statement, so the count and the write it guards contend on the row lock
+like any other write.
 
 A locked-out school is the builder's `POST /schools/{slug}/admin-password`,
 which re-keys an admin that still exists. Manual fallback (the recovery path
 if an older build already emptied a school's admin set): run
 
-```surql
-UPDATE user SET role = 'admin' WHERE username = 'ada';
+```sql
+UPDATE app_user SET role = 'admin' WHERE username = 'ada';
 ```
 
-against the SurrealDB server, with `--db` naming the **school's** database (its
-slug), not the control one — e.g.
-`surreal sql --conn ws://127.0.0.1:8000 --user root --pass root --ns hezarfen --db demo`
-(in the container setup, `podman exec -it hezarfen-surrealdb /surreal sql ...`).
+against the **school's** database (`{control}_school_{slug}`), not the
+control one — e.g. `podman exec -it hezarfen-postgres psql -U hezarfen -d
+hezarfen_control_school_demo` for the compose stack.
 
 ## Endpoints
 
@@ -1344,7 +1349,7 @@ A course may carry a `term_id` (`null` = unassigned); on `PATCH
 /courses/{id}`, an omitted `term_id` keeps the link and an explicit `null`
 clears it.
 `role` ∈ `parent | student | teacher | manager | admin`. Ids in responses are
-ULIDs. `parent` accounts are made by an admin (register as `student`, then
+hyphenated UUIDv7s. `parent` accounts are made by an admin (register as `student`, then
 `PATCH /users/{id}/role`) and observe only the students an admin tied to them
 — see "Roles & access control".
 An exam `mark` is an integer `0`–`100`; it lives in its own `exam_result` row,
@@ -1991,7 +1996,7 @@ asker withdrawing, or teacher+ moderating — takes its solutions and every
 photo blob (its own and its solutions') with it. Each question row reports
 its `solution_count`, and questions and solutions embed their people as
 person refs (`{id, username, display_name}`), so the UI never shows a raw
-ULID.
+uuid.
 
 ## Per-school policy (settings & terms)
 
@@ -2257,7 +2262,7 @@ teacher or manager ordering a child's lunch is a `403`.
   is a decision, not a side effect.
 - **The capacity check is a single conditional write, decided by the
   database.** Counting rows and then writing one would be write-skew —
-  SurrealDB does not conflict-check a cross-record count against a concurrent
+  a count read in one statement does not conflict-check against a concurrent
   insert, so 24 students racing for 3 seats would all pass the count — so the
   seat is instead claimed on a counter kept on the **menu row itself**, taken
   and spent by one `UPDATE … WHERE` that also places the booking row in the
@@ -2469,7 +2474,7 @@ is a counter that can drift.
   the separator inside a ledger line's id) and the line is keyed
   `<student>_k_<key>`, so a client retry after a network timeout returns the
   line the first attempt wrote instead of crediting the money twice. Without
-  one the id is a fresh ulid and a resent request is a second credit, as a desk
+  one the id is a fresh uuid and a resent request is a second credit, as a desk
   taking the same amount twice really is — and since nothing here edits or
   deletes a line, that doubled credit can only be corrected by a compensating
   one. The same key with a different `amount_minor` is a `409`, never the
@@ -2624,16 +2629,17 @@ account.
   room back and the charge **can be paid again** — and reversing that refund
   takes the room back with it. Money that came back out is not money the school
   still holds.
-- **The over-payment cap is not the database's.** The `409` past a charge's or
-  a credit's worth is a cross-record fold, which SurrealDB cannot enforce on
-  its own; it holds because the backend is one process and the fold, and the
-  append it authorizes, are taken under one lock. Should an over-payment ever
+- **The over-payment cap is not the database's.** The `409` past a charge's or a
+  credit's worth is a cross-record fold, which no constraint can enforce on
+  its own; it holds because the fold, and the append it authorizes, are
+  taken under the target's ancestor-chain row locks (`FOR UPDATE`) — writers
+  on one subtree take turns, different subtrees never contend. Should an over-payment ever
   be recorded anyway it is not a crisis: this is human data entry at an office
   desk, the outcome is an over-paid charge that is plainly visible in the
   statement, and it is undone by appending a refund. Both lines are true
   records of money that really arrived — refusing them would be the worse lie.
 - **A line carries at most 20 applied lines.** The cap above is folded one
-  query per line of the target's subtree, all of them while that single lock is
+  query per line of the target's subtree, all of them while those row locks are
   held, so a charge settled in a thousand pieces would stall every other
   payment in the school behind its own arithmetic. Past 20 (payments under a
   charge, refunds under a payment, and the reversals among them) a further
@@ -2803,24 +2809,12 @@ question + answer images (blobs included) along with results; unenrolling mid-ex
 hides the student from the monitor roster but keeps the attempt and mark
 rows, mirroring the marks report.
 
-> **Upgrading a pre-course database**: `exam` rows created before courses
-> existed lack the now-required `course` field and will fail to deserialize.
-> For a dev database, delete `./data/hezarfen.db` and reboot; to keep data,
-> backfill manually with the SurrealDB CLI (server stopped), e.g.
-> `UPDATE exam SET course = course:<id> WHERE course = NONE;`
-> after creating a course to attach them to.
->
-> **Upgrading to the attempts/rejoin build needs nothing manual**: the boot
-> migration backfills `max_attempts = 1`, `allow_rejoin = true`, and attempt
-> `seq = 1` on existing rows, and swaps the single-attempt unique index for
-> the per-sitting one. Pre-upgrade attempts keep their record ids and count
-> as sitting #1.
->
-> **Upgrading to the kind-weight build is a clean break**: weights moved off
-> exams onto the settings `exam_kinds` entries (`{name, weight}` objects) with
-> no data migration. A database from an older build has string kinds and a
-> per-exam `weight` column the code no longer understands — delete
-> `./data/hezarfen.db` and reboot.
+> **Schema changes are migrations, not boot batches.** The sqlx migrator
+> applies `migrations/control` to the control database at boot and
+> `migrations/school` to the school template and every newly minted school
+> database, tracked in `_sqlx_migrations` — an up-to-date database boots
+> without touching a row, and there is no manual backfill. The SurrealDB-era
+> `surreal sql` repair notes died with the old store.
 
 ## Taking an exam: questions, answers & the exam room
 
@@ -2907,7 +2901,7 @@ no-store`. The metadata rides the answer as `answer_image: {content_type,
 size} | null` on both the sitting view and the grading sheet. To the backend
 it is a normal raster PNG; the frontend piggybacks its editable stroke data in
 a PNG `tEXt` chunk, opaque here — stored on disk under `Config::files_path`
-by a ULID, metadata in the `answer_image` table, structurally identical to
+under a fresh uuid, metadata in the `answer_image` table, structurally identical to
 question images.
 
 **Grading view** (course-management rights): `GET /exams/{id}/attempts/{user}/answers` returns
@@ -3439,7 +3433,7 @@ way — the ambiguity `matched` closes on the grade-wide pumps).
 Stocking is best-effort all the way to the end of that route: a template that
 could not be read, or a pump that faulted part-way, leaves `stocked_from` null
 rather than turning a class that *exists* into a `500` whose caller never learns
-its id — a class id is a ULID and `POST /classes` is the only place it is
+its id — a class id is a uuid and `POST /classes` is the only place it is
 returned from, unlike a blueprint, whose id is the grade label the caller sent.
 The retry is `POST /classes/{id}/blueprint`, which is idempotent and is also
 what a caller runs when there is genuinely no template, so the two cases need
@@ -4557,9 +4551,9 @@ const send = (payload) =>
 The backend runs as **one process against one database**, and that buys less
 than it sounds like: every request is an async task, dozens are in flight at
 once, and each of them awaits the database in the middle of its work. So
-"read, decide, write" is never safe on its own — SurrealDB does not
-conflict-check a cross-record `count()` against a concurrent insert
-(write-skew), and that fires between two tasks in one process exactly as it
+"read, decide, write" is never safe on its own — under `READ COMMITTED` a
+count read in one statement does not conflict-check against a concurrent
+insert (write-skew), and that fires between two tasks in one process exactly as it
 would between two machines. The mutex-only design this replaced was already
 losing races at one process. Every invariant is therefore guarded where the
 database itself decides the winner. Three tiers:
@@ -4569,8 +4563,11 @@ database itself decides the winner. Three tiers:
    atomic, so of N concurrent tasks exactly the allowed number get a non-empty
    result: the database decides the winner, the loser retries
    (`CAS_UPDATE_RETRIES`) or gets a 409.
-2. **In-transaction `IF … THROW` gates** — the check runs inside the same
-   statement as the write it authorizes, so it is atomic with it. Used where
+2. **One-statement gates** — the check runs inside the same statement as
+   the write it authorizes, so it is atomic with it: a guarded
+   `UPDATE … WHERE` (the last-admin floor), an
+   `INSERT … SELECT … WHERE EXISTS` behind a real `FOREIGN KEY` (the
+   existence proofs), the CTE recipes in `db::cap`. Used where
    the rule reads the row being written (state machines, delete guards).
    "Is anything still attached?" is answered the same way, by a counter on the
    row being deleted rather than a `SELECT` over the children: a course is
@@ -4583,52 +4580,43 @@ database itself decides the winner. Three tiers:
    Where the child also carries a deterministic id — one enrollment per
    (course, user), one registration per (event, user), one fee-plan assignment
    per (plan, student) — the seat and the row
-   are claimed in one transaction (`cap::claim_and_create`), so a duplicate
-   `CREATE` rolls its own seat back instead of costing a stranger their place.
-3. **Three accepted races**, reviewed and deliberately left open:
+   are claimed in one statement (`db::cap`'s `claim_and_create` recipes), so a
+   duplicate insert rolls its own seat back instead of costing a stranger their
+   place. Where no single statement can decide the rule — an appointment
+   approval reads other rows that may not exist yet — that one decision
+   escalates to `SERIALIZABLE`, and `tx_with_retry` re-sends it when Postgres
+   aborts the loser (`40001`); the re-run sees the winner committed and
+   refuses with the ordinary `409`.
+3. **Two accepted races**, reviewed and deliberately left open:
    - *Attempt-seq late save* — an exam-room socket writes into the sitting it
      joined with, a choice made before any lock is taken, so a save racing a
      retake can stamp an answer onto the just-terminal previous sitting.
      Damage: one history row; the grade of record (latest `seq`) is never
      touched.
-   - *Approved-overlap* — two approvals landing in the same instant can
-     double-book a teacher. Damage: one overlapping half-hour, visible to both
-     parties, fixable by cancelling either side.
    - *Archive-vs-write* — the archived-term guard is a pre-flight read on the
      term row, so an archive committing in the same instant as a write already
      in flight lets that one write through. Damage: one write on a
      just-archived term; nothing corrupts, and every later write is refused.
 
-In-process locks remain, and they are a *second* line, never the guarantee:
-`PRESENCE_LOCK` guards in-process socket state (there is no row to conditional
--write), `CLAIM_LOCK` keeps one counter writer at a time (the `WHERE` clause is
-the cap — the lock only tames the retry loop, and keeps the tests' in-memory
-engine deterministic), `APPOINTMENT_LOCK` collapses the common overlap case in
-front of a rule no single-record write can express. Removing one of them costs
-throughput or an accepted race; removing the conditional write behind it costs
-the invariant.
+One in-process lock remains, and it is a *second* line, never the guarantee:
+`PRESENCE_LOCK` guards the exam-room presence map (in-process socket state;
+there is no row to conditional-write). The other two are gone with the old
+store: `CLAIM_LOCK` tamed a retry loop that `tx_with_retry` now owns, and
+what `APPOINTMENT_LOCK` serialized is three database guarantees — the seat
+claim's one-statement write, the publish-overlap exclusion constraint, and
+the serializable approval.
 
-Boot is unconditional: the schema batches, the backfills and the admin seed all
-run on every start, because exactly one process ever starts (the one exception
-is the marked one-time repair below). Deployment is
-stop-the-world — `podman compose down` then `up`, never overlapping — and a
-release that adds or renames a stored counter *requires* it. An old binary
-writes rows without touching the new counter, the `= NONE` backfill guard
-(correctly) refuses to re-seed, and the resulting permanent under-count lets a
-guard approve exactly what it exists to refuse. The one exception is a counter
-that is not an opinion but a plain row count — a board's `total_stroke_count`,
-recomputed from its strokes on every boot rather than seeded once, which is why
-that repair heals an under-count the `= NONE` guard would have skipped.
-In-flight work does not survive
-a restart either: a chatbot turn mid-inference settles `failed`/`interrupted`.
-
-The one thing boot does *not* redo is tracked in `migration_mark` — one row per
-backfill that is genuinely one-time, keyed by the backfill's own name. Most
-backfills converge to a `WHERE` that matches nothing and are free to re-run, so
-they carry no mark; the board-roster repair is different because its cost is
-the **scan** (a `user` pass per board) rather than the write, so it is gated on
-`migration_mark:board_roster` and skipped entirely once done. A volume that
-never ran the repair holds no mark and still gets repaired on its next boot.
+Boot is idempotent: the sqlx migrators apply `migrations/control` to the
+control database (and `migrations/school` to the school template, and to
+every school database at mint), tracked in `_sqlx_migrations`, so a second
+boot touches nothing; the builder seed runs on every start but writes only
+when the username is absent. A release that adds a migration simply applies
+it on the next boot — there is no stop-the-world counter backfill to
+schedule and no `migration_mark`: the counters the guards lean on
+(`total_stroke_count` among them) are maintained by the same conditional
+writes that spend them. In-flight work does not survive a restart either:
+a chatbot turn left `pending` by a dead process reads back as `failed`
+(a read-time projection, not a sweep).
 
 ## Layout
 
@@ -4640,19 +4628,26 @@ src/
   constant.rs      validation limits
   validate.rs      field validators (used by every newtype's try_new)
   error.rs         ValidationError + AppError -> HTTP responses
-  database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration; init()
-                   brings up the control database, migrate() a school's
-  tenant.rs        Slug · SchoolStatus · School · Tenants: one database per
-                   school inside one namespace, plus the control database that
-                   registers them (DEMO_SLUG is the in-memory test school)
-  migration_sql.rs the three boot batches as SurrealQL text (PRE_REPAIR,
-                   MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them,
-                   and CONTROL_MIGRATION_BATCHES for the control database
+  database.rs      PgPool + tx_with_retry (a guarded BEGIN…COMMIT that re-runs
+                   while Postgres says "contended") + the two sqlx migrator
+                   sets; init() brings up the control database, a mint
+                   migrates a school's from the shared template
+  tenant.rs        Slug · SchoolStatus · School · Tenants: one Postgres
+                   database per school (`{control}_school_{slug}`), plus the
+                   control database that registers them (DEMO_SLUG is the
+                   tests' school)
+  db/              the only layer that executes queries: per-table SQL, one
+                   file per resource · cap.rs (the count-cap CTE recipes and
+                   their verdict types) · field_update.rs (one UPDATE … SET
+                   from only the fields a PATCH carried) · page.rs (PagedList:
+                   one paged SELECT — the window and its `total`)
+  service/         workflows the handlers call: each multi-step invariant is
+                   one tx_with_retry-guarded transaction
   module.rs        Module (one router nest a school may buy) · Package ·
                    ModuleSet: dependency edges, validation, stored names
   rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
   state.rs         AppState { db, tenants, files_path, cookie_secure, rate_limit,
-                   chatbot_limit, exam_presence, board_hub, db_up, ai }
+                   chatbot_limit, exam_presence, board_hub, ai, metrics }
   ai/              QUIC bridge to the out-of-process AI services
                    (see "AI bridge (QUIC)"; the HTTP half is web/ai.rs)
     protocol.rs    Hello/Greeting/Request/Response + length-prefixed JSON framing
@@ -4665,33 +4660,23 @@ src/
                    changed, so its stored output is refreshed in a background task
     api.rs         AI_API_ALLOWLIST: the exact REST paths an AI service may read
                    (deny-by-default, segment-for-segment, no wildcard tail)
-  domain/          validated newtypes + entities (derive SurrealValue),
-                   each owning its persistence
+  domain/          validated newtypes + entities (pure data and validation;
+                   persistence lives in db/)
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
     role.rs        Role enum (student < teacher < manager < admin), at_least()
-    field_update.rs FieldUpdate: one UPDATE ... SET built from only the fields a
-                   PATCH actually carried (an omitted field is never written)
-    monotonic_id.rs next_ulid: ids that sort in write order — one process-wide
-                   Generator, so same-millisecond rows never scramble
+    monotonic_id.rs next_uuid: UUIDv7 ids that sort in write order — one
+                   process-wide ContextV7, so same-millisecond rows never scramble
     key.rs         sitting(): the deterministic per-sitting record key shared by
                    attempts, answers, answer images and results (seq 1 stays bare)
-    cap.rs         claim()/release(): the count caps the database enforces — an
-                   atomic `UPDATE parent SET n += 1 WHERE n < cap` on a counter
-                   column of the parent row, replacing count-then-write mutexes
-                   that could not see a concurrent insert;
-                   claim_and_create() commits that seat and the child row in
-                   one transaction, for children with a deterministic id
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
-                   the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
-    page.rs        PagedList: one paged SELECT — the window and its `total`, both
-                   done by the database rather than by slicing a full scan
+                   the Rust needle and the SQL column (Turkish İ/ı, ü, ö…)
     session.rs     SessionId · SessionToken · Session (7-day expiry)
     builder.rs     BuilderId · Builder · BuilderSession: the deployment operator
                    who creates and suspends schools, in the control database
     timestamp.rs   Timestamp (unix-millisecond instant)
     note.rs        NoteId · NoteTitle · NoteContent · Note
     note_file.rs   NoteFileId · FileName · FileContentType · NoteFile (metadata row;
-                   blob on disk under FILES_PATH, named by the row's ULID)
+                   blob on disk under FILES_PATH, named by the row's uuid)
     event.rs       EventId · EventTitle · EventDescription · Event
     attendance.rs  AttendanceId · AttendanceStatus · Attendance
     course.rs      CourseId · CourseTitle · CourseDescription · Course
@@ -4842,19 +4827,21 @@ src/
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 
-Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
-db), rate-limit (both tiers, proxy-header and peer-address keying, shipped
+Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` over
+per-test PostgreSQL databases), rate-limit (both tiers, proxy-header and peer-address keying, shipped
 limits over every route, two limiters sharing one budget over one db), e2e
 (real TCP + reqwest cookie jar), persistence
-(tempfile file engine, including close + reopen), ai-bridge (real QUIC on
+(an idempotent re-migration over a live database must leave its seeded rows
+intact), ai-bridge (real QUIC on
 loopback against a fake AI service), ai-protocol (the `hab/2` wire contract,
 driven by a client that shares no code with the backend).
 
-The cross-school isolation probes run twice: once in memory mode, once against
-a **real** SurrealDB, because production is remote mode and there a school is a
-database inside one namespace rather than its own datastore. So `cargo test`
-starts a throwaway `surreal start … memory` server on a free port, taken from
-`~/.surrealdb/surreal`, and kills it when the last test using it finishes. A
-missing binary is a hard failure, not a skip — install it with
-`curl -sSf https://install.surrealdb.com | sh`, or set `HEZARFEN_SKIP_REMOTE=1`
-to skip the remote half deliberately.
+Every suite runs against a **real** PostgreSQL, because production is real
+PostgreSQL. The harness (tests/common) mints each test a private pair of
+databases on one server — `heztest_<16 hex>` for the control side and its
+`heztest_<…>_school_demo` school, template-cloned so a schema edit migrates
+the shared template once — and drops them when the deployment's last handle
+dies; a janitor sweeps what a crashed run left behind. The server comes from
+`HEZARFEN_TEST_DATABASE_URL` (default: the compose stack's maintenance
+database). A missing server is a hard failure, not a skip — start it with
+`podman compose up -d postgres`.
