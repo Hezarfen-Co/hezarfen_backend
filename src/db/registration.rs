@@ -69,21 +69,23 @@ pub async fn claim_seat(
 ) -> Result<Claimed<Registration>, AppError> {
     match query_as!(
         Registration,
-        "WITH seat AS (
+        "WITH person AS (
+             -- The lock handshake comes FIRST: FOR NO KEY UPDATE waits out a
+             -- racing demotion and re-checks the role against the committed
+             -- row. A data-modifying CTE executes even when the INSERT below
+             -- matches nothing, so the bump must depend on this CTE's result —
+             -- the EXISTS reference in `seat` forces that order.
+             SELECT 1 FROM app_user WHERE id = $2 AND role IS DISTINCT FROM 'parent'
+             FOR NO KEY UPDATE),
+         seat AS (
              UPDATE event SET registration_count = registration_count + 1
              WHERE id = $1
                AND (audience_capacity IS NULL OR registration_count < audience_capacity)
-               -- The role gate rides the bump's WHERE: a data-modifying CTE
-               -- executes even when the INSERT below matches nothing, so the
-               -- count must refuse exactly when the seat refuses.
-               AND EXISTS (SELECT 1 FROM app_user WHERE id = $2 AND role IS DISTINCT FROM 'parent')
-             RETURNING 1),
-         person AS (
-             SELECT 1 FROM app_user WHERE id = $2 AND role IS DISTINCT FROM 'parent'
-             FOR NO KEY UPDATE)
+               AND EXISTS (SELECT 1 FROM person)
+             RETURNING 1)
          INSERT INTO registration (event, app_user, registered_by)
          SELECT $1, $2, $3
-         WHERE EXISTS (SELECT 1 FROM seat) AND EXISTS (SELECT 1 FROM person)
+         WHERE EXISTS (SELECT 1 FROM seat)
          RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\"",
         event.uuid(),
         user.uuid(),

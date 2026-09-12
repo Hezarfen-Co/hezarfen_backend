@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "WITH gone AS (\n                 DELETE FROM pomodoro_session\n                 WHERE app_user = $1 AND finished_at IS NULL\n                 RETURNING 1)\n             INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)\n             SELECT $2, $1, $3, NULL, NULL, $4\n             RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", started_at AS \"started_at: Timestamp\", finished_at AS \"finished_at: Timestamp\", counted, label",
+  "query": "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)\n         VALUES ($2, $1, $3, NULL, NULL, $4)\n         ON CONFLICT (app_user) WHERE finished_at IS NULL DO UPDATE\n         SET started_at = EXCLUDED.started_at, finished_at = NULL, counted = NULL,\n             label = EXCLUDED.label\n         RETURNING id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", started_at AS \"started_at: Timestamp\", finished_at AS \"finished_at: Timestamp\", counted, label",
   "describe": {
     "columns": [
       {
@@ -87,5 +87,5 @@
       true
     ]
   },
-  "hash": "7baced8897e05cb3b277caa9debc4e9b995552d82a210994c46c2e4c520d5e08"
+  "hash": "1070ebb26873befdc19bf655f37b781a841bb664b14ec5adaca33f1cac0c05e8"
 }
