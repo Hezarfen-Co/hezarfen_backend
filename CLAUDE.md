@@ -3,35 +3,11 @@
 Rust/axum school-management API (auth, roles, exams, notes, messaging,
 courses, attendance, pomodoro, meals) on PostgreSQL (sqlx). Swagger UI at `/swagger`.
 
-## Project docs — query the knowledge base, do NOT read README.md
+## Project docs — README.md, read sections not the whole file
 
-README.md is ~355KB (~90k tokens). Its `##` sections live in an embedded
-SurrealDB knowledge base. Fetch only what you need:
-
-```bash
-KB() { ~/.surrealdb/surreal sql -e "surrealkv://$HOME/.claude/kb/kb.db" \
-      --ns claude --db hezarfen_backend --json --hide-welcome --log error; }
-# list sections
-echo 'SELECT id, title FROM doc;' | KB
-# fetch one section body
-echo 'SELECT body FROM doc:`time-policy`;' | KB
-# full-text search, best sections first
-echo "SELECT id, title, search::score(0) AS s FROM doc WHERE body @0@ 'retake' ORDER BY s DESC LIMIT 3;" | KB
-# routes for ONE resource (auth, users, notes, messages, events, courses,
-# subjects, sessions, exams, marks, work, pomodoro, attendance, settings, terms)
-echo 'SELECT routes FROM endpoint:exams;' | KB
-```
-
-Staleness: if `sha256sum README.md` differs from
-`echo 'SELECT sha256 FROM meta:readme;' | KB`, re-ingest:
-
-```bash
-python3 ~/.claude/kb/ingest.py README.md | KB
-python3 ~/.claude/kb/ingest-endpoints.py README.md | KB
-```
-
-The project's own PostgreSQL (container `hezarfen-postgres`) is runtime data —
-never write knowledge-base rows there (the KB lives in `~/.claude/kb/kb.db`).
+README.md is ~355KB (~90k tokens). Never read it whole: grep for the `## `
+heading you need, then read that range. Its `## Endpoints` table is GENERATED
+(see Conventions); prose sections are hand-written.
 
 ## Code map — orient here, skip discovery greps
 
