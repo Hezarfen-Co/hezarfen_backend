@@ -1,7 +1,22 @@
-# Deploys to the VPS on every push to main, im-style (see im's
-# .github/workflows/main.yml): the whole suite gates the deploy, the release
-# lands as one swapped directory, and the service must answer /health from
-# this build's process — or the previous release is rolled back.
+# VPS deploy, im-style, split into two jobs so failure recovery is cheap:
+#
+#   Build and test  —  Postgres sidecar, clippy, the whole suite, the release
+#                      build; uploads the staged release as the run's artifact.
+#   Deploy          —  SSH release-dir swap + systemd user-unit restart,
+#                      /health gated on THIS build's process, rollback on
+#                      failure, independent after-the-fact verify.
+#
+# The split is the recovery story, not ceremony:
+#   * "Re-run failed jobs" on a run whose Deploy step failed re-runs ONLY the
+#     ~1-minute deploy job — the built release is still in the run's artifact.
+#   * workflow_dispatch (the manual door: Actions tab → Run workflow on main,
+#     or `gh workflow run main.yml --ref main`) deploys WITHOUT the suite: it
+#     takes the newest artifact a green Build-and-test produced — which can
+#     lag HEAD while a push is mid-CI, and that is the point: redeploy the
+#     known-good release, e.g. after a server-side fix (env file, proxy,
+#     database). For env-only changes a plain
+#     `ssh <vps> 'systemctl --user restart hezarfen'` needs no workflow at
+#     all: the process reads its env at boot.
 #
 # One-time prerequisites, outside the workflow's reach:
 #   * the repo secrets SSH_PRIVATE_KEY / SSH_HOST / SSH_USER (im's values
@@ -11,13 +26,19 @@
 #   * a Postgres the backend can reach, and ~/hezarfen/hezarfen.env (0600)
 #     with at least DATABASE_URL — see deploy/hezarfen.service for the keys.
 
+name: VPS deploy
+
 on:
   push:
     branches:
       - main
+  # The manual redeploy door — see the header comment for how and why.
+  workflow_dispatch:
 
-# The deploy swaps a release directory and restarts one service; two of them
-# racing would leave the binary and the running process from different builds.
+# One deploy at a time: the deploy swaps a release directory and restarts one
+# service; two of them racing would leave the binary and the running process
+# from different builds. A dispatched redeploy queues behind any in-flight
+# push deploy rather than racing it.
 concurrency:
   group: deploy
   cancel-in-progress: false
@@ -51,16 +72,38 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
-  deploy:
-    name: Deploy
+  build:
+    name: Build and test
+    # Pushes only: a manual redeploy reuses the newest green artifact
+    # instead of paying the suite again.
+    if: github.event_name == 'push'
     # Pinned, not `latest`: ubuntu-latest floating to the next LTS would
     # one day ship a glibc newer than the server's, and the gnu binary
     # would stop running there. See the TARGET comment above.
     runs-on: ubuntu-24.04
+    env:
+      # The 41 test binaries each link the full tonic/otlp/axum/sqlx stack;
+      # with debug info they blow past the runner's free disk and the
+      # linker dies with SIGBUS (run 34736185339). The only cost of
+      # dropping it is line-number backtraces.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      # A one-shot CI build never reuses incremental artifacts — they are
+      # pure disk waste.
+      CARGO_INCREMENTAL: "0"
     steps:
+      # The runner's preinstalled SDKs (~20GB of Android/.NET/ghc/CodeQL)
+      # are dead weight here, and the suite needs the room (see the env
+      # block above for the other half of the fix).
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null || true
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Rust
         run: rustup toolchain install stable --profile minimal
 
@@ -117,6 +160,78 @@ jobs:
           cp deploy/hezarfen.service stage/hezarfen.service
           strip stage/hezarfen_backend
           ls -l stage
+
+      # The deploy job (and, later, a manual redeploy) consumes this. 30
+      # days is also the dispatch door's reach-back window: an older green
+      # build's artifact is gone, and the redeploy fails loudly instead of
+      # silently shipping something ancient.
+      - name: Upload the release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: stage
+          retention-days: 30
+
+  deploy:
+    name: Deploy
+    needs: build
+    # Push: only behind a green build — the suite gates the server.
+    # Dispatch: build is skipped on purpose (see its `if`), and `always()`
+    # is what stops that skip from cascading past this gate.
+    if: >-
+      always() &&
+      (needs.build.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    steps:
+      # A push deploy takes the release this very run built and gated.
+      - name: Fetch this run's release
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: stage
+
+      # A manual redeploy takes the newest release whose BUILD job went
+      # green — not the newest fully-green run: a run can be red because
+      # Deploy failed at the health gate while its build is exactly the
+      # release we want back on the server. `gh run list --status success`
+      # would skip exactly those, hence the per-run job check.
+      - name: Find the newest green build
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id=""
+          for rid in $(gh run list --workflow main.yml --branch main --event push --limit 15 --json databaseId --jq '.[].databaseId'); do
+            if [ "$(gh run view "$rid" --json jobs --jq '.jobs[] | select(.name=="Build and test") | .conclusion')" = "success" ]; then
+              run_id=$rid
+              break
+            fi
+          done
+          if [ -z "$run_id" ]; then
+            echo 'no run on main has a green Build-and-test job (or its artifact has expired)' >&2
+            exit 1
+          fi
+          echo "redeploying the release from run $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_ENV"
+
+      - name: Fetch the green release
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: stage
+          run-id: ${{ env.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Check the release is complete
+        run: |
+          set -euo pipefail
+          test -f stage/hezarfen_backend
+          test -d stage/migrations/control
+          test -f stage/hezarfen.service
 
       - name: Install SSH keys
         run: |
