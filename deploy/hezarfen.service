@@ -1,0 +1,41 @@
+# The systemd user unit the deploy installs to ~/.config/systemd/user/ and
+# restarts. The release layout: ~/hezarfen/current/hezarfen_backend with
+# migrations/ beside the binary (the app resolves the schema there when the
+# compile-time checkout path is absent — see migrations_path in the source).
+#
+# ~/hezarfen/hezarfen.env (0600, written once by hand, never by the deploy)
+# carries the deployment's own values and overrides the Environment= lines
+# below:
+#   DATABASE_URL               required — a Postgres with the control database
+#                              (first boot creates the schema; each school is
+#                              minted as its own database by the builder API)
+#   BUILDER_USERNAME/PASSWORD  first-boot operator seed
+#   AI_QUIC_ADDR + AI_SHARED_TOKEN  the AI bridge (UDP); unset = off
+#   COOKIE_SECURE=true         behind TLS
+#   CORS_ALLOWED_ORIGINS       a lone `*` reflects any origin with credentials
+#                              ("anywhere, for now"); list the real origins
+#                              once the frontends are known
+#   TRUST_PROXY=true           client IPs from X-Forwarded-For behind a proxy
+#
+# The service binds loopback only by default — terminate TLS on a reverse
+# proxy and forward to 127.0.0.1:8080.
+
+[Unit]
+Description=Hezarfen backend (school management API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/hezarfen/current/hezarfen_backend
+WorkingDirectory=%h/hezarfen/current
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=FILES_PATH=%h/hezarfen/data/files
+Environment=RUST_LOG=info,hezarfen_backend=debug
+EnvironmentFile=%h/hezarfen/hezarfen.env
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

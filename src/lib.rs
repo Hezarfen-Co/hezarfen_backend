@@ -505,14 +505,22 @@ fn cors_allowlist_from_env() -> Vec<HeaderValue> {
 ///
 /// With no allowlist (dev) the caller's origin is mirrored, but WITHOUT
 /// credentials: mirror + credentials would let any website ride a visitor's
-/// session cookie, so the two must NEVER be recombined (the cookie's
-/// `SameSite=Lax` in `web/auth.rs` is the only other guard on that door). A
-/// cross-origin dev frontend can't send the Lax cookie anyway, so credentials
+/// session cookie, so the two must never be recombined by default (the
+/// cookie's `SameSite=Lax` in `web/auth.rs` is the other guard on that door).
+/// A cross-origin dev frontend can't send the Lax cookie anyway, so credentials
 /// bought nothing in mirror mode; a credentialed browser frontend requires
 /// listing its origin in `CORS_ALLOWED_ORIGINS`.
 ///
+/// One deliberate exception — `CORS_ALLOWED_ORIGINS=*` ("allow CORS to
+/// anywhere for now", ordered 2026-09-13): a `*` entry mirrors every origin
+/// WITH credentials, for a deployment whose frontend origins are not settled
+/// yet. `SameSite=Lax` is what still holds the door: a Lax cookie never rides
+/// a cross-site fetch, so what this opens is same-site origins (the
+/// deployment's own subdomains and ports), not third-party websites. Replace
+/// the `*` with the real origins once they are known.
+///
 /// Takes the allowlist as a parameter (env read once in `build_router`) so
-/// tests can exercise both modes without racing on process-global env vars.
+/// tests can exercise the modes without racing on process-global env vars.
 pub fn cors_layer(allowlist: Vec<HeaderValue>) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([
@@ -527,6 +535,13 @@ pub fn cors_layer(allowlist: Vec<HeaderValue>) -> CorsLayer {
         // on 429s and `Content-Disposition` (original filename) on downloads.
         .expose_headers([header::RETRY_AFTER, header::CONTENT_DISPOSITION]);
 
+    // A `*` entry anywhere in the list asks for anywhere-mode: every origin
+    // mirrored AND credentialed (the exception paragraph above).
+    if allowlist.iter().any(|origin| origin == "*") {
+        return layer
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_credentials(true);
+    }
     if allowlist.is_empty() {
         layer
             .allow_origin(AllowOrigin::mirror_request())

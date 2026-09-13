@@ -6794,6 +6794,46 @@ async fn cors_allowlist_mode_credits_only_listed_origins() {
     );
 }
 
+/// Star mode (`CORS_ALLOWED_ORIGINS=*`): every origin is reflected AND
+/// credentialed — the deliberate "anywhere, for now" mode for a deployment
+/// whose frontend origins are not settled. `SameSite=Lax` (pinned by its own
+/// test above) is what keeps third-party sites from riding the cookie
+/// cross-site; this opens the door to same-site origins only.
+#[tokio::test]
+async fn cors_star_mode_reflects_any_origin_with_credentials() {
+    async fn probe(origin: &str) -> axum::http::HeaderMap {
+        let app = axum::Router::new()
+            .route("/ping", axum::routing::get(|| async { "pong" }))
+            .layer(hezarfen_backend::cors_layer(vec!["*".parse().unwrap()]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/ping")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().headers().clone()
+    }
+
+    let any = probe("https://frontends.example").await;
+    assert_eq!(
+        any.get("access-control-allow-origin").unwrap(),
+        "https://frontends.example",
+        "star mode must reflect the caller's origin, never the literal `*`"
+    );
+    assert_eq!(
+        any.get("access-control-allow-credentials").unwrap(),
+        "true",
+        "star mode exists so unlisted frontends can send the session cookie"
+    );
+
+    let other = probe("https://anything-else.example").await;
+    assert_eq!(
+        other.get("access-control-allow-origin").unwrap(),
+        "https://anything-else.example",
+        "every origin qualifies in star mode, not just the first one seen"
+    );
+}
+
 /// Both CORS modes share one layer base, so a single probe proves the exposed
 /// headers: without them, cross-origin JS reads `null` for the documented
 /// `Retry-After` (429s) and `Content-Disposition` (download filename) headers.

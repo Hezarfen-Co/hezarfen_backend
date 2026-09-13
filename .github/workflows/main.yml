@@ -1,0 +1,266 @@
+# Deploys to the VPS on every push to main, im-style (see im's
+# .github/workflows/main.yml): the whole suite gates the deploy, the release
+# lands as one swapped directory, and the service must answer /health from
+# this build's process — or the previous release is rolled back.
+#
+# One-time prerequisites, outside the workflow's reach:
+#   * the repo secrets SSH_PRIVATE_KEY / SSH_HOST / SSH_USER (im's values
+#     work if this deploys as the same user);
+#   * `loginctl enable-linger <user>` on the server unless the deploy user
+#     already has it (im's does) — user units need a running user manager;
+#   * a Postgres the backend can reach, and ~/hezarfen/hezarfen.env (0600)
+#     with at least DATABASE_URL — see deploy/hezarfen.service for the keys.
+
+on:
+  push:
+    branches:
+      - main
+
+# The deploy swaps a release directory and restarts one service; two of them
+# racing would leave the binary and the running process from different builds.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # A gnu binary links against the runner's glibc, so the runner is pinned
+  # (see runs-on below) to the same 24.04 the server runs; the day either
+  # side moves, the pin is what forces a conscious decision rather than a
+  # broken deploy. In exchange: no cross-toolchain, and the linker is
+  # rustc's default bundled lld.
+  TARGET: x86_64-unknown-linux-gnu
+  # The systemd user unit that owns the process. See deploy/hezarfen.service.
+  SERVICE: hezarfen
+  # The deploy lives in this subdirectory of the SSH user's home. The home
+  # itself is resolved on the server ($HOME), so switching the deploy user
+  # moves the path with it — a baked-in absolute path once kept pointing at
+  # the previous user's home and failed the deploy on permissions.
+  DEPLOY_SUBDIR: hezarfen
+  # The unit reads its secrets from this file on the server; the deploy
+  # never writes it, only checks it exists and holds DATABASE_URL.
+  ENV_FILE_NAME: hezarfen.env
+  # The Postgres the test suite mints its per-test databases on. Credentials
+  # and port match the harness default (HEZARFEN_TEST_DATABASE_URL), so the
+  # tests need no extra environment — only the server, with the raised
+  # connection ceiling the parallel suite exhausts (see compose.yaml).
+  PG_USER: hezarfen
+  PG_PASSWORD: hezarfen
+  # sqlx's compile-time macros verify every query against the committed .sqlx
+  # cache, so the build must never reach for a live database (same as the
+  # Containerfile).
+  SQLX_OFFLINE: "true"
+
+jobs:
+  deploy:
+    name: Deploy
+    # Pinned, not `latest`: ubuntu-latest floating to the next LTS would
+    # one day ship a glibc newer than the server's, and the gnu binary
+    # would stop running there. See the TARGET comment above.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          # Bump when the target, the profile or any rustflags change: the
+          # key does not otherwise see those, and a run that restores the
+          # old key reports it up-to-date at save time — discarding the
+          # recompiled dependencies and silently recompiling them on every
+          # later run.
+          prefix-key: v1-rust-gnu
+
+      # The suite mints a control+school database pair per test; the default
+      # 100-connection ceiling runs out under that, so the server gets the
+      # same 500 the compose stack runs (see compose.yaml).
+      - name: Start Postgres
+        run: |
+          docker run -d --name hezarfen-pg \
+            -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+            -p 127.0.0.1:5432:5432 \
+            postgres:18-alpine -c max_connections=500
+          for _ in $(seq 1 30); do
+            docker exec hezarfen-pg pg_isready -U "$PG_USER" && break
+            sleep 1
+          done
+          docker exec hezarfen-pg pg_isready -U "$PG_USER"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Zero clippy warnings is a standing project rule; CI is what keeps it.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # A broken build must never reach the server: the whole suite gates
+      # the deploy (doc_sync included, so README drift blocks it too).
+      - name: Test
+        run: cargo nextest run
+
+      - name: Build the release
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          mkdir -p stage
+          cp "target/$TARGET/release/hezarfen_backend" stage/hezarfen_backend
+          # The migrators resolve `migrations/` beside the binary when the
+          # compile-time checkout path is absent (see migrations_path), so
+          # the schema ships with the release it belongs to.
+          cp -r migrations stage/migrations
+          cp deploy/hezarfen.service stage/hezarfen.service
+          strip stage/hezarfen_backend
+          ls -l stage
+
+      - name: Install SSH keys
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} > ~/.ssh/known_hosts
+
+      - name: Upload the release
+        run: |
+          set -euo pipefail
+          ssh_target="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+
+          # The server's login shell is not bash, and ssh would hand this
+          # script to it; `bash -s` takes it on stdin instead, so the login
+          # shell only ever parses one plain command.
+          #
+          # The deploy path is $DEPLOY_SUBDIR under the SSH user's home,
+          # resolved on the server as $HOME: there is no path secret to go
+          # stale, and switching the deploy user moves the deploy with it.
+          ssh "$ssh_target" "bash -se -- '$DEPLOY_SUBDIR'" <<'REMOTE'
+          set -euo pipefail
+          case "$1" in
+            ''|/*|*..*)
+              echo "Refusing a broad deploy subdirectory: '$1'" >&2
+              exit 1
+              ;;
+          esac
+          deploy_path=$HOME/$1
+          # The deploy path is the service's working tree: hezarfen.env and
+          # data/ live there and are never touched from here. Only 'current'
+          # is replaced.
+          mkdir -p -- "$deploy_path"
+          rm -rf -- "$deploy_path/current.new"
+          mkdir -p -- "$deploy_path/current.new"
+          REMOTE
+          # stdin carries the tarball, so the script cannot; the extraction
+          # still goes through bash -c because the login shell is not bash
+          # and would not expand $HOME.
+          tar -C stage -czf - . | ssh "$ssh_target" "bash -c 'exec tar -xzf - -C \"\$HOME/\$1/current.new\"' -- '$DEPLOY_SUBDIR'"
+
+      - name: Swap and restart
+        run: |
+          set -euo pipefail
+          ssh_target="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+
+          # bash -s for the same reason as above: the login shell is not
+          # bash and must never see this script.
+          ssh "$ssh_target" "bash -se -- '$DEPLOY_SUBDIR' '$SERVICE' '$ENV_FILE_NAME'" <<'REMOTE'
+          set -euo pipefail
+          deploy_path=$HOME/$1
+          service=$2
+          env_file=$deploy_path/$3
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          # Read before anything moves: the env file is the operator's, on
+          # the server, written once (see deploy/hezarfen.service for the
+          # keys). A missing file or a missing DATABASE_URL is a failure to
+          # stop on, not one to roll back from.
+          if [ ! -f "$env_file" ]; then
+            echo "missing $env_file — create it (0600) with at least DATABASE_URL; see deploy/hezarfen.service" >&2
+            exit 1
+          fi
+          chmod 0600 -- "$env_file"
+          if ! grep -q '^DATABASE_URL=' "$env_file"; then
+            echo "no DATABASE_URL in $env_file" >&2
+            exit 1
+          fi
+          # The unit defaults to 8080; the env file may override.
+          port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
+          port=${port:-8080}
+          mkdir -p -- "$deploy_path/data/files"
+          chmod +x -- "$deploy_path/current.new/hezarfen_backend"
+          rm -rf -- "$deploy_path/current.previous"
+          if [ -e "$deploy_path/current" ]; then
+            mv -- "$deploy_path/current" "$deploy_path/current.previous"
+          fi
+          mv -- "$deploy_path/current.new" "$deploy_path/current"
+          # The unit ships with the release: a freshly provisioned box has
+          # no unit until the first deploy writes it, and a changed unit
+          # lands with the code that needs it. Enabling is idempotent.
+          mkdir -p -- "$HOME/.config/systemd/user"
+          install -m 644 -- "$deploy_path/current/hezarfen.service" "$HOME/.config/systemd/user/$service.service"
+          systemctl --user daemon-reload
+          systemctl --user enable -- "$service"
+          systemctl --user restart "$service"
+          # The unit is Type=simple, so a restart returns before the new
+          # process has bound its port — and before an old one has let go
+          # of it. Wait for the health route rather than a clock: /health
+          # answers 503 (curl -f fails) while the database is unreachable,
+          # so a 200 here already means status "ok".
+          rollback() {
+            rm -rf -- "$deploy_path/current"
+            mv -- "$deploy_path/current.previous" "$deploy_path/current"
+            systemctl --user restart "$service"
+          }
+          for _ in $(seq 1 30); do
+            served=$(curl -fsS "http://127.0.0.1:$port/health" 2>/dev/null) || { sleep 1; continue; }
+            # A stale process from an older deploy can answer too, so the
+            # running binary must be THIS release's, or it rolls back.
+            pid=$(systemctl --user show -p MainPID --value "$service")
+            exe=$(readlink "/proc/$pid/exe")
+            case "$exe" in
+              "$deploy_path/current/hezarfen_backend") ;;
+              *)
+                echo "/health answered, but the process is '$exe' — not this release; rolling back" >&2
+                rollback
+                exit 1
+                ;;
+            esac
+            echo 'hezarfen is up'
+            rm -rf -- "$deploy_path/current.previous"
+            exit 0
+          done
+          echo 'hezarfen did not answer /health; rolling back' >&2
+          rollback
+          exit 1
+          REMOTE
+
+      # The independent after-the-fact check: the process answering must
+      # still be this release's, and the validation contract must be served.
+      - name: Verify the served API
+        run: |
+          set -euo pipefail
+          ssh_target="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
+          # One remote script, im-style: mixing runner-side and server-side
+          # variables in nested ssh quoting once shipped a check that failed
+          # on a healthy deploy. Everything happens inside the heredoc.
+          ssh "$ssh_target" "bash -se -- '$DEPLOY_SUBDIR' '$SERVICE' '$ENV_FILE_NAME'" <<'REMOTE'
+          set -euo pipefail
+          deploy_path=$HOME/$1
+          service=$2
+          env_file=$deploy_path/$3
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
+          port=${port:-8080}
+          pid=$(systemctl --user show -p MainPID --value "$service")
+          exe=$(readlink "/proc/$pid/exe")
+          [ "$exe" = "$deploy_path/current/hezarfen_backend" ] || {
+            echo "serving '$exe', not the current release" >&2
+            exit 1
+          }
+          curl -fsS "http://127.0.0.1:$port/health" | grep -q '"status":"ok"'
+          curl -fsS -o /dev/null "http://127.0.0.1:$port/limits"
+          echo 'health ok, limits served'
+          REMOTE
+
+      - name: Cleaning
+        run: rm -rf ~/.ssh

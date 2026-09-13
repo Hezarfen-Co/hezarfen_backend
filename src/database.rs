@@ -6,7 +6,8 @@
 //! shared rate-limit window) and `migrations/school` for every school
 //! database. They are applied by two separate [`sqlx::migrate::Migrator`]s —
 //! the compile-time `migrate!` macro cannot be aimed at two directories, so
-//! each is constructed at runtime from its path under `CARGO_MANIFEST_DIR`.
+//! each is resolved at runtime from the checkout's `CARGO_MANIFEST_DIR` or,
+//! for a deployed binary, from beside the executable (see [`migrations_path`]).
 //! Their table names are disjoint by design, which is what lets one prepare
 //! database carry the union for the compile-time `query!` checks.
 
@@ -183,11 +184,27 @@ fn is_dial_error(err: &sqlx::Error) -> bool {
     )
 }
 
-/// The `migrations/<set>` directory under `CARGO_MANIFEST_DIR`. Two sets
-/// cannot both feed the compile-time `migrate!` macro, so both are resolved
-/// from their paths at runtime.
+/// The `migrations/<set>` directory: the one under `CARGO_MANIFEST_DIR` (the
+/// dev/CI checkout) when that exists, else the one beside the executable.
+/// Two sets cannot both feed the compile-time `migrate!` macro, so both are
+/// resolved from their paths at runtime — and the compile-time path is baked
+/// on the build machine, so a binary deployed outside a checkout (the release
+/// layout ships `migrations/` next to the binary) must fall back to its own
+/// directory or look for the schema where it was compiled.
 fn migrations_path(set: &str) -> std::path::PathBuf {
-    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).join(set)
+    let manifest = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).join(set);
+    if manifest.is_dir() {
+        return manifest;
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let beside = dir.join("migrations").join(set);
+        if beside.is_dir() {
+            return beside;
+        }
+    }
+    manifest
 }
 
 async fn migrator(set: &str) -> Result<Migrator, AppError> {
