@@ -184,10 +184,7 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({
-            "school": "demo",
-            "school": "demo", "username": "ali", "password": "secret1"
-        })),
+        Some(json!({ "username": "ali", "password": "secret1" })),
     )
     .await
     .cookie

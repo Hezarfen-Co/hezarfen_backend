@@ -4,6 +4,7 @@
 //! the row mint, and the field-scoped writers live in [`crate::db::user`].
 
 use crate::database::Database;
+use crate::tenant::{Slug, Tenants};
 use crate::db::user;
 use crate::domain::board::Board;
 use crate::domain::note_file::FileContentType;
@@ -20,18 +21,20 @@ use crate::error::AppError;
 /// a warning: silently promoting an account someone else registered would
 /// be a privilege escalation, so that conflict is resolved out-of-band.
 pub async fn ensure_admin(
-    db: &Database,
+    tenants: &Tenants,
+    slug: &Slug,
     username: Username,
     password: Password,
 ) -> Result<(), AppError> {
-    match user::find_by_username(db, username.as_str()).await? {
-        Some(user) if user.role == Role::Admin => Ok(()),
+    let db = tenants.get(slug).await?;
+    match user::find_by_username(&db, username.as_str()).await? {
+        Some(user) if user.role == Role::Admin => {}
         Some(_) => {
             tracing::warn!(
                 "ADMIN_USERNAME names an existing non-admin account; refusing to promote it. \
                  Grant the role through an existing admin or a hand-run SQL session."
             );
-            Ok(())
+            return Ok(());
         }
         None => {
             // One statement, admin from birth. Never create-then-promote:
@@ -41,13 +44,30 @@ pub async fn ensure_admin(
             // is no marker that could tell such a row apart from a stranger
             // who registered the name first, so the hole cannot be healed
             // later; it has to be impossible to open.
-            user::create_with_role(db, username, password.hash_async().await?, Role::Admin).await?;
+            user::create_with_role(
+                &db,
+                username.clone(),
+                password.hash_async().await?,
+                Role::Admin,
+            )
+            .await?;
             // No `username` field: with OTLP on every event is exported as a
             // log record, so an account name here leaves the process.
             tracing::info!("seeded the admin account named by ADMIN_USERNAME");
-            Ok(())
         }
     }
+    // The person half: login reads the control-plane credential, so the
+    // seeded admin needs their `person` row and the membership too. Both
+    // writes are idempotent (create-or-load never re-keys an existing
+    // person's password; the membership insert is `ON CONFLICT DO NOTHING`),
+    // so every boot re-runs them — and a school whose seed predates the
+    // person half heals on the next boot instead of stranding an admin who
+    // cannot log in.
+    let password_hash = password.hash_async().await?;
+    let person =
+        crate::service::person::create_or_load(tenants.control(), username, password_hash).await?;
+    crate::service::person::link_school(tenants.control(), person.get_id(), slug).await?;
+    Ok(())
 }
 
 /// Overwrite this user's role **and** shed every grant the new role may not

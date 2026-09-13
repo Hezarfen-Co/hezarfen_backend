@@ -14,7 +14,7 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
     let (app, db) = app_and_db().await;
     let taken = json!({ "school": "demo", "username": "ada", "password": "secret1" });
 
-    let first = send(&app, "POST", "/auth/register", None, Some(taken.clone())).await;
+    let first = send(&app, "POST", "/auth/register", None, Some(taken)).await;
     assert_eq!(first.status, StatusCode::CREATED);
 
     // Same username again, different password: still 201, same body shape.
@@ -25,7 +25,7 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
         "POST",
         "/auth/register",
         None,
-        Some(dup_creds.clone()),
+        Some(dup_creds),
     )
     .await;
     let dup_elapsed = started.elapsed();
@@ -79,13 +79,27 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
 
     // The original account is untouched: its password still works and the
     // attacker's does not.
-    let login = send(&app, "POST", "/auth/login", None, Some(taken)).await;
+    let login = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ada", "password": "secret1" })),
+    )
+    .await;
     assert_eq!(
         login.status,
         StatusCode::OK,
         "original password stopped working"
     );
-    let hijack = send(&app, "POST", "/auth/login", None, Some(dup_creds)).await;
+    let hijack = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ada", "password": "attacker" })),
+    )
+    .await;
     assert_eq!(
         hijack.status,
         StatusCode::UNAUTHORIZED,

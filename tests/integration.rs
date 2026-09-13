@@ -274,7 +274,7 @@ async fn register_validates_input() {
 
     // Valid -> 201, no password echoed back, defaults to the student role.
     let ok = json!({ "school": "demo", "username": "bob", "password": "secret1" });
-    let res = send(&app, "POST", "/auth/register", None, Some(ok.clone())).await;
+    let res = send(&app, "POST", "/auth/register", None, Some(ok)).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["username"], "bob");
     assert_eq!(res.body["role"], "student");
@@ -285,15 +285,29 @@ async fn register_validates_input() {
     // write is still rejected: the original password keeps working and the
     // second one never becomes valid.
     let dup = json!({ "school": "demo", "username": "bob", "password": "hijack1" });
-    let res = send(&app, "POST", "/auth/register", None, Some(dup.clone())).await;
+    let res = send(&app, "POST", "/auth/register", None, Some(dup)).await;
     assert_eq!(res.status, StatusCode::CREATED);
-    let res = send(&app, "POST", "/auth/login", None, Some(ok)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "bob", "password": "secret1" })),
+    )
+    .await;
     assert_eq!(
         res.status,
         StatusCode::OK,
         "original password stopped working"
     );
-    let res = send(&app, "POST", "/auth/login", None, Some(dup)).await;
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "bob", "password": "hijack1" })),
+    )
+    .await;
     assert_eq!(
         res.status,
         StatusCode::UNAUTHORIZED,
@@ -329,7 +343,7 @@ async fn register_rejects_reserved_usernames() {
     // (created through `ensure_admin`, not `/auth/register`) still logs in.
     // Covered by the admin bootstrap tests; here just prove a reserved name
     // is not permanently poisoned for login by the register-level check.
-    let creds = json!({ "school": "demo", "username": "admin", "password": "wrong" });
+    let creds = json!({ "username": "admin", "password": "wrong" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED); // bad credentials, not "reserved"
 }
@@ -352,7 +366,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "demo", "username": "kate", "password": "wrong" })),
+        Some(json!({ "username": "kate", "password": "wrong" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
@@ -363,7 +377,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "demo", "username": "ghost", "password": "secret1" })),
+        Some(json!({ "username": "ghost", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
@@ -383,6 +397,9 @@ const PUBLIC: &[(&str, &str)] = &[
     ("GET", "/modules/catalog"),
     ("POST", "/auth/register"),
     ("POST", "/auth/login"),
+    // Person-cookie gated, not a school session: OpenAPI declares no
+    // session_cookie security, so the public-route audit lists it here.
+    ("POST", "/auth/school"),
     // Idempotent: revokes the session if there is one, `204` either way.
     ("POST", "/auth/logout"),
     // A server certificate is handed to every peer in the TLS handshake, so
@@ -531,6 +548,12 @@ async fn logout_invalidates_the_session_server_side() {
 
     let res = send(&app, "POST", "/auth/logout", Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        res.cookie.as_deref(),
+        Some("session="),
+        "logout must send a clearing Set-Cookie, got {:?}",
+        res.cookie
+    );
 
     // Re-using the same token now fails: the session row is gone.
     let res = send(&app, "GET", "/auth/me", Some(&ali), None).await;
@@ -4931,12 +4954,11 @@ async fn a_subject_delete_racing_question_creates_leaves_no_orphan() {
     }
     let killed = killer.await.unwrap();
 
-    let counter: i64 =
-        sqlx::query_scalar("SELECT exam_question_count FROM subject WHERE id = $1")
-            .bind(Uuid::parse_str(&subject).expect("subject id"))
-            .fetch_one(&db)
-            .await
-            .expect("counter read");
+    let counter: i64 = sqlx::query_scalar("SELECT exam_question_count FROM subject WHERE id = $1")
+        .bind(Uuid::parse_str(&subject).expect("subject id"))
+        .fetch_one(&db)
+        .await
+        .expect("counter read");
     let landed: i64 = sqlx::query_scalar("SELECT count(*) FROM exam_question WHERE subject = $1")
         .bind(Uuid::parse_str(&subject).expect("subject id"))
         .fetch_one(&db)
@@ -5900,13 +5922,15 @@ async fn login_purges_expired_sessions() {
     // Inject a session that has already expired. The FK forces the row to
     // point at a real user; the old engine allowed a dangling one.
     let ali_id = me_id(&app, &ali).await;
-    sqlx::query("INSERT INTO user_session (id, app_user, token, expires_at) \
-                 VALUES ($1, $2, 'expired-token', 1)")
-        .bind(Uuid::now_v7())
-        .bind(Uuid::parse_str(&ali_id).expect("user id"))
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_session (id, app_user, token, expires_at) \
+                 VALUES ($1, $2, 'expired-token', 1)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(Uuid::parse_str(&ali_id).expect("user id"))
+    .execute(&db)
+    .await
+    .unwrap();
     assert!(
         session::find_by_token(&db, "expired-token")
             .await
@@ -6021,7 +6045,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "school": "demo", "username": attempt, "password": "secret1" })),
+            Some(json!({ "username": attempt, "password": "secret1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::OK, "login as {attempt:?}");
@@ -6030,7 +6054,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "school": "demo", "username": attempt, "password": "spoof1" })),
+            Some(json!({ "username": attempt, "password": "spoof1" })),
         )
         .await;
         assert_eq!(
@@ -6059,7 +6083,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "school": "demo", "username": attempt, "password": "secret1" })),
+            Some(json!({ "username": attempt, "password": "secret1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::OK, "login as {attempt:?}");
@@ -6371,10 +6395,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         .fetch_one(&db)
         .await
         .unwrap();
-    assert_eq!(
-        users, 1,
-        "exactly one user row for the duplicated name"
-    );
+    assert_eq!(users, 1, "exactly one user row for the duplicated name");
 
     // And the winner's credentials survived the pile-up: a further duplicate
     // asking for a different password does not replace them.
@@ -6392,7 +6413,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "demo", "username": "dup", "password": "secret1" })),
+        Some(json!({ "username": "dup", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "the winning password broke");
@@ -6401,7 +6422,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "demo", "username": "dup", "password": "hijack1" })),
+        Some(json!({ "username": "dup", "password": "hijack1" })),
     )
     .await;
     assert_eq!(
@@ -6472,16 +6493,17 @@ async fn session_cookie_secure_attribute_follows_config() {
     async fn login_set_cookie(app: &axum::Router) -> String {
         let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
         assert_eq!(
-            send(app, "POST", "/auth/register", None, Some(creds.clone()))
+            send(app, "POST", "/auth/register", None, Some(creds))
                 .await
                 .status,
             StatusCode::CREATED
         );
+        let login = json!({ "username": "ada", "password": "secret1" });
         let req = Request::builder()
             .method("POST")
             .uri("/auth/login")
             .header("content-type", "application/json")
-            .body(Body::from(creds.to_string()))
+            .body(Body::from(login.to_string()))
             .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -6860,14 +6882,19 @@ async fn cors_exposes_retry_after_and_content_disposition() {
 /// credentials and the account can reach admin-only endpoints immediately.
 #[tokio::test]
 async fn admin_seed_creates_working_admin() {
-    let (app, db) = app_and_db().await;
+    let (app, _db, tenants) = app_and_tenants().await;
     let username = Username::try_new("root").unwrap();
     let password = Password::try_new("secret1").unwrap();
-    hezarfen_backend::service::user::ensure_admin(&db, username, password)
-        .await
-        .unwrap();
+    hezarfen_backend::service::user::ensure_admin(
+        &tenants,
+        &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+        username,
+        password,
+    )
+    .await
+    .unwrap();
 
-    let creds = json!({ "school": "demo", "username": "root", "password": "secret1" });
+    let creds = json!({ "username": "root", "password": "secret1" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["role"], "admin");
@@ -6881,17 +6908,22 @@ async fn admin_seed_creates_working_admin() {
 /// demote it, or overwrite its password.
 #[tokio::test]
 async fn admin_seed_is_idempotent() {
-    let (app, db) = app_and_db().await;
+    let (app, _db, tenants) = app_and_tenants().await;
     for _ in 0..2 {
         let username = Username::try_new("root").unwrap();
         let password = Password::try_new("secret1").unwrap();
-        hezarfen_backend::service::user::ensure_admin(&db, username, password)
-            .await
-            .unwrap();
+        hezarfen_backend::service::user::ensure_admin(
+            &tenants,
+            &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+            username,
+            password,
+        )
+        .await
+        .unwrap();
     }
 
     let cookie = {
-        let creds = json!({ "school": "demo", "username": "root", "password": "secret1" });
+        let creds = json!({ "username": "root", "password": "secret1" });
         let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::OK);
         res.cookie.expect("session cookie")
@@ -6906,21 +6938,26 @@ async fn admin_seed_is_idempotent() {
 /// password replaced) by the seed — that would be privilege escalation.
 #[tokio::test]
 async fn admin_seed_refuses_existing_non_admin() {
-    let (app, db) = app_and_db().await;
+    let (app, _db, tenants) = app_and_tenants().await;
     let cookie = login(&app, "squatter").await; // registers with password `secret1`
 
     let username = Username::try_new("squatter").unwrap();
     let password = Password::try_new("attacker-pw").unwrap();
-    hezarfen_backend::service::user::ensure_admin(&db, username, password)
-        .await
-        .unwrap();
+    hezarfen_backend::service::user::ensure_admin(
+        &tenants,
+        &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+        username,
+        password,
+    )
+    .await
+    .unwrap();
 
     // Still a student: the admin-only listing stays closed...
     let res = send(&app, "GET", "/users", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "must not be promoted");
 
     // ...and the original password still logs in (nothing was overwritten).
-    let creds = json!({ "school": "demo", "username": "squatter", "password": "secret1" });
+    let creds = json!({ "username": "squatter", "password": "secret1" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["role"], "student");
@@ -13817,11 +13854,10 @@ async fn messages_remember_the_folder_a_filed_copy_came_from() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    let origins: Vec<Option<String>> =
-        sqlx::query_scalar("SELECT sender_origin FROM message")
-            .fetch_all(&db)
-            .await
-            .expect("read origins");
+    let origins: Vec<Option<String>> = sqlx::query_scalar("SELECT sender_origin FROM message")
+        .fetch_all(&db)
+        .await
+        .expect("read origins");
     assert_eq!(origins, vec![None], "the deleted side keeps no origin");
 }
 
@@ -15450,15 +15486,7 @@ async fn homework_grading_gates_and_bounds() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "students never grade");
     let res = grade_hw(&app, &w.teacher, &hw, &teacher_id, "done", None).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "no self-grading");
-    let res = grade_hw(
-        &app,
-        &w.teacher,
-        &hw,
-        common::ABSENT_ID,
-        "done",
-        None,
-    )
-    .await;
+    let res = grade_hw(&app, &w.teacher, &hw, common::ABSENT_ID, "done", None).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "target must exist");
     let rival = login_as(&app, &db, "rival", "teacher").await;
     let rival_id = me_id(&app, &rival).await;
@@ -24542,9 +24570,7 @@ async fn the_statement_reports_overdue_and_its_rollup_matches_the_balance() {
         "POST",
         "/auth/login",
         None,
-        Some(
-            json!({ "school": "demo", "school": "demo", "username": "ali", "password": "secret1" }),
-        ),
+        Some(json!({ "username": "ali", "password": "secret1" })),
     )
     .await
     .cookie
@@ -27850,7 +27876,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "beta", "username": "boran", "password": "secret1" })),
+        Some(json!({ "username": "boran", "password": "secret1" })),
     )
     .await;
     assert_eq!(
@@ -28080,14 +28106,15 @@ async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, ten
         assert_eq!(found, 1, "exactly one 'ayse' in {slug}");
     }
 
-    // Unknown school: same 401 and same body as a bad credential — no
-    // enumeration of the customer list.
-    let unknown = send(
+    // The login body names no school, so the customer list is not probeable
+    // there at all. The parity that remains is unknown-username vs bad
+    // password: same 401, same body, same argon2 bill.
+    let unknown_user = send(
         app,
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "not-a-school", "username": "ayse", "password": "secret1" })),
+        Some(json!({ "username": "nobody-here", "password": "secret1" })),
     )
     .await;
     let bad_pass = send(
@@ -28095,15 +28122,20 @@ async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, ten
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": DEMO_SLUG, "username": "ayse", "password": "wrongpw1" })),
+        Some(json!({ "username": "ayse", "password": "wrongpw1" })),
     )
     .await;
-    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "{}", unknown.body);
-    assert_eq!(unknown.status, bad_pass.status, "status differs");
     assert_eq!(
-        unknown.body, bad_pass.body,
-        "an unknown school answers differently from a bad password: {} vs {}",
-        unknown.body, bad_pass.body
+        unknown_user.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        unknown_user.body
+    );
+    assert_eq!(unknown_user.status, bad_pass.status, "status differs");
+    assert_eq!(
+        unknown_user.body, bad_pass.body,
+        "an unknown username answers differently from a bad password: {} vs {}",
+        unknown_user.body, bad_pass.body
     );
 
     // Register against an unknown school: same treatment.
@@ -28334,7 +28366,9 @@ async fn remote_probe_remote_mode_keeps_two_schools_apart() {
     let slug_a = Slug::try_new("ata-koleji").unwrap();
     let slug_b = Slug::try_new("2024school").unwrap();
 
-    // The same username in both schools, over the real router.
+    // Same username in both schools is one person with two memberships.
+    // Login into the second school therefore returns a person cookie; bind
+    // each membership so the rest of the test holds two school sessions.
     let mut cookies = Vec::new();
     for slug in [&slug_a, &slug_b] {
         let creds = json!({ "school": slug.as_str(), "username": "ada", "password": "secret1" });
@@ -28349,7 +28383,26 @@ async fn remote_probe_remote_mode_keeps_two_schools_apart() {
         common::set_role(&db, "ada", "admin").await;
         let res = send(app, "POST", "/auth/login", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::OK, "login in {slug}: {}", res.body);
-        cookies.push(res.cookie.expect("cookie"));
+        let cookie = if res.body["schools"].is_array() {
+            let selected = send(
+                app,
+                "POST",
+                "/auth/school",
+                res.cookie.as_deref(),
+                Some(json!({ "school": slug.as_str() })),
+            )
+            .await;
+            assert_eq!(
+                selected.status,
+                StatusCode::OK,
+                "select {slug}: {}",
+                selected.body
+            );
+            selected.cookie.expect("school cookie")
+        } else {
+            res.cookie.expect("cookie")
+        };
+        cookies.push(cookie);
     }
     let (a, b) = (cookies[0].clone(), cookies[1].clone());
 
@@ -29162,4 +29215,216 @@ async fn the_catalog_lists_every_module() {
             "{module} is not for sale"
         );
     }
+}
+
+// --- person-scoped login ---------------------------------------------------
+
+/// A person registered at exactly one school is entered straight into it: the
+/// login body carries no school, the reply names the person, and the session
+/// cookie is that school's.
+#[tokio::test]
+async fn login_without_school_enters_a_single_school_person() {
+    let (app, _db) = app_and_db().await;
+    let reg = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": DEMO_SLUG, "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["id"].is_string(), "the person's id: {}", res.body);
+    assert_eq!(res.body["username"], "personada");
+    let cookie = res.cookie.expect("school cookie");
+    assert!(cookie.starts_with("session=demo."), "cookie: {cookie}");
+
+    let res = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// A person registered at two schools is entered nowhere by login: the reply
+/// lists both schools and the cookie is a person cookie that has chosen
+/// nothing yet; `POST /auth/school` then binds it to one school.
+#[tokio::test]
+async fn a_multischool_person_selects_a_school() {
+    let d = common::deployment_with(TWO_SCHOOLS).await;
+    let app = &d.app;
+    for school in [DEMO_SLUG, "beta"] {
+        let reg = send(
+            app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({ "school": school, "username": "personada", "password": "secret1" })),
+        )
+        .await;
+        assert_eq!(
+            reg.status,
+            StatusCode::CREATED,
+            "register into {school}: {}",
+            reg.body
+        );
+    }
+
+    let res = send(
+        app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["username"], "personada");
+    let mut slugs: Vec<&str> = res.body["schools"]
+        .as_array()
+        .expect("schools list")
+        .iter()
+        .map(|s| s["slug"].as_str().expect("school slug"))
+        .collect();
+    slugs.sort_unstable();
+    assert_eq!(slugs, ["beta", "demo"]);
+    assert!(
+        res.body.get("id").is_none(),
+        "no school chosen yet: {}",
+        res.body
+    );
+    let person = res.cookie.expect("person cookie");
+    assert!(person.starts_with("session=person."), "cookie: {person}");
+
+    // A person cookie alone is not a session: `/auth/me` refuses it.
+    let res = send(app, "GET", "/auth/me", Some(&person), None).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+
+    let res = send(
+        app,
+        "POST",
+        "/auth/school",
+        Some(&person),
+        Some(json!({ "school": DEMO_SLUG })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["id"].is_string(), "the person's id: {}", res.body);
+    let cookie = res.cookie.expect("school cookie");
+    assert!(cookie.starts_with("session=demo."), "cookie: {cookie}");
+    let res = send(app, "GET", "/auth/me", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// `POST /auth/school` is member-only and cookie-strict: a slug the person is
+/// not registered under, a missing cookie, and an already-bound school cookie
+/// all refuse.
+#[tokio::test]
+async fn school_selection_refuses_non_members_and_wrong_cookies() {
+    let d = common::deployment_with(TWO_SCHOOLS).await;
+    let app = &d.app;
+    for school in [DEMO_SLUG, "beta"] {
+        let reg = send(
+            app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({ "school": school, "username": "personada", "password": "secret1" })),
+        )
+        .await;
+        assert_eq!(
+            reg.status,
+            StatusCode::CREATED,
+            "register into {school}: {}",
+            reg.body
+        );
+    }
+    let res = send(
+        app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let person = res.cookie.expect("person cookie");
+
+    // Not a member of the requested school.
+    let res = send(
+        app,
+        "POST",
+        "/auth/school",
+        Some(&person),
+        Some(json!({ "school": "ghost-slug" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+
+    // No cookie at all.
+    let res = send(
+        app,
+        "POST",
+        "/auth/school",
+        None,
+        Some(json!({ "school": DEMO_SLUG })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+
+    // Selecting a school for real...
+    let res = send(
+        app,
+        "POST",
+        "/auth/school",
+        Some(&person),
+        Some(json!({ "school": DEMO_SLUG })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let school_cookie = res.cookie.expect("school cookie");
+
+    // ...and asking again with the school cookie: refused.
+    let res = send(
+        app,
+        "POST",
+        "/auth/school",
+        Some(&school_cookie),
+        Some(json!({ "school": DEMO_SLUG })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+}
+
+/// The old client shape — a leftover `"school"` field in the login body — is
+/// ignored, not refused: serde drops fields the login no longer knows.
+#[tokio::test]
+async fn login_ignores_a_leftover_school_field() {
+    let (app, _db) = app_and_db().await;
+    let reg = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": DEMO_SLUG, "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "school": "demo", "username": "personada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }

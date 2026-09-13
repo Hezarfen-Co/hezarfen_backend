@@ -52,8 +52,8 @@ pub use dto::{
     UserResponse, course_people, person_map,
 };
 pub use extractor::{
-    BUILDER_COOKIE_PREFIX, CurrentUser, RequireAdmin, RequireBuilder, RequireManager,
-    RequireStudent, RequireTeacher,
+    BUILDER_COOKIE_PREFIX, CurrentUser, PERSON_COOKIE_PREFIX, RequireAdmin, RequireBuilder,
+    RequireManager, RequireStudent, RequireTeacher,
 };
 pub(crate) use image::{ImageUpload, read_image_upload, store_blob};
 pub use page::{Page, PageParams, Scheduled, WindowParams, paginate};

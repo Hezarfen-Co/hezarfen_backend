@@ -211,13 +211,48 @@ pub async fn login_as_school(
     username: &str,
     role: &str,
 ) -> String {
-    let creds = json!({ "school": school, "username": username, "password": "secret1" });
-    let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    let reg = send(
+        app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": school, "username": username, "password": "secret1" })),
+    )
+    .await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
     set_role(db, username, role).await;
-    let res = send(app, "POST", "/auth/login", None, Some(creds)).await;
+    let res = send(
+        app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": username, "password": "secret1" })),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "login {username}");
-    res.cookie.expect("session cookie set on login")
+    // The account is a person: if `username` already belongs to another
+    // school, login answers a choice list and never names a school — bind
+    // the school this helper was called for.
+    let cookie = if res.body["schools"].is_array() {
+        let selected = send(
+            app,
+            "POST",
+            "/auth/school",
+            res.cookie.as_deref(),
+            Some(json!({ "school": school })),
+        )
+        .await;
+        assert_eq!(
+            selected.status,
+            StatusCode::OK,
+            "select {school} for {username}: {}",
+            selected.body
+        );
+        selected.cookie.expect("school cookie after selection")
+    } else {
+        res.cookie.expect("session cookie set on login")
+    };
+    cookie
 }
 
 /// Send one request through `app`. `cookie` is a raw `Cookie` header value.
@@ -385,10 +420,23 @@ pub async fn upload_course_note_file(
 
 /// Register (password `secret1`) then log in; returns the session `Cookie` value.
 pub async fn login(app: &Router, username: &str) -> String {
-    let creds = json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" });
-    let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    let reg = send(
+        app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" })),
+    )
+    .await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
-    let res = send(app, "POST", "/auth/login", None, Some(creds)).await;
+    let res = send(
+        app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": username, "password": "secret1" })),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK, "login {username}");
     res.cookie.expect("session cookie set on login")
 }

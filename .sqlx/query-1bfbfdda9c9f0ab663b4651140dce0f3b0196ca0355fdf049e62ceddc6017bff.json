@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT person AS \"person: PersonId\",\n                  token AS \"token: SessionToken\",\n                  expires_at AS \"expires_at: Timestamp\"\n           FROM person_session WHERE token = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "person: PersonId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "person"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "token: SessionToken",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1bfbfdda9c9f0ab663b4651140dce0f3b0196ca0355fdf049e62ceddc6017bff"
+}

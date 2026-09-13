@@ -192,3 +192,11 @@ where
 /// The cookie prefix a builder session carries in place of a school slug.
 /// `Slug::try_new` reserves this word, so it can never also name a school.
 pub const BUILDER_COOKIE_PREFIX: &str = "builder";
+
+/// The cookie prefix a not-yet-bound person session carries in place of a
+/// school slug: a person who belongs to several schools logs into the
+/// control plane first and names a school afterwards (`POST /auth/school`).
+/// `Slug::try_new` reserves this word (`RESERVED_SLUGS`), so it can never
+/// also name a school — a `person.` cookie is `401` on every school surface,
+/// exactly like `builder.`.
+pub const PERSON_COOKIE_PREFIX: &str = "person";

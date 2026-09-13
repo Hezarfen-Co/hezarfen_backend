@@ -331,7 +331,7 @@ async fn builder_me(RequireBuilder(builder): RequireBuilder) -> Json<BuilderResp
         (status = 201, description = "School created, with its first admin", body = SchoolResponse),
         (status = 400, description = "Invalid slug, name, admin credentials, or module name", body = ErrorResponse, example = json!({"error": "module: `kantin` is not a known module"})),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
-        (status = 409, description = "That slug is already taken, or the module set is unsatisfiable", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
+        (status = 409, description = "That slug is already taken, the module set is unsatisfiable, or the admin username exists under a different password", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -346,7 +346,8 @@ async fn create_school(
     let slug = Slug::try_new(&req.slug)?;
     let name = school_name(&req.name)?;
     let username = Username::try_new(&req.admin_username)?;
-    let password_hash = Password::try_new(&req.admin_password)?.hash_async().await?;
+    let password = Password::try_new(&req.admin_password)?;
+    let password_hash = password.hash_async().await?;
 
     let modules = match req.modules.as_deref() {
         Some(names) => ModuleSet::from_names(names)?,
@@ -355,11 +356,29 @@ async fn create_school(
     // Before `create`, so an unsatisfiable set is a refusal and not a school
     // that has to be deleted again.
     modules.validate()?;
+    // The school's first admin is also a *person*: create the control-plane
+    // account, or meet the one already standing. A taken username under a
+    // different password is a `409` — a builder is authenticated, so there
+    // is nothing to enumerate — and it refuses here, before anything is
+    // provisioned, so there is nothing to clean up either.
+    let person =
+        service::person::create_or_load(&st.db, username.clone(), password_hash.clone()).await?;
+    if !person.get_password_hash().verify_async(&password).await {
+        return Err(AppError::Conflict(
+            "an account with that username exists under a different password",
+        ));
+    }
 
     let db = st.tenants.create(&slug, &name, modules).await?;
-    if let Err(err) =
-        crate::service::user::create_with_role(&db, username, password_hash, Role::Admin).await
-    {
+    let seeded = async {
+        crate::service::user::create_with_role(&db, username, password_hash, Role::Admin).await?;
+        // The admin's person gets the membership the school row answers for —
+        // idempotent, so a retried create after a torn pair completes it.
+        service::person::link_school(&st.db, person.get_id(), &slug).await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if let Err(err) = seeded {
         // A school nobody can log into is worse than no school: take the
         // database back so the very same request can simply be retried.
         if let Err(cleanup) = st.tenants.drop(&slug).await {
@@ -751,18 +770,26 @@ async fn reset_admin_password(
     Json(req): Json<AdminPassword>,
 ) -> Result<StatusCode, AppError> {
     let slug = path_slug(&slug)?;
-    // `get_any_status`, not `get`: a lockout is exactly the situation a school
-    // may be suspended in, and the vendor must still be able to fix it.
     let (db, _status) = st.tenants.get_any_status(&slug).await?;
     let user = school_admin(&req.username, &db).await?;
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
 
-    crate::service::user::set_password_hash(&db, user.get_id(), password_hash)
+    crate::service::user::set_password_hash(&db, user.get_id(), password_hash.clone())
         .await?
         .ok_or(AppError::NotFound)?;
+    // The person credential is the one login reads; the school row's copy
+    // exists so school-side queries keep compiling. Both move together, or a
+    // reset would leave the old password working everywhere.
+    service::person::set_password_hash(&st.db, user.get_username(), &password_hash).await?;
     // The other half: the new password means nothing while a cookie minted
-    // under the old one still authenticates.
+    // under the old one still authenticates — school sessions *and* any
+    // unbound `person.<token>` that could mint a fresh school session.
     service::session::delete_by_user(&db, user.get_id()).await?;
+    if let Some(person) =
+        service::person::find_by_username(&st.db, user.get_username().as_str()).await?
+    {
+        service::person::delete_sessions_by_person(&st.db, person.get_id()).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

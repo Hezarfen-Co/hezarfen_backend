@@ -38,10 +38,11 @@ use crate::web::tenant_state::ResolvedTenant;
 /// the suites agree on.
 pub const DEMO_SLUG: &str = "demo";
 
-/// Slugs that name something other than a school: the builder cookie prefix and
-/// the control database itself. Refused at construction, so neither a login nor
-/// a `CREATE DATABASE` can ever be aimed at them.
-pub const RESERVED_SLUGS: [&str; 2] = ["builder", "control"];
+/// Slugs that name something other than a school: the builder cookie prefix,
+/// the control database itself, and the person cookie prefix. Refused at
+/// construction, so neither a login nor a `CREATE DATABASE` can ever be
+/// aimed at them.
+pub const RESERVED_SLUGS: [&str; 3] = ["builder", "control", "person"];
 
 /// A school's identity everywhere it is named: the cookie prefix, the database
 /// name, and the files subdirectory. The character set is deliberately the
@@ -503,6 +504,12 @@ impl Tenants {
         // database is about to go away, and `WITH (FORCE)` should never find
         // one of our connections to kill.
         self.evict(slug).await;
+        // The control-plane membership rows point at the school by slug, and
+        // `ON DELETE NO ACTION` would refuse the registry delete while any
+        // stand. Person sessions carry no school, so only memberships go —
+        // the persons themselves survive (a person is a global account, not
+        // the school's).
+        crate::db::person::delete_memberships_by_school(&self.control, slug).await?;
         sqlx::query("DELETE FROM school WHERE slug = $1")
             .bind(slug.as_str())
             .execute(&self.control)

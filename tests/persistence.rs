@@ -45,9 +45,10 @@ async fn settings_and_terms_survive_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
 
     let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
-    send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    send(&app, "POST", "/auth/register", None, Some(creds)).await;
     set_role(&db, "boss", "manager").await;
-    let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+    let login = json!({ "username": "boss", "password": "secret1" });
+    let cookie = send(&app, "POST", "/auth/login", None, Some(login.clone()))
         .await
         .cookie
         .unwrap();
@@ -91,7 +92,7 @@ async fn settings_and_terms_survive_remigration() {
 
     // Second boot: migration re-applied over live data.
     let app = reboot(&db, &tenants).await;
-    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+    let cookie = send(&app, "POST", "/auth/login", None, Some(login))
         .await
         .cookie
         .unwrap();
@@ -146,7 +147,7 @@ async fn appointments_survive_remigration() {
         "POST",
         "/auth/login",
         None,
-        Some(teacher_creds.clone()),
+        Some(json!({ "username": "ali", "password": "secret1" })),
     )
     .await
     .cookie
@@ -156,7 +157,7 @@ async fn appointments_survive_remigration() {
         "POST",
         "/auth/login",
         None,
-        Some(student_creds.clone()),
+        Some(json!({ "username": "ayse", "password": "secret1" })),
     )
     .await
     .cookie
@@ -292,7 +293,7 @@ async fn attempt_history_survives_remigration() {
         "POST",
         "/auth/login",
         None,
-        Some(teacher_creds.clone()),
+        Some(json!({ "username": "ali", "password": "secret1" })),
     )
     .await
     .cookie
@@ -302,7 +303,7 @@ async fn attempt_history_survives_remigration() {
         "POST",
         "/auth/login",
         None,
-        Some(student_creds.clone()),
+        Some(json!({ "username": "ayse", "password": "secret1" })),
     )
     .await
     .cookie
@@ -378,10 +379,16 @@ async fn attempt_history_survives_remigration() {
 
     // Second boot: migration re-applied over the two sittings' live rows.
     let app = reboot(&db, &tenants).await;
-    let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds))
-        .await
-        .cookie
-        .unwrap();
+    let teacher = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ali", "password": "secret1" })),
+    )
+    .await
+    .cookie
+    .unwrap();
 
     let res = send(
         &app,
@@ -556,14 +563,15 @@ async fn settings_slots_without_a_serving_minute_still_patch() {
     let (app, db, tenants) = common::app_and_tenants().await;
 
     let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
-    send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    send(&app, "POST", "/auth/register", None, Some(creds)).await;
     set_role(&db, "boss", "manager").await;
+    let login = json!({ "username": "boss", "password": "secret1" });
 
     let res = send(
         &app,
         "PATCH",
         "/settings",
-        Some(&send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+        Some(&send(&app, "POST", "/auth/login", None, Some(login.clone()))
             .await
             .cookie
             .unwrap()),
@@ -574,7 +582,7 @@ async fn settings_slots_without_a_serving_minute_still_patch() {
 
     // Second boot, then read and patch again.
     let app = reboot(&db, &tenants).await;
-    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+    let cookie = send(&app, "POST", "/auth/login", None, Some(login))
         .await
         .cookie
         .unwrap();
@@ -616,14 +624,26 @@ async fn fee_plans_and_their_charges_survive_remigration() {
         );
     }
     set_role(&db, "ali", "manager").await;
-    let manager = send(&app, "POST", "/auth/login", None, Some(manager_creds))
-        .await
-        .cookie
-        .unwrap();
-    let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
-        .await
-        .cookie
-        .unwrap();
+    let manager = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ali", "password": "secret1" })),
+    )
+    .await
+    .cookie
+    .unwrap();
+    let student = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ayse", "password": "secret1" })),
+    )
+    .await
+    .cookie
+    .unwrap();
     let student_id = me_id(&app, &student).await;
 
     let res = send(
@@ -693,7 +713,7 @@ async fn fee_plans_and_their_charges_survive_remigration() {
 #[tokio::test]
 async fn boards_and_their_strokes_survive_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
+    let creds = json!({ "username": "ali", "password": "secret1" });
     let cookie = common::login(&app, "ali").await;
     let veli = common::login(&app, "veli").await;
     let ali_id = me_id(&app, &cookie).await;

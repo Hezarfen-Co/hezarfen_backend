@@ -94,7 +94,7 @@ async fn register(client: &Client, base: &str, user: &str) -> reqwest::Response 
 async fn login(client: &Client, base: &str, user: &str) {
     let res = client
         .post(format!("{base}/auth/login"))
-        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
+        .json(&json!({ "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap();
@@ -440,7 +440,7 @@ async fn attendance_rollup_across_users() {
 async fn raw_session_cookie(base: &str, user: &str) -> String {
     let res = Client::new()
         .post(format!("{base}/auth/login"))
-        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
+        .json(&json!({ "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap();
@@ -3709,7 +3709,7 @@ async fn a_builder_creates_a_school_over_tcp_and_its_admin_logs_in() {
     let admin = client();
     let res = admin
         .post(format!("{base}/auth/login"))
-        .json(&json!({ "school": "tcp-koleji", "username": "admin", "password": "secret1" }))
+        .json(&json!({ "username": "admin", "password": "secret1" }))
         .send()
         .await
         .unwrap();

@@ -46,6 +46,7 @@ pub mod note;
 pub mod note_file;
 pub mod page;
 pub mod parent_link;
+pub mod person;
 pub mod payment_ledger;
 pub mod pomodoro;
 pub mod pool_question;

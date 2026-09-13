@@ -57,6 +57,7 @@ pub mod profile;
 pub mod question_image;
 pub mod rag_output;
 pub mod registration;
+pub mod person;
 pub mod role;
 pub mod session;
 pub mod session_attendance;

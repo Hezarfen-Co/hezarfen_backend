@@ -69,7 +69,7 @@ async fn send_as(
 }
 
 fn bad_login() -> Option<Value> {
-    Some(json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
+    Some(json!({ "username": "ghost", "password": "wrong-pass" }))
 }
 
 fn auth_only(per_minute: u32) -> RateLimitConfig {
@@ -111,16 +111,30 @@ async fn register_and_login_share_the_auth_bucket() {
         "1.1.1.1",
         "POST",
         "/auth/register",
-        Some(creds.clone()),
+        Some(creds),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    let (status, _, _) = send_as(&app, "1.1.1.1", "POST", "/auth/login", Some(creds.clone())).await;
+    let (status, _, _) = send_as(
+        &app,
+        "1.1.1.1",
+        "POST",
+        "/auth/login",
+        Some(json!({ "username": "ada", "password": "secret1" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Two credential requests spent the whole budget; the third is metered
     // regardless of whether it would have succeeded.
-    let (status, _, _) = send_as(&app, "1.1.1.1", "POST", "/auth/login", Some(creds)).await;
+    let (status, _, _) = send_as(
+        &app,
+        "1.1.1.1",
+        "POST",
+        "/auth/login",
+        Some(json!({ "username": "ada", "password": "secret1" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -596,7 +610,7 @@ async fn real_connections_are_keyed_by_peer_address() {
         let res = client
             .post(format!("{base}/auth/login"))
             .header("x-forwarded-for", spoof)
-            .json(&json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
+            .json(&json!({ "username": "ghost", "password": "wrong-pass" }))
             .send()
             .await
             .unwrap();
@@ -606,7 +620,7 @@ async fn real_connections_are_keyed_by_peer_address() {
     let res = client
         .post(format!("{base}/auth/login"))
         .header("x-forwarded-for", "3.3.3.3")
-        .json(&json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
+        .json(&json!({ "username": "ghost", "password": "wrong-pass" }))
         .send()
         .await
         .unwrap();

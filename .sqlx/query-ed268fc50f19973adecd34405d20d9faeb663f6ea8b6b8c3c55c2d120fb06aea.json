@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO person_session (id, person, token, created_at, expires_at)\n           VALUES ($1, $2, $3, $4, $5)\n           RETURNING person AS \"person: PersonId\",\n                     token AS \"token: SessionToken\",\n                     expires_at AS \"expires_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "person: PersonId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "person"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "token: SessionToken",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "person_session",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ed268fc50f19973adecd34405d20d9faeb663f6ea8b6b8c3c55c2d120fb06aea"
+}

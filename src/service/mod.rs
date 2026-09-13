@@ -43,6 +43,7 @@ pub mod note;
 pub mod note_file;
 pub mod parent_link;
 pub mod payment_ledger;
+pub mod person;
 pub mod pomodoro;
 pub mod pool_question;
 pub mod profile;

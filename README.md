@@ -301,13 +301,15 @@ school database sees only its own rows, so no query carries a
 `WHERE school = ...` somebody could forget.
 
 **Slugs.** 2-32 characters of `a-z`, `0-9` and `-`, starting with a letter or
-digit (`MIN_SLUG_LEN`/`MAX_SLUG_LEN`); `builder` and `control` are reserved and
-refused. A slug names the school's database, its blob directory and its cookie
-prefix, so it is immutable once taken — a rename changes the display name only.
+digit (`MIN_SLUG_LEN`/`MAX_SLUG_LEN`); `builder`, `control` and `person` are
+reserved and refused. A slug names the school's database, its blob directory
+and its cookie prefix, so it is immutable once taken — a rename changes the
+display name only.
 
 **Cookies.** A school session is `session=<slug>.<token>`, the vendor's is
-`session=builder.<token>`, split at the *first* dot so a token can never be
-read as a slug. Neither cookie is accepted on the other's surface (`401` both
+`session=builder.<token>`, and a person who still has to pick a school carries
+`session=person.<token>` — all split at the *first* dot so a token can never
+be read as a slug. No cookie is accepted on another's surface (`401` all
 ways), and a cookie with no dot names no school and is refused everywhere.
 
 **How a request finds its school.** Every school-scoped handler takes the
@@ -329,8 +331,10 @@ working on a suspended school — that is how it comes back — except
 operator account at boot (both or neither; half a pair aborts startup, and an
 existing account is never rewritten). From there: `POST /builder/login` →
 `POST /schools` (registry row, database, schema and the school's first admin —
-one call or none of it) → that admin logs in at `POST /auth/login` naming the
-school → `PATCH /schools/{slug}` renames, suspends or resumes →
+one call or none of it) → that admin (a **person** in the control database)
+logs in at `POST /auth/login` with just username + password, and is entered
+into the school straight away → `PATCH /schools/{slug}` renames, suspends or
+resumes →
 `POST /schools/{slug}/admin-password` re-keys a locked-out admin and revokes
 every session it held → `POST /schools/{slug}/enter` mints an ordinary school
 session for one of its admins (support access, no builder power inside) →
@@ -464,29 +468,51 @@ curl -b v.txt -X POST localhost:6060/schools/demo/modules/meals        # 200, an
 
 ## Auth model
 
-Login sets an `HttpOnly`, `SameSite=Lax` `session` cookie (7-day expiry, stored
-server-side); its value is `<school-slug>.<token>`, so `POST /auth/login` and
-`POST /auth/register` name the school alongside the username (see
-"Multi-school (SaaS)"). Send the cookie back on later requests. Every endpoint
-below whose `Auth` column names a role requires a valid session; the ones marked `no` (`/health`,
-the docs pages, `register` / `login` / `logout`) don't (`logout` is idempotent —
-it clears the session if one is present). Set `COOKIE_SECURE=true` when serving
-behind TLS to add the cookie's `Secure` attribute.
+The account is a **person**: one global username + password, held in the
+control database, that can belong to any number of schools. Login never names
+a school — `POST /auth/login` takes `{username, password}` alone. A person
+with exactly one active membership is logged straight into it: the response is
+the full user object and the cookie is the school's own
+`session=<school-slug>.<token>`. A person with two or more active memberships
+answers `{username, schools: [{slug, name}]}` with a `session=person.<token>`
+cookie instead, and names a school with `POST /auth/school`
+(`{"school": "<slug>"}`), which swaps the cookie for that school's
+`<slug>.<token>` and revokes the person session. Register still names the
+school: `POST /auth/register` takes `{school, username, password}` (see
+"Multi-school (SaaS)").
 
-**Register never reveals whether a username is taken.** `POST /auth/register`
-answers `201` either way with the *same* body — `{username, role}`, the echoed
-name and the `student` role every fresh account gets. Both outcomes return one
-value built before the insert is even attempted, so they are byte-identical by
-construction. This is deliberate: the route is unauthenticated, so a `409` (or a
-faster reply) would let anyone enumerate the school's users. The password is
-hashed *before* the availability check so both outcomes cost the same ~33ms.
+Login sets an `HttpOnly`, `SameSite=Lax` `session` cookie (7-day expiry,
+stored server-side), split at the *first* dot so a token can never be read as
+a slug. Send the cookie back on later requests. Every endpoint below whose
+`Auth` column names a role requires a valid school session; the ones marked
+`no` (`/health`, the docs pages, `register` / `login` / `school` / `logout`)
+don't (`logout` is idempotent — it clears whichever session the cookie names:
+school, person, or builder). `GET /auth/me` is school-cookie only: a person
+cookie answers `401`, because who you *are* depends on the school you have not
+picked yet. Set `COOKIE_SECURE=true` when serving behind TLS to add the
+cookie's `Secure` attribute.
 
-The reply carries **no `id`**: on the taken path there is no row to name, and a
-fabricated one would leave the client holding an id that matches nothing. Log
-in and read `GET /auth/me` to learn who you are. The accepted cost: a caller who
-collides with an existing account gets no distinct error and simply cannot log
-in with that password — they pick another name. Do not "fix" this back to a
-`409`, and do not add an `id` back.
+**Register never reveals anything.** `POST /auth/register` answers `201` in
+every outcome with the *same* body — `{username, role}`, the echoed name and
+the `student` role every fresh account gets. A username that is new creates
+the person plus the school's `app_user`; a person who already exists is
+attached to this school as one more membership — but only when the password
+matches the person credential, and a wrong password joins nothing while the
+reply stays the same. All outcomes return one value built before any branch,
+and the password is hashed before any lookup, so they cost the same ~33ms
+up front. This is deliberate: the route is unauthenticated, so a `409` (or a
+faster reply) would let anyone enumerate accounts. The same holds on login:
+an unknown username burns the same argon2 work against a decoy hash as a
+wrong password, and a person with no memberships left to enter answers the
+same `401`. Do not "fix" any of this back to a distinct error, and do not add
+an `id` to the register reply.
+
+The reply carries **no `id`**: on the taken path there is no row to name, and
+a fabricated one would leave the client holding an id that matches nothing.
+Log in and read `GET /auth/me` to learn who you are. The accepted cost: a
+caller who collides with an existing person's name gets no distinct error and
+cannot join another school with that name without the right password — they
+pick another name.
 
 ## Time policy
 
@@ -1047,10 +1073,11 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/appointments/{id}/reschedule/decline`                          | student | Refuse the teacher's counter-proposal. The requester's call alone, and it **cancels the booking**: the proposal replaced the time that was asked for, so there is nothing left to fall back to — book another slot instead. The slot frees up, and the original request stays readable as `cancelled` with the refused proposal still on it. Declining is a cancel, so it answers to the same deadline: `409` once the meeting's effective window has started. |
 | GET    | `/attendance/me`                                                 | student | The current user's attendance report: event tallies, lesson roll-call tallies, and a per-course breakdown with attendance rates. |
 | GET    | `/attendance/{user}`                                             | teacher | Any user's attendance report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every course; a teacher sees the event tallies plus only the roll-call blocks of the target's courses they manage. |
-| POST   | `/auth/login`                                                    | no      | Log in with school + username + password. Sets a `session` cookie (`<school>.<token>`) on success. |
+| POST   | `/auth/login`                                                    | no      | Log in with username + password — no school. Sets a `session` cookie on success: exactly one active membership enters that school right away (`<slug>.<token>` and the full [`UserResponse`], unchanged for single-school clients), several answer a [`SchoolChoiceResponse`] with a `person.<token>` cookie that `POST /auth/school` binds. |
 | POST   | `/auth/logout`                                                   | no      | Log out: revoke the current session (if any) and clear the cookie. Idempotent — no session required; answers `204` either way. |
 | GET    | `/auth/me`                                                       | student | Return the currently authenticated user. |
-| POST   | `/auth/register`                                                 | no      | Register a new user account: `{school, username, password}` in, `{username, role}` back (no `id`; new accounts are `student`). Always `201`, even if the name was already taken — see "Auth model". |
+| POST   | `/auth/register`                                                 | no      | Register a new user account, or attach an existing person to one more school: `{school, username, password}` in, `{username, role}` back (no `id`; new accounts are `student`). Always `201` — see below. |
+| POST   | `/auth/school`                                                   | no      | Bind a `person.<token>` session to one of the person's schools: the cookie is replaced with that school's own `<slug>.<token>` and the person session is revoked. Deliberately outside the credential rate-limit tier — this is not a credential guess, and it requires a session cookie already. |
 | GET    | `/bank-questions`                                                | teacher | The bank the caller may see — their own templates plus the ones published to the school (admins see every one), **newest first**. `?subject=` narrows to one origin subject; `?owner=` to one owner (a user id, or `me` for the caller); `?q=` to a case-insensitive fragment of the question text; `?visibility=private\|school` to one shelf — it narrows what the caller may already see and never widens it, so `private` is "my drafts" and `school` the published library. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope, where `total` counts every match under the same filters, not just this page. Each item carries the resolved `subject_name`/`owner_name` so a client needn't look them up per row, plus `used_count` — how many exam questions were copied out of that template (one grouped query for the page, not one per row). |
 | POST   | `/bank-questions`                                                | teacher | Add a template to the bank. Requires teacher+. `subject_id` is origin metadata (any subject — the same-course rule lives at instantiate time), so it need only exist (an unknown subject is a `400`). `choice` templates carry 2–10 `choices` plus `correct` naming one of them by id; `text` templates carry neither. The caller becomes the owner. |
 | GET    | `/bank-questions/{bid}`                                          | teacher | One template by id. Visible ones only: a `private` template belonging to someone else is a 404, not a 403 — a 403 would confirm it exists. |

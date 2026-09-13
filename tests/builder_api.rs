@@ -60,15 +60,38 @@ async fn create_school(app: &Router, cookie: &str, slug: &str, admin_pass: &str)
     .await
 }
 
+/// Log `username` into the school named `slug`. The login itself names no
+/// school any more — the admin fixtures reuse one username across many
+/// schools, which makes that admin one *person* with several memberships —
+/// so when login answers a choice list, bind the requested school before
+/// returning. The result is whatever a plain school login would have said.
 async fn school_login(app: &Router, slug: &str, username: &str, password: &str) -> Res {
-    send(
+    let res = send(
         app,
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": slug, "username": username, "password": password })),
+        Some(json!({ "username": username, "password": password })),
     )
-    .await
+    .await;
+    if res.body["schools"].is_array() {
+        assert_eq!(res.status, StatusCode::OK, "choice login {username}");
+        let selected = send(
+            app,
+            "POST",
+            "/auth/school",
+            res.cookie.as_deref(),
+            Some(json!({ "school": slug })),
+        )
+        .await;
+        assert_eq!(
+            selected.status,
+            StatusCode::OK,
+            "select {slug} for {username}"
+        );
+        return selected;
+    }
+    res
 }
 
 fn slugs(body: &Value) -> Vec<String> {
@@ -215,10 +238,14 @@ async fn creating_a_school_seeds_an_admin_who_can_log_in() {
             StatusCode::BAD_REQUEST
         );
     }
-    assert_eq!(
-        school_login(&app, "yeni", "admin", "secret1").await.status,
-        StatusCode::UNAUTHORIZED,
-        "a refused create must not have made a school"
+    // A refused create must not have made a school: the admin's login has
+    // only the one school they actually have to enter — `yeni` names nothing.
+    let refused_create = school_login(&app, "yeni", "admin", "secret1").await;
+    assert_eq!(refused_create.status, StatusCode::OK);
+    let cookie = refused_create.cookie.expect("cookie");
+    assert!(
+        cookie.starts_with("session=ata-koleji."),
+        "a refused create must not have made a school: {cookie:?}"
     );
 }
 
@@ -364,10 +391,21 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
     create_school(&app, &builder, "gamma", "secret1").await;
+    create_school(&app, &builder, "delta", "secret1").await;
     let old_cookie = school_login(&app, "gamma", "admin", "secret1")
         .await
         .cookie
         .expect("school cookie");
+    let person_cookie = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "admin", "password": "secret1" })),
+    )
+    .await
+    .cookie
+    .expect("person cookie from a two-school login");
 
     // An account that is not an admin of that school, and one that is not there
     // at all, are told apart.
@@ -437,6 +475,19 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
             .status,
         StatusCode::UNAUTHORIZED,
         "a reset that leaves the old cookie working resets nothing"
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/auth/school",
+            Some(&person_cookie),
+            Some(json!({ "school": "gamma" })),
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED,
+        "a person cookie minted under the old password must die too"
     );
 }
 
@@ -581,10 +632,13 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
             .status,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        school_login(&app, "delta", "admin", "secret1").await.status,
-        StatusCode::UNAUTHORIZED,
-        "a deleted school is an unknown school, never a 403"
+    // A deleted school is not a door any more. The person's login has only
+    // `epsilon` left to enter — the dropped slug is neither offered nor 403'd.
+    let after_delete = school_login(&app, "delta", "admin", "secret1").await;
+    assert_eq!(after_delete.status, StatusCode::OK);
+    assert!(
+        after_delete.cookie.expect("cookie").contains("epsilon."),
+        "the deleted school must not be reachable at login"
     );
     assert!(
         !files_dir().join("delta").exists(),
@@ -775,20 +829,22 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
         send(&app, "GET", "/auth/me", Some(&a), None).await.status,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(
-        school_login(&app, "p2a", "admin", "secret1").await.status,
-        StatusCode::UNAUTHORIZED
+    // The person behind `admin` still belongs to p2b: the login has that
+    // school left to enter, and the dropped slug is not among the choices.
+    let after_drop = school_login(&app, "p2a", "admin", "secret1").await;
+    assert_eq!(after_drop.status, StatusCode::OK);
+    assert!(
+        after_drop.cookie.expect("cookie").contains("p2b."),
+        "the dropped school must not come back at login"
     );
 
-    // Re-created with the same slug: nothing of the old school comes back.
-    let again = create_school(&app, &builder, "p2a", "secret2").await;
+    // Re-created with the same slug. `admin` is one *person*: the same
+    // username under the same password links that person into the new
+    // school, and under a *different* password the create itself refuses
+    // with a 409 — a builder is authenticated, there is nothing to enumerate.
+    let again = create_school(&app, &builder, "p2a", "secret1").await;
     assert_eq!(again.status, StatusCode::CREATED, "{:?}", again.body);
-    assert_eq!(
-        school_login(&app, "p2a", "admin", "secret1").await.status,
-        StatusCode::UNAUTHORIZED,
-        "the OLD admin credential still opens the re-created school"
-    );
-    let fresh = school_login(&app, "p2a", "admin", "secret2")
+    let fresh = school_login(&app, "p2a", "admin", "secret1")
         .await
         .cookie
         .expect("fresh admin cookie");
@@ -803,6 +859,23 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
     let notes = send(&app, "GET", "/notes", Some(&fresh), None).await;
     assert_eq!(notes.status, StatusCode::OK);
     assert_eq!(total(&notes.body), 0, "old rows survived the drop");
+
+    // A *different* password for an existing person is a plain 409, and no
+    // school is left behind by the refusal.
+    let mismatched = create_school(&app, &builder, "p2c", "secret9").await;
+    assert_eq!(
+        mismatched.status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        mismatched.body
+    );
+    assert_eq!(
+        send(&app, "GET", "/schools/p2c", Some(&builder), None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a refused create must not leave a school behind"
+    );
 }
 
 /// Claim 2, the school lifecycle: `Tenants::create`/`drop` interpolate the slug
@@ -1290,10 +1363,19 @@ async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
     );
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert!(!listed(&after_delete.body));
+    // The person still has `atakoleji` to enter; the deleted slug is neither
+    // offered nor 403'd — it is simply not a door.
     assert_eq!(
         login_after_delete.status,
-        StatusCode::UNAUTHORIZED,
-        "a deleted school is unknown at login"
+        StatusCode::OK,
+        "the person keeps their other membership"
+    );
+    assert!(
+        login_after_delete
+            .cookie
+            .expect("cookie")
+            .contains("atakoleji."),
+        "the deleted school must not come back at login"
     );
 }
 
