@@ -58,7 +58,7 @@ const STATIC_ROWS: [(&str, &str, &str, &str); 5] = [
 ];
 
 /// Table order within one path. The repo uses `GET`/`POST`/`PATCH`/`DELETE`
-/// only (CLAUDE.md: no `PUT`); anything else sorts last.
+/// only (AGENTS.md: no `PUT`); anything else sorts last.
 fn method_rank(m: &str) -> usize {
     ["GET", "POST", "PATCH", "DELETE"]
         .iter()
