@@ -1,0 +1,3 @@
+# One flake must not hide the rest. Deploy still requires the job to be green.
+[profile.default]
+fail-fast = false

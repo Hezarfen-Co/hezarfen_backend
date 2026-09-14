@@ -184,8 +184,9 @@ jobs:
 
       # A broken build must never reach the server: the whole suite gates
       # the deploy (doc_sync included, so README drift blocks it too).
+      # --no-fail-fast: one load-luck assert must not skip the other 1000 tests.
       - name: Test
-        run: cargo nextest run
+        run: cargo nextest run --no-fail-fast
 
 
       - name: Build the release
