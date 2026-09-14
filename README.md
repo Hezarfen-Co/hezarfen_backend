@@ -649,7 +649,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 194 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 200 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
