@@ -11479,7 +11479,7 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
     );
     assert_eq!(
         res.body["attendance_statuses"],
-        json!(["present", "absent", "late", "excused"])
+        json!(["absent", "excused", "late", "present"])
     );
     assert_eq!(res.body["grade_bands"], json!([]));
 
@@ -11518,7 +11518,7 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
     );
     assert_eq!(
         res.body["attendance_statuses"],
-        json!(["present", "absent", "late", "excused"])
+        json!(["absent", "excused", "late", "present"])
     );
 
     // Every reader sees the new policy at once.

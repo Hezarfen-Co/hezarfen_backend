@@ -11,7 +11,6 @@
 //! without a backfill (backfills crash boots — `DEFAULT` never rescues
 //! existing rows, and `UPDATE` re-validates whole records).
 
-
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
@@ -249,7 +248,11 @@ impl Settings {
                     })
                     .to_vec(),
             ),
-            attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
+            attendance_statuses: {
+                let mut statuses = DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec();
+                statuses.sort();
+                statuses
+            },
             grade_bands: Json(Vec::new()),
             max_file_bytes: None,
             chatbot_history_turns: None,
@@ -461,19 +464,22 @@ impl Settings {
     /// one (including rows saved before the field existed). An explicitly
     /// stored empty list stays empty — that is "no meal program", not "unset".
     pub fn get_meal_slots(&self) -> Vec<MealSlotDef> {
-        self.meal_slots.as_ref().map(|slots| slots.0.clone()).unwrap_or_else(|| {
-            DEFAULT_MEAL_SLOTS
-                .map(|name| MealSlotDef {
-                    name: name.to_string(),
-                    // No built-in serving time, and the backend will not guess
-                    // one: a slot with no hour has no instant for the cutoff to
-                    // count back from, so the school's `meal_cancel_cutoff_
-                    // minutes` binds none of these slots until it sets real
-                    // hours (see `check_cutoff`).
-                    serving_minute: None,
-                })
-                .to_vec()
-        })
+        self.meal_slots
+            .as_ref()
+            .map(|slots| slots.0.clone())
+            .unwrap_or_else(|| {
+                DEFAULT_MEAL_SLOTS
+                    .map(|name| MealSlotDef {
+                        name: name.to_string(),
+                        // No built-in serving time, and the backend will not guess
+                        // one: a slot with no hour has no instant for the cutoff to
+                        // count back from, so the school's `meal_cancel_cutoff_
+                        // minutes` binds none of these slots until it sets real
+                        // hours (see `check_cutoff`).
+                        serving_minute: None,
+                    })
+                    .to_vec()
+            })
     }
 
     /// The dietary tags a dish and a student's profile may carry; the built-in
