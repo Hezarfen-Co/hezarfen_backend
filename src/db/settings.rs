@@ -195,6 +195,16 @@ where
         .map(|slots| serde_json::to_value(&slots.0))
         .transpose()
         .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_exam_kinds = serde_json::to_value(&expected.exam_kinds.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_grade_bands = serde_json::to_value(&expected.grade_bands.0)
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let expected_meal_slots = expected
+        .meal_slots
+        .as_ref()
+        .map(|slots| serde_json::to_value(&slots.0))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
     let attendance = sorted(&settings.attendance_statuses);
     let expected_attendance = sorted(&expected.attendance_statuses);
     // An empty `Some` must compare equal to the stored NULL an empty set
@@ -221,14 +231,14 @@ where
                    max_chatbot_threads = $7,
                    meal_slots = $8,
                    meal_cancel_cutoff_minutes = $10
-               WHERE settings.exam_kinds                 IS NOT DISTINCT FROM $1
-                 AND settings.grade_bands                IS NOT DISTINCT FROM $3
-                 AND settings.max_file_bytes             IS NOT DISTINCT FROM $4
-                 AND settings.chatbot_history_turns      IS NOT DISTINCT FROM $5
-                 AND settings.max_chatbot_message_len    IS NOT DISTINCT FROM $6
-                 AND settings.max_chatbot_threads        IS NOT DISTINCT FROM $7
-                 AND settings.meal_slots                 IS NOT DISTINCT FROM $8
-                 AND settings.meal_cancel_cutoff_minutes IS NOT DISTINCT FROM $10
+               WHERE settings.exam_kinds                 IS NOT DISTINCT FROM $13
+                 AND settings.grade_bands                IS NOT DISTINCT FROM $14
+                 AND settings.max_file_bytes             IS NOT DISTINCT FROM $15
+                 AND settings.chatbot_history_turns      IS NOT DISTINCT FROM $16
+                 AND settings.max_chatbot_message_len    IS NOT DISTINCT FROM $17
+                 AND settings.max_chatbot_threads        IS NOT DISTINCT FROM $18
+                 AND settings.meal_slots                 IS NOT DISTINCT FROM $19
+                 AND settings.meal_cancel_cutoff_minutes IS NOT DISTINCT FROM $20
                  AND COALESCE((SELECT array_agg(s.status ORDER BY s.status)
                                FROM settings_attendance_status s
                                WHERE s.settings = settings.id), '{}')
@@ -284,6 +294,14 @@ where
         settings.meal_cancel_cutoff_minutes,
         &expected_attendance,
         expected_dietary,
+        expected_exam_kinds,
+        expected_grade_bands,
+        expected.max_file_bytes,
+        expected.chatbot_history_turns,
+        expected.max_chatbot_message_len,
+        expected.max_chatbot_threads,
+        expected_meal_slots,
+        expected.meal_cancel_cutoff_minutes,
     )
     .fetch_optional(db)
     .await?;
