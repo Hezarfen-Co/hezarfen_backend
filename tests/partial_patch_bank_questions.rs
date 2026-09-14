@@ -1,8 +1,8 @@
 //! A bank-template PATCH is a read-modify-write: the kind/choices/correct trio
 //! has to be re-submitted as a unit (choices carry their ids, and their
 //! pictures hang off those ids), so the row read, the merge and the write are
-//! held together under the *writer* lease of `BANK_LOCK`. Without that, two
-//! concurrent partial PATCHes revert each other.
+//! a compare-and-set on the stored snapshot. Without that, two concurrent
+//! partial PATCHes revert each other.
 
 mod common;
 

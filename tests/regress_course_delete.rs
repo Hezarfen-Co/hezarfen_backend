@@ -1,24 +1,16 @@
 //! A course delete must take every attempt under it with it — the same hole
-//! `regress_exam_delete` pins one level down, and the same lease.
+//! `regress_exam_delete` pins one level down.
 //!
 //! `delete_course` cascades the course's exams *and their attempts*, and an
 //! attempt is still the one exam child whose write cannot collide with that
-//! sweep: its create rides `cap::claim_and_create` against the *student's* row,
-//! which this cascade never touches. So the sweep and a start in flight can
-//! both commit, and only `EXAM_LOCK.write()` keeps them apart.
+//! sweep on a key: its create rides `cap::claim_and_create` against the
+//! *student's* row, which this cascade never touches. The exam row lock
+//! (`FOR UPDATE` on start, `DELETE` waiting behind it) is what keeps the
+//! sweep and a start from both committing.
 //!
-//! **Its own test binary on purpose.** `EXAM_LOCK` is process-wide, so this
-//! test and `regress_exam_delete`'s share it across two unrelated databases
-//! when they run in one binary: the neighbour holds the writer lease through
-//! its own one-second window, the start here queues behind it, and the timeline
-//! this test is built on stops holding. It was mutation-proven red alone and
-//! green — on the *broken* code — beside that neighbour. Anything else added
-//! here must not take `EXAM_LOCK` either.
-//!
-//! Which is why the two cascade tests below fire the delete at
-//! [`Course::delete`] rather than at `DELETE /courses/{id}`: the handler takes
-//! the writer lease, the defects they pin live in that transaction's SQL, and
-//! neither one needs a race to show.
+//! The two cascade tests below fire the delete at [`Course::delete`] rather
+//! than at `DELETE /courses/{id}`: the defects they pin live in that
+//! transaction's SQL, and neither one needs a race to show.
 
 mod common;
 
@@ -33,7 +25,7 @@ use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::exam::ExamId;
 use serde_json::json;
 
-/// Delete `course` the way the handler would, minus its `EXAM_LOCK` lease.
+/// Delete `course` at the store, bypassing HTTP.
 async fn drop_course(db: &hezarfen_backend::database::Database, course: &str) {
     let row = course::read(db, &CourseId::from_key(course))
         .await

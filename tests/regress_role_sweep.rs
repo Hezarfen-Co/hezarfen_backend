@@ -118,9 +118,10 @@ async fn hold_the_sweep(table: &str, db: &Database) {
 /// transaction open for seconds against the shared Postgres server, so run in
 /// parallel they push each other clean out of their windows: measured, all
 /// three then pass on code with the claim removed, while serialized all three
-/// fail it. Same trap as the process-wide `EXAM_LOCK` note in
-/// `regress_course_delete`, and the guard is handed back into a binding that
-/// lives for the whole test the way `init_test_server`'s does.
+/// fail it. Same trap as two race suites sharing one process-wide lock across
+/// unrelated databases: the neighbour holds the lease through its window, this
+/// start queues, and the timeline stops holding. The guard is handed back into
+/// a binding that lives for the whole test the way `init_test_server`'s does.
 static ONE_WINDOW_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Start the demotion and wait until it is *inside* the held window, then hand

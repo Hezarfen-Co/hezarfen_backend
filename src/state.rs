@@ -68,10 +68,10 @@ pub fn scoped_key(slug: &Slug, key: &str) -> String {
 /// closing one of two tabs never counts as having left the exam.
 ///
 /// The inner mutex only guards the map (never held across an await — keep it
-/// that way). Each count transition and its matching `left_at` DB write are
-/// serialized as one critical section by the exam room's `PRESENCE_LOCK`
-/// (see `web::exam_ws`), so "clear on join" and "stamp on last-out" stay
-/// atomic with the counts they depend on.
+/// that way). The matching `left_at` writes are idempotent single statements
+/// against the sitting's own row (see `web::exam_ws`): join clears the marker;
+/// last socket out stamps it only while `left_at IS NULL`. Concurrent last-outs
+/// are harmless — only the first stamp lands.
 #[derive(Clone, Default)]
 pub struct ExamPresence(Arc<Mutex<HashMap<String, usize>>>);
 

@@ -6,13 +6,14 @@
 //! contends on a single key and the store aborts a side. An attempt cannot do
 //! that: its create rides `cap::claim_and_create` against the *student's* row
 //! (`exam_sat_total`), which this delete never touches, so nothing collides and
-//! the freeze/existence gate is a plain read. `start_attempt` has always held
-//! `EXAM_LOCK.write()` from its exam read through the insert; `delete_exam`
-//! held nothing at all, and that asymmetry is what let a sitting start inside
-//! the delete window and outlive the exam.
+//! the freeze/existence gate is a plain read. The start path now takes
+//! `FOR UPDATE` on the exam row from the exam read through the insert, so a
+//! delete waits behind an in-flight start and a start after the delete finds
+//! no row. The old hole was that `start_attempt` held a process
+//! `EXAM_LOCK.write()` while `delete_exam` held nothing.
 //!
-//! This suite drives the real handlers, because the lease being tested lives in
-//! the web layer and no domain call can observe it.
+//! This suite drives the real handlers: the gates live on the HTTP path as
+//! well as the store.
 
 mod common;
 

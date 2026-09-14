@@ -83,9 +83,9 @@ async fn course_with_student(
     (course, subject, student, student_id)
 }
 
-/// The upload streams its body *before* it takes `HOMEWORK_LOCK`, and the
-/// homework snapshot it acts on was read before that stream — so a delete
-/// (which takes and releases the write lease inside that window) leaves the
+/// The upload used to stream its body *before* it took `HOMEWORK_LOCK`, and
+/// the homework snapshot it acted on was read before that stream — so a delete
+/// (which took and released the write lease inside that window) left the
 /// handler holding a homework that is gone. It then auto-created a submission
 /// under it, credited both badge counters, wrote a blob and a file row, and
 /// answered `201`. Every route to any of that goes through the vanished
@@ -440,12 +440,12 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
     assert_eq!(over_http.status, StatusCode::NOT_FOUND);
 }
 
-/// `delete_course` took `EXAM_LOCK` and nothing else, while its cascade sweeps
-/// the course's homework, submissions, files and results. Grading holds
-/// `HOMEWORK_LOCK.write()` across a transaction that only *reads* the homework,
-/// and the store conflict-checks write sets rather than read sets — so the
-/// sweep ran on a snapshot without the grade and both committed: an orphan
-/// `homework_result` under a vanished homework, readable ever after at
+/// `delete_course` used to take `EXAM_LOCK` and nothing else, while its cascade
+/// swept the course's homework, submissions, files and results. Grading used
+/// to hold `HOMEWORK_LOCK.write()` across a transaction that only *read* the
+/// homework, and the store conflict-checked write sets rather than read sets —
+/// so the sweep ran on a snapshot without the grade and both committed: an
+/// orphan `homework_result` under a vanished homework, readable ever after at
 /// `GET /homework/{id}/result`, which has no existence check of its own.
 ///
 /// The window is the grade's, not the delete's: a course delete is refused
@@ -648,9 +648,10 @@ async fn a_student_sees_only_themselves_in_an_assigned_subset() {
 
 /// A file add and a file delete on one submission write the same row — the
 /// upload claims its seat on it, the delete re-stamps it — and both handlers
-/// hold only `HOMEWORK_LOCK.read()`, so they contend by design. The delete sent
-/// its cascade through a plain `db.query`, unlike every sibling in the module,
-/// so a lost round came back as a 500 on a request that had written nothing.
+/// used to hold only `HOMEWORK_LOCK.read()`, so they contended by design. The
+/// delete sent its cascade through a plain `db.query`, unlike every sibling in
+/// the module, so a lost round came back as a 500 on a request that had written
+/// nothing.
 ///
 /// The window is the *delete's* own — the retry-less side has to be the one
 /// holding a stale write when the other commits, or nothing it does can be

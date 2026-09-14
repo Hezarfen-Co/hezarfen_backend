@@ -21343,11 +21343,11 @@ async fn refreshing_a_question_recopies_its_template() {
 }
 
 /// A course PATCH is a field-scoped write. The handler reads the course, then
-/// awaits a term lookup (and its `TERM_LOCK`) before saving, holding nothing
-/// over the course row itself — so a manager's teacher assignment can land in
-/// that window. A whole-row save from the stale struct would silently revert
-/// the staffing. Driven at the domain level: HTTP offers no way to interleave
-/// inside the handler.
+/// awaits a term lookup before saving, holding nothing over the course row
+/// itself — so a manager's teacher assignment can land in that window. A
+/// whole-row save from the stale struct would silently revert the staffing.
+/// Driven at the domain level: HTTP offers no way to interleave inside the
+/// handler.
 #[tokio::test]
 async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
     use hezarfen_backend::db::course;
@@ -22235,11 +22235,10 @@ async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
     assert_eq!(common::total(&res.body), 1, "and exactly one menu exists");
 }
 
-/// Two appends of one ledger id must both succeed: the id is the idempotence
-/// key, so the loser reads back the winner's line instead of surfacing the
-/// duplicate-key error as a 500. Driven at the domain level on purpose — every
-/// HTTP path into the ledger runs under `MENU_LOCK`, which serializes the two
-/// writers before they can ever collide.
+/// Two appends of one ledger id must both succeed: the id is the store's
+/// idempotence key, so the loser reads back the winner's line instead of
+/// surfacing the duplicate-key error as a 500. Driven at the domain level
+/// because that is the collision, not HTTP.
 #[tokio::test]
 async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
     use hezarfen_backend::db::meal_ledger;

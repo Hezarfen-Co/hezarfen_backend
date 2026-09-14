@@ -261,8 +261,8 @@ pub async fn list_by_ids(db: &Database, ids: &[CourseId]) -> Result<Vec<Course>,
 }
 
 /// Field-scoped: nothing guards the course row across the handler's read
-/// and this write (its `TERM_LOCK` window guards the *term* it links, and
-/// the assign path takes no lock at all) — so a field the request omitted
+/// and this write (the term it links is guarded by its own refcount write,
+/// and the assign path takes no lock at all) — so a field the request omitted
 /// (`None`) is not written at all. Sending the snapshot's value back
 /// instead would revert a concurrent edit of that field; scoping the `SET`
 /// alone does not stop that, the values have to come from the request.

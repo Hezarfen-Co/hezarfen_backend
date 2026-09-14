@@ -3678,14 +3678,12 @@ and pumps it while the delete runs would otherwise leave rows tagged with a
 blueprint that no longer exists, and since the grade label *is* the record id,
 nothing could ever reach them again. The pump carries the other half of that —
 an attach whose blueprint was deleted mid-run writes nothing and is reported as
-`blueprint_deleted`. Those two narrow the window rather than close it — a pump
-that read the template alive can still commit its link after the sweep has run,
-since a read of one record and a write of another are not serialized against
-each other — so the delete and each individual attach are also serialized in
-process: the delete holds a write lease across its compare-and-set and its
-sweep, and a pump takes a read lease one course at a time, so a delete never
-waits behind a whole grade. The backend runs as a single process by decision, which
-is what makes an in-process lock the complete answer. The delete is also a
+`blueprint_deleted`. The attach's in-transaction claim is a `FOR KEY SHARE`
+row lock on `class_blueprint` — the one strength a `DELETE` of the row
+cannot take — so a sourced attach that started first holds the row and the
+delete waits behind it; an attach starting after the delete finds no row
+and writes nothing. A pump takes that lock one course at a time, so a
+delete never waits behind a whole grade. The delete is also a
 compare-and-set on the list the call read: a `409` means somebody edited the
 template in between, and nothing was written — though a template deleted and
 recreated at the same grade with the same list satisfies that comparison, which
@@ -4679,11 +4677,12 @@ database itself decides the winner. Three tiers:
      in flight lets that one write through. Damage: one write on a
      just-archived term; nothing corrupts, and every later write is refused.
 
-One in-process lock remains, and it is a *second* line, never the guarantee:
-`PRESENCE_LOCK` guards the exam-room presence map (in-process socket state;
-there is no row to conditional-write). The other two are gone with the old
-store: `CLAIM_LOCK` tamed a retry loop that `tx_with_retry` now owns, and
-what `APPOINTMENT_LOCK` serialized is three database guarantees — the seat
+No process-wide domain lock remains. Exam-room presence is an in-process
+map (`ExamPresence` in `src/state.rs`; the mutex never spans an await).
+There is no row to conditional-write for socket counts; the paired
+`left_at` stamp is an idempotent statement on the sitting. `CLAIM_LOCK`
+tamed a retry loop that `tx_with_retry` now owns, and what
+`APPOINTMENT_LOCK` serialized is three database guarantees — the seat
 claim's one-statement write, the publish-overlap exclusion constraint, and
 the serializable approval.
 
@@ -4850,8 +4849,8 @@ src/
                    recurring publish is expanded into rows sharing a series id)
     appointment.rs AppointmentId · AppointmentStatus · AppointmentReason ·
                    Appointment (a booking on a slot; occupancy is the slot's
-                   stored `occupied` cap-1 counter, overlap is derived under
-                   APPOINTMENT_LOCK)
+                   seat claim, publish overlap is the exclusion constraint,
+                   approval overlap is SERIALIZABLE)
     pomodoro.rs    PomodoroSessionId · PomodoroSession (student focus log)
     pool_question.rs PoolQuestionId · PoolQuestionTitle · PoolQuestionBody ·
                    PoolQuestion (student-asked question; teacher-approved into

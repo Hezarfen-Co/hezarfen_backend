@@ -17,10 +17,10 @@
 //!
 //! These two need no server, so they run in CI by default. The *raced* halves
 //! of the same three holes live beside the code they test, in
-//! `bank_question_image`'s own test module, where `init_test_server` and
-//! `RACE_LOCK` are in reach: the store's conflict detection is their subject,
-//! and re-spelling the real bootstrap out here would be a hand-kept copy that
-//! drifts silently the first time migration or router construction changes.
+//! `bank_question_image`'s own test module, where `init_test_server` is in
+//! reach: the store's conflict detection is their subject, and re-spelling
+//! the real bootstrap out here would be a hand-kept copy that drifts silently
+//! the first time migration or router construction changes.
 
 mod common;
 

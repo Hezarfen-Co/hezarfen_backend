@@ -333,6 +333,6 @@ async fn an_answer_resolves_its_own_prompt_across_an_interleave() {
 }
 
 // ---------------------------------------------------------------------------
-// The store property behind `APPOINTMENT_LOCK`.
+// The store property that replaced `APPOINTMENT_LOCK`.
 // ---------------------------------------------------------------------------
 

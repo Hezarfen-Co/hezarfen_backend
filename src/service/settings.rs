@@ -557,11 +557,11 @@ mod tests {
     /// the list the store actually holds.
     ///
     /// One of the two decides the removal, retires the kind and saves; the
-    /// other cannot even see the old list, because the whole snapshot-retire-
-    /// save pair is serialized (`SETTINGS_LOCK`). Interleaved, the second
-    /// attempt would be told "already retired", record no undo, win the
-    /// compare-and-set, and leave the first attempt un-retiring the kind it had
-    /// legitimately removed — off the list and gradable.
+    /// other cannot even see the old list, because retirement and save share
+    /// one transaction. Interleaved, the second attempt would be told "already
+    /// retired", record no undo, win the compare-and-set, and leave the first
+    /// attempt un-retiring the kind it had legitimately removed — off the list
+    /// and gradable.
     #[tokio::test]
     async fn two_edits_dropping_the_same_kind_leave_it_retired() {
         let (db, _leases) = init_test_db().await;
