@@ -25,7 +25,7 @@
 #
 # Env-only restart (restart re-runs `compose up -d`, recreating containers
 # whose environment changed):
-#   systemctl --user restart hezarfen-compose
+#   systemctl --user restart hezarfen_backend_compose
 
 [Unit]
 Description=Hezarfen backend compose stack (postgres + backend + openobserve)
@@ -39,7 +39,7 @@ WorkingDirectory=%h/hezarfen_backend
 # Later --env-file wins for duplicate keys: the operator's secrets file
 # first, the deploy-owned stack.env (HEZARFEN_TAG) second.
 ExecStart=/usr/bin/podman compose --env-file %h/hezarfen_backend/hezarfen_backend.env --env-file %h/hezarfen_backend/stack.env up -d --no-build
-# No -v: the pgdata/hezarfen-data/openobserve-data volumes must survive stop.
+# No -v: named volumes must survive stop.
 ExecStop=/usr/bin/podman compose down
 TimeoutStartSec=180
 

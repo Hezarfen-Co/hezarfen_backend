@@ -18,7 +18,7 @@
 services:
   postgres:
     image: docker.io/library/postgres:18-alpine
-    container_name: hezarfen-postgres
+    container_name: hezarfen_backend_postgres
     # 500 connections: the test suite mints a control+school pool per test
     # (nextest runs ~a dozen concurrently), which exhausts the 100 default.
     command: ["postgres", "-c", "max_connections=500"]
@@ -32,7 +32,7 @@ services:
       # postgres:18 declares VOLUME /var/lib/postgresql (PGDATA is
       # /var/lib/postgresql/18/docker); mounting the parent keeps the whole
       # data dir — including future major-version subdirs — in the volume.
-      - pgdata:/var/lib/postgresql
+      - hezarfen_backend_pgdata:/var/lib/postgresql
     restart: unless-stopped
     healthcheck:
       # $$ keeps compose from interpolating; the shell inside the container
@@ -49,8 +49,8 @@ services:
       dockerfile: Containerfile
     # HEZARFEN_TAG comes from the deploy-owned stack.env (--env-file), or the
     # latest local build on a laptop.
-    image: localhost/hezarfen-backend:${HEZARFEN_TAG:-latest}
-    container_name: hezarfen-backend
+    image: localhost/hezarfen_backend:${HEZARFEN_TAG:-latest}
+    container_name: hezarfen_backend
     ports:
       # Loopback only: terminate TLS on a reverse proxy in front of this.
       - "127.0.0.1:7656:7656"
@@ -82,7 +82,7 @@ services:
       # Every service must present this to register.
       AI_SHARED_TOKEN: ${AI_SHARED_TOKEN:-change-me}
     volumes:
-      - hezarfen-data:/data
+      - hezarfen_backend_data:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,7 +102,7 @@ services:
   # when OTEL_* keys are present in hezarfen_backend.env (see the example).
   openobserve:
     image: docker.io/openobserve/openobserve:v1.0.0-rc2
-    container_name: hezarfen-openobserve
+    container_name: hezarfen_backend_openobserve
     environment:
       # First-boot root account, created once. OpenObserve enforces a password
       # policy (8-128 chars, upper + lower + digit + special) and panics on
@@ -117,7 +117,7 @@ services:
       - "127.0.0.1:5080:5080"
       - "127.0.0.1:5081:5081"
     volumes:
-      - openobserve-data:/data
+      - hezarfen_backend_openobserve_data:/data
     restart: unless-stopped
     healthcheck:
       # corner-cut: the image is distroless (only /openobserve, no shell and no
@@ -133,6 +133,6 @@ services:
       start_period: 10s
 
 volumes:
-  hezarfen-data:
-  pgdata:
-  openobserve-data:
+  hezarfen_backend_data:
+  hezarfen_backend_pgdata:
+  hezarfen_backend_openobserve_data:

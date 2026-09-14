@@ -7,7 +7,7 @@
 #                      artifact.
 #   Deploy          —  SSH: podman load the image, point the deploy-owned
 #                      stack.env's HEZARFEN_TAG at it, install compose.yaml +
-#                      the hezarfen-compose user unit + the backup script,
+#                      the hezarfen_backend_compose user unit + the backup script,
 #                      restart the stack, /health-gated rollback to the
 #                      previous tag, independent after-the-fact verify.
 #
@@ -20,7 +20,7 @@
 #     lag HEAD while a push is mid-CI, and that is the point: redeploy the
 #     known-good image, e.g. after a server-side fix (env file, proxy,
 #     database). For env-only changes a plain
-#     `ssh <vps> 'systemctl --user restart hezarfen-compose'` needs no
+#     `ssh <vps> 'systemctl --user restart hezarfen_backend_compose'` needs no
 #     workflow at all: the stack re-reads its env files on the next
 #     `podman compose up`.
 #
@@ -61,8 +61,8 @@ env:
   # and the linker is rustc's default bundled lld.
   TARGET: x86_64-unknown-linux-gnu
   # The systemd user unit that wraps `podman compose`. See
-  # deploy/hezarfen-compose.service.
-  SERVICE: hezarfen-compose
+  # deploy/hezarfen_backend_compose.service.
+  SERVICE: hezarfen_backend_compose
   # The deploy lives in this subdirectory of the SSH user's home. The home
   # itself is resolved on the server ($HOME), so switching the deploy user
   # moves the path with it — a baked-in absolute path once kept pointing at
@@ -136,15 +136,15 @@ jobs:
       # same 500 the compose stack runs (see compose.yaml).
       - name: Start Postgres
         run: |
-          docker run -d --name hezarfen-pg \
+          docker run -d --name hezarfen_backend_pg \
             -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" \
             -p 127.0.0.1:5432:5432 \
             postgres:18-alpine -c max_connections=500
           for _ in $(seq 1 30); do
-            docker exec hezarfen-pg pg_isready -U "$PG_USER" && break
+            docker exec hezarfen_backend_pg pg_isready -U "$PG_USER" && break
             sleep 1
           done
-          docker exec hezarfen-pg pg_isready -U "$PG_USER"
+          docker exec hezarfen_backend_pg pg_isready -U "$PG_USER"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -179,21 +179,21 @@ jobs:
           # Pack the already-built, already-stripped gnu binary into the
           # runtime image. Never build from source here: a second rust
           # compile blows the runner's disk.
-          docker build -f deploy/Containerfile.runtime -t localhost/hezarfen-backend:$GITHUB_SHA stage/
-          docker save localhost/hezarfen-backend:$GITHUB_SHA | gzip > stage/hezarfen-backend.tar.gz
+          docker build -f deploy/Containerfile.runtime -t localhost/hezarfen_backend:$GITHUB_SHA stage/
+          docker save localhost/hezarfen_backend:$GITHUB_SHA | gzip > stage/hezarfen_backend.tar.gz
 
       - name: Stage the compose bundle
         run: |
           set -euo pipefail
-          cp compose.yaml deploy/hezarfen-compose.service deploy/backup-postgres.sh stage/
+          cp compose.yaml deploy/hezarfen_backend_compose.service deploy/backup-postgres.sh stage/
           echo -n "$GITHUB_SHA" > stage/tag
           # Everything the deploy installs on the server must be here; a
           # missing piece fails here, on the runner, not mid-deploy on the
           # VPS. The raw binary and migrations may linger as docker build
           # context — they are no longer load-bearing.
-          test -f stage/hezarfen-backend.tar.gz
+          test -f stage/hezarfen_backend.tar.gz
           test -f stage/compose.yaml
-          test -f stage/hezarfen-compose.service
+          test -f stage/hezarfen_backend_compose.service
           test -f stage/backup-postgres.sh
           test -f stage/tag
           ls -l stage
@@ -268,9 +268,9 @@ jobs:
       - name: Check the release is complete
         run: |
           set -euo pipefail
-          test -f stage/hezarfen-backend.tar.gz
+          test -f stage/hezarfen_backend.tar.gz
           test -f stage/compose.yaml
-          test -f stage/hezarfen-compose.service
+          test -f stage/hezarfen_backend_compose.service
           test -f stage/backup-postgres.sh
           test -f stage/tag
 
@@ -311,7 +311,7 @@ jobs:
           # and would not expand $HOME. Only the five deploy files ship —
           # the raw binary and migrations stay on the runner (they were
           # docker build context, nothing more).
-          tar -C stage -czf - hezarfen-backend.tar.gz compose.yaml hezarfen-compose.service backup-postgres.sh tag | ssh "$ssh_target" "bash -c 'exec tar -xzf - -C \"\$HOME/\$1\"' -- '$DEPLOY_SUBDIR'"
+          tar -C stage -czf - hezarfen_backend.tar.gz compose.yaml hezarfen_backend_compose.service backup-postgres.sh tag | ssh "$ssh_target" "bash -c 'exec tar -xzf - -C \"\$HOME/\$1\"' -- '$DEPLOY_SUBDIR'"
 
       - name: Load the image and restart the stack
         run: |
@@ -362,7 +362,7 @@ jobs:
 
           # Load THIS build's image and read the tag the build stamped into
           # it (build time and deploy time must agree on what is shipping).
-          gunzip -c "$deploy_path/hezarfen-backend.tar.gz" | podman load
+          gunzip -c "$deploy_path/hezarfen_backend.tar.gz" | podman load
           tag=$(cat -- "$deploy_path/tag")
 
           # Tag rotation: previous_tag is the rollback target (absent on a
@@ -379,11 +379,11 @@ jobs:
 
           # The freshly extracted bundle: compose file and unit are
           # world-readable, the backup script is run by hand or a timer.
-          chmod 0644 -- "$deploy_path/compose.yaml" "$deploy_path/hezarfen-compose.service"
+          chmod 0644 -- "$deploy_path/compose.yaml" "$deploy_path/hezarfen_backend_compose.service"
           chmod 0755 -- "$deploy_path/backup-postgres.sh"
           # The image tarball was only a transport; the image is loaded into
           # podman's storage now.
-          rm -f -- "$deploy_path/hezarfen-backend.tar.gz"
+          rm -f -- "$deploy_path/hezarfen_backend.tar.gz"
 
           compose_up() {
             podman compose --env-file "$env_file" --env-file "$deploy_path/stack.env" up -d --no-build
@@ -408,11 +408,12 @@ jobs:
           # no unit until the first deploy writes it, and a changed unit
           # lands with the compose file that needs it.
           mkdir -p -- "$HOME/.config/systemd/user"
-          install -m 0644 -- "$deploy_path/hezarfen-compose.service" "$HOME/.config/systemd/user/$service.service"
+          install -m 0644 -- "$deploy_path/hezarfen_backend_compose.service" "$HOME/.config/systemd/user/$service.service"
           systemctl --user daemon-reload
-          # Retire the binary-era unit: disable it (absent on fresh boxes)
-          # and drop its unit file so it can never come back at boot.
+          # Retire leftover units: the binary-era hezarfen.service and the
+          # hyphenated hezarfen-compose.service from the first compose cut.
           systemctl --user disable --now hezarfen.service 2>/dev/null || true; rm -f -- "$HOME/.config/systemd/user/hezarfen.service"
+          systemctl --user disable --now hezarfen-compose.service 2>/dev/null || true; rm -f -- "$HOME/.config/systemd/user/hezarfen-compose.service"
 
           # The unit is a oneshot with RemainAfterExit, so `start` on the
           # active (exited) unit would be a no-op — every deploy restarts
@@ -444,7 +445,7 @@ jobs:
 
           # A stale stack from an older deploy can answer too, so the
           # running container must be THIS build's image, or it rolls back.
-          image=$(podman inspect -f '{{.Config.Image}}' hezarfen-backend)
+          image=$(podman inspect -f '{{.Config.Image}}' hezarfen_backend)
           case "$image" in
             *"$tag"*) ;;
             *)
@@ -453,7 +454,7 @@ jobs:
               exit 1
               ;;
           esac
-          echo 'hezarfen-compose is up'
+          echo 'hezarfen_backend_compose is up'
           REMOTE
 
       # The independent after-the-fact check: the container answering must
@@ -472,7 +473,7 @@ jobs:
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
           cd -- "$deploy_path"
           tag=$(cat -- "$deploy_path/current_tag")
-          image=$(podman inspect -f '{{.Config.Image}}' hezarfen-backend)
+          image=$(podman inspect -f '{{.Config.Image}}' hezarfen_backend)
           case "$image" in
             *"$tag"*) ;;
             *)

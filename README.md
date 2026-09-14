@@ -249,7 +249,7 @@ reachable (`HOST` is forced to `0.0.0.0` inside the container so the publish
 works). Each service has its own named volume: `pgdata` holds the database
 — it is mounted at `/var/lib/postgresql`, which the postgres:18 image keeps
 its cluster under (`/var/lib/postgresql/18/docker`), so the data really
-lands in the volume — and `hezarfen-data` holds the
+lands in the volume — and `hezarfen_backend_data` holds the
 uploaded note files (`/data/files`). Production knobs (`COOKIE_SECURE`,
 `CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) reach the backend through
 the env file (below), not through `compose.yaml`. Leaving
@@ -303,19 +303,19 @@ shipped with the deploy artifact and living next to `compose.yaml` on the VPS
 the control database and all of them. Restore with:
 
 ```sh
-gunzip -c backups/FILE.sql.gz | podman exec -i hezarfen-postgres psql -U hezarfen -d postgres
+gunzip -c backups/FILE.sql.gz | podman exec -i hezarfen_backend_postgres psql -U hezarfen -d postgres
 ```
 
 Deploying is GitHub Actions' job, not the server's: the workflow packs the
 already-built binary and the migrations into a runtime image
 (`deploy/Containerfile.runtime`), ships the image tarball together with
-`compose.yaml`, the `hezarfen-compose.service` unit and the backup script as
+`compose.yaml`, the `hezarfen_backend_compose.service` unit and the backup script as
 an artifact, and the deploy job loads it on the VPS and starts the stack with
 `podman compose up -d --no-build` — the image tag travels in a deploy-owned
 `stack.env`, so a release never rewrites the operator's secrets file. The
 operator's only manual step is writing the env file once (above). Reboots
 heal themselves: the user session lingers (`loginctl enable-linger`) and the
-`hezarfen-compose.service` user unit runs compose again at boot.
+`hezarfen_backend_compose.service` user unit runs compose again at boot.
 
 The backend survives the database going away, at boot and at runtime.
 
@@ -337,8 +337,8 @@ request; there is nothing to re-arm.
 Without compose:
 
 ```sh
-podman build -t hezarfen-backend .
-podman run -d --name hezarfen -p 7656:7656 -v hezarfen-data:/data hezarfen-backend
+podman build -t hezarfen_backend .
+podman run -d --name hezarfen -p 7656:7656 -v hezarfen_backend_data:/data hezarfen_backend
 ```
 
 ## Multi-school (SaaS)
@@ -1012,7 +1012,7 @@ UPDATE app_user SET role = 'admin' WHERE username = 'ada';
 
 against the **school's** database (`{control}_school_{uuid hex}` — the hex of
 the school's registry `id`, no dashes), not the control one. List the school
-databases with `\l` — e.g. `podman exec -it hezarfen-postgres psql -U hezarfen
+databases with `\l` — e.g. `podman exec -it hezarfen_backend_postgres psql -U hezarfen
 -d hezarfen_control -c "SELECT slug, id FROM school"` names each school and
 its database suffix for the compose stack.
 

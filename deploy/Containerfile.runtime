@@ -5,7 +5,7 @@
 #
 # Build context is stage/, populated by CI:
 #   docker build -f deploy/Containerfile.runtime \
-#     -t localhost/hezarfen-backend:$GITHUB_SHA stage/
+#     -t localhost/hezarfen_backend:$GITHUB_SHA stage/
 # with stage/hezarfen_backend (the binary) and stage/migrations/.
 FROM docker.io/library/debian:trixie-slim
 

@@ -17,7 +17,7 @@
 # Requires the compose Postgres: `podman compose up -d postgres`.
 set -euo pipefail
 
-CONTAINER="${HEZARFEN_PG_CONTAINER:-hezarfen-postgres}"
+CONTAINER="${HEZARFEN_PG_CONTAINER:-hezarfen_backend_postgres}"
 PREPARE_DB="${HEZARFEN_PREPARE_DB:-hezarfen_sqlx_prepare}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

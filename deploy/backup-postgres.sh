@@ -8,7 +8,7 @@
 #   20 4 * * * $HOME/hezarfen_backend/backup-postgres.sh
 #
 # Restore (from ~/hezarfen_backend):
-#   gunzip -c backups/FILE.sql.gz | podman exec -i hezarfen-postgres psql -U hezarfen -d postgres
+#   gunzip -c backups/FILE.sql.gz | podman exec -i hezarfen_backend_postgres psql -U hezarfen -d postgres
 set -euo pipefail
 
 dir="$(cd "$(dirname "$0")" && pwd)"
@@ -22,5 +22,5 @@ user="${user:-hezarfen}"
 out="$dir/backups/hezarfen-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
 umask 077
 # pipefail (set above): a failed pg_dumpall must not leave a "good" empty dump.
-podman exec hezarfen-postgres pg_dumpall -U "$user" | gzip > "$out"
+podman exec hezarfen_backend_postgres pg_dumpall -U "$user" | gzip > "$out"
 echo "wrote $out ($(du -h "$out" | cut -f1))"
