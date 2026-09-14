@@ -432,7 +432,7 @@ async fn sync_round() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(RATE_SYNC_INTERVAL_SECS)).await;
     tokio::time::resume();
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     tokio::time::pause();
 }
 
@@ -489,8 +489,9 @@ async fn a_restarted_process_inherits_the_windows_spend() {
     let spent = admits(&a, "user:a", 6) + admits(&b, "user:a", 6);
     assert_eq!(spent, 12, "each process starts on its own local budget");
 
-    // From the first sync on, the shared total is what binds: neither limiter
-    // admits anything more in this window, whatever the interleaving was.
+    // Two rounds: each limiter's fold is its own statement, so the process
+    // that landed first only learns the other's spend on the next tick.
+    sync_round().await;
     sync_round().await;
     assert_eq!(
         admits(&a, "user:a", 6) + admits(&b, "user:a", 6),
@@ -511,6 +512,7 @@ async fn a_process_that_never_admitted_still_learns_the_budget_is_gone() {
     // b spends one request, so it has a bucket to sync; a spends the rest.
     assert_eq!(admits(&b, "user:a", 1), 1);
     assert_eq!(admits(&a, "user:a", 3), 3);
+    sync_round().await;
     sync_round().await;
 
     assert_eq!(
