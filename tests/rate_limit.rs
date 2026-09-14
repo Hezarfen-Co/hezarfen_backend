@@ -404,7 +404,7 @@ async fn keyless_clients_share_one_budget_once_the_map_is_saturated() {
 // admissions and on the rows the fold wrote: which limiter's statement lands
 // first cannot matter, a round is one atomic statement per limiter.
 
-use hezarfen_backend::constant::RATE_SYNC_INTERVAL_SECS;
+use hezarfen_backend::constant::{RATE_SYNC_INTERVAL_SECS, RATE_SYNC_TIMEOUT_SECS};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::UserRateLimiter;
 use hezarfen_backend::tenant::Tenants;
@@ -548,6 +548,12 @@ async fn a_down_database_leaves_each_process_on_its_local_budget() {
     }
     assert_eq!(admits(&a, "user:a", 1), 0, "the local budget still binds");
     assert_eq!(admits(&b, "user:a", 1), 0);
+
+    // Drain in-flight folds that started while the table was gone. Restoring
+    // earlier lets a parked query land and the empty-row assert is load luck.
+    tokio::time::resume();
+    tokio::time::sleep(Duration::from_secs(RATE_SYNC_TIMEOUT_SECS + 1)).await;
+    tokio::time::pause();
 
     // The table comes back before the read, so the assertion reads the state
     // the outage left: no round landed, so there is no row at all — and the
