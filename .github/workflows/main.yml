@@ -1,6 +1,7 @@
-# VPS deploy, compose-style, split into two jobs so failure recovery is cheap:
+# VPS deploy, compose-style, split so failure recovery is cheap:
 #
-#   Build and test  —  Postgres sidecar, clippy, the whole suite, the release
+#   Clippy          —  -D warnings on --all-targets, own runner. No Postgres.
+#   Build and test  —  Postgres sidecar, the whole suite, the release
 #                      build; packs the stripped binary + migrations into the
 #                      runtime image (deploy/Containerfile.runtime) and
 #                      uploads the image tarball + compose files as the run's
@@ -10,6 +11,11 @@
 #                      the hezarfen_backend_compose user unit + the backup script,
 #                      restart the stack, /health-gated rollback to the
 #                      previous tag, independent after-the-fact verify.
+#
+# Clippy and Build and test run in parallel. Deploy needs both green.
+# A new push cancels in-flight Clippy/Build on the same ref; it never
+# cancels an in-flight Deploy (two deploys racing would interleave the
+# compose stack).
 #
 # The split is the recovery story, not ceremony:
 #   * "Re-run failed jobs" on a run whose Deploy step failed re-runs ONLY the
@@ -44,13 +50,10 @@ on:
   # The manual redeploy door — see the header comment for how and why.
   workflow_dispatch:
 
-# One deploy at a time: the deploy reloads one compose stack; two of them
-# racing would interleave container recreations and could leave the served
-# image and the tag files from different builds. A dispatched redeploy
-# queues behind any in-flight push deploy rather than racing it.
-concurrency:
-  group: deploy
-  cancel-in-progress: false
+# Deploy serialisation lives on the deploy job, not the workflow: a new
+# push must be allowed to cancel stale Clippy/Build without touching an
+# in-flight VPS swap.
+
 
 env:
   # A gnu binary links against the toolchain's glibc, so the runner is
@@ -85,11 +88,39 @@ env:
   SQLX_OFFLINE: "true"
 
 jobs:
+  clippy:
+    name: Clippy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.ref }}-clippy
+      cancel-in-progress: true
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          prefix-key: v1-rust-gnu
+          # Restore the build job's cache; never save over it. Two jobs
+          # writing the same key race, and clippy is check-mode rmeta.
+          save-if: false
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
   build:
     name: Build and test
     # Pushes only: a manual redeploy reuses the newest green artifact
     # instead of paying the suite again.
     if: github.event_name == 'push'
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.ref }}-build
+      cancel-in-progress: true
     # Pinned, not `latest`: the gnu build links the runner's glibc and the
     # runtime image is debian:trixie-slim — float either side carelessly
     # and the binary stops loading. See the TARGET comment above.
@@ -151,14 +182,11 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # Zero clippy warnings is a standing project rule; CI is what keeps it.
-      - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       # A broken build must never reach the server: the whole suite gates
       # the deploy (doc_sync included, so README drift blocks it too).
       - name: Test
         run: cargo nextest run
+
 
       - name: Build the release
         run: |
@@ -211,14 +239,19 @@ jobs:
 
   deploy:
     name: Deploy
-    needs: build
-    # Push: only behind a green build — the suite gates the server.
-    # Dispatch: build is skipped on purpose (see its `if`), and `always()`
-    # is what stops that skip from cascading past this gate.
+    needs: [clippy, build]
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+    # Push: only behind green clippy AND a green build — both gate the server.
+    # Dispatch: both CI jobs are skipped on purpose (see their `if`), and
+    # `always()` is what stops that skip from cascading past this gate.
     if: >-
       always() &&
-      (needs.build.result == 'success' ||
-       (github.event_name == 'workflow_dispatch' && needs.build.result == 'skipped'))
+      ((needs.clippy.result == 'success' && needs.build.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' &&
+        needs.clippy.result == 'skipped' &&
+        needs.build.result == 'skipped'))
     runs-on: ubuntu-24.04
     steps:
       # A push deploy takes the release this very run built and gated.
