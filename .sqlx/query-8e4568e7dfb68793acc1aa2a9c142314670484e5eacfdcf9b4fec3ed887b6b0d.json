@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blueprint_course (blueprint, course)\n                       SELECT $1, x FROM unnest($2::uuid[]) AS t(x)\n                       ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8e4568e7dfb68793acc1aa2a9c142314670484e5eacfdcf9b4fec3ed887b6b0d"
+}

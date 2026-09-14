@@ -1610,7 +1610,7 @@ async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
     );
     assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
     assert_eq!(
-        counter("SELECT COALESCE(sum(cardinality(teachers)), 0)::bigint FROM course", &db).await,
+        counter("SELECT count(*) FROM course_teacher", &db).await,
         0,
         "the assignment must be dropped again, not left granting nothing"
     );

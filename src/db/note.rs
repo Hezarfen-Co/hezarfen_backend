@@ -108,6 +108,15 @@ pub async fn update(
 /// separate `delete_for_note` call stays, as a harmless idempotent repeat.
 pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), AppError> {
     tx_with_retry(db, true, async move |conn| {
+        // Links before rows: the outputs' citation links are their children
+        // (`ON DELETE NO ACTION`).
+        sqlx::query!(
+            "DELETE FROM rag_output_source WHERE output IN
+             (SELECT id FROM rag_output WHERE course_note = $1)",
+            note.id.uuid()
+        )
+        .execute(&mut *conn)
+        .await?;
         sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id.uuid())
             .execute(&mut *conn)
             .await?;

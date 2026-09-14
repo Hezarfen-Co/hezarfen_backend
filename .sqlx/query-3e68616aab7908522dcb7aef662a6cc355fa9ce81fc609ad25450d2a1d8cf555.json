@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO dietary_profile (student, note, updated_by, updated_at)\n             VALUES ($1, $2, $3, $4)\n             ON CONFLICT (student) DO UPDATE SET\n                 note = CASE WHEN $5 THEN $2 ELSE dietary_profile.note END,\n                 updated_by = $3,\n                 updated_at = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e68616aab7908522dcb7aef662a6cc355fa9ce81fc609ad25450d2a1d8cf555"
+}

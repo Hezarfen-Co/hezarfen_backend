@@ -27,7 +27,9 @@ CREATE TABLE person (
 
 CREATE TABLE person_school (
     person uuid NOT NULL REFERENCES person(id) ON DELETE NO ACTION,
-    school TEXT NOT NULL REFERENCES school(slug) ON DELETE NO ACTION,
+    -- Points at the school's uuid identity, not its slug: the slug is a
+    -- renameable label, and a membership must survive one.
+    school uuid NOT NULL REFERENCES school(id) ON DELETE NO ACTION,
     created_at BIGINT NOT NULL,
     CONSTRAINT person_school_person_school PRIMARY KEY (person, school)
 );

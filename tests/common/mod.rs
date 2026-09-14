@@ -641,6 +641,7 @@ pub async fn deployment_with(schools: &[(&str, &str)]) -> TestDeployment {
     for (slug, name) in schools {
         tenants
             .create(
+                hezarfen_backend::tenant::SchoolId::generate(),
                 &Slug::try_new(slug).expect("a school slug"),
                 name,
                 ModuleSet::all(),

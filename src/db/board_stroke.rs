@@ -176,7 +176,9 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
             Board,
             r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
                       title AS "title: BoardTitle",
-                      participants AS "participants: Vec<UserId>", locked,
+                      ARRAY(SELECT p.participant FROM board_participant p
+                            WHERE p.board = board.id ORDER BY p.participant)
+                          AS "participants!: Vec<UserId>", locked,
                       locked_by AS "locked_by: UserId",
                       locked_at AS "locked_at: Timestamp", epoch,
                       closed_at AS "closed_at: Timestamp",

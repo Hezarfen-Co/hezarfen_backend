@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO settings_attendance_status (settings, status)\n         SELECT 'school', t.status FROM unnest($1::text[]) AS t(status)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "03c775aaaa23fc44b29fe4a4d64074eb43d881555a2d278f30abf5ef6b4cef54"
+}

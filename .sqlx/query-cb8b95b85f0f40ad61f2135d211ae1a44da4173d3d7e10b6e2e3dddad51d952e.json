@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO homework_assignment (homework, student)\n                     SELECT $2, s FROM unnest($1::uuid[]) AS t(s)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb8b95b85f0f40ad61f2135d211ae1a44da4173d3d7e10b6e2e3dddad51d952e"
+}

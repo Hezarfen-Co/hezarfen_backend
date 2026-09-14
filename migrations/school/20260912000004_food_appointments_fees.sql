@@ -95,19 +95,39 @@ CREATE TABLE menu_dish (
     description TEXT NULL,
     -- Money is minor units (kuruş) as an integer, everywhere. Never decimal.
     price_minor BIGINT NOT NULL,
-    tags        TEXT[] NOT NULL DEFAULT '{}',
     created_at  BIGINT NOT NULL
 );
 
 CREATE INDEX menu_dish_menu ON menu_dish (menu);
 
+-- The dish's dietary tags, one row each (was a TEXT[] column). `ord` keeps
+-- the order the kitchen gave the list in: a profile intersection reports
+-- conflicts in dish-tag order. Deleting a dish sweeps these rows first —
+-- the FK is NO ACTION.
+CREATE TABLE menu_dish_tag (
+    dish uuid NOT NULL REFERENCES menu_dish(id) ON DELETE NO ACTION,
+    tag  TEXT NOT NULL,
+    ord  SMALLINT NOT NULL,
+    CONSTRAINT menu_dish_tag_dish_tag PRIMARY KEY (dish, tag)
+);
+
 CREATE TABLE dietary_profile (
     student    uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
-    tags       TEXT[] NOT NULL DEFAULT '{}',
     note       TEXT NULL,
     updated_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     updated_at BIGINT NOT NULL,
     CONSTRAINT dietary_profile_student PRIMARY KEY (student)
+);
+
+-- The student's dietary tags, one row each (was a TEXT[] column): the same
+-- vocabulary and the same `ord` order-preservation as menu_dish_tag. The
+-- profile is the parent (no app_user FK of its own), so a tag exists only
+-- while its profile row stands.
+CREATE TABLE dietary_profile_tag (
+    student uuid NOT NULL REFERENCES dietary_profile(student) ON DELETE NO ACTION,
+    tag     TEXT NOT NULL,
+    ord     SMALLINT NOT NULL,
+    CONSTRAINT dietary_profile_tag_student_tag PRIMARY KEY (student, tag)
 );
 
 -- A cancel flips `status` and stamps `cancelled_at`; the row stays so the

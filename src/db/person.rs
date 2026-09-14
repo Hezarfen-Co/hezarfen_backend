@@ -11,7 +11,7 @@ use crate::domain::session::{SessionId, SessionToken};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{PasswordHash, Username};
 use crate::error::AppError;
-use crate::tenant::{SchoolStatus, Slug};
+use crate::tenant::{SchoolId, SchoolStatus, Slug};
 
 /// The raw account insert behind [`crate::service::person::create_or_load`].
 /// The unique index on `username` is the whole availability check; the loser
@@ -75,7 +75,7 @@ pub async fn memberships(db: &Database, person: &PersonId) -> Result<Vec<Members
                   s.name,
                   s.status AS "status: SchoolStatus"
            FROM person_school ps
-           JOIN school s ON s.slug = ps.school
+           JOIN school s ON s.id = ps.school
            WHERE ps.person = $1
            ORDER BY s.slug"#,
         person.uuid()
@@ -99,8 +99,8 @@ pub async fn membership_of(
                   s.name,
                   s.status AS "status: SchoolStatus"
            FROM person_school ps
-           JOIN school s ON s.slug = ps.school
-           WHERE ps.person = $1 AND ps.school = $2"#,
+           JOIN school s ON s.id = ps.school
+           WHERE ps.person = $1 AND s.slug = $2"#,
         person.uuid(),
         slug.as_str()
     )
@@ -110,10 +110,15 @@ pub async fn membership_of(
 }
 
 /// Attach a person to a school. Idempotent by the primary key: a racing or
-/// repeated join is a no-op, not an error.
+/// repeated join is a no-op, not an error. The membership carries the
+/// school's uuid, resolved from the slug in the same statement — so a school
+/// deleted mid-flight joins nothing instead of erroring, which is the honest
+/// outcome (there is nothing left to join).
 pub async fn add_membership(db: &Database, person: &PersonId, slug: &Slug) -> Result<(), AppError> {
     sqlx::query!(
-        "INSERT INTO person_school (person, school, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        "INSERT INTO person_school (person, school, created_at)
+         SELECT $1, s.id, $3 FROM school s WHERE s.slug = $2
+         ON CONFLICT DO NOTHING",
         person.uuid(),
         slug.as_str(),
         Timestamp::now().as_millis()
@@ -127,8 +132,8 @@ pub async fn add_membership(db: &Database, person: &PersonId, slug: &Slug) -> Re
 /// first control-plane half, so `ON DELETE NO ACTION` never refuses the
 /// registry delete. Persons themselves survive: a person is a global
 /// account, not the school's.
-pub async fn delete_memberships_by_school(db: &Database, slug: &Slug) -> Result<(), AppError> {
-    sqlx::query!("DELETE FROM person_school WHERE school = $1", slug.as_str())
+pub async fn delete_memberships_by_school(db: &Database, school: &SchoolId) -> Result<(), AppError> {
+    sqlx::query!("DELETE FROM person_school WHERE school = $1", school.uuid())
         .execute(db)
         .await?;
     Ok(())

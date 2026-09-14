@@ -43,7 +43,8 @@ impl DietaryProfileId {
 
 /// The tags a student's diet carries, drawn from the school's `dietary_tags`
 /// list — the same vocabulary a dish is tagged from, deduplicated and in the
-/// order given. Stored as a `TEXT[]` column. `no_pg_array` skips the derive's
+/// order given. Stored one row per tag in `dietary_profile_tag` (an `ord`
+/// column keeps the given order). `no_pg_array` skips the derive's
 /// element-array assertion (which a `Vec` inner cannot satisfy); the impls
 /// still delegate to `Vec<String>`.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]

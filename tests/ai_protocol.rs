@@ -1208,6 +1208,7 @@ async fn two_schools(bridge: &AiBridge) -> (axum::Router, Tenants, String, Strin
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta_db = tenants
         .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
             &Slug::try_new("beta").unwrap(),
             "Beta College",
             ModuleSet::all(),

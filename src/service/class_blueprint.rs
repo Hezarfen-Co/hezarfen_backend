@@ -171,7 +171,8 @@ pub async fn set_courses(
 /// a silent detach of somebody else's additions. Known hole, accepted: the
 /// grade label *is* the primary key and the comparison is by **content**, so
 /// a blueprint deleted and recreated at the same grade with the same list
-/// satisfies `WHERE courses = $held` and this call deletes the *new* row.
+/// names the same course set as the stored junction rows, and this call
+/// deletes the *new* row.
 ///
 /// Content-equal is intent-equal — the end state is the one the caller
 /// asked for — and telling the two apart needs a revision column on the
@@ -448,6 +449,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let blueprint = a_blueprint(vec![course.clone()], &db).await;
+        // Children first, the ordering the course's own cascade runs: with the
+        // junction row standing, the raw course delete below is a foreign-key
+        // refusal. What is left is exactly the pump-window state the handle
+        // still walks.
+        sqlx::query("DELETE FROM blueprint_course WHERE course = $1")
+            .bind(course.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM course WHERE id = $1")
             .bind(course.uuid())
             .execute(&db)
@@ -810,6 +820,14 @@ mod tests {
         let a = a_section("9-A", &db).await;
         let b = a_section("9-B", &db).await;
         let mut blueprint = a_blueprint(vec![astronomy.clone(), algebra.clone()], &db).await;
+        // Children first, the ordering the course's own cascade runs — the
+        // junction row standing would make the raw delete a foreign-key
+        // refusal. The handle below still walks the list it read.
+        sqlx::query("DELETE FROM blueprint_course WHERE course = $1")
+            .bind(astronomy.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM course WHERE id = $1")
             .bind(astronomy.uuid())
             .execute(&db)

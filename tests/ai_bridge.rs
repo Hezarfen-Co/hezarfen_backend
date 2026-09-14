@@ -1784,7 +1784,12 @@ async fn an_index_dispatch_names_the_notes_own_school_and_stores_the_answer_ther
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta = Slug::try_new("beta").unwrap();
     let beta_db = tenants
-        .create(&beta, "Beta College", ModuleSet::all())
+        .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
+            &beta,
+            "Beta College",
+            ModuleSet::all(),
+        )
         .await
         .expect("beta");
 

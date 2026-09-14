@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO rag_output (id, course_note, course, payload, generated_at)\n               VALUES ($1, $2, $3, $4, $5)\n               RETURNING id AS \"id: RagOutputId\", course_note AS \"course_note: CourseNoteId\",\n                         course AS \"course: CourseId\",\n                         payload AS \"payload: Json<Value>\",\n                         generated_at AS \"generated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RagOutputId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_output",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course_note: CourseNoteId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_output",
+            "name": "course_note"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_output",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "payload: Json<Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "rag_output",
+            "name": "payload"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "generated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_output",
+            "name": "generated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "171dde095199b0d28722a55df522824bacb3b971bb88a99db0fbeb148045048d"
+}

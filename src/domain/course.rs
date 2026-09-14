@@ -96,11 +96,12 @@ impl CourseKind {
 /// `creator` owns the course for good — only they (or a manager+) may delete
 /// it. `teachers` are the staff a manager assigned to run it: full management
 /// rights inside the course, no power to delete it or change the assignment
-/// list.
+/// list. The assignment itself is `course_teacher` rows; the struct carries
+/// the resolved list, joined on by the db layer.
 ///
 /// Fields are crate-visible: [`crate::db::course`] mints the rows on create
 /// and reads the id when updating and cascading a delete.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct Course {
     pub(crate) id: CourseId,
     pub(crate) creator: UserId,
@@ -146,7 +147,8 @@ impl Course {
         &self.creator == user
     }
 
-    /// The staff assigned to run this course, in assignment order.
+    /// The staff assigned to run this course. Assignment order is not kept:
+    /// the links are `course_teacher` rows now, and a set has no order.
     pub fn get_teachers(&self) -> &[UserId] {
         &self.teachers
     }

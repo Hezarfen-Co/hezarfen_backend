@@ -28,7 +28,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, Username};
 use crate::error::AppError;
 use crate::module::ModuleSet;
-use crate::tenant::{DEMO_SLUG, SchoolStatus, Slug, Tenants, school_db_name};
+use crate::tenant::{DEMO_SLUG, SchoolId, SchoolStatus, Tenants, school_db_name};
 
 /// The shared database handle.
 ///
@@ -134,9 +134,10 @@ pub(crate) async fn school_pool(
 /// A `CREATE DATABASE` / `DROP DATABASE` statement for a quoted identifier.
 /// The names passed here are the control database's name (from
 /// `DATABASE_URL`), the template's (`{control}_school_template`) or
-/// [`crate::tenant::school_db_name`]'s output — never user input: the slug
-/// charset is `[a-z0-9-]` and an embedded quote is doubled, so the statement
-/// cannot be escaped from. That manual audit is what licenses the
+/// [`crate::tenant::school_db_name`]'s output — never user input: the control
+/// and template names come from configuration, the school name from a uuid's
+/// hex (fixed `[0-9a-f]`), and an embedded quote is doubled besides, so the
+/// statement cannot be escaped from. That manual audit is what licenses the
 /// `AssertSqlSafe` wrapper every caller applies (sqlx refuses non-literal
 /// query strings without it).
 pub(crate) fn create_database_sql(statement: &str, name: &str) -> String {
@@ -451,7 +452,7 @@ fn builder_credentials(cfg: &Config) -> Result<Option<(Username, Password)>, App
 //
 // Every test run gets a **private pair of databases** on the compose Postgres:
 // a control database and the demo school's database, both named after one
-// random suffix — `heztest_<16 hex>` and `heztest_<…>_school_demo` — so
+// random suffix — `heztest_<16 hex>` and `heztest_<…>_school_<uuid hex>` — so
 // nextest's parallel processes neither collide nor see each other's rows. The
 // school schema is not migrated per test: it is cloned from a shared template
 // database whose name carries a hash of `migrations/school`, so a schema edit
@@ -612,9 +613,8 @@ pub async fn init_test_tenants() -> Tenants {
         .unwrap_or_else(|err| panic!("migrate the test control database {control_db}: {err}"));
 
     let template = ensure_test_template(&maintenance, &base).await;
-
-    let demo = Slug::try_new(DEMO_SLUG).expect("the demo slug");
-    let school_db = school_db_name(&control_db, &demo);
+    let demo_id = SchoolId::generate();
+    let school_db = school_db_name(&control_db, demo_id.uuid());
     create_database(&maintenance, &school_db, Some(&template)).await;
     lease.track(&school_db);
     let school = school_pool(&base, &school_db)
@@ -625,24 +625,32 @@ pub async fn init_test_tenants() -> Tenants {
     // without the per-school migration its `bring_up` runs, which the
     // template clone has just replaced.
     sqlx::query(
-        "INSERT INTO school (slug, name, status, created_at, modules)
+        "INSERT INTO school (id, slug, name, status, created_at)
          VALUES ($1, $2, $3, $4, $5)",
     )
+    .bind(demo_id.uuid())
     .bind(DEMO_SLUG)
     .bind("Demo School")
     .bind(SchoolStatus::Active)
     .bind(Timestamp::now().as_millis())
-    .bind(ModuleSet::all().names())
     .execute(&control)
     .await
     .expect("register the test demo school");
+    for module in ModuleSet::all().names() {
+        sqlx::query("INSERT INTO school_module (school, module) VALUES ($1, $2)")
+            .bind(demo_id.uuid())
+            .bind(module)
+            .execute(&control)
+            .await
+            .expect("register the test demo school's modules");
+    }
 
     Tenants::new_test_adopting(
         control,
         base.database(&control_db),
         control_db,
         lease,
-        [(demo, school)],
+        [(demo_id, school)],
     )
 }
 

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT blueprint, course AS \"course: CourseId\" FROM blueprint_course\n           WHERE blueprint = ANY($1) ORDER BY blueprint, course",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blueprint",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "blueprint_course",
+            "name": "blueprint"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "blueprint_course",
+            "name": "course"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "bd7a06a5112f3a1489d0f3800e42bee96cd9acec380c29c4006c9d68f5becd57"
+}

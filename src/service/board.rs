@@ -1,5 +1,5 @@
 //! Board workflows: the roster gates the REST surface drives, and the
-//! atomic-array write that replaced the old process-wide roster lock. The
+//! atomic-union insert that replaced the old process-wide roster lock. The
 //! queries live in [`crate::db::board`]; the room's WebSocket keeps its
 //! own binding policy in [`crate::web::board_ws`], reading through here.
 
@@ -117,10 +117,10 @@ pub async fn resolve_participants(
 /// **all-or-nothing**: an over-full union is refused with a `409` naming the
 /// two numbers and the roster is left exactly as it was.
 ///
-/// The merge itself is one atomic guarded statement
-/// ([`board::invite_group`]): `SET` and guard both read the row version the
-/// `UPDATE` is acting on, so of two concurrent invites neither can drop the
-/// other's group and the cap refuses the second — the property the old
+/// The merge itself is one serialized union ([`board::invite_group`]): the
+/// board row is locked first, so of two concurrent invites the second
+/// waits, counts against the first's committed roster and the cap refuses
+/// it — neither can drop the other's group, the property the old
 /// process-wide roster lock existed to provide, now enforced by the row
 /// itself. Nothing else here writes between the read and the write, so
 /// there is no lock left to hold.

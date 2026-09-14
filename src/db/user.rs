@@ -512,7 +512,12 @@ pub async fn set_role_cascade(
             // board and its whole history, and the creator's `board_count`
             // seat stays taken, which is correct while the row it counts
             // exists. Stamped *before* the roster strip so the strip's
-            // `RETURNING` carries the closed row the caller fans out.
+            // read-back below carries the closed row the caller fans out.
+            // The strip itself is the junction's: the demoted user's roster
+            // rows are deleted and their board ids collected from
+            // RETURNING, then the affected rooms are read back in the same
+            // transaction — the junction delete cannot return the whole
+            // row the way the old `array_remove` `UPDATE` did.
             sqlx::query!(
                 "UPDATE board SET closed_at = $2 WHERE creator = $1 AND closed_at IS NULL",
                 target.uuid(),
@@ -520,21 +525,29 @@ pub async fn set_role_cascade(
             )
             .execute(&mut *tx)
             .await?;
+            let stripped = sqlx::query!(
+                "DELETE FROM board_participant WHERE participant = $1 RETURNING board",
+                target.uuid(),
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            let stripped_boards: Vec<uuid::Uuid> =
+                stripped.into_iter().map(|row| row.board).collect();
             let boards = sqlx::query_as!(
                 Board,
-                r#"UPDATE board
-                   SET participants = array_remove(participants, $1)
-                   WHERE $1 = ANY(participants) OR creator = $1
-                   RETURNING id AS "id: BoardId",
-                             creator AS "creator: UserId",
-                             title AS "title: BoardTitle",
-                             participants AS "participants: Vec<UserId>",
-                             locked,
-                             locked_by AS "locked_by: UserId",
-                             locked_at AS "locked_at: Timestamp",
-                             epoch,
-                             closed_at AS "closed_at: Timestamp",
-                             created_at AS "created_at: Timestamp""#,
+                r#"SELECT b.id AS "id: BoardId", b.creator AS "creator: UserId",
+                       b.title AS "title: BoardTitle",
+                       ARRAY(SELECT p.participant FROM board_participant p
+                             WHERE p.board = b.id ORDER BY p.participant)
+                           AS "participants!: Vec<UserId>",
+                       b.locked, b.locked_by AS "locked_by: UserId",
+                       b.locked_at AS "locked_at: Timestamp", b.epoch,
+                       b.closed_at AS "closed_at: Timestamp",
+                       b.created_at AS "created_at: Timestamp"
+                   FROM board b
+                   WHERE b.id = ANY($1::uuid[]) OR b.creator = $2
+                   ORDER BY b.id"#,
+                &stripped_boards,
                 target.uuid(),
             )
             .fetch_all(&mut *tx)
@@ -549,10 +562,11 @@ pub async fn set_role_cascade(
         }
 
         if !role.at_least(Role::Teacher) {
-            // Course staffing goes — only teacher+ may hold a seat on the
-            // list.
+            // Course staffing goes — only teacher+ may hold a seat, and the
+            // seat is a `course_teacher` row now: one `DELETE` by its
+            // `teacher` index takes every assignment.
             sqlx::query!(
-                "UPDATE course SET teachers = array_remove(teachers, $1) WHERE $1 = ANY(teachers)",
+                "DELETE FROM course_teacher WHERE teacher = $1",
                 target.uuid(),
             )
             .execute(&mut *tx)

@@ -1,3 +1,20 @@
+# The whole stack: postgres + backend + OpenObserve behind podman compose.
+#
+# Credentials live in three places, never mixed (see README):
+#   laptop    the ${VAR:-default} interpolations below — `podman compose up`
+#             works with zero extra files
+#   CI        the workflow's throwaway postgres sidecar (hezarfen/hezarfen)
+#   VPS prod  ~/hezarfen_backend/hezarfen_backend.env (0600, written by hand
+#             from deploy/hezarfen_backend.env.example)
+#
+# Interpolation reads the --env-file arguments (hezarfen_backend.env first,
+# deploy-owned stack.env second). The `env_file:` on the backend passes the
+# same secrets file into the container so extra keys (OTEL_*, COOKIE_SECURE,
+# TRUST_PROXY, CORS_*, RATE_LIMIT_*) reach it without being listed in
+# `environment:`. `environment:` wins over `env_file`, which is why
+# DATABASE_URL is always constructed here: a leftover DATABASE_URL in the env
+# file cannot point the container at the host.
+
 services:
   postgres:
     image: docker.io/library/postgres:18-alpine
@@ -6,16 +23,21 @@ services:
     # (nextest runs ~a dozen concurrently), which exhausts the 100 default.
     command: ["postgres", "-c", "max_connections=500"]
     environment:
-      POSTGRES_USER: hezarfen
-      POSTGRES_PASSWORD: hezarfen
-      POSTGRES_DB: hezarfen_control
+      POSTGRES_USER: ${POSTGRES_USER:-hezarfen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hezarfen}
+      POSTGRES_DB: ${POSTGRES_DB:-hezarfen_control}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/data
+      # postgres:18 declares VOLUME /var/lib/postgresql (PGDATA is
+      # /var/lib/postgresql/18/docker); mounting the parent keeps the whole
+      # data dir — including future major-version subdirs — in the volume.
+      - pgdata:/var/lib/postgresql
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hezarfen -d hezarfen_control"]
+      # $$ keeps compose from interpolating; the shell inside the container
+      # expands the image's own POSTGRES_USER / POSTGRES_DB.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -25,52 +47,40 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    image: localhost/hezarfen-backend:latest
+    # HEZARFEN_TAG comes from the deploy-owned stack.env (--env-file), or the
+    # latest local build on a laptop.
+    image: localhost/hezarfen-backend:${HEZARFEN_TAG:-latest}
     container_name: hezarfen-backend
     ports:
-      - "7656:7656"
+      # Loopback only: terminate TLS on a reverse proxy in front of this.
+      - "127.0.0.1:7656:7656"
       # AI bridge (QUIC = UDP). Paired with AI_QUIC_ADDR below.
       - "8090:8090/udp"
+    env_file:
+      # Written once by the operator on the VPS (0600); absent on a laptop.
+      - path: hezarfen_backend.env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: "7656"
       # The control database: the school registry + the builder accounts. Each
       # school lives in a Postgres database of its own, named from its slug.
-      DATABASE_URL: postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control
+      # Constructed from POSTGRES_* and always aimed at the compose postgres.
+      DATABASE_URL: postgres://${POSTGRES_USER:-hezarfen}:${POSTGRES_PASSWORD:-hezarfen}@postgres:5432/${POSTGRES_DB:-hezarfen_control}
+      # Hardcoded: must not pick up an old systemd host path from the env file.
       FILES_PATH: /data/files
       RUST_LOG: info,hezarfen_backend=debug
       # First-boot builder seed: the operator who creates and suspends schools,
-      # created once if the username doesn't exist yet. Local-dev credentials —
-      # change or remove before exposing this anywhere.
-      BUILDER_USERNAME: builder
-      BUILDER_PASSWORD: builder123
-      # Production knobs — uncomment as needed (see .env.example for docs):
-      # COOKIE_SECURE: "true"
-      # CORS_ALLOWED_ORIGINS: https://app.example.com
-      # RATE_LIMIT_AUTH_PER_MINUTE: "10"
-      # RATE_LIMIT_API_PER_MINUTE: "300"
-      # TRUST_PROXY: "true"
-      # Telemetry — export traces, metrics and logs to OpenObserve over OTLP.
-      # The Authorization value is base64("<ZO_ROOT_USER_EMAIL>:<password>");
-      # for the local-dev pair above that is the string below. gRPC carries the
-      # organization and the target stream as metadata headers.
-      # OTEL_EXPORTER_OTLP_ENDPOINT: http://openobserve:5081
-      # OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Basic YWRtaW5AaGV6YXJmZW4ubG9jYWw6SGV6YXJmZW5fZGV2MSE=,organization=default,stream-name=default"
-      # OTEL_SERVICE_NAME: hezarfen-backend
-      # OTLP/HTTP instead: the org goes in the path (the SDK appends
-      # /v1/{traces,metrics,logs}) and only Authorization is needed.
-      # OTEL_EXPORTER_OTLP_ENDPOINT: http://openobserve:5080/api/default
-      # OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      # OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Basic YWRtaW5AaGV6YXJmZW4ubG9jYWw6SGV6YXJmZW5fZGV2MSE="
+      # created once if the username doesn't exist yet.
+      BUILDER_USERNAME: ${BUILDER_USERNAME:-builder}
+      BUILDER_PASSWORD: ${BUILDER_PASSWORD:-builder123}
       # AI bridge — the AI services dial IN over QUIC. Unset means off; a
       # bad address or a missing token fails the boot rather than leaving a
       # silently dead feature. Listening with no service connected is fine:
       # chat answers 503 until one registers `chat.reply`.
-      AI_QUIC_ADDR: 0.0.0.0:8090
-      # Every service must present this to register. Local-dev value — change
-      # it before this is reachable from anywhere but your machine.
-      AI_SHARED_TOKEN: change-me
-      # AI_REQUEST_TIMEOUT_SECS: "30"
+      AI_QUIC_ADDR: ${AI_QUIC_ADDR:-0.0.0.0:8090}
+      # Every service must present this to register.
+      AI_SHARED_TOKEN: ${AI_SHARED_TOKEN:-change-me}
     volumes:
       - hezarfen-data:/data
     depends_on:
@@ -88,18 +98,17 @@ services:
   # OpenObserve is the only telemetry sink (no Grafana/Jaeger/Loki): one Rust
   # binary, its own storage, no container socket and no sidecar databases. It
   # speaks OTLP itself — HTTP on 5080 (also the UI and the search API), gRPC on
-  # 5081. Both are published on loopback only.
+  # 5081. Both are published on loopback only. The backend exports to it only
+  # when OTEL_* keys are present in hezarfen_backend.env (see the example).
   openobserve:
     image: docker.io/openobserve/openobserve:v1.0.0-rc2
     container_name: hezarfen-openobserve
     environment:
-      # First-boot root account, created once. Local-dev credentials, same
-      # status as the root/root above — change them before this is reachable
-      # from anywhere but your machine. OpenObserve enforces a password policy
-      # (8-128 chars, upper + lower + digit + special) and panics on boot
-      # otherwise, hence the shape of this one.
-      ZO_ROOT_USER_EMAIL: admin@hezarfen.local
-      ZO_ROOT_USER_PASSWORD: Hezarfen_dev1!
+      # First-boot root account, created once. OpenObserve enforces a password
+      # policy (8-128 chars, upper + lower + digit + special) and panics on
+      # boot otherwise.
+      ZO_ROOT_USER_EMAIL: ${ZO_ROOT_USER_EMAIL:-admin@hezarfen.local}
+      ZO_ROOT_USER_PASSWORD: ${ZO_ROOT_USER_PASSWORD:-Hezarfen_dev1!}
       ZO_DATA_DIR: /data
       # Retention is per stream in days; this is the global default applied to
       # streams that don't override it (upstream default is 3650).

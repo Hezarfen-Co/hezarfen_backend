@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO menu_dish (id, menu, name, description, price_minor, created_at)\n             SELECT $1, $2, $3, $4, $5, $6\n             WHERE (SELECT count(*) FROM menu_dish WHERE menu = $2) < $7",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cdd48454144e721a0c3bab8b0859396b9a134f3b85a727c8fb08b01c9fa1fd6b"
+}

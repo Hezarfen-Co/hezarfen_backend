@@ -35,9 +35,9 @@ pub async fn delete_for_note(db: &Database, note: &CourseNoteId) -> Result<(), A
     rag_output::delete_for_note(db, note).await
 }
 
-/// Cascade: every output built from `file`. Runs on a file delete even
-/// with no AI service connected, so a stale output cannot survive its
-/// source.
+/// Cascade: the citation links pointing at `file`. Runs on a file delete
+/// even with no AI service connected — the file row refuses to go while a
+/// link still cites it.
 pub async fn delete_with_source(db: &Database, file: &CourseNoteFileId) -> Result<(), AppError> {
     rag_output::delete_with_source(db, file).await
 }

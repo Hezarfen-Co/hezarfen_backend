@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO person_school (person, school, created_at)\n         SELECT $1, s.id, $3 FROM school s WHERE s.slug = $2\n         ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ede2ad9dfbe1e9e069bd8912acb49d13f43f251bc7276d1a6b6fe249920677ad"
+}

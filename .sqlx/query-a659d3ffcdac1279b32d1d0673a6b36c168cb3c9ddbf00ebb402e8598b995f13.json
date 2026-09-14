@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO settings_dietary_tag (settings, tag)\n         SELECT 'school', t.tag FROM unnest($1::text[]) AS t(tag)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a659d3ffcdac1279b32d1d0673a6b36c168cb3c9ddbf00ebb402e8598b995f13"
+}

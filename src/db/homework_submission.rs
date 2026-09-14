@@ -79,7 +79,11 @@ pub async fn upsert(
             // student the homework no longer names must read as gone — the
             // same 404 their own lookup answers.
             r#"SELECT due_at AS "due_at: Timestamp" FROM homework
-               WHERE id = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
+               WHERE id = $1
+                 AND (NOT EXISTS (SELECT 1 FROM homework_assignment a
+                                   WHERE a.homework = homework.id)
+                      OR EXISTS (SELECT 1 FROM homework_assignment a
+                                  WHERE a.homework = homework.id AND a.student = $2))
                FOR UPDATE"#,
             homework_id.uuid(),
             user.uuid()

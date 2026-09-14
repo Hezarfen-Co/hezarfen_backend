@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM menu_dish_tag WHERE dish IN (SELECT id FROM menu_dish WHERE menu = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a8f1d82b2d0a543ea09ea62f8bb88a7365573ea7f566f9ff3f625e6a034d181c"
+}

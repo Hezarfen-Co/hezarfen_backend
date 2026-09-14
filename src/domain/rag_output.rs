@@ -9,7 +9,7 @@
 //! from both sides of what it was built from —
 //! [`delete_for_note`](crate::db::rag_output::delete_for_note) when the note
 //! goes, [`delete_with_source`](crate::db::rag_output::delete_with_source)
-//! when one of the attachments it was built from goes — so a stale output
+//! dropping the citation links a file delete strands — so the stored shape
 //! never outlives its input, even in a deployment with no AI service
 //! connected. Persistence lives in [`crate::db::rag_output`].
 
@@ -57,16 +57,19 @@ impl RagOutputId {
     }
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// The backend's stored rag-output row. No `sqlx::FromRow`: the citations
+/// are `rag_output_source` link rows, not columns — the db layer decodes
+/// its own plain-columns struct and attaches the links.
+#[derive(Debug, Clone)]
 pub struct RagOutput {
     pub(crate) id: RagOutputId,
     pub(crate) course_note: CourseNoteId,
     /// The note's course, denormalised so a course-wide read needs no join.
     pub(crate) course: CourseId,
-    /// The attachments the output was built from, as they stood at generation
-    /// time. Deleting any one of them drops this row
-    /// ([`delete_with_source`](crate::db::rag_output::delete_with_source))
-    /// rather than leaving an output citing a file that no longer exists.
+    /// The attachments the output was built from, in source-id order.
+    /// Stored as `rag_output_source` link rows; deleting a file drops its
+    /// links ([`delete_with_source`](crate::db::rag_output::delete_with_source))
+    /// and deleting an output drops its links, before either parent goes.
     pub(crate) sources: Vec<CourseNoteFileId>,
     /// The service's answer, stored verbatim in a JSONB column. Opaque to the
     /// backend — it is a service-owned shape, so this side neither validates

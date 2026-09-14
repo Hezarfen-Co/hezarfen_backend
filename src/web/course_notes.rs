@@ -56,11 +56,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 /// The note plus its course, or a 404 — every entity handler here gates on
 /// the parent course, so they always travel together.
-async fn note_with_course(id: &str, db: &Database) -> Result<(CourseNote, Course), AppError> {
-    let note = service::course_note::read(db, &CourseNoteId::from_key(id))
+async fn note_with_course(id: String, db: Database) -> Result<(CourseNote, Course), AppError> {
+    let id = CourseNoteId::from_key(&id);
+    let note = service::course_note::read(&db, &id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = crate::service::course::read(db, note.get_course())
+    let course = crate::service::course::read(&db, note.get_course())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok((note, course))
@@ -214,7 +215,7 @@ async fn get_one(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<CourseNoteResponse>, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note",
@@ -249,7 +250,7 @@ async fn update(
     Path(id): Path<String>,
     Json(req): Json<UpdateCourseNote>,
 ) -> Result<Json<CourseNoteResponse>, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can edit this course note",
@@ -295,7 +296,7 @@ async fn delete_one(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
@@ -373,7 +374,7 @@ async fn upload_file(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<CourseNoteFileResponse>), AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can add a file to this course note",
@@ -436,7 +437,7 @@ async fn list_files(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseNoteFileResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's files",
@@ -471,7 +472,7 @@ async fn download_file(
     CurrentUser(user): CurrentUser,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can download this course note's files",
@@ -533,7 +534,7 @@ async fn delete_file(
     RequireTeacher(user): RequireTeacher,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's files",
@@ -547,10 +548,10 @@ async fn delete_file(
     )
     .await?
     .ok_or(AppError::NotFound)?;
-    // Drop every output built from this file before the file itself, so a
-    // stale index cannot outlive its source in a deployment with no AI service
-    // at all, and a failure here leaves the file whole instead of stranding its
-    // blob; the re-index rebuilds from what is left, if a service is connected.
+    // Drop every link citing this file before the file itself — the file
+    // row refuses to go while one stands — so a failure here leaves the file
+    // whole instead of stranding its blob; the re-index rebuilds the
+    // outputs from what is left, if a service is connected.
     service::rag_output::delete_with_source(&st.db, file.get_id()).await?;
     let file = service::course_note_file::delete(&st.db, file).await?;
     remove_blob(&st.files_path, &file.get_id().key()).await;
@@ -615,7 +616,7 @@ async fn list_rag(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<RagOutputResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's AI outputs",
@@ -652,7 +653,7 @@ async fn delete_rag(
     RequireTeacher(user): RequireTeacher,
     Path((id, output_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let (note, course) = note_with_course(&id, &st.db).await?;
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's AI outputs",

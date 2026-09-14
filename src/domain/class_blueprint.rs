@@ -48,13 +48,14 @@ impl ClassBlueprintId {
     }
 }
 
-/// One grade's template. `grade` is stored beside the key it *is*, so a read
-/// never has to parse a record id back into a domain value.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// One grade's template. The id is the grade label itself — the key one
+/// grade always maps to — stored here beside the `grade` field so a read
+/// never has to parse a record id back into a domain value. `courses` is
+/// not a column of the row: it is the `blueprint_course` junction, joined
+/// on by the db layer (sorted by course, which is the order every CAS
+/// comparison relies on).
+#[derive(Debug, Clone)]
 pub struct ClassBlueprint {
-    /// The table's `TEXT` primary key column, stored once and read into both
-    /// this field and `grade` — the key *is* the grade label.
-    #[sqlx(rename = "grade")]
     pub(crate) id: ClassBlueprintId,
     pub(crate) grade: ClassGrade,
     pub(crate) courses: Vec<CourseId>,

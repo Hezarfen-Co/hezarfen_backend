@@ -215,13 +215,23 @@ CREATE TABLE homework (
     title       TEXT NOT NULL,
     description TEXT NULL,
     due_at      BIGINT NOT NULL,
-    -- NULL/empty means the whole course.
-    assigned    uuid[] NOT NULL DEFAULT '{}',
     created_by  uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     created_at  BIGINT NOT NULL
 );
 
 CREATE INDEX homework_course ON homework (course);
+
+-- The audience of a homework: no rows = the whole course (whoever is enrolled
+-- when they submit — later enrollees included); rows name the student subset,
+-- a fixed snapshot taken at assign (or last PATCH) time. NO ACTION orders the
+-- deletes: these rows go before the homework they scope.
+CREATE TABLE homework_assignment (
+    homework uuid NOT NULL REFERENCES homework(id) ON DELETE NO ACTION,
+    student  uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    CONSTRAINT homework_assignment_homework_student PRIMARY KEY (homework, student)
+);
+
+CREATE INDEX homework_assignment_student ON homework_assignment (student);
 
 CREATE TABLE homework_result (
     id        uuid PRIMARY KEY,

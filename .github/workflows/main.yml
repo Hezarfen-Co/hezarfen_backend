@@ -1,30 +1,39 @@
-# VPS deploy, im-style, split into two jobs so failure recovery is cheap:
+# VPS deploy, compose-style, split into two jobs so failure recovery is cheap:
 #
 #   Build and test  —  Postgres sidecar, clippy, the whole suite, the release
-#                      build; uploads the staged release as the run's artifact.
-#   Deploy          —  SSH release-dir swap + systemd user-unit restart,
-#                      /health gated on THIS build's process, rollback on
-#                      failure, independent after-the-fact verify.
+#                      build; packs the stripped binary + migrations into the
+#                      runtime image (deploy/Containerfile.runtime) and
+#                      uploads the image tarball + compose files as the run's
+#                      artifact.
+#   Deploy          —  SSH: podman load the image, point the deploy-owned
+#                      stack.env's HEZARFEN_TAG at it, install compose.yaml +
+#                      the hezarfen-compose user unit + the backup script,
+#                      restart the stack, /health-gated rollback to the
+#                      previous tag, independent after-the-fact verify.
 #
 # The split is the recovery story, not ceremony:
 #   * "Re-run failed jobs" on a run whose Deploy step failed re-runs ONLY the
-#     ~1-minute deploy job — the built release is still in the run's artifact.
+#     ~1-minute deploy job — the built image is still in the run's artifact.
 #   * workflow_dispatch (the manual door: Actions tab → Run workflow on main,
 #     or `gh workflow run main.yml --ref main`) deploys WITHOUT the suite: it
 #     takes the newest artifact a green Build-and-test produced — which can
 #     lag HEAD while a push is mid-CI, and that is the point: redeploy the
-#     known-good release, e.g. after a server-side fix (env file, proxy,
+#     known-good image, e.g. after a server-side fix (env file, proxy,
 #     database). For env-only changes a plain
-#     `ssh <vps> 'systemctl --user restart hezarfen'` needs no workflow at
-#     all: the process reads its env at boot.
+#     `ssh <vps> 'systemctl --user restart hezarfen-compose'` needs no
+#     workflow at all: the stack re-reads its env files on the next
+#     `podman compose up`.
 #
 # One-time prerequisites, outside the workflow's reach:
-#   * the repo secrets SSH_PRIVATE_KEY / SSH_HOST / SSH_USER (im's values
-#     work if this deploys as the same user);
+#   * the repo secrets SSH_PRIVATE_KEY / SSH_HOST / SSH_USER;
 #   * `loginctl enable-linger <user>` on the server unless the deploy user
-#     already has it (im's does) — user units need a running user manager;
-#   * a Postgres the backend can reach, and ~/hezarfen_backend/hezarfen_backend.env (0600)
-#     with at least DATABASE_URL — see deploy/hezarfen.service for the keys.
+#     already has it — user units need a running user manager;
+#   * podman plus a compose provider on the server (the deploy checks for
+#     both and fails with a one-line install hint);
+#   * the operator's ~/hezarfen_backend/hezarfen_backend.env (0600), written
+#     once by hand from deploy/hezarfen_backend.env.example — at minimum the
+#     POSTGRES_PASSWORD and BUILDER_PASSWORD lines. The deploy never
+#     creates or overwrites it.
 
 name: VPS deploy
 
@@ -35,30 +44,34 @@ on:
   # The manual redeploy door — see the header comment for how and why.
   workflow_dispatch:
 
-# One deploy at a time: the deploy swaps a release directory and restarts one
-# service; two of them racing would leave the binary and the running process
-# from different builds. A dispatched redeploy queues behind any in-flight
-# push deploy rather than racing it.
+# One deploy at a time: the deploy reloads one compose stack; two of them
+# racing would interleave container recreations and could leave the served
+# image and the tag files from different builds. A dispatched redeploy
+# queues behind any in-flight push deploy rather than racing it.
 concurrency:
   group: deploy
   cancel-in-progress: false
 
 env:
-  # A gnu binary links against the runner's glibc, so the runner is pinned
-  # (see runs-on below) to the same 24.04 the server runs; the day either
-  # side moves, the pin is what forces a conscious decision rather than a
-  # broken deploy. In exchange: no cross-toolchain, and the linker is
-  # rustc's default bundled lld.
+  # A gnu binary links against the toolchain's glibc, so the runner is
+  # pinned (see runs-on below) to 24.04, and the runtime image is
+  # debian:trixie-slim: move either side without thinking and the binary
+  # stops loading inside the container. The pin is what forces a conscious
+  # decision rather than a broken deploy. In exchange: no cross-toolchain,
+  # and the linker is rustc's default bundled lld.
   TARGET: x86_64-unknown-linux-gnu
-  # The systemd user unit that owns the process. See deploy/hezarfen.service.
-  SERVICE: hezarfen
+  # The systemd user unit that wraps `podman compose`. See
+  # deploy/hezarfen-compose.service.
+  SERVICE: hezarfen-compose
   # The deploy lives in this subdirectory of the SSH user's home. The home
   # itself is resolved on the server ($HOME), so switching the deploy user
   # moves the path with it — a baked-in absolute path once kept pointing at
   # the previous user's home and failed the deploy on permissions.
   DEPLOY_SUBDIR: hezarfen_backend
-  # The unit reads its secrets from this file on the server; the deploy
-  # never writes it, only checks it exists and holds DATABASE_URL.
+  # Compose interpolates its secrets from this file on the server (passed
+  # as --env-file, and to the backend container as env_file). The deploy
+  # never writes it, only checks it exists and carries the
+  # POSTGRES_PASSWORD / BUILDER_PASSWORD lines prod must not run without.
   ENV_FILE_NAME: hezarfen_backend.env
   # The Postgres the test suite mints its per-test databases on. Credentials
   # and port match the harness default (HEZARFEN_TEST_DATABASE_URL), so the
@@ -77,9 +90,9 @@ jobs:
     # Pushes only: a manual redeploy reuses the newest green artifact
     # instead of paying the suite again.
     if: github.event_name == 'push'
-    # Pinned, not `latest`: ubuntu-latest floating to the next LTS would
-    # one day ship a glibc newer than the server's, and the gnu binary
-    # would stop running there. See the TARGET comment above.
+    # Pinned, not `latest`: the gnu build links the runner's glibc and the
+    # runtime image is debian:trixie-slim — float either side carelessly
+    # and the binary stops loading. See the TARGET comment above.
     runs-on: ubuntu-24.04
     env:
       # The 41 test binaries each link the full tonic/otlp/axum/sqlx stack;
@@ -155,10 +168,34 @@ jobs:
           cp "target/$TARGET/release/hezarfen_backend" stage/hezarfen_backend
           # The migrators resolve `migrations/` beside the binary when the
           # compile-time checkout path is absent (see migrations_path), so
-          # the schema ships with the release it belongs to.
+          # the schema ships inside the image, next to /app/hezarfen_backend.
           cp -r migrations stage/migrations
-          cp deploy/hezarfen.service stage/hezarfen.service
           strip stage/hezarfen_backend
+          ls -l stage
+
+      - name: Build the runtime image
+        run: |
+          set -euo pipefail
+          # Pack the already-built, already-stripped gnu binary into the
+          # runtime image. Never build from source here: a second rust
+          # compile blows the runner's disk.
+          docker build -f deploy/Containerfile.runtime -t localhost/hezarfen-backend:$GITHUB_SHA stage/
+          docker save localhost/hezarfen-backend:$GITHUB_SHA | gzip > stage/hezarfen-backend.tar.gz
+
+      - name: Stage the compose bundle
+        run: |
+          set -euo pipefail
+          cp compose.yaml deploy/hezarfen-compose.service deploy/backup-postgres.sh stage/
+          echo -n "$GITHUB_SHA" > stage/tag
+          # Everything the deploy installs on the server must be here; a
+          # missing piece fails here, on the runner, not mid-deploy on the
+          # VPS. The raw binary and migrations may linger as docker build
+          # context — they are no longer load-bearing.
+          test -f stage/hezarfen-backend.tar.gz
+          test -f stage/compose.yaml
+          test -f stage/hezarfen-compose.service
+          test -f stage/backup-postgres.sh
+          test -f stage/tag
           ls -l stage
 
       # The deploy job (and, later, a manual redeploy) consumes this. 30
@@ -226,12 +263,16 @@ jobs:
           run-id: ${{ env.run_id }}
           github-token: ${{ github.token }}
 
+      # The dispatch path downloads a possibly-days-old artifact; re-check
+      # the bundle is whole before pointing any of it at the server.
       - name: Check the release is complete
         run: |
           set -euo pipefail
-          test -f stage/hezarfen_backend
-          test -d stage/migrations/control
-          test -f stage/hezarfen.service
+          test -f stage/hezarfen-backend.tar.gz
+          test -f stage/compose.yaml
+          test -f stage/hezarfen-compose.service
+          test -f stage/backup-postgres.sh
+          test -f stage/tag
 
       - name: Install SSH keys
         run: |
@@ -260,19 +301,19 @@ jobs:
               ;;
           esac
           deploy_path=$HOME/$1
-          # The deploy path is the service's working tree: hezarfen_backend.env and
-          # data/ live there and are never touched from here. Only 'current'
-          # is replaced.
+          # The deploy path holds the operator's hezarfen_backend.env, the
+          # compose files and the tag files; nothing in it is deleted
+          # wholesale, ever.
           mkdir -p -- "$deploy_path"
-          rm -rf -- "$deploy_path/current.new"
-          mkdir -p -- "$deploy_path/current.new"
           REMOTE
-          # stdin carries the tarball, so the script cannot; the extraction
+          # stdin carries the bundle, so the script cannot; the extraction
           # still goes through bash -c because the login shell is not bash
-          # and would not expand $HOME.
-          tar -C stage -czf - . | ssh "$ssh_target" "bash -c 'exec tar -xzf - -C \"\$HOME/\$1/current.new\"' -- '$DEPLOY_SUBDIR'"
+          # and would not expand $HOME. Only the five deploy files ship —
+          # the raw binary and migrations stay on the runner (they were
+          # docker build context, nothing more).
+          tar -C stage -czf - hezarfen-backend.tar.gz compose.yaml hezarfen-compose.service backup-postgres.sh tag | ssh "$ssh_target" "bash -c 'exec tar -xzf - -C \"\$HOME/\$1\"' -- '$DEPLOY_SUBDIR'"
 
-      - name: Swap and restart
+      - name: Load the image and restart the stack
         run: |
           set -euo pipefail
           ssh_target="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}"
@@ -285,72 +326,139 @@ jobs:
           service=$2
           env_file=$deploy_path/$3
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          # compose.yaml is resolved from the working directory: the unit's
+          # ExecStart carries WorkingDirectory, but the rollback compose up
+          # and a first-deploy down run from right here.
+          cd -- "$deploy_path"
+
           # Read before anything moves: the env file is the operator's, on
-          # the server, written once (see deploy/hezarfen.service for the
-          # keys). A missing file or a missing DATABASE_URL is a failure to
-          # stop on, not one to roll back from.
+          # the server, written once by hand (see
+          # deploy/hezarfen_backend.env.example for the keys). The deploy
+          # never creates or overwrites it. The password and OpenObserve lines
+          # are load-bearing: without them compose would silently run the stack
+          # on its laptop defaults.
           if [ ! -f "$env_file" ]; then
-            echo "missing $env_file — create it (0600) with at least DATABASE_URL; see deploy/hezarfen.service" >&2
+            echo "missing $env_file — create it (0600) from deploy/hezarfen_backend.env.example" >&2
             exit 1
           fi
           chmod 0600 -- "$env_file"
-          if ! grep -q '^DATABASE_URL=' "$env_file"; then
-            echo "no DATABASE_URL in $env_file" >&2
+          for key in POSTGRES_PASSWORD BUILDER_PASSWORD ZO_ROOT_USER_EMAIL ZO_ROOT_USER_PASSWORD; do
+            grep -Eq "^${key}=.+" "$env_file" || {
+              echo "no non-empty ${key}= line in $env_file — prod must not run on the compose defaults" >&2
+              exit 1
+            }
+          done
+
+          # Rootless podman plus a compose provider; fail with the fix, not
+          # a bare command-not-found three steps in.
+          command -v podman >/dev/null || {
+            echo "podman not found — install podman and a compose provider (e.g. dnf install podman podman-compose)" >&2
             exit 1
+          }
+          podman compose version >/dev/null 2>&1 || {
+            echo "'podman compose' unavailable — install a compose provider (podman-compose or docker-compose)" >&2
+            exit 1
+          }
+
+          # Load THIS build's image and read the tag the build stamped into
+          # it (build time and deploy time must agree on what is shipping).
+          gunzip -c "$deploy_path/hezarfen-backend.tar.gz" | podman load
+          tag=$(cat -- "$deploy_path/tag")
+
+          # Tag rotation: previous_tag is the rollback target (absent on a
+          # first deploy); current_tag records what should now be running.
+          if [ -f "$deploy_path/current_tag" ]; then
+            cp -- "$deploy_path/current_tag" "$deploy_path/previous_tag"
           fi
-          # The unit defaults to 7656; the env file may override.
-          port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
-          port=${port:-7656}
-          mkdir -p -- "$deploy_path/data/files"
-          chmod +x -- "$deploy_path/current.new/hezarfen_backend"
-          rm -rf -- "$deploy_path/current.previous"
-          if [ -e "$deploy_path/current" ]; then
-            mv -- "$deploy_path/current" "$deploy_path/current.previous"
-          fi
-          mv -- "$deploy_path/current.new" "$deploy_path/current"
+          printf '%s\n' "$tag" > "$deploy_path/current_tag"
+
+          # stack.env is deploy-owned (unlike the secrets file): it carries
+          # only the image tag, and --env-file order makes it win over the
+          # operator's file for HEZARFEN_TAG.
+          printf 'HEZARFEN_TAG=%s\n' "$tag" > "$deploy_path/stack.env"
+
+          # The freshly extracted bundle: compose file and unit are
+          # world-readable, the backup script is run by hand or a timer.
+          chmod 0644 -- "$deploy_path/compose.yaml" "$deploy_path/hezarfen-compose.service"
+          chmod 0755 -- "$deploy_path/backup-postgres.sh"
+          # The image tarball was only a transport; the image is loaded into
+          # podman's storage now.
+          rm -f -- "$deploy_path/hezarfen-backend.tar.gz"
+
+          compose_up() {
+            podman compose --env-file "$env_file" --env-file "$deploy_path/stack.env" up -d --no-build
+          }
+          rollback() {
+            if [ -f "$deploy_path/previous_tag" ]; then
+              prev=$(cat -- "$deploy_path/previous_tag")
+              printf 'HEZARFEN_TAG=%s\n' "$prev" > "$deploy_path/stack.env"
+              printf '%s\n' "$prev" > "$deploy_path/current_tag"
+              compose_up
+              echo "rolled back to $prev" >&2
+            else
+              # First deploy: nothing to roll back to, so stop the
+              # half-brought-up stack. Plain down — the volumes hold the
+              # operator's data and postgres's first-boot password.
+              podman compose --env-file "$env_file" --env-file "$deploy_path/stack.env" down
+              echo 'first deploy failed; stack stopped, volumes kept' >&2
+            fi
+          }
+
           # The unit ships with the release: a freshly provisioned box has
           # no unit until the first deploy writes it, and a changed unit
-          # lands with the code that needs it. Enabling is idempotent.
+          # lands with the compose file that needs it.
           mkdir -p -- "$HOME/.config/systemd/user"
-          install -m 644 -- "$deploy_path/current/hezarfen.service" "$HOME/.config/systemd/user/$service.service"
+          install -m 0644 -- "$deploy_path/hezarfen-compose.service" "$HOME/.config/systemd/user/$service.service"
           systemctl --user daemon-reload
+          # Retire the binary-era unit: disable it (absent on fresh boxes)
+          # and drop its unit file so it can never come back at boot.
+          systemctl --user disable --now hezarfen.service 2>/dev/null || true; rm -f -- "$HOME/.config/systemd/user/hezarfen.service"
+
+          # The unit is a oneshot with RemainAfterExit, so `start` on the
+          # active (exited) unit would be a no-op — every deploy restarts
+          # to re-run ExecStart. A failed restart (bad interpolation, a
+          # provider hiccup) must still reach the health gate below: it
+          # decides between rollback and success.
           systemctl --user enable -- "$service"
-          systemctl --user restart "$service"
-          # The unit is Type=simple, so a restart returns before the new
-          # process has bound its port — and before an old one has let go
-          # of it. Wait for the health route rather than a clock: /health
+          systemctl --user restart "$service" || true
+
+          # The oneshot returns before the containers have bound their
+          # ports. Wait for the health route rather than a clock: /health
           # answers 503 (curl -f fails) while the database is unreachable,
-          # so a 200 here already means status "ok".
-          rollback() {
-            rm -rf -- "$deploy_path/current"
-            mv -- "$deploy_path/current.previous" "$deploy_path/current"
-            systemctl --user restart "$service"
-          }
-          for _ in $(seq 1 30); do
-            served=$(curl -fsS "http://127.0.0.1:$port/health" 2>/dev/null) || { sleep 1; continue; }
-            # A stale process from an older deploy can answer too, so the
-            # running binary must be THIS release's, or it rolls back.
-            pid=$(systemctl --user show -p MainPID --value "$service")
-            exe=$(readlink "/proc/$pid/exe")
-            case "$exe" in
-              "$deploy_path/current/hezarfen_backend") ;;
-              *)
-                echo "/health answered, but the process is '$exe' — not this release; rolling back" >&2
-                rollback
-                exit 1
-                ;;
+          # so a 200 whose body says "status":"ok" means the new stack is
+          # truly serving. 90 attempts, not 30: a first deploy also pulls
+          # the postgres and observability base images.
+          health_ok=0
+          for _ in $(seq 1 90); do
+            served=$(curl -fsS http://127.0.0.1:7656/health 2>/dev/null) || true
+            case "$served" in
+              *'"status":"ok"'*) health_ok=1; break ;;
             esac
-            echo 'hezarfen is up'
-            rm -rf -- "$deploy_path/current.previous"
-            exit 0
+            sleep 1
           done
-          echo 'hezarfen did not answer /health; rolling back' >&2
-          rollback
-          exit 1
+          if [ "$health_ok" -ne 1 ]; then
+            echo '/health never said "status":"ok"; rolling back' >&2
+            rollback
+            exit 1
+          fi
+
+          # A stale stack from an older deploy can answer too, so the
+          # running container must be THIS build's image, or it rolls back.
+          image=$(podman inspect -f '{{.Config.Image}}' hezarfen-backend)
+          case "$image" in
+            *"$tag"*) ;;
+            *)
+              echo "/health answered, but the container runs '$image' — not this build ($tag); rolling back" >&2
+              rollback
+              exit 1
+              ;;
+          esac
+          echo 'hezarfen-compose is up'
           REMOTE
 
-      # The independent after-the-fact check: the process answering must
-      # still be this release's, and the validation contract must be served.
+      # The independent after-the-fact check: the container answering must
+      # still be the current tag's, and the validation contract must be
+      # served.
       - name: Verify the served API
         run: |
           set -euo pipefail
@@ -358,22 +466,26 @@ jobs:
           # One remote script, im-style: mixing runner-side and server-side
           # variables in nested ssh quoting once shipped a check that failed
           # on a healthy deploy. Everything happens inside the heredoc.
-          ssh "$ssh_target" "bash -se -- '$DEPLOY_SUBDIR' '$SERVICE' '$ENV_FILE_NAME'" <<'REMOTE'
+          ssh "$ssh_target" "bash -se -- '$DEPLOY_SUBDIR'" <<'REMOTE'
           set -euo pipefail
           deploy_path=$HOME/$1
-          service=$2
-          env_file=$deploy_path/$3
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
-          port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
-          port=${port:-7656}
-          pid=$(systemctl --user show -p MainPID --value "$service")
-          exe=$(readlink "/proc/$pid/exe")
-          [ "$exe" = "$deploy_path/current/hezarfen_backend" ] || {
-            echo "serving '$exe', not the current release" >&2
-            exit 1
-          }
-          curl -fsS "http://127.0.0.1:$port/health" | grep -q '"status":"ok"'
-          curl -fsS -o /dev/null "http://127.0.0.1:$port/limits"
+          cd -- "$deploy_path"
+          tag=$(cat -- "$deploy_path/current_tag")
+          image=$(podman inspect -f '{{.Config.Image}}' hezarfen-backend)
+          case "$image" in
+            *"$tag"*) ;;
+            *)
+              echo "container runs '$image', not the current tag '$tag'" >&2
+              exit 1
+              ;;
+          esac
+          served=$(curl -fsS http://127.0.0.1:7656/health) || { echo '/health failed' >&2; exit 1; }
+          case "$served" in
+            *'"status":"ok"'*) ;;
+            *) echo '/health did not report "status":"ok"' >&2; exit 1 ;;
+          esac
+          curl -fsS -o /dev/null http://127.0.0.1:7656/limits
           echo 'health ok, limits served'
           REMOTE
 

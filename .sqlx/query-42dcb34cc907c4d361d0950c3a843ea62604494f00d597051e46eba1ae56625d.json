@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM settings_attendance_status WHERE settings = 'school'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "42dcb34cc907c4d361d0950c3a843ea62604494f00d597051e46eba1ae56625d"
+}

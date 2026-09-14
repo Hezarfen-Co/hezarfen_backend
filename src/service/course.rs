@@ -17,10 +17,11 @@ use crate::service::term;
 /// accepted race (see README concurrency model): a term archived after this
 /// read still lets the write through.
 pub async fn require_open(db: &Database, course: &Course) -> Result<(), AppError> {
-    match course.get_term() {
-        None => Ok(()),
-        Some(term) => term::require_open(db, term).await,
-    }
+    let Some(term) = course.get_term().cloned() else {
+        return Ok(());
+    };
+    let db = db.clone();
+    term::require_open(&db, &term).await
 }
 
 pub async fn create(

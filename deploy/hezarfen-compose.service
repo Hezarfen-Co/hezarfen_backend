@@ -1,0 +1,47 @@
+# systemd USER unit running the whole stack via podman compose (replaces the
+# old bare-binary unit). Files expected in %h/hezarfen_backend:
+#   compose.yaml                from the deploy artifact
+#   hezarfen_backend.env        0600, written ONCE BY HAND from
+#                               deploy/hezarfen_backend.env.example — the
+#                               deploy never creates or overwrites it
+#   stack.env                   deploy-owned; carries HEZARFEN_TAG
+#   backup-postgres.sh          from the deploy artifact (0755)
+#
+# Required hezarfen_backend.env keys (full docs in
+# deploy/hezarfen_backend.env.example):
+#   POSTGRES_USER/PASSWORD/DB   first-boot postgres credentials;
+#                               POSTGRES_PASSWORD is baked into the pgdata
+#                               volume on the FIRST up and must be URL-safe
+#                               (no @ : / — it is interpolated into
+#                               DATABASE_URL)
+#   BUILDER_USERNAME/PASSWORD   first-boot operator seed
+#   COOKIE_SECURE               true behind TLS
+#   TRUST_PROXY                 true behind the reverse proxy
+#   CORS_ALLOWED_ORIGINS        the browser frontends' origins
+#   AI_QUIC_ADDR/AI_SHARED_TOKEN  the QUIC AI bridge
+#   OTEL_*                      OTLP export to http://openobserve:5081
+#   ZO_ROOT_USER_EMAIL/PASSWORD OpenObserve first-boot root account
+#   DEPLOY_ENV                  production
+#
+# Env-only restart (restart re-runs `compose up -d`, recreating containers
+# whose environment changed):
+#   systemctl --user restart hezarfen-compose
+
+[Unit]
+Description=Hezarfen backend compose stack (postgres + backend + openobserve)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/hezarfen_backend
+# Later --env-file wins for duplicate keys: the operator's secrets file
+# first, the deploy-owned stack.env (HEZARFEN_TAG) second.
+ExecStart=/usr/bin/podman compose --env-file %h/hezarfen_backend/hezarfen_backend.env --env-file %h/hezarfen_backend/stack.env up -d --no-build
+# No -v: the pgdata/hezarfen-data/openobserve-data volumes must survive stop.
+ExecStop=/usr/bin/podman compose down
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

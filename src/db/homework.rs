@@ -51,7 +51,9 @@ pub async fn create(
     // is the 400 the web layer's pre-flight check answers with. The subject
     // delete is refused while this counter is non-zero, so the two writers
     // contend on the subject row itself, and a crash cannot strand a claim
-    // that would make the subject undeletable forever.
+    // that would make the subject undeletable forever. The audience rows
+    // ride the same transaction: a subset homework never appears
+    // whole-course, not even for the instant of its create.
     let homework = Homework {
         id: HomeworkId::generate(),
         course: course.clone(),
@@ -70,47 +72,86 @@ pub async fn create(
         .iter()
         .map(UserId::uuid)
         .collect();
-    // The fresh v7 id cannot collide, so the pair-unique answer has no rival
-    // here; the mapping is kept for symmetry with the other claim sites.
-    let created = sqlx::query_as!(
-        Homework,
-        r#"WITH seat AS (
-               UPDATE subject SET homework_count = homework_count + 1
-               WHERE id = $1
-               RETURNING 1
-           )
-           INSERT INTO homework (id, course, subject, title, description, due_at, assigned, created_by, created_at)
-           SELECT $2, $3, $1, $4, $5, $6, $7, $8, $9 WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id AS "id: HomeworkId",
-                     course AS "course: CourseId",
-                     subject AS "subject: SubjectId",
-                     title AS "title: HomeworkTitle",
-                     description AS "description: HomeworkDescription",
-                     due_at AS "due_at: Timestamp",
-                     CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                         AS "assigned: Vec<UserId>",
-                     created_by AS "created_by: UserId",
-                     created_at AS "created_at: Timestamp""#,
-        subject.uuid(),
-        homework.id.uuid(),
-        course.uuid(),
-        homework.title.as_str(),
-        homework.description.as_ref().map(HomeworkDescription::as_str),
-        homework.due_at.as_millis(),
-        &assigned_values,
-        homework.created_by.uuid(),
-        homework.created_at.as_millis(),
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|err| {
-        if crate::database::unique_violation(&err).is_some() {
-            AppError::Internal("failed to create homework".into())
-        } else {
-            AppError::from(err)
+    // The subset the caller passed is the truth — the store holds no roster
+    // column to read back; the whole-course case stays `None`. Cloned out
+    // here because the closure below consumes `homework`.
+    let assigned = homework.assigned.clone();
+    // Owned BEFORE the closure. A reference parameter captured by the
+    // coroutine (`&CourseId`, `&SubjectId`) leaves that borrow in the
+    // statement future, and the `Send` proof at the `routes!` registration
+    // comes back "not general enough" over the higher-ranked connection
+    // lease — every tx_with_retry site captures only owned values.
+    let subject = *subject;
+    let course = course.clone();
+    tx_with_retry(db, false, async move |tx| {
+        // And every bind is a precomputed value of this coroutine's own: a
+        // bind expression reading a capture inside the macro keeps that
+        // borrow alive across the await to the same `Send` end.
+        let subject_uuid = subject.uuid();
+        let course_uuid = course.uuid();
+        let homework_uuid = homework.id.uuid();
+        let title = homework.title.clone();
+        let description = homework.description.clone();
+        let due_at_millis = homework.due_at.as_millis();
+        let created_by_uuid = homework.created_by.uuid();
+        let created_at_millis = homework.created_at.as_millis();
+        let assigned_values = assigned_values.clone();
+        let created = sqlx::query_as!(
+            Homework,
+            r#"WITH seat AS (
+                   UPDATE subject SET homework_count = homework_count + 1
+                   WHERE id = $1
+                   RETURNING 1
+               )
+               INSERT INTO homework (id, course, subject, title, description, due_at, created_by, created_at)
+               SELECT $2, $3, $1, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM seat)
+               RETURNING id AS "id: HomeworkId",
+                         course AS "course: CourseId",
+                         subject AS "subject: SubjectId",
+                         title AS "title: HomeworkTitle",
+                         description AS "description: HomeworkDescription",
+                         due_at AS "due_at: Timestamp",
+                         NULL::uuid[] AS "assigned: Vec<UserId>",
+                         created_by AS "created_by: UserId",
+                         created_at AS "created_at: Timestamp""#,
+            subject_uuid,
+            homework_uuid,
+            course_uuid,
+            title.as_str(),
+            description.as_ref().map(HomeworkDescription::as_str),
+            due_at_millis,
+            created_by_uuid,
+            created_at_millis,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| {
+            if crate::database::unique_violation(&err).is_some() {
+                AppError::Internal("failed to create homework".into())
+            } else {
+                AppError::from(err)
+            }
+        })?;
+        // The audience subset, written beside the row it scopes: a refused
+        // create (subject gone) writes no audience either, and any other
+        // failure rolls the homework row back with its audience rows.
+        if created.is_some() && !assigned_values.is_empty() {
+            sqlx::query!(
+                "INSERT INTO homework_assignment (homework, student)
+                 SELECT $2, s FROM unnest($1::uuid[]) AS t(s)",
+                &assigned_values,
+                homework_uuid
+            )
+            .execute(&mut *tx)
+            .await?;
         }
-    })?;
-    created.ok_or_else(subject_gone)
+        created.ok_or_else(subject_gone)
+    })
+    .await
+    .map(move |mut created| {
+        created.assigned = assigned;
+        created
+    })
 }
 
 pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, AppError> {
@@ -122,8 +163,8 @@ pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, Ap
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
-                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Vec<UserId>",
+                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE id = $1"#,
@@ -144,8 +185,8 @@ pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Hom
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
-                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Vec<UserId>",
+                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE course = $1 ORDER BY id DESC"#,
@@ -166,8 +207,8 @@ pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
-                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Vec<UserId>",
+                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework ORDER BY id DESC"#,
@@ -196,8 +237,8 @@ pub async fn list_for_courses(
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
-                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Vec<UserId>",
+                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE course = ANY($1) ORDER BY id DESC"#,
@@ -225,12 +266,16 @@ pub async fn list_for_user_in_course(
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
-                  CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Vec<UserId>",
+                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework
-           WHERE course = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
+           WHERE course = $1
+             AND (NOT EXISTS (SELECT 1 FROM homework_assignment a
+                               WHERE a.homework = homework.id)
+                  OR EXISTS (SELECT 1 FROM homework_assignment a
+                              WHERE a.homework = homework.id AND a.student = $2))
            ORDER BY id DESC"#,
         course.uuid(),
         user.uuid()
@@ -248,7 +293,8 @@ pub async fn list_for_user_in_course(
 /// and `created_at` are readonly and never appear in the write.
 ///
 /// `description` takes `Some(None)` to clear; `assigned` takes `Some(None)`
-/// to widen back to the whole course (stored as `'{}'`, read back as `None`).
+/// to widen back to the whole course (stored as no `homework_assignment` rows,
+/// read back as `None`).
 /// The web layer has already re-checked a new `due_at` against now, a new
 /// `subject` against the course, and — inside the transaction here — the
 /// narrowing against the work that would be orphaned by it.
@@ -277,8 +323,8 @@ pub async fn update(
                       title AS "title: HomeworkTitle",
                       description AS "description: HomeworkDescription",
                       due_at AS "due_at: Timestamp",
-                      CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                          AS "assigned: Vec<UserId>",
+                      (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                        WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                       created_by AS "created_by: UserId",
                       created_at AS "created_at: Timestamp"
                FROM homework WHERE id = $1 FOR UPDATE"#,
@@ -331,6 +377,29 @@ pub async fn update(
         if subject.is_some() && current.subject != homework.subject {
             return Err(AppError::Conflict(STALE_MOVE));
         }
+        // The carried `assigned` replaces the junction rows wholesale —
+        // delete-then-insert under the row lock, so the audience (or its
+        // absence, = whole course) is exactly what the request named. An
+        // uncarried `assigned` writes no rows, keeping the stored audience.
+        if let Some(resolved) = assigned.as_ref() {
+            sqlx::query!(
+                "DELETE FROM homework_assignment WHERE homework = $1",
+                homework.get_id().uuid()
+            )
+            .execute(&mut *tx)
+            .await?;
+            let values: Vec<uuid::Uuid> = resolved.iter().flatten().map(UserId::uuid).collect();
+            if !values.is_empty() {
+                sqlx::query!(
+                    "INSERT INTO homework_assignment (homework, student)
+                     SELECT $2, s FROM unnest($1::uuid[]) AS t(s)",
+                    &values,
+                    homework.get_id().uuid()
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
 
         // What the PATCH carried is written; what it did not carry keeps the
         // value just read under the lock. Under that lock this resolved
@@ -345,22 +414,10 @@ pub async fn update(
             Some(Some(text)) => Some(text),
         };
         let new_due_at = due_at.unwrap_or(current.due_at);
-        let new_assigned = match assigned.clone() {
-            None => current.assigned.clone(),
-            // Clear = the whole course, stored as `'{}'`.
-            Some(None) => None,
-            Some(Some(subset)) => Some(subset),
-        };
-        let assigned_values: Vec<uuid::Uuid> = new_assigned
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(UserId::uuid)
-            .collect();
         sqlx::query_as!(
             Homework,
             r#"UPDATE homework SET subject = $2, title = $3, description = $4,
-                   due_at = $5, assigned = $6
+                   due_at = $5
                WHERE id = $1
                RETURNING id AS "id: HomeworkId",
                          course AS "course: CourseId",
@@ -368,8 +425,8 @@ pub async fn update(
                          title AS "title: HomeworkTitle",
                          description AS "description: HomeworkDescription",
                          due_at AS "due_at: Timestamp",
-                         CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                             AS "assigned: Vec<UserId>",
+                         (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                           WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                          created_by AS "created_by: UserId",
                          created_at AS "created_at: Timestamp""#,
             homework.get_id().uuid(),
@@ -377,7 +434,6 @@ pub async fn update(
             new_title.as_str(),
             new_description.as_ref().map(HomeworkDescription::as_str),
             new_due_at.as_millis(),
-            &assigned_values,
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -445,7 +501,8 @@ async fn ensure_no_orphans(
 /// vanished homework. The cascade runs children-first (every FK here is
 /// `ON DELETE NO ACTION`): files, then submissions — whose `graded_by_result`
 /// stamp points at a result row, so they must be gone before it — then the
-/// results, then the homework. The submission file *blobs* are the web
+/// results, the audience rows, then the homework. The submission file *blobs*
+/// are the web
 /// layer's to unlink: their names are returned (collected inside the
 /// transaction, before the wipes — a file row inserted after an
 /// out-of-transaction collection would be deleted here while its key was
@@ -485,6 +542,12 @@ pub async fn delete(
         )
         .execute(&mut *tx)
         .await?;
+        sqlx::query!(
+            "DELETE FROM homework_assignment WHERE homework = $1",
+            homework.get_id().uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
         let deleted = sqlx::query_as!(
             Homework,
             r#"DELETE FROM homework WHERE id = $1
@@ -494,8 +557,8 @@ pub async fn delete(
                          title AS "title: HomeworkTitle",
                          description AS "description: HomeworkDescription",
                          due_at AS "due_at: Timestamp",
-                         CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                             AS "assigned: Vec<UserId>",
+                         (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
+                           WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                          created_by AS "created_by: UserId",
                          created_at AS "created_at: Timestamp""#,
             homework.get_id().uuid()
@@ -821,5 +884,82 @@ mod tests {
             "still no counter move"
         );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once, still");
+    }
+
+    /// The audience contract in SQL: no `homework_assignment` rows = the whole
+    /// course (every student's list, later enrollees included); rows name the
+    /// subset, and `list_for_user_in_course` answers it to the named student
+    /// alone. The read-back roster is the junction itself.
+    #[tokio::test]
+    async fn a_subset_reaches_only_the_named_and_widening_clears_the_rows() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let subject = a_subject("tarih", &db).await;
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("homework-audience-{}", &teacher.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
+        let ali = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'student')",
+        )
+        .bind(ali.uuid())
+        .bind(format!("homework-audience-{}", &ali.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
+        let veli = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'student')",
+        )
+        .bind(veli.uuid())
+        .bind(format!("homework-audience-{}", &veli.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
+        let course = crate::db::course::a_test_course(&db).await;
+        let homework = create(
+            &db,
+            &course,
+            subject.get_id(),
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            Timestamp::from_millis(1),
+            Some(vec![ali]),
+            &teacher,
+        )
+        .await
+        .unwrap();
+        assert_eq!(homework.get_assigned(), Some(&[ali][..]));
+        assert_eq!(
+            list_for_user_in_course(&db, &course, &ali).await.unwrap().len(),
+            1,
+            "the named student sees the subset"
+        );
+        assert!(
+            list_for_user_in_course(&db, &course, &veli)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unnamed student sees nothing"
+        );
+        // Widening back to the whole course (`Some(None)`) empties the
+        // junction: everyone — including the never-named student — is covered.
+        let widened = update(&db, homework, None, None, None, None, Some(None))
+            .await
+            .unwrap();
+        assert_eq!(widened.get_assigned(), None);
+        assert_eq!(
+            list_for_user_in_course(&db, &course, &veli).await.unwrap().len(),
+            1,
+            "whole-course reaches the never-named student"
+        );
     }
 }

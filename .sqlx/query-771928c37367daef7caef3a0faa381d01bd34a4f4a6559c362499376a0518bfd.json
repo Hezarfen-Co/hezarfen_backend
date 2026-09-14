@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM settings_dietary_tag WHERE settings = 'school'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "771928c37367daef7caef3a0faa381d01bd34a4f4a6559c362499376a0518bfd"
+}

@@ -81,11 +81,12 @@ impl HomeworkDescription {
     }
 }
 
-/// A homework assignment. `assigned` is the optional student subset (`uuid[]
-/// NULL`): `NULL` and an empty list both mean "the whole course" — see
-/// [`Homework::student_sees`]. Because whole-course homework carries no roster,
-/// a student who enrolls later is covered automatically; a subset is a fixed
-/// snapshot of the students named at assign (or last PATCH) time.
+/// A homework assignment. `assigned` is the optional student subset,
+/// assembled from the `homework_assignment` child rows (`None` = no rows =
+/// the whole course — see [`Homework::student_sees`]). Because whole-course
+/// homework carries no roster, a student who enrolls later is covered
+/// automatically; a subset is a fixed snapshot of the students named at
+/// assign (or last PATCH) time.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Homework {
     pub(crate) id: HomeworkId,

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rag_output_source WHERE output IN\n         (SELECT id FROM rag_output WHERE course_note = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c95bf5c2dfe3ef6919ddb41983f1ab4392ea31250f0c00db33e0864a33dfde42"
+}

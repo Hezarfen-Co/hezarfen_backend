@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM board_participant WHERE participant = $1 RETURNING board",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "board",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board_participant",
+            "name": "board"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2a15712642955d8e832f14d5173c9f44414871c3bca6f106e33eea0aaf7ba82e"
+}

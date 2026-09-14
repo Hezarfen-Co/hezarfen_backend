@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT student AS \"student: UserId\",\n                 COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM dietary_profile_tag t WHERE t.student = dietary_profile.student), '{}'::text[]) AS \"tags!: DietaryTags\",\n                 note AS \"note: DietaryNote\", updated_by AS \"updated_by: UserId\", updated_at AS \"updated_at: Timestamp\"\n             FROM dietary_profile WHERE student = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tags!: DietaryTags",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "note: DietaryNote",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "c41fb6b0ecd0a378198552f4c36085f8c0d229a7a83b23fb3ba02c1e6b675fe6"
+}

@@ -571,10 +571,12 @@ async fn settings_slots_without_a_serving_minute_still_patch() {
         &app,
         "PATCH",
         "/settings",
-        Some(&send(&app, "POST", "/auth/login", None, Some(login.clone()))
-            .await
-            .cookie
-            .unwrap()),
+        Some(
+            &send(&app, "POST", "/auth/login", None, Some(login.clone()))
+                .await
+                .cookie
+                .unwrap(),
+        ),
         Some(json!({ "meal_slots": [{ "name": "lunch" }] })),
     )
     .await;
@@ -810,22 +812,19 @@ async fn boards_and_their_strokes_survive_remigration() {
     // the rows: a re-migration must not have reset either of them.
     use sqlx::Row as _;
     let board_id = hezarfen_backend::domain::board::BoardId::from_key(&board);
-    let row = sqlx::query(
-        "SELECT epoch_stroke_count, total_stroke_count FROM board WHERE id = $1",
-    )
-    .bind(board_id.uuid())
-    .fetch_one(&db)
-    .await
-    .expect("board row");
+    let row = sqlx::query("SELECT epoch_stroke_count, total_stroke_count FROM board WHERE id = $1")
+        .bind(board_id.uuid())
+        .fetch_one(&db)
+        .await
+        .expect("board row");
     let epoch_count: i64 = row.try_get(0).unwrap();
     let total_count: i64 = row.try_get(1).unwrap();
     let user_id = hezarfen_backend::domain::user::UserId::from_key(&ali_id);
-    let board_count: i64 =
-        sqlx::query_scalar("SELECT board_count FROM app_user WHERE id = $1")
-            .bind(user_id.uuid())
-            .fetch_one(&db)
-            .await
-            .expect("creator row");
+    let board_count: i64 = sqlx::query_scalar("SELECT board_count FROM app_user WHERE id = $1")
+        .bind(user_id.uuid())
+        .fetch_one(&db)
+        .await
+        .expect("creator row");
     assert_eq!(
         (epoch_count, total_count, board_count),
         (1, 4, 1),
@@ -859,7 +858,12 @@ async fn an_empty_module_list_survives_a_second_boot() {
     let tenants = database::init_test_tenants().await;
     let slug = Slug::try_new("bare").unwrap();
     tenants
-        .create(&slug, "Bare School", ModuleSet::empty())
+        .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
+            &slug,
+            "Bare School",
+            ModuleSet::empty(),
+        )
         .await
         .expect("a school with nothing switched on");
 
@@ -867,18 +871,17 @@ async fn an_empty_module_list_survives_a_second_boot() {
         .await
         .expect("a second boot");
 
-    use sqlx::Row as _;
-    let stored: Option<Vec<String>> = sqlx::query(
-        "SELECT modules FROM school WHERE slug = $1",
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM school_module sm
+         JOIN school s ON s.id = sm.school
+         WHERE s.slug = $1",
     )
     .bind(slug.as_str())
-    .fetch_optional(tenants.control())
+    .fetch_one(tenants.control())
     .await
-    .expect("read the row back")
-    .map(|row| row.try_get::<Vec<String>, _>(0).unwrap());
+    .expect("read the row back");
     assert_eq!(
-        stored.unwrap_or_default(),
-        Vec::<String>::new(),
+        stored, 0,
         "an empty list is a decision, never a hole to fill"
     );
 }
@@ -901,7 +904,12 @@ async fn probe_control_migration_is_idempotent_over_aged_rows() {
         ("narrow", "Narrow School", narrow),
     ] {
         tenants
-            .create(&Slug::try_new(slug).unwrap(), name, modules)
+            .create(
+                hezarfen_backend::tenant::SchoolId::generate(),
+                &Slug::try_new(slug).unwrap(),
+                name,
+                modules,
+            )
             .await
             .unwrap_or_else(|err| panic!("create {slug}: {err}"));
     }
@@ -921,21 +929,29 @@ async fn probe_control_migration_is_idempotent_over_aged_rows() {
     assert_eq!(before, after, "a re-run must not disturb school rows");
 }
 
-/// Every school row as `(slug, name, status, modules)`, in slug order.
+/// Every school row as `(slug, name, status, modules)`, in slug order — the
+/// modules aggregated off the `school_module` child table, as every read path
+/// assembles them.
 async fn school_rows(control: &Database) -> Vec<(String, String, String, Vec<String>)> {
     use sqlx::Row as _;
-    sqlx::query("SELECT slug, name, status, modules FROM school ORDER BY slug")
-        .fetch_all(control)
-        .await
-        .expect("school rows")
-        .into_iter()
-        .map(|row| {
-            (
-                row.try_get::<String, _>(0).unwrap(),
-                row.try_get::<String, _>(1).unwrap(),
-                row.try_get::<String, _>(2).unwrap(),
-                row.try_get::<Vec<String>, _>(3).unwrap(),
-            )
-        })
-        .collect()
+    sqlx::query(
+        "SELECT s.slug, s.name, s.status,
+                COALESCE(array_agg(sm.module) FILTER (WHERE sm.module IS NOT NULL), '{}')
+         FROM school s LEFT JOIN school_module sm ON sm.school = s.id
+         GROUP BY s.id
+         ORDER BY s.slug",
+    )
+    .fetch_all(control)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get::<String, _>(0).unwrap(),
+            row.try_get::<String, _>(1).unwrap(),
+            row.try_get::<String, _>(2).unwrap(),
+            row.try_get::<Vec<String>, _>(3).unwrap(),
+        )
+    })
+    .collect()
 }

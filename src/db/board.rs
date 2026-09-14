@@ -28,26 +28,40 @@ pub async fn create(
         closed_at: None,
         created_at: Timestamp::now(),
     };
-    // The seat claim and the row are one statement (the `cap::claim_and_create`
-    // CTE, spelled out at its call site): a refused insert takes its own
-    // seat bump back, so the counter can never count a row that did not commit.
+    // The seat claim, the row and the roster are one statement (the
+    // `cap::claim_and_create` CTE, spelled out at its call site): a refused
+    // insert takes its own seat bump back, so the counter can never count a
+    // row that did not commit, and the roster can never trail the row. The
+    // `participants` array is aggregated from the roster CTE's RETURNING —
+    // the statement cannot see its own writes to `board_participant`.
     let saved = sqlx::query_as!(
         Board,
         r#"WITH seat AS (
                UPDATE app_user SET board_count = board_count + 1
                WHERE id = $1 AND board_count < $2
-               RETURNING 1)
-           INSERT INTO board (id, creator, title, participants, locked, locked_by, locked_at,
-                              epoch, closed_at, created_at)
-           SELECT $3, $1, $4, $5, false, NULL, NULL, 0, NULL, $6
-           WHERE EXISTS (SELECT 1 FROM seat)
-           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
-               title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: UserId",
-               locked_at AS "locked_at: Timestamp", epoch,
-               closed_at AS "closed_at: Timestamp",
-               created_at AS "created_at: Timestamp""#,
+               RETURNING 1),
+           new_board AS (
+               INSERT INTO board (id, creator, title, locked, locked_by, locked_at,
+                                  epoch, closed_at, created_at)
+               SELECT $3, $1, $4, false, NULL, NULL, 0, NULL, $6
+               WHERE EXISTS (SELECT 1 FROM seat)
+               RETURNING id, creator, title, locked, locked_by, locked_at,
+                         epoch, closed_at, created_at),
+           roster AS (
+               INSERT INTO board_participant (board, participant)
+               SELECT $3, t.x FROM unnest($5::uuid[]) AS t(x)
+               WHERE EXISTS (SELECT 1 FROM new_board)
+               RETURNING participant)
+           SELECT nb.id AS "id: BoardId", nb.creator AS "creator: UserId",
+                  nb.title AS "title: BoardTitle",
+                  COALESCE((SELECT array_agg(r.participant ORDER BY r.participant)
+                            FROM roster r), '{}')
+                      AS "participants!: Vec<UserId>",
+                  nb.locked, nb.locked_by AS "locked_by: UserId",
+                  nb.locked_at AS "locked_at: Timestamp", nb.epoch,
+                  nb.closed_at AS "closed_at: Timestamp",
+                  nb.created_at AS "created_at: Timestamp"
+           FROM new_board nb"#,
         board.creator.uuid(),
         MAX_BOARDS_PER_CREATOR,
         board.id.uuid(),
@@ -77,22 +91,35 @@ pub async fn create(
     }
 }
 
-pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError> {
+/// The one board read: row columns plus the roster, re-assembled from
+/// `board_participant` (the array column is gone). The junction keeps no
+/// insertion order, so every reader sorts by participant and the wire list
+/// is deterministic.
+async fn read_row<'e, E>(db: E, id: &BoardId) -> Result<Option<Board>, AppError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let board = sqlx::query_as!(
         Board,
-        r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
-               title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: UserId",
-               locked_at AS "locked_at: Timestamp", epoch,
-               closed_at AS "closed_at: Timestamp",
-               created_at AS "created_at: Timestamp"
-           FROM board WHERE id = $1"#,
+        r#"SELECT b.id AS "id: BoardId", b.creator AS "creator: UserId",
+               b.title AS "title: BoardTitle",
+               ARRAY(SELECT p.participant FROM board_participant p
+                     WHERE p.board = b.id ORDER BY p.participant)
+                   AS "participants!: Vec<UserId>",
+               b.locked, b.locked_by AS "locked_by: UserId",
+               b.locked_at AS "locked_at: Timestamp", b.epoch,
+               b.closed_at AS "closed_at: Timestamp",
+               b.created_at AS "created_at: Timestamp"
+           FROM board b WHERE b.id = $1"#,
         id.uuid()
     )
     .fetch_optional(db)
     .await?;
     Ok(board)
+}
+
+pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError> {
+    read_row(db, id).await
 }
 
 /// Every board `user` may open: the ones they created and the ones they
@@ -111,12 +138,26 @@ pub async fn list_for_user(
     offset: i64,
 ) -> Result<(Vec<Board>, i64), AppError> {
     let open_clause = match open {
-        Some(true) => " AND closed_at IS NULL",
-        Some(false) => " AND closed_at IS NOT NULL",
+        Some(true) => " AND b.closed_at IS NULL",
+        Some(false) => " AND b.closed_at IS NOT NULL",
         None => "",
     };
+    // `PagedList` wraps `from_where` in `SELECT * FROM (…)`, so the window
+    // is a whole derived table: the row columns plus the roster
+    // re-assembled from `board_participant`, and the membership half of the
+    // predicate as an `EXISTS` over it (the participant-side index covers
+    // it, as the GIN index once did).
     PagedList::new(
-        format!("board WHERE (creator = $1 OR $2 = ANY(participants)){open_clause}"),
+        format!(
+            "(SELECT b.id, b.creator, b.title,
+                    ARRAY(SELECT p.participant FROM board_participant p
+                          WHERE p.board = b.id ORDER BY p.participant) AS participants,
+                    b.locked, b.locked_by, b.locked_at, b.epoch, b.closed_at, b.created_at
+             FROM board b
+             WHERE (b.creator = $1
+                    OR EXISTS (SELECT 1 FROM board_participant bp
+                               WHERE bp.board = b.id AND bp.participant = $2)){open_clause})"
+        ),
         "ORDER BY id DESC",
     )
     .bind(user.uuid())
@@ -125,33 +166,38 @@ pub async fn list_for_user(
     .await
 }
 
-/// Re-invite. Field-scoped, like every write here: a stroke landing
-/// concurrently is moving the counters this struct does not carry.
+/// Re-invite: the creator-driven roster replace. The write is the
+/// junction's — rows go in one transaction with the read-back, because the
+/// old single `UPDATE` both wrote the array and returned the row; a read
+/// issued apart from the write could answer a roster someone else had
+/// replaced in between.
 pub async fn set_participants(
     db: &Database,
     board: &Board,
     participants: Vec<UserId>,
 ) -> Result<Board, AppError> {
     let participants = checked_participants(participants)?;
-    let updated = sqlx::query_as!(
-        Board,
-        r#"UPDATE board SET participants = $2 WHERE id = $1
-           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
-               title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: UserId",
-               locked_at AS "locked_at: Timestamp", epoch,
-               closed_at AS "closed_at: Timestamp",
-               created_at AS "created_at: Timestamp""#,
-        board.id.uuid(),
-        &participants
-            .iter()
-            .map(UserId::uuid)
-            .collect::<Vec<uuid::Uuid>>()
-    )
-    .fetch_optional(db)
-    .await?;
-    one(updated)
+    let ids: Vec<uuid::Uuid> = participants.iter().map(UserId::uuid).collect();
+    let id = board.id.clone();
+    tx_with_retry(db, true, async move |tx| {
+        sqlx::query!("DELETE FROM board_participant WHERE board = $1", id.uuid())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!(
+            "INSERT INTO board_participant (board, participant)
+             SELECT $1, t.x FROM unnest($2::uuid[]) AS t(x)
+             ON CONFLICT DO NOTHING",
+            id.uuid(),
+            &ids,
+        )
+        .execute(&mut *tx)
+        .await?;
+        // The read-back is under the write path's own transaction: None here
+        // means the board vanished between the caller's read and this tx,
+        // which is the same 404 the old `UPDATE … RETURNING` produced.
+        read_row(&mut *tx, &id).await?.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Result<Board, AppError> {
@@ -160,7 +206,9 @@ pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Resul
         r#"UPDATE board SET title = $2 WHERE id = $1
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
+               ARRAY(SELECT p.participant FROM board_participant p
+                     WHERE p.board = board.id ORDER BY p.participant)
+                   AS "participants!: Vec<UserId>", locked,
                locked_by AS "locked_by: UserId",
                locked_at AS "locked_at: Timestamp", epoch,
                closed_at AS "closed_at: Timestamp",
@@ -187,7 +235,9 @@ pub async fn set_locked(
         r#"UPDATE board SET locked = $2, locked_by = $3, locked_at = $4 WHERE id = $1
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
+               ARRAY(SELECT p.participant FROM board_participant p
+                     WHERE p.board = board.id ORDER BY p.participant)
+                   AS "participants!: Vec<UserId>", locked,
                locked_by AS "locked_by: UserId",
                locked_at AS "locked_at: Timestamp", epoch,
                closed_at AS "closed_at: Timestamp",
@@ -202,13 +252,14 @@ pub async fn set_locked(
     one(updated)
 }
 
-/// Union a bulk invite's resolved ids into the roster — the atomic-array
-/// replacement for the old process-wide roster lock. The merge and the
-/// participant cap are one guarded statement: `SET` and `WHERE` both read
-/// the row version this `UPDATE` is acting on, so of two concurrent invites
-/// each sees the other's committed roster and the cap refuses the second —
-/// neither can drop the other's group, which is what the lock existed to
-/// prevent.
+/// Union a bulk invite's resolved ids into the roster — the atomic-union
+/// replacement for the old process-wide roster lock. The merge is `INSERT
+/// … ON CONFLICT DO NOTHING`, and the board row is locked (`FOR NO KEY
+/// UPDATE`) before the cap counts: that lock is what the old guarded array
+/// `UPDATE` got from its own row write, and it keeps the same property —
+/// of two concurrent invites the second waits, counts against the first's
+/// committed roster, and the cap refuses it — neither can drop the other's
+/// group.
 ///
 /// `None` means the guard refused (or the board is gone): the roster was
 /// left exactly as it was, and the caller re-reads to pick the message.
@@ -217,31 +268,46 @@ pub(crate) async fn invite_group(
     board: &BoardId,
     invited: Vec<UserId>,
 ) -> Result<Option<Board>, AppError> {
-    let updated = sqlx::query_as!(
-        Board,
-        r#"UPDATE board
-           SET participants = (SELECT coalesce(array_agg(DISTINCT x), '{}')
-                               FROM unnest(participants || $2::uuid[]) AS x)
-           WHERE id = $1
-             AND cardinality((SELECT coalesce(array_agg(DISTINCT x), '{}')
-                              FROM unnest(participants || $2::uuid[]) AS x)) <= $3
-           RETURNING id AS "id: BoardId", creator AS "creator: UserId",
-               title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: UserId",
-               locked_at AS "locked_at: Timestamp", epoch,
-               closed_at AS "closed_at: Timestamp",
-               created_at AS "created_at: Timestamp""#,
-        board.uuid(),
-        &invited
-            .iter()
-            .map(UserId::uuid)
-            .collect::<Vec<uuid::Uuid>>(),
-        MAX_BOARD_PARTICIPANTS as i64
-    )
-    .fetch_optional(db)
-    .await?;
-    Ok(updated)
+    let invited: Vec<uuid::Uuid> = invited.iter().map(UserId::uuid).collect();
+    let board = board.clone();
+    tx_with_retry(db, true, async move |tx| {
+        // The serialization point; a vanished board refuses here, exactly
+        // like the old conditional `UPDATE` matching nothing.
+        let live = sqlx::query!(
+            "SELECT id FROM board WHERE id = $1 FOR NO KEY UPDATE",
+            board.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Ok(None);
+        }
+        let would_be: i64 = sqlx::query_scalar!(
+            r#"SELECT ((SELECT count(*) FROM board_participant WHERE board = $1)
+                    + (SELECT count(*) FROM unnest($2::uuid[]) AS t(x)
+                       WHERE NOT EXISTS (SELECT 1 FROM board_participant bp
+                                         WHERE bp.board = $1 AND bp.participant = t.x)))
+                AS "filled!""#,
+            board.uuid(),
+            &invited,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if would_be > MAX_BOARD_PARTICIPANTS as i64 {
+            return Ok(None);
+        }
+        sqlx::query!(
+            "INSERT INTO board_participant (board, participant)
+             SELECT $1, t.x FROM unnest($2::uuid[]) AS t(x)
+             ON CONFLICT DO NOTHING",
+            board.uuid(),
+            &invited,
+        )
+        .execute(&mut *tx)
+        .await?;
+        read_row(&mut *tx, &board).await
+    })
+    .await
 }
 
 // The demotion sweep — stripping a user off every roster they are listed
@@ -258,7 +324,9 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
         r#"UPDATE board SET closed_at = $2 WHERE id = $1 AND closed_at IS NULL
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
+               ARRAY(SELECT p.participant FROM board_participant p
+                     WHERE p.board = board.id ORDER BY p.participant)
+                   AS "participants!: Vec<UserId>", locked,
                locked_by AS "locked_by: UserId",
                locked_at AS "locked_at: Timestamp", epoch,
                closed_at AS "closed_at: Timestamp",
@@ -280,12 +348,17 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
 /// transaction — a release issued afterwards can be lost, and the counter
 /// would then ratchet the creator's limit shut forever.
 ///
-/// The stroke cascade rides in that same transaction: it is the one and
-/// only legitimate delete of `board_stroke` rows (a clear deletes nothing),
-/// and issued separately it could leave a board's whole history orphaned
-/// under a record that no longer exists.
+/// The roster and the stroke cascade ride in that same transaction: the FK
+/// is NO ACTION, so the junction rows go before the board row they name,
+/// and the stroke delete is the one and only legitimate delete of
+/// `board_stroke` rows (a clear deletes nothing) — issued separately it
+/// could leave a board's whole history orphaned under a record that no
+/// longer exists.
 pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
     tx_with_retry(db, true, async move |conn| {
+        sqlx::query!("DELETE FROM board_participant WHERE board = $1", board.id.uuid())
+            .execute(&mut *conn)
+            .await?;
         sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id.uuid())
             .execute(&mut *conn)
             .await?;
@@ -294,7 +367,9 @@ pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
             r#"DELETE FROM board WHERE id = $1
                RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
-               participants AS "participants: Vec<UserId>", locked,
+               ARRAY(SELECT p.participant FROM board_participant p
+                     WHERE p.board = board.id ORDER BY p.participant)
+                   AS "participants!: Vec<UserId>", locked,
                locked_by AS "locked_by: UserId",
                locked_at AS "locked_at: Timestamp", epoch,
                closed_at AS "closed_at: Timestamp",

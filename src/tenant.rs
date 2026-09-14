@@ -23,10 +23,13 @@ use serde::Serialize;
 use sqlx::postgres::PgConnectOptions;
 
 use crate::constant::{MAX_SLUG_LEN, MIN_SLUG_LEN};
+use uuid::Uuid;
+
 use crate::database::{
     Database, create_database_sql, is_duplicate_database, migrate_school, school_pool,
     unique_violation,
 };
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::module::ModuleSet;
@@ -44,12 +47,12 @@ pub const DEMO_SLUG: &str = "demo";
 /// aimed at them.
 pub const RESERVED_SLUGS: [&str; 3] = ["builder", "control", "person"];
 
-/// A school's identity everywhere it is named: the cookie prefix, the database
-/// name, and the files subdirectory. The character set is deliberately the
-/// intersection of what all three accept — lowercase alphanumerics and `-`,
-/// starting with an alphanumeric. It is also what makes the database names
-/// injective: `school_db_name` maps `-` to `_`, and `_` is not in the slug
-/// charset, so two slugs can never collide onto one database.
+/// A school's public label: the cookie prefix, the URL paths and the files
+/// subdirectory. The character set is deliberately the intersection of what
+/// all three accept — lowercase alphanumerics and `-`, starting with an
+/// alphanumeric. It is no longer the school's identity: the registry row's
+/// uuid is (see [`SchoolId`]), which is why a label rename can no longer
+/// orphan anything structural.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, sqlx::Type)]
 #[serde(transparent)]
 #[sqlx(transparent)]
@@ -98,11 +101,17 @@ impl std::fmt::Display for Slug {
     }
 }
 
-/// A school database's name: `{control_db}_school_{slug}`, the slug's `-`
-/// spelled `_` (Postgres identifiers allow `-` only quoted, and the name is
-/// built, not user-typed). Injective — see [`Slug`]'s charset note.
-pub fn school_db_name(control_db: &str, slug: &Slug) -> String {
-    format!("{}_school_{}", control_db, slug.as_str().replace('-', "_"))
+/// A school database's name: `{control_db}_school_{uuid hex}` — the uuid's
+/// lowercase hex without dashes (the contract's example:
+/// `019732e3-7b00-7000-8000-00000000dead` →
+/// `…_school_019732e37b007000800000000000dead`). Fixed-width and injective:
+/// two uuids never share a database, and the slug appears nowhere, so a slug
+/// rename can never orphan one. The server's 63-byte identifier cap can clip
+/// the name's tail on deployments with a long control-database name — uuid
+/// v7's random tail still separates schools far past any realistic registry
+/// size, and creator and dialler truncate identically.
+pub fn school_db_name(control_db: &str, id: Uuid) -> String {
+    format!("{}_school_{}", control_db, id.simple())
 }
 
 /// Whether a school may be reached at all. Suspension is immediate and total:
@@ -137,39 +146,51 @@ impl SchoolStatus {
     }
 }
 
-/// A school's id **is** its slug — the registry can never hold two rows for
-/// one school, and the database name is derived from the same word.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SchoolId(Slug);
+/// A school's identity inside the control plane: the registry row's uuid
+/// primary key, app-minted uuid v7. The database name and every structural
+/// reference (person_school) mint from it; the slug — the public label — never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SchoolId(Uuid);
 
 impl SchoolId {
-    pub fn from_slug(slug: &Slug) -> Self {
-        Self(slug.clone())
+    /// Wrap a uuid read off a registry row — naming a school that already
+    /// exists (a test evicting the demo pool, say) rather than minting one.
+    pub fn from_uuid(id: Uuid) -> Self {
+        Self(id)
     }
 
-    pub fn key(&self) -> &str {
-        self.0.as_str()
+    /// The next id in write order — see
+    /// [`crate::domain::monotonic_id::next_uuid`].
+    pub fn generate() -> Self {
+        Self(next_uuid())
+    }
+
+    pub fn uuid(self) -> Uuid {
+        self.0
     }
 }
 
-/// A row in the control database's school registry.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct School {
+    id: Uuid,
     slug: Slug,
     name: String,
     status: SchoolStatus,
     created_at: Timestamp,
-    /// Which product modules this school has bought, as their stored names.
-    /// Kept as strings rather than a [`ModuleSet`] so a name this binary does
-    /// not know (an older deploy reading a newer row) is data to ignore, not a
-    /// deserialization failure that would lock the school out entirely.
+    /// Which product modules this school has bought, as their stored names —
+    /// joined in from `school_module` by every read below, never a column of
+    /// `school`. Kept as strings rather than a [`ModuleSet`] so a name this
+    /// binary does not know (an older deploy reading a newer row) is data to
+    /// ignore, not a deserialization failure that would lock the school out
+    /// entirely.
     modules: Vec<String>,
 }
 
 impl School {
-    /// The id is the slug; rebuilt rather than stored a second copy.
+    /// The row's uuid — the identity the database name and every structural
+    /// reference (person_school) mint from. The slug is not it.
     pub fn get_id(&self) -> SchoolId {
-        SchoolId::from_slug(&self.slug)
+        SchoolId(self.id)
     }
 
     pub fn slug(&self) -> &Slug {
@@ -207,7 +228,11 @@ impl School {
 
     pub async fn read(slug: &Slug, control: &Database) -> Result<Option<School>, AppError> {
         sqlx::query_as::<_, School>(
-            "SELECT slug, name, status, created_at, modules FROM school WHERE slug = $1",
+            "SELECT s.id, s.slug, s.name, s.status, s.created_at,
+                    COALESCE(array_agg(sm.module) FILTER (WHERE sm.module IS NOT NULL), '{}') AS modules
+             FROM school s LEFT JOIN school_module sm ON sm.school = s.id
+             WHERE s.slug = $1
+             GROUP BY s.id",
         )
         .bind(slug.as_str())
         .fetch_optional(control)
@@ -224,8 +249,11 @@ impl School {
         control: &Database,
     ) -> Result<(Vec<School>, i64), AppError> {
         let rows = sqlx::query_as::<_, School>(
-            "SELECT slug, name, status, created_at, modules FROM school
-             ORDER BY created_at DESC, slug DESC
+            "SELECT s.id, s.slug, s.name, s.status, s.created_at,
+                    COALESCE(array_agg(sm.module) FILTER (WHERE sm.module IS NOT NULL), '{}') AS modules
+             FROM school s LEFT JOIN school_module sm ON sm.school = s.id
+             GROUP BY s.id
+             ORDER BY s.created_at DESC, s.slug DESC
              LIMIT $1 OFFSET $2",
         )
         .bind(limit)
@@ -238,16 +266,24 @@ impl School {
         Ok((rows, total))
     }
 
-    /// Rename a school. The slug is immutable — it names a database and a
-    /// directory, so it is the one field a rename must not touch.
+    /// Rename a school — its display `name`, not its slug. The slug is
+    /// immutable in this cut (it is the cookie prefix and the files
+    /// subdirectory), though it no longer names the database: the uuid does.
     pub async fn update_name(
         slug: &Slug,
         name: &str,
         control: &Database,
     ) -> Result<School, AppError> {
         sqlx::query_as::<_, School>(
-            "UPDATE school SET name = $1 WHERE slug = $2
-             RETURNING slug, name, status, created_at, modules",
+            "WITH updated AS (
+                 UPDATE school SET name = $1 WHERE slug = $2
+                 RETURNING id, slug, name, status, created_at
+             )
+             SELECT u.id, u.slug, u.name, u.status, u.created_at,
+                    COALESCE(array_agg(sm.module) FILTER (WHERE sm.module IS NOT NULL), '{}') AS modules
+             FROM updated u
+             LEFT JOIN school_module sm ON sm.school = u.id
+             GROUP BY u.id, u.slug, u.name, u.status, u.created_at",
         )
         .bind(name)
         .bind(slug.as_str())
@@ -261,6 +297,9 @@ impl School {
 #[derive(Clone)]
 pub struct Tenants {
     control: Database,
+    /// Live school pools, keyed by the school's uuid hex (no dashes — the
+    /// same form [`school_db_name`] spells). The slug never keys it: a pool
+    /// belongs to a school's identity, not to its current label.
     cache: Arc<RwLock<HashMap<String, Database>>>,
     /// Dial options for the Postgres server the control pool came from — a
     /// school pool is the same dial with only the database swapped.
@@ -297,11 +336,11 @@ impl Tenants {
         base: PgConnectOptions,
         control_db: String,
         leases: crate::database::TestDatabases,
-        prewarmed: impl IntoIterator<Item = (Slug, Database)>,
+        prewarmed: impl IntoIterator<Item = (SchoolId, Database)>,
     ) -> Tenants {
         let cache: HashMap<String, Database> = prewarmed
             .into_iter()
-            .map(|(slug, db)| (slug.as_str().to_owned(), db))
+            .map(|(id, db)| (id.uuid().simple().to_string(), db))
             .collect();
         Tenants {
             control,
@@ -346,12 +385,12 @@ impl Tenants {
         match School::read(slug, &self.control).await? {
             None => Err(AppError::Unauthorized),
             Some(school) if school.status == SchoolStatus::Suspended => {
-                self.evict(slug).await;
+                self.evict(school.get_id()).await;
                 Err(AppError::Forbidden("school is suspended"))
             }
             Some(school) => Ok(ResolvedTenant {
                 slug: slug.clone(),
-                db: self.handle(slug).await?,
+                db: self.handle(school.get_id()).await?,
                 modules: school.modules(),
             }),
         }
@@ -364,14 +403,17 @@ impl Tenants {
         let school = School::read(slug, &self.control)
             .await?
             .ok_or(AppError::NotFound)?;
-        Ok((self.handle(slug).await?, school.status))
+        Ok((self.handle(school.get_id()).await?, school.status))
     }
 
     /// Register a school and bring its database into being: registry row first
     /// (so a lost race is a `409` and not a half-made database), then
-    /// `CREATE DATABASE`, then the school schema.
+    /// `CREATE DATABASE`, then the school schema. The caller mints the id —
+    /// the web create path is the one minter — and it becomes the row's PK,
+    /// the database name's source and the pool cache key.
     pub async fn create(
         &self,
+        id: SchoolId,
         slug: &Slug,
         name: &str,
         modules: ModuleSet,
@@ -380,37 +422,53 @@ impl Tenants {
         // every violation at once), but the registry refuses an unsatisfiable
         // set too, so no future caller can persist one.
         modules.validate()?;
+        // The registry row and its entitlements land as one transaction: a
+        // school row never stands without the modules its creation asked for.
+        let mut tx = self.control.begin().await?;
         let inserted = sqlx::query(
-            "INSERT INTO school (slug, name, status, created_at, modules)
+            "INSERT INTO school (id, slug, name, status, created_at)
              VALUES ($1, $2, $3, $4, $5)",
         )
+        .bind(id.uuid())
         .bind(slug.as_str())
         .bind(name)
         .bind(SchoolStatus::Active)
         .bind(Timestamp::now().as_millis())
-        .bind(modules.names())
-        .execute(&self.control)
+        .execute(&mut *tx)
         .await;
         if let Err(err) = inserted {
-            // The slug is the table's only unique key, so a unique violation
-            // here is exactly "taken" — a rival's row, or the row already
-            // stood. Same verdict either way, as it always was.
+            // The slug's UNIQUE constraint (`school_slug`) is the only key a
+            // rival can collide on — a fresh uuid v7 does not repeat. So a
+            // unique violation here is exactly "taken": a rival's row, or the
+            // row already stood. Same verdict either way, as it always was.
             if unique_violation(&err).is_some() {
                 return Err(AppError::Conflict("school slug already taken"));
             }
             return Err(err.into());
         }
+        for name in modules.names() {
+            sqlx::query("INSERT INTO school_module (school, module) VALUES ($1, $2)")
+                .bind(id.uuid())
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
 
         // Everything past the registry row rolls that row back on failure:
         // the row is what makes the slug "taken", and a slug taken by a
         // school that never came to exist is wedged for good. (A database
         // created before the failure is not a wedge: the adopt branch in
         // [`Self::bring_up`] picks it up, migrations being idempotent.)
-        let db = match self.bring_up(slug).await {
+        let db = match self.bring_up(id).await {
             Ok(db) => db,
             Err(err) => {
-                let _ = sqlx::query("DELETE FROM school WHERE slug = $1")
-                    .bind(slug.as_str())
+                let _ = sqlx::query("DELETE FROM school_module WHERE school = $1")
+                    .bind(id.uuid())
+                    .execute(&self.control)
+                    .await;
+                let _ = sqlx::query("DELETE FROM school WHERE id = $1")
+                    .bind(id.uuid())
                     .execute(&self.control)
                     .await;
                 return Err(err);
@@ -418,14 +476,14 @@ impl Tenants {
         };
         let size = {
             let mut cache = self.cache.write().expect("tenant cache lock");
-            cache.insert(slug.as_str().to_string(), db.clone());
+            cache.insert(id.uuid().simple().to_string(), db.clone());
             cache.len()
         };
         Self::report_size(size);
         // A test deployment's lease learns every school the deployment
         // mints, so a school created mid-test dies with the deployment.
         if let Some(leases) = &self.leases {
-            leases.track(&school_db_name(&self.control_db, slug));
+            leases.track(&school_db_name(&self.control_db, id.uuid()));
         }
         Ok(db)
     }
@@ -433,8 +491,8 @@ impl Tenants {
     /// Create (or adopt) the school's database and apply the school schema to
     /// it. Split out of [`Tenants::create`] so one `?` chain can be rolled
     /// back as a unit.
-    async fn bring_up(&self, slug: &Slug) -> Result<Database, AppError> {
-        let db_name = school_db_name(&self.control_db, slug);
+    async fn bring_up(&self, id: SchoolId) -> Result<Database, AppError> {
+        let db_name = school_db_name(&self.control_db, id.uuid());
         // `CREATE DATABASE` cannot run inside a transaction; `Pool::execute`
         // sends it as a bare autocommit statement. A name left over by a
         // create that died before its rollback is adopted, not fought.
@@ -459,19 +517,17 @@ impl Tenants {
     /// Flip a school between active and suspended. Suspending also drops the
     /// cached pool, so nothing that already resolved keeps serving.
     pub async fn set_status(&self, slug: &Slug, status: SchoolStatus) -> Result<(), AppError> {
-        let updated = sqlx::query_as::<_, School>(
-            "UPDATE school SET status = $1 WHERE slug = $2
-             RETURNING slug, name, status, created_at, modules",
-        )
-        .bind(status)
-        .bind(slug.as_str())
-        .fetch_optional(&self.control)
-        .await?;
-        if updated.is_none() {
+        let updated: Option<Uuid> =
+            sqlx::query_scalar("UPDATE school SET status = $1 WHERE slug = $2 RETURNING id")
+                .bind(status)
+                .bind(slug.as_str())
+                .fetch_optional(&self.control)
+                .await?;
+        let Some(id) = updated else {
             return Err(AppError::NotFound);
-        }
+        };
         if status == SchoolStatus::Suspended {
-            self.evict(slug).await;
+            self.evict(SchoolId(id)).await;
         }
         Ok(())
     }
@@ -482,17 +538,29 @@ impl Tenants {
     /// stale answer.
     pub async fn set_modules(&self, slug: &Slug, modules: &ModuleSet) -> Result<(), AppError> {
         modules.validate()?;
-        let updated = sqlx::query_as::<_, School>(
-            "UPDATE school SET modules = $1 WHERE slug = $2
-             RETURNING slug, name, status, created_at, modules",
-        )
-        .bind(modules.names())
-        .bind(slug.as_str())
-        .fetch_optional(&self.control)
-        .await?;
-        if updated.is_none() {
+        // The swap is parent + children in one transaction: take the registry
+        // row's lock so racing sellers serialize, then replace the whole shelf.
+        let mut tx = self.control.begin().await?;
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM school WHERE slug = $1 FOR UPDATE")
+                .bind(slug.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(id) = id else {
             return Err(AppError::NotFound);
+        };
+        sqlx::query("DELETE FROM school_module WHERE school = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for name in modules.names() {
+            sqlx::query("INSERT INTO school_module (school, module) VALUES ($1, $2)")
+                .bind(id)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -500,26 +568,38 @@ impl Tenants {
     /// pool. Irreversible on purpose — there is no soft-delete state, that is
     /// what [`SchoolStatus::Suspended`] is for.
     pub async fn drop(&self, slug: &Slug) -> Result<(), AppError> {
+        // The id comes off the row: the database is named by the uuid, not
+        // the slug. A row already gone means the goal state stands — nothing
+        // to destroy left.
+        let Some(school) = School::read(slug, &self.control).await? else {
+            return Ok(());
+        };
+        let id = school.get_id();
         // Close the pool first: nothing should be dialling a school whose
         // database is about to go away, and `WITH (FORCE)` should never find
         // one of our connections to kill.
-        self.evict(slug).await;
-        // The control-plane membership rows point at the school by slug, and
-        // `ON DELETE NO ACTION` would refuse the registry delete while any
-        // stand. Person sessions carry no school, so only memberships go —
-        // the persons themselves survive (a person is a global account, not
-        // the school's).
-        crate::db::person::delete_memberships_by_school(&self.control, slug).await?;
-        sqlx::query("DELETE FROM school WHERE slug = $1")
-            .bind(slug.as_str())
+        self.evict(id).await;
+        // The control-plane rows pointing at the school by uuid — membership
+        // and entitlement alike — go first: `ON DELETE NO ACTION` would refuse
+        // the registry delete while any stand. Person sessions carry no
+        // school, so only memberships go — the persons themselves survive (a
+        // person is a global account, not the school's).
+        crate::db::person::delete_memberships_by_school(&self.control, &id).await?;
+        sqlx::query("DELETE FROM school_module WHERE school = $1")
+            .bind(id.uuid())
             .execute(&self.control)
             .await?;
-        let db_name = school_db_name(&self.control_db, slug);
+        let db_name = school_db_name(&self.control_db, id.uuid());
         sqlx::query(sqlx::AssertSqlSafe(
             create_database_sql("DROP DATABASE IF EXISTS", &db_name) + " WITH (FORCE)",
         ))
         .execute(&self.control)
         .await?;
+        sqlx::query("DELETE FROM school WHERE id = $1")
+            .bind(id.uuid())
+            .execute(&self.control)
+            .await?;
+
         Ok(())
     }
 
@@ -530,43 +610,40 @@ impl Tenants {
     /// re-reads the registry row on every request, so a suspension is refused
     /// whether or not a pool survived it. [`Tenants::drop`], which does mean
     /// to destroy the store, evicts unconditionally.
-    pub async fn evict(&self, slug: &Slug) {
-        if let Some(pool) = self.forget(slug) {
+    pub async fn evict(&self, id: SchoolId) {
+        if let Some(pool) = self.forget(id) {
             pool.close().await;
         }
     }
 
-    fn forget(&self, slug: &Slug) -> Option<Database> {
+    fn forget(&self, id: SchoolId) -> Option<Database> {
+        let key = id.uuid().simple().to_string();
         let (removed, size) = {
             let mut cache = self.cache.write().expect("tenant cache lock");
-            (cache.remove(slug.as_str()), cache.len())
+            (cache.remove(&key), cache.len())
         };
         if removed.is_some() {
-            tracing::info!(school = %slug, "tenant pool evicted");
+            tracing::info!(school = %id.uuid(), "tenant pool evicted");
             Self::report_size(size);
         }
         removed
     }
 
     /// The cached pool, or a freshly dialled one.
-    async fn handle(&self, slug: &Slug) -> Result<Database, AppError> {
-        if let Some(db) = self
-            .cache
-            .read()
-            .expect("tenant cache lock")
-            .get(slug.as_str())
-        {
+    async fn handle(&self, id: SchoolId) -> Result<Database, AppError> {
+        let key = id.uuid().simple().to_string();
+        if let Some(db) = self.cache.read().expect("tenant cache lock").get(&key) {
             return Ok(db.clone());
         }
-        let db = school_pool(&self.base, &school_db_name(&self.control_db, slug)).await?;
+        let db = school_pool(&self.base, &school_db_name(&self.control_db, id.uuid())).await?;
         // Losing the race here is harmless — both pools are equivalent — but
         // the winner is kept so two requests never diverge onto two pools.
         let (db, size) = {
             let mut cache = self.cache.write().expect("tenant cache lock");
-            let db = cache.entry(slug.as_str().to_string()).or_insert(db).clone();
+            let db = cache.entry(key).or_insert(db).clone();
             (db, cache.len())
         };
-        tracing::info!(school = %slug, "tenant pool opened");
+        tracing::info!(school = %id.uuid(), "tenant pool opened");
         Self::report_size(size);
         Ok(db)
     }
@@ -583,9 +660,6 @@ impl Tenants {
 mod tests {
     use super::*;
 
-    fn slug(value: &str) -> Slug {
-        Slug::try_new(value).expect(value)
-    }
 
     #[test]
     fn a_slug_names_a_school_and_nothing_reserved() {
@@ -611,35 +685,30 @@ mod tests {
     }
 
     /// The database-per-school model lives or dies by this mapping: two
-    /// schools sharing a database name would share every row in it. `-`
-    /// becoming `_` is the only rewrite, and `_` is not in the slug charset,
-    /// so no two slugs can land on one name.
+    /// schools sharing a database name would share every row in it. The name
+    /// now mints from the school's uuid — lowercase hex without dashes, fixed
+    /// width — so it is injective by construction, and the slug appears
+    /// nowhere: a slug rename can never orphan a database.
     #[test]
     fn school_db_names_are_injective() {
         let control = "hezarfen_control";
+        // The contract's example, pinned byte for byte.
+        let id = Uuid::try_parse("019732e3-7b00-7000-8000-00000000dead").unwrap();
         assert_eq!(
-            school_db_name(control, &slug("demo")),
-            "hezarfen_control_school_demo"
+            school_db_name(control, id),
+            "hezarfen_control_school_019732e37b007000800000000000dead"
         );
-        assert_eq!(
-            school_db_name(control, &slug("ata-koleji")),
-            "hezarfen_control_school_ata_koleji"
+        // Two uuids never collide onto one database, and no slug is in the
+        // name — not even the slug the uuid was minted for.
+        let other = Uuid::try_parse("019732e3-7b00-7000-8000-00000000beef").unwrap();
+        assert_ne!(
+            school_db_name(control, id),
+            school_db_name(control, other),
+            "two uuids must not share a database"
         );
-        // Slugs are at least two characters, so the shortest pair stands in
-        // for the old single-letter probe.
-        for a in ["ab", "a-b", "abc", "a1b", "1a", "x-y-z"] {
-            for b in ["ab", "a-b", "abc", "a1b", "1a", "x-y-z"] {
-                if a != b {
-                    assert_ne!(
-                        school_db_name(control, &slug(a)),
-                        school_db_name(control, &slug(b)),
-                        "{a:?} and {b:?} must not share a database"
-                    );
-                }
-            }
-        }
+        assert!(!school_db_name(control, id).contains("demo"));
         // The control database's own name is never a school's name: the
         // suffix keeps the namespaces apart.
-        assert_ne!(school_db_name(control, &slug("school")), control);
+        assert_ne!(school_db_name(control, id), control);
     }
 }

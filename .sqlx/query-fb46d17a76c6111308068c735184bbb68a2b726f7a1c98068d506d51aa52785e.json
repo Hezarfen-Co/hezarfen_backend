@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                  COALESCE((SELECT array_agg(t.status ORDER BY t.status)\n                            FROM settings_attendance_status t\n                            WHERE t.settings = s.id), '{}') AS \"attendance_statuses!: Vec<String>\",\n                  s.grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                  s.max_file_bytes,\n                  s.chatbot_history_turns,\n                  s.max_chatbot_message_len,\n                  s.max_chatbot_threads,\n                  s.meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                  (SELECT array_agg(t.tag ORDER BY t.tag)\n                   FROM settings_dietary_tag t\n                   WHERE t.settings = s.id) AS dietary_tags,\n                  s.meal_cancel_cutoff_minutes\n           FROM settings s WHERE s.id = 'school'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam_kinds: Json<Vec<ExamKindDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "exam_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "attendance_statuses!: Vec<String>",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "grade_bands: Json<Vec<GradeBand>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "grade_bands"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "max_file_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_file_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "chatbot_history_turns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "chatbot_history_turns"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "max_chatbot_message_len",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_message_len"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_chatbot_threads",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_threads"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "meal_slots: Json<Vec<MealSlotDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_slots"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "dietary_tags",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "meal_cancel_cutoff_minutes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_cancel_cutoff_minutes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      true
+    ]
+  },
+  "hash": "fb46d17a76c6111308068c735184bbb68a2b726f7a1c98068d506d51aa52785e"
+}

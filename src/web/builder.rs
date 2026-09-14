@@ -34,7 +34,7 @@ use crate::module::{Module, ModuleSet, Package};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::service;
 use crate::state::AppState;
-use crate::tenant::{School, SchoolStatus, Slug};
+use crate::tenant::{School, SchoolId, SchoolStatus, Slug};
 use crate::validate::validate_required;
 use crate::web::tenant_state::school_files_path;
 
@@ -124,8 +124,9 @@ impl SchoolResponse {
 #[derive(Deserialize, ToSchema)]
 struct CreateSchool {
     /// Lowercase `a-z`, `0-9` and `-`, starting with a letter or digit. Names
-    /// the school's database, its blob directory and its cookie prefix, so it
-    /// is immutable once taken.
+    /// the school's blob directory and its cookie prefix. It is the school's
+    /// public label, not its identity — the uuid minted at create time is —
+    /// and it must stay unique across the deployment.
     #[schema(example = "ata-koleji", min_length = 2, max_length = 32)]
     slug: String,
     #[schema(example = "Ata Koleji", max_length = 120)]
@@ -369,7 +370,11 @@ async fn create_school(
         ));
     }
 
-    let db = st.tenants.create(&slug, &name, modules).await?;
+    // The school's uuid is minted here, on the one path that creates schools:
+    // it becomes the registry row's PK and the database name's source, and
+    // the slug stays a label the wire keeps answering with.
+    let id = SchoolId::generate();
+    let db = st.tenants.create(id, &slug, &name, modules).await?;
     let seeded = async {
         crate::service::user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin)
             .await?;
@@ -444,8 +449,9 @@ async fn get_school(
 }
 
 /// Rename a school and/or flip it between `active` and `suspended`. Omitted
-/// fields keep their value. The slug itself is immutable — it names a database
-/// and a directory.
+/// fields keep their value. The slug itself is immutable in this cut — it is
+/// the cookie prefix and the blob directory — though it no longer names the
+/// database (the school's uuid does); a rename API is not offered yet.
 ///
 /// Suspending is immediate and total for the school's own users: their next
 /// request is a `403`, live session or not.

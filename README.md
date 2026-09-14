@@ -242,14 +242,40 @@ so the build never touches a database — the macros read the committed
 `postgres:18-alpine` image, `max_connections=500` so the test suite's
 parallel control+school pools fit) and the backend, which waits for the
 database's healthcheck and connects over `DATABASE_URL`
-(`postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control`). Each has
-its own named volume — `pgdata` holds the database, `hezarfen-data` the
-uploaded note files (`/data/files`). `HOST` is forced to `0.0.0.0` inside the
-container so the published port works. Production knobs (`COOKIE_SECURE`,
-`CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) are commented in
-`compose.yaml` — uncomment as needed. Leaving `CORS_ALLOWED_ORIGINS` unset
-means dev mirror mode without credentials; a cookie-using browser frontend
-must be allowlisted explicitly. Works with `docker compose` too.
+(`postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control`). The backend
+port is published on loopback only — `127.0.0.1:7656:7656` — so a server
+deployment sits behind a reverse proxy and the API is never directly
+reachable (`HOST` is forced to `0.0.0.0` inside the container so the publish
+works). Each service has its own named volume: `pgdata` holds the database
+— it is mounted at `/var/lib/postgresql`, which the postgres:18 image keeps
+its cluster under (`/var/lib/postgresql/18/docker`), so the data really
+lands in the volume — and `hezarfen-data` holds the
+uploaded note files (`/data/files`). Production knobs (`COOKIE_SECURE`,
+`CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) reach the backend through
+the env file (below), not through `compose.yaml`. Leaving
+`CORS_ALLOWED_ORIGINS` unset means dev mirror mode without credentials; a
+cookie-using browser frontend must be allowlisted explicitly. Works with
+`docker compose` too.
+
+**Credentials live in three places and are never mixed.** CI's postgres
+sidecar uses a throwaway `hezarfen`/`hezarfen` pair declared in the workflow
+— no GitHub secrets involved. Local compose interpolates dev defaults
+(`hezarfen`/`hezarfen` for postgres, `builder`/`builder123` for the builder
+account, `admin@hezarfen.local` / `Hezarfen_dev1!` for OpenObserve), so the
+`up` above works with zero extra files. Production is the operator's job:
+ssh to the VPS, copy `deploy/hezarfen_backend.env.example` to
+`$HOME/hezarfen_backend/hezarfen_backend.env`, `chmod 0600` it, and set the
+real passwords — the deploy pipeline never creates, overwrites or uploads
+that file, it only refuses to run unless the file exists at mode `0600` with
+non-empty `POSTGRES_PASSWORD=`, `BUILDER_PASSWORD=`, `ZO_ROOT_USER_EMAIL=` and
+`ZO_ROOT_USER_PASSWORD=` values (prod never silently falls back to the dev defaults). The first `podman compose up` bakes
+`POSTGRES_PASSWORD` into the `pgdata` volume: changing the env file
+afterwards does not re-key the database, so the real password must be in
+place before that first up, and it must be URL-safe (no `@`, `:`, `/` — it
+is interpolated into `DATABASE_URL`). The same file is the backend's
+optional `env_file`, so extra keys it carries (`COOKIE_SECURE`,
+`TRUST_PROXY`, `CORS_*`, `RATE_LIMIT_*`, `OTEL_*`) reach the container
+without being listed in `environment:`.
 
 One more service is the telemetry sink: `openobserve`, a single Rust binary
 that stores logs, metrics and traces itself — no sidecar databases and no
@@ -258,13 +284,38 @@ container socket. Its UI, search API and OTLP/HTTP ingest share
 http://127.0.0.1:5080 as the `ZO_ROOT_USER_EMAIL`/`ZO_ROOT_USER_PASSWORD` pair
 set on the service (`admin@hezarfen.local` / `Hezarfen_dev1!` for local dev —
 OpenObserve rejects a weaker password at boot). Retention is per stream in
-days, defaulted globally to 90 by `ZO_COMPACT_DATA_RETENTION_DAYS`. Uncomment
-the backend's `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://openobserve:5081`) and
+days, defaulted globally to 90 by `ZO_COMPACT_DATA_RETENTION_DAYS`. Traces,
+metrics and logs start landing when the backend's environment carries
+`OTEL_EXPORTER_OTLP_ENDPOINT` (`http://openobserve:5081`) and
 `OTEL_EXPORTER_OTLP_HEADERS` (`Authorization=Basic <base64 email:password>`
-plus `organization=default,stream-name=default`), and traces, metrics and logs
-start landing; the commented OTLP/HTTP variant uses
-`http://openobserve:5080/api/default` with `OTEL_EXPORTER_OTLP_PROTOCOL:
-http/protobuf` instead.
+plus `organization=default,stream-name=default`) — those keys belong in the
+env file (production: `hezarfen_backend.env`; locally: an optional file of
+the same name beside `compose.yaml`), never in `compose.yaml` itself, where
+an empty OTEL value would switch export on and fail the boot. The OTLP/HTTP
+variant (`http://openobserve:5080/api/default` with
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`) is the alternative.
+
+Running a server means running its backups too. `./backup-postgres.sh` —
+shipped with the deploy artifact and living next to `compose.yaml` on the VPS
+— streams `pg_dumpall` out of the postgres container into
+`backups/hezarfen-<UTC>.sql.gz`, mode `0600`. `pg_dumpall` rather than
+`pg_dump`, because every school is its own database and one dump has to cover
+the control database and all of them. Restore with:
+
+```sh
+gunzip -c backups/FILE.sql.gz | podman exec -i hezarfen-postgres psql -U hezarfen -d postgres
+```
+
+Deploying is GitHub Actions' job, not the server's: the workflow packs the
+already-built binary and the migrations into a runtime image
+(`deploy/Containerfile.runtime`), ships the image tarball together with
+`compose.yaml`, the `hezarfen-compose.service` unit and the backup script as
+an artifact, and the deploy job loads it on the VPS and starts the stack with
+`podman compose up -d --no-build` — the image tag travels in a deploy-owned
+`stack.env`, so a release never rewrites the operator's secrets file. The
+operator's only manual step is writing the env file once (above). Reboots
+heal themselves: the user session lingers (`loginctl enable-linger`) and the
+`hezarfen-compose.service` user unit runs compose again at boot.
 
 The backend survives the database going away, at boot and at runtime.
 
@@ -959,9 +1010,11 @@ if an older build already emptied a school's admin set): run
 UPDATE app_user SET role = 'admin' WHERE username = 'ada';
 ```
 
-against the **school's** database (`{control}_school_{slug}`), not the
-control one — e.g. `podman exec -it hezarfen-postgres psql -U hezarfen -d
-hezarfen_control_school_demo` for the compose stack.
+against the **school's** database (`{control}_school_{uuid hex}` — the hex of
+the school's registry `id`, no dashes), not the control one. List the school
+databases with `\l` — e.g. `podman exec -it hezarfen-postgres psql -U hezarfen
+-d hezarfen_control -c "SELECT slug, id FROM school"` names each school and
+its database suffix for the compose stack.
 
 ## Endpoints
 
@@ -4866,7 +4919,8 @@ driven by a client that shares no code with the backend).
 Every suite runs against a **real** PostgreSQL, because production is real
 PostgreSQL. The harness (tests/common) mints each test a private pair of
 databases on one server — `heztest_<16 hex>` for the control side and its
-`heztest_<…>_school_demo` school, template-cloned so a schema edit migrates
+`heztest_<…>_school_<uuid hex>` school (the school's registry id, clipped to
+Postgres's 63-byte identifier cap), template-cloned so a schema edit migrates
 the shared template once — and drops them when the deployment's last handle
 dies; a janitor sweeps what a crashed run left behind. The server comes from
 `HEZARFEN_TEST_DATABASE_URL` (default: the compose stack's maintenance

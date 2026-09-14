@@ -6638,8 +6638,14 @@ async fn db_down_refuses_before_touching_the_database() {
 
     // Recovery is eviction: the dead pool leaves the cache, the next request
     // dials fresh — and the refused write is still not in the database.
+    let demo_id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE slug = 'demo'")
+        .fetch_one(tenants.control())
+        .await
+        .expect("demo id");
     let slug = Slug::try_new("demo").expect("slug");
-    tenants.evict(&slug).await;
+    tenants
+        .evict(hezarfen_backend::tenant::SchoolId::from_uuid(demo_id))
+        .await;
     let live = tenants.get(&slug).await.expect("redial after eviction");
     assert_eq!(
         count_rows(&live, "app_user").await,
@@ -27406,7 +27412,12 @@ async fn two_schools() -> (
     let (app, db_a, tenants) = common::app_and_tenants().await;
     let slug_b = Slug::try_new("beta").expect("slug");
     let db_b = tenants
-        .create(&slug_b, "Beta Koleji", ModuleSet::all())
+        .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
+            &slug_b,
+            "Beta Koleji",
+            ModuleSet::all(),
+        )
         .await
         .expect("school B");
     (app, db_a, db_b, tenants)
@@ -28475,7 +28486,8 @@ async fn remote_probe_remote_mode_keeps_two_schools_apart() {
 // -------------------------------------------------------------------------
 
 /// The server's database list, off the control handle: the control database
-/// itself plus every school database, named `{control}_school_{slug}`.
+/// itself plus every school database, named `{control}_school_{uuid hex}` —
+/// the school's uuid, never its slug.
 async fn namespace_databases(tenants: &Tenants) -> Vec<String> {
     let control = tenants.control();
     let control_db: String = sqlx::query_scalar("SELECT current_database()")
@@ -28495,6 +28507,22 @@ async fn namespace_databases(tenants: &Tenants) -> Vec<String> {
     names
 }
 
+/// A school database's name, read off the registry: the control database's
+/// name plus the school's uuid in lowercase hex, no dashes. Postgres
+/// truncates identifiers at 63 bytes (NAMEDATALEN - 1), and a test control
+/// database's `heztest_` prefix runs the name one character past that — the
+/// server creates and dials the truncated name on both sides, so the
+/// expectation truncates with it.
+async fn school_db_by_slug(control_db: &str, slug: &str, control: &sqlx::PgPool) -> String {
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE slug = $1")
+        .bind(slug)
+        .fetch_one(control)
+        .await
+        .expect("school id");
+    let name = format!("{control_db}_school_{}", id.simple());
+    name.chars().take(63).collect()
+}
+
 /// A school **is** a database, so the server must hold exactly the created
 /// schools plus the control database — and `DELETE /schools/{slug}` must drop
 /// the database, not merely delete the registry row.
@@ -28505,13 +28533,13 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
         .fetch_one(d.tenants.control())
         .await
         .expect("control name");
+    let demo_db = school_db_by_slug(&control_db, DEMO_SLUG, d.tenants.control()).await;
+    let beta_db = school_db_by_slug(&control_db, "beta", d.tenants.control()).await;
+    let mut expected = vec![control_db.clone(), demo_db.clone(), beta_db];
+    expected.sort();
     assert_eq!(
         namespace_databases(&d.tenants).await,
-        vec![
-            control_db.clone(),
-            format!("{control_db}_school_beta"),
-            format!("{control_db}_school_demo"),
-        ],
+        expected,
         "the server holds exactly the two schools and the control database"
     );
 
@@ -28535,9 +28563,11 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
 
     let res = send(&d.app, "DELETE", "/schools/beta", Some(&builder), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let mut expected = vec![control_db.clone(), demo_db];
+    expected.sort();
     assert_eq!(
         namespace_databases(&d.tenants).await,
-        vec![control_db.clone(), format!("{control_db}_school_demo")],
+        expected,
         "DELETE /schools/beta dropped beta's database"
     );
 }

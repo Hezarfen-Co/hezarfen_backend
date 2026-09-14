@@ -240,12 +240,18 @@ pub async fn delete(db: &Database, menu: Menu) -> Result<Menu, AppError> {
         if guard.is_none() {
             return Ok(None);
         }
-        // The children go first: both `menu_dish.menu` and
-        // `meal_attendance.menu` are `ON DELETE NO ACTION`, so the parent
-        // row cannot leave while they stand.
+        // The children go first: `menu_dish_tag.dish`, `menu_dish.menu` and
+        // `meal_attendance.menu` are all `ON DELETE NO ACTION`, so the
+        // parent rows cannot leave while they stand.
         sqlx::query!("DELETE FROM meal_attendance WHERE menu = $1", key)
             .execute(&mut *tx)
             .await?;
+        sqlx::query!(
+            "DELETE FROM menu_dish_tag WHERE dish IN (SELECT id FROM menu_dish WHERE menu = $1)",
+            key,
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::query!("DELETE FROM menu_dish WHERE menu = $1", key)
             .execute(&mut *tx)
             .await?;

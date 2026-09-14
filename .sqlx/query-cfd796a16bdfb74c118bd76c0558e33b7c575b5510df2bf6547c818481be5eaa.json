@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO board_participant (board, participant)\n             SELECT $1, t.x FROM unnest($2::uuid[]) AS t(x)\n             ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cfd796a16bdfb74c118bd76c0558e33b7c575b5510df2bf6547c818481be5eaa"
+}

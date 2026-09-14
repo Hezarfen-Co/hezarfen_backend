@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ((SELECT count(*) FROM board_participant WHERE board = $1)\n                    + (SELECT count(*) FROM unnest($2::uuid[]) AS t(x)\n                       WHERE NOT EXISTS (SELECT 1 FROM board_participant bp\n                                         WHERE bp.board = $1 AND bp.participant = t.x)))\n                AS \"filled!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filled!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c853378f65634bdb7e00a372fa188979bc2758176b486ac554a763653e04c718"
+}

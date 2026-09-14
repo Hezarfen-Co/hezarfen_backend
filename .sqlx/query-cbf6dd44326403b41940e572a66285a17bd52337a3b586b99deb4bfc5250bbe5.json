@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT source AS \"source: CourseNoteFileId\"\n               FROM rag_output_source WHERE output = $1 ORDER BY source",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source: CourseNoteFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_output_source",
+            "name": "source"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cbf6dd44326403b41940e572a66285a17bd52337a3b586b99deb4bfc5250bbe5"
+}

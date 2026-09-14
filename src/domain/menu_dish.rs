@@ -111,8 +111,9 @@ impl DishPrice {
 
 /// The dietary tags a dish carries, drawn from the school's `dietary_tags`
 /// list. Deduplicated, order preserved — the list is what a student's profile
-/// is matched against, so a repeat carries no extra meaning. Stored as a
-/// `TEXT[]` column.
+/// is matched against, so a repeat carries no extra meaning. Stored one row
+/// per tag in `menu_dish_tag` — an `ord` column keeps the given order, and
+/// reads re-aggregate in that order.
 #[derive(Debug, Clone, PartialEq, Eq, Type)]
 #[sqlx(transparent, no_pg_array)]
 pub struct DishTags(Vec<String>);

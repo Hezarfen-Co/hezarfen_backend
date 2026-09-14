@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM blueprint_course WHERE course = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3d1db83ef8c406a80281be9cfc968dc81304180cd047d1ae2b65951528e1d4b1"
+}

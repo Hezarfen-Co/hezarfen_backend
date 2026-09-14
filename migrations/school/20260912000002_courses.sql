@@ -33,15 +33,14 @@ CREATE TABLE term (
 -- locked FOR UPDATE and refused while its enrollment_count is non-zero. The
 -- child order is the FK-safest one: exam results/attempts/answers/images and
 -- questions, homework files/submissions/results, rag output, note files and
--- notes, class_course links (each class gets its class_course_count back and
--- every blueprint drops the id from its list), session_attendance and
+-- notes, class_course links (each class gets its class_course_count back),
+-- blueprint_course and course_teacher links, session_attendance and
 -- course_session, enrollment (each seat given back), then the exam, homework
 -- and subject rows themselves. Bank questions keep their templates; only
 -- their subject/source_exam links are cleared.
 CREATE TABLE course (
     id               uuid PRIMARY KEY,
     creator          uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
-    teachers         uuid[] NOT NULL DEFAULT '{}',
     title            TEXT NOT NULL,
     description      TEXT NOT NULL,
     kind             TEXT NOT NULL DEFAULT 'course',
@@ -49,9 +48,20 @@ CREATE TABLE course (
     capacity         BIGINT NULL,
     enrollment_count BIGINT NOT NULL DEFAULT 0
 );
--- No GIN on teachers, faithful to the Surreal schema: the teachers-membership
--- read stays a scan, exactly as today (see src/db/course.rs — the Surreal
--- per-element index form returned zero rows and was never defined).
+
+-- The staff a manager assigned to run a course. The old `teachers uuid[]` on
+-- the course row is a junction now, like enrollment: membership is a row with
+-- a foreign key, so an assigned user is a real reference (no dangling id a
+-- demotion sweep or a delete can strand), the membership read is an index
+-- lookup instead of an array scan, and "assigned to a course that is gone" is
+-- unrepresentable rather than swept.
+CREATE TABLE course_teacher (
+    course  uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
+    teacher uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    CONSTRAINT course_teacher_course_teacher PRIMARY KEY (course, teacher)
+);
+
+CREATE INDEX course_teacher_teacher ON course_teacher (teacher);
 
 CREATE TABLE subject (
     id                  uuid PRIMARY KEY,
@@ -91,15 +101,24 @@ CREATE TABLE rag_output (
     id          uuid PRIMARY KEY,
     course_note uuid NOT NULL REFERENCES course_note(id) ON DELETE NO ACTION,
     course      uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
-    sources     uuid[] NOT NULL DEFAULT '{}',
     payload     JSONB NOT NULL,
     generated_at BIGINT NOT NULL
 );
 
 CREATE INDEX rag_output_note ON rag_output (course_note);
--- The source cascade asks `sources CONTAINS $file`; the GIN index makes it a
--- lookup instead of a scan.
-CREATE INDEX rag_output_source ON rag_output USING GIN (sources);
+
+-- Citations: which course-note files an output was built from, as link rows
+-- with real foreign keys rather than an array column. A file delete sweeps
+-- the links that cite it before the file row goes, and deleting an output
+-- sweeps its links before the output row does — `ON DELETE NO ACTION` makes
+-- the refusal (23503) the backstop if a sweep is forgotten.
+CREATE TABLE rag_output_source (
+    output uuid NOT NULL REFERENCES rag_output(id) ON DELETE NO ACTION,
+    source uuid NOT NULL REFERENCES course_note_file(id) ON DELETE NO ACTION,
+    CONSTRAINT rag_output_source_output_source PRIMARY KEY (output, source)
+);
+
+CREATE INDEX rag_output_source_source ON rag_output_source (source);
 
 CREATE TABLE course_session (
     id              uuid PRIMARY KEY,
@@ -150,9 +169,23 @@ CREATE INDEX class_group_grade ON class_group (grade);
 CREATE TABLE class_blueprint (
     id      uuid PRIMARY KEY,
     grade   TEXT NOT NULL CONSTRAINT class_blueprint_grade_key UNIQUE,
-    courses uuid[] NOT NULL DEFAULT '{}',
     creator uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION
 );
+
+-- A template's course list. The old `courses uuid[]` on the blueprint row is
+-- a junction now, like the class_course links it pumps: a course in a
+-- template is a foreign-keyed row, so the course delete's own cascade takes
+-- the link out (no dangling id a prune had to chase), the compare-and-set
+-- edits compare row sets, and the grade-with-no-sections case loses its dead
+-- course for free.
+CREATE TABLE blueprint_course (
+    blueprint uuid NOT NULL REFERENCES class_blueprint(id) ON DELETE NO ACTION,
+    course    uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
+    CONSTRAINT blueprint_course_blueprint_course PRIMARY KEY (blueprint, course)
+);
+
+-- The course delete's sweep strikes the link by course.
+CREATE INDEX blueprint_course_course ON blueprint_course (course);
 
 CREATE TABLE class_member (
     class    uuid NOT NULL REFERENCES class_group(id) ON DELETE NO ACTION,

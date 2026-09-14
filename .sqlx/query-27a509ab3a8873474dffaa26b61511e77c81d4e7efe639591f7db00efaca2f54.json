@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO rag_output_source (output, source)\n             SELECT $1, s FROM unnest($2::uuid[]) AS t(s)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "27a509ab3a8873474dffaa26b61511e77c81d4e7efe639591f7db00efaca2f54"
+}

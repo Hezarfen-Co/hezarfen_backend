@@ -12,9 +12,10 @@
 -- default); timestamps stay BIGINT unix-ms. All FKs are ON DELETE NO ACTION —
 -- cascades stay explicit application transactions.
 --
--- Renames (reserved words, never quoted): table `school` keeps its name (its
--- Surreal record id WAS the slug, so slug is the PRIMARY KEY, constraint
--- carrying the old index name school_slug).
+-- Renames (reserved words, never quoted): table `school` keeps its name. Its
+-- Surreal record id WAS the slug; the Postgres table instead carries an
+-- app-minted uuid PRIMARY KEY (`id`) so the slug is a renameable label, with
+-- the old PK index name `school_slug` kept as the UNIQUE constraint on slug.
 --
 -- `rate_limit` exists ONLY here, not in the school schema: rate limiting is
 -- billed against the control handle before any cookie names a school (see the
@@ -23,17 +24,25 @@
 -- `tier:client:window` key, so the PK is TEXT.
 
 CREATE TABLE school (
-    -- Immutable: a rename is blocked by the school_slug primary key below and
-    -- by the per-school database name ({control}_school_{slug}) minted from
-    -- it — a slug change would orphan the database.
+    -- Surrogate identity, app-minted uuid v7 (no DB default): the per-school
+    -- database name is minted from it (see tenant::school_db_name), so a slug
+    -- rename — once offered — can never orphan a database. Immutable keys
+    -- belong to the uuid, never to the label.
+    id         uuid PRIMARY KEY,
     slug       TEXT NOT NULL,
     name       TEXT NOT NULL,
     status     TEXT NOT NULL CONSTRAINT school_status CHECK (status IN ('active', 'suspended')),
     created_at BIGINT NOT NULL,
-    -- Which product modules this school has bought; names bound from
-    -- Module::ALL at write time, never spelled here.
-    modules    TEXT[] NOT NULL DEFAULT '{}',
-    CONSTRAINT school_slug PRIMARY KEY (slug)
+    CONSTRAINT school_slug UNIQUE (slug)
+);
+
+-- One row per product module the school has bought; names bound from
+-- Module::ALL at write time, never spelled here. The pair is the key: the
+-- membership is the link, and a read joins it back onto the school row.
+CREATE TABLE school_module (
+    school uuid NOT NULL REFERENCES school(id) ON DELETE NO ACTION,
+    module TEXT NOT NULL,
+    PRIMARY KEY (school, module)
 );
 
 CREATE TABLE builder (

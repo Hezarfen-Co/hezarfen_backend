@@ -74,7 +74,9 @@ async fn source_of(class: &str, course: &str, db: &Database) -> Option<String> {
 /// Does that grade's template still name that course, in the store?
 async fn templated(grade: &str, course: &str, db: &Database) -> bool {
     sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM class_blueprint WHERE grade = $1 AND $2 = ANY(courses)",
+        "SELECT count(*) FROM blueprint_course bc \
+         JOIN class_blueprint b ON b.id = bc.blueprint \
+         WHERE b.grade = $1 AND bc.course = $2",
     )
     .bind(grade)
     .bind(CourseId::from_key(course))
@@ -459,13 +461,14 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
 /// A create whose stocking cannot place everything still creates the class: the
 /// pair that did not fit comes back in `skipped`, best-effort exactly like
 /// every other pump here.
-///
 /// The dead course is forged in the store rather than deleted through the API,
-/// because `DELETE /courses/{id}` now takes the id out of every template naming
-/// it (see `deleting_a_course_takes_it_out_of_every_blueprint`) and would leave
-/// nothing to skip. What is left here is exactly the state that still occurs: a
-/// row written before that cascade existed, and the pump's own window — a
-/// course deleted after the pump read the list it walks.
+/// because `DELETE /courses/{id}` takes the id out of every template naming it
+/// (see `deleting_a_course_takes_it_out_of_every_blueprint`) and would leave
+/// nothing to skip. Under the `blueprint_course` junction the live store cannot
+/// hold this state at all — the link is a foreign key — so the course row is
+/// deleted with FK triggers suspended: the legacy-row state the prune still
+/// exists for, and the same shape the pump's own window meets (a course gone
+/// after the pump read the list it walks).
 #[tokio::test]
 async fn a_create_reports_what_its_blueprint_could_not_stock() {
     let (app, db) = app_and_db().await;
@@ -486,12 +489,21 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
     // the state the delete's own sweep no longer produces, and the one a pump
     // meets when a course goes after it read the list. Nothing carries it yet
     // (no section exists at grade 9), so this is the pair that cannot fit when
-    // the first one is created.
-    sqlx::query("DELETE FROM course WHERE id = $1")
-        .bind(CourseId::from_key(&physics))
-        .execute(&db)
+    // the first one is created. The junction makes the live state impossible —
+    // `blueprint_course.course` is a foreign key — so the course row goes with
+    // FK triggers suspended: exactly what a row written before that cascade
+    // existed looks like, which is the state the prune still exists for.
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM course WHERE id = $1")
+        .bind(CourseId::from_key(&physics))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(
         templated("9", &physics, &db).await,
         "the id is still listed"
@@ -1424,11 +1436,15 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
 
     // The state a sweep that died half-way leaves: the list is stored without
     // history, its attachment is not.
-    sqlx::query("UPDATE class_blueprint SET courses = $1 WHERE grade = '9'")
-        .bind(vec![CourseId::from_key(&algebra)])
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM blueprint_course \
+         WHERE course = $1 \
+           AND blueprint = (SELECT id FROM class_blueprint WHERE grade = '9')",
+    )
+    .bind(CourseId::from_key(&history))
+    .execute(&db)
+    .await
+    .unwrap();
 
     let courses = held(&app, &manager, "9").await;
     assert_eq!(
@@ -1491,9 +1507,10 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
 /// the `201`/`200` listed a course the `GET` a moment later did not.
 ///
 /// Both write routes are driven, and the window is opened by the schema rather
-/// than by a lucky interleaving: a `DEFINE EVENT` on `class_blueprint` fires
-/// inside the very transaction that stores the list, which is exactly "after
-/// the courses were resolved, before the pump runs", every single time.
+/// than by a lucky interleaving: a trigger on `blueprint_course` fires inside
+/// the very transaction that stores the list — after the link row landed, so
+/// the foreign key allows the course's own death — which is exactly "after the
+/// courses were resolved, before the pump runs", every single time.
 #[tokio::test]
 async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     let (app, db) = app_and_db().await;
@@ -1505,10 +1522,13 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     let mut conn = db.acquire().await.expect("acquire for the trigger");
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION heztest_kill_on_create() RETURNS trigger AS $$
-         BEGIN DELETE FROM course WHERE id = '{algebra}'; RETURN NULL; END;
+         BEGIN DELETE FROM blueprint_course WHERE blueprint = NEW.blueprint \
+               AND course = NEW.course;
+               DELETE FROM course WHERE id = NEW.course; RETURN NULL; END;
          $$ LANGUAGE plpgsql;
-         CREATE TRIGGER heztest_kill_on_create AFTER INSERT ON class_blueprint
-         FOR EACH ROW EXECUTE FUNCTION heztest_kill_on_create();"
+         CREATE TRIGGER heztest_kill_on_create AFTER INSERT ON blueprint_course
+         FOR EACH ROW WHEN (NEW.course = '{algebra}')
+         EXECUTE FUNCTION heztest_kill_on_create();"
     )))
     .execute(&mut *conn)
     .await
@@ -1540,10 +1560,13 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     // The same window on the edit route.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE FUNCTION heztest_kill_on_update() RETURNS trigger AS $$
-         BEGIN DELETE FROM course WHERE id = '{history}'; RETURN NULL; END;
+         BEGIN DELETE FROM blueprint_course WHERE blueprint = NEW.blueprint \
+               AND course = NEW.course;
+               DELETE FROM course WHERE id = NEW.course; RETURN NULL; END;
          $$ LANGUAGE plpgsql;
-         CREATE TRIGGER heztest_kill_on_update AFTER UPDATE ON class_blueprint
-         FOR EACH ROW EXECUTE FUNCTION heztest_kill_on_update();"
+         CREATE TRIGGER heztest_kill_on_update AFTER INSERT ON blueprint_course
+         FOR EACH ROW WHEN (NEW.course = '{history}')
+         EXECUTE FUNCTION heztest_kill_on_update();"
     )))
     .execute(&mut *conn)
     .await

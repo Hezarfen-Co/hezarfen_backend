@@ -50,30 +50,47 @@ pub async fn create(
         )
         .execute(&mut *tx)
         .await?;
-        let placed = sqlx::query_as!(
-            MenuDish,
-            "INSERT INTO menu_dish (id, menu, name, description, price_minor, tags, created_at)
-             SELECT $1, $2, $3, $4, $5, $6, $7
-             WHERE (SELECT count(*) FROM menu_dish WHERE menu = $2) < $8
-             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
+        let placed = sqlx::query!(
+            "INSERT INTO menu_dish (id, menu, name, description, price_minor, created_at)
+             SELECT $1, $2, $3, $4, $5, $6
+             WHERE (SELECT count(*) FROM menu_dish WHERE menu = $2) < $7",
             id.uuid(),
             menu_key,
             name.as_str(),
             description.as_ref().map(|d| d.as_str()),
             price_minor.as_minor(),
-            tags.as_slice(),
             created_at.as_millis(),
             cap,
         )
-        .fetch_optional(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        match placed {
-            Some(dish) => Ok(dish),
+        if placed.rows_affected() == 0 {
             // The menu exists (locked above), so an empty result is the cap.
-            None => Err(AppError::Conflict(
+            return Err(AppError::Conflict(
                 "the menu already carries the maximum number of dishes",
-            )),
+            ));
         }
+        // The tags are child rows: one per tag, `ord` carrying the order
+        // the caller gave the list in (already deduplicated by DishTags).
+        sqlx::query!(
+            "INSERT INTO menu_dish_tag (dish, tag, ord)
+             SELECT $1, tag, ord FROM unnest($2::text[]) WITH ORDINALITY AS t(tag, ord)",
+            id.uuid(),
+            tags.as_slice(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query_as!(
+            MenuDish,
+            "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\",
+                 COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM menu_dish_tag t WHERE t.dish = menu_dish.id), '{}'::text[]) AS \"tags!: DishTags\",
+                 created_at AS \"created_at: Timestamp\"
+             FROM menu_dish WHERE id = $1",
+            id.uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(row)
     })
     .await
 }
@@ -81,7 +98,9 @@ pub async fn create(
 pub async fn read(db: &Database, id: &MenuDishId) -> Result<Option<MenuDish>, AppError> {
     let row = sqlx::query_as!(
         MenuDish,
-        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"
+        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\",
+             COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM menu_dish_tag t WHERE t.dish = menu_dish.id), '{}'::text[]) AS \"tags!: DishTags\",
+             created_at AS \"created_at: Timestamp\"
          FROM menu_dish WHERE id = $1",
         id.uuid(),
     )
@@ -104,7 +123,9 @@ pub async fn list_for_menus(db: &Database, menus: &[MenuId]) -> Result<Vec<MenuD
     let keys: Vec<String> = menus.iter().map(|m| m.key().to_string()).collect();
     let rows = sqlx::query_as!(
         MenuDish,
-        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"
+        "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\",
+             COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM menu_dish_tag t WHERE t.dish = menu_dish.id), '{}'::text[]) AS \"tags!: DishTags\",
+             created_at AS \"created_at: Timestamp\"
          FROM menu_dish WHERE menu = ANY($1) ORDER BY id ASC",
         &keys,
     )
@@ -144,25 +165,50 @@ pub async fn update(
         if bumped.is_none() {
             return Err(AppError::NotFound);
         }
-        let row = sqlx::query_as!(
-            MenuDish,
+        let updated = sqlx::query!(
             "UPDATE menu_dish SET
                  name = COALESCE($2, name),
                  description = CASE WHEN $3 THEN $4 ELSE description END,
-                 price_minor = COALESCE($5, price_minor),
-                 tags = COALESCE($6, tags)
-             WHERE id = $1
-             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
+                 price_minor = COALESCE($5, price_minor)
+             WHERE id = $1",
             dish_key,
             name.as_ref().map(|n| n.as_str()),
             description.is_some(),
             description.as_ref().and_then(|d| d.as_ref()).map(|d| d.as_str()),
             price_minor.map(DishPrice::as_minor),
-            tags.as_ref().map(|t| t.as_slice()),
         )
-        .fetch_optional(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        row.ok_or(AppError::NotFound)
+        if updated.rows_affected() == 0 {
+            return Err(AppError::NotFound);
+        }
+        // The tags are child rows now: an absent field keeps the stored
+        // ones, a carried field replaces the whole set (an empty list
+        // clears it) — under the same transaction as the bump above.
+        if let Some(tags) = &tags {
+            sqlx::query!("DELETE FROM menu_dish_tag WHERE dish = $1", dish_key)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query!(
+                "INSERT INTO menu_dish_tag (dish, tag, ord)
+                 SELECT $1, tag, ord FROM unnest($2::text[]) WITH ORDINALITY AS t(tag, ord)",
+                dish_key,
+                tags.as_slice(),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        let row = sqlx::query_as!(
+            MenuDish,
+            "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\",
+                 COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM menu_dish_tag t WHERE t.dish = menu_dish.id), '{}'::text[]) AS \"tags!: DishTags\",
+                 created_at AS \"created_at: Timestamp\"
+             FROM menu_dish WHERE id = $1",
+            dish_key,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(row)
     })
     .await
 }
@@ -183,13 +229,23 @@ pub async fn delete(db: &Database, dish: MenuDish) -> Result<MenuDish, AppError>
         }
         let row = sqlx::query_as!(
             MenuDish,
-            "DELETE FROM menu_dish WHERE id = $1
-             RETURNING id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\", tags AS \"tags: DishTags\", created_at AS \"created_at: Timestamp\"",
+            "SELECT id AS \"id: MenuDishId\", menu AS \"menu: MenuId\", name AS \"name: DishName\", description AS \"description: DishDescription\", price_minor AS \"price_minor: DishPrice\",
+                 COALESCE((SELECT array_agg(t.tag ORDER BY t.ord) FROM menu_dish_tag t WHERE t.dish = menu_dish.id), '{}'::text[]) AS \"tags!: DishTags\",
+                 created_at AS \"created_at: Timestamp\"
+             FROM menu_dish WHERE id = $1",
             dish_key,
         )
         .fetch_optional(&mut *tx)
         .await?;
-        row.ok_or(AppError::NotFound)
+        let dish = row.ok_or(AppError::NotFound)?;
+        // The tag rows go first: `menu_dish_tag.dish` is NO ACTION too.
+        sqlx::query!("DELETE FROM menu_dish_tag WHERE dish = $1", dish_key)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM menu_dish WHERE id = $1", dish_key)
+            .execute(&mut *tx)
+            .await?;
+        Ok(dish)
     })
     .await
 }

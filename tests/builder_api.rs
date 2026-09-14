@@ -2082,11 +2082,15 @@ async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
     let builder = builder_login(&app).await;
 
     async fn raw_row(tenants: &Tenants) -> Vec<String> {
-        sqlx::query_scalar("SELECT modules FROM school WHERE slug = $1")
-            .bind(DEMO_SLUG)
-            .fetch_one(tenants.control())
-            .await
-            .expect("raw read")
+        sqlx::query_scalar(
+            "SELECT sm.module FROM school_module sm
+             JOIN school s ON s.id = sm.school
+             WHERE s.slug = $1 ORDER BY sm.module",
+        )
+        .bind(DEMO_SLUG)
+        .fetch_all(tenants.control())
+        .await
+        .expect("raw read")
     }
 
     let before = raw_row(&tenants).await;

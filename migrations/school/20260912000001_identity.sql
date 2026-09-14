@@ -195,7 +195,6 @@ CREATE TABLE board (
     id                 uuid PRIMARY KEY,
     creator            uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     title              TEXT NOT NULL,
-    participants       uuid[] NOT NULL DEFAULT '{}',
     locked             BOOLEAN NOT NULL DEFAULT false,
     locked_by          uuid NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     locked_at          BIGINT NULL,
@@ -207,9 +206,20 @@ CREATE TABLE board (
 );
 
 CREATE INDEX board_creator ON board (creator);
--- The board list asks `creator = $u OR participants CONTAINS $u`; the GIN
--- index covers the membership half ($1 = ANY(participants) at query sites).
-CREATE INDEX board_participants ON board USING GIN (participants);
+
+-- The roster, one row per (board, invited user). The membership predicate
+-- everywhere is `creator = $u OR EXISTS (… WHERE participant = $u)` over
+-- this table; the participant-side index is what the board list, the
+-- demotion strip in src/db/user.rs and the cap checks read through. Rows
+-- carry no order: every reader sorts by participant, so the assembled
+-- roster is deterministic.
+CREATE TABLE board_participant (
+    board       uuid NOT NULL REFERENCES board(id) ON DELETE NO ACTION,
+    participant uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    CONSTRAINT board_participant_board_participant PRIMARY KEY (board, participant)
+);
+
+CREATE INDEX board_participant_participant ON board_participant (participant);
 
 CREATE TABLE board_stroke (
     id         uuid PRIMARY KEY,
@@ -256,18 +266,32 @@ CREATE INDEX chatbot_message_user ON chatbot_message (user_id);
 CREATE INDEX chatbot_message_status_created ON chatbot_message (status, created_at);
 
 CREATE TABLE settings (
-    -- Singleton row: id = 'school'.
     id                         TEXT PRIMARY KEY,
     exam_kinds                 JSONB NOT NULL,
-    attendance_statuses        TEXT[] NOT NULL,
     grade_bands                JSONB NOT NULL,
     max_file_bytes             BIGINT NULL,
     chatbot_history_turns      BIGINT NULL,
     max_chatbot_message_len    BIGINT NULL,
     max_chatbot_threads        BIGINT NULL,
     meal_slots                 JSONB NULL,
-    dietary_tags               TEXT[] NULL,
     meal_cancel_cutoff_minutes BIGINT NULL
+);
+
+-- The settings singleton's two vocabulary lists, one row per entry. They
+-- replace TEXT[] columns; the compare-and-set guard in src/db/settings.rs
+-- compares these row *sets*, so nothing here carries order — every reader
+-- sorts, and an absent set (never configured) and an explicitly empty one
+-- both read as zero rows.
+CREATE TABLE settings_attendance_status (
+    settings TEXT NOT NULL REFERENCES settings(id) ON DELETE NO ACTION,
+    status   TEXT NOT NULL,
+    CONSTRAINT settings_attendance_status_settings_status PRIMARY KEY (settings, status)
+);
+
+CREATE TABLE settings_dietary_tag (
+    settings TEXT NOT NULL REFERENCES settings(id) ON DELETE NO ACTION,
+    tag      TEXT NOT NULL,
+    CONSTRAINT settings_dietary_tag_settings_tag PRIMARY KEY (settings, tag)
 );
 
 -- Reference counters, one row per *name* the settings offer. Created by the

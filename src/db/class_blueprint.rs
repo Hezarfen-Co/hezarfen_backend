@@ -6,6 +6,8 @@
 
 use sqlx::postgres::PgConnection;
 
+use std::collections::HashMap;
+
 use crate::constant::CLASS_BLUEPRINT_TABLE;
 use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::class_pump;
@@ -16,6 +18,86 @@ use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+
+/// The stored columns of one `class_blueprint` row. A template's course list
+/// is *not* one of them — it lives across the `blueprint_course` junction and
+/// is joined on in a batch after the read ([`with_courses`]), because the
+/// paged list here reads whole rows (`SELECT *`), a shape no aggregate column
+/// can ride.
+#[derive(Debug, sqlx::FromRow)]
+struct BlueprintRow {
+    /// The surrogate uuid primary key — the key the junction rows reference.
+    #[sqlx(rename = "id")]
+    key: uuid::Uuid,
+    grade: ClassGrade,
+    creator: UserId,
+}
+
+impl BlueprintRow {
+    fn into_blueprint(self, courses: Vec<CourseId>) -> ClassBlueprint {
+        ClassBlueprint {
+            // The API identity is the grade label, which the key column also
+            // stores — the id *is* the grade.
+            id: ClassBlueprintId::for_grade(&self.grade),
+            grade: self.grade,
+            courses,
+            creator: self.creator,
+        }
+    }
+}
+
+/// The stored course list of one blueprint, sorted by course. Every read goes
+/// through this ordering, which is what makes the compare-and-set below a
+/// plain vector comparison: both sides of it are junction reads.
+async fn junction_courses<'e, E>(
+    executor: E,
+    blueprint: uuid::Uuid,
+) -> Result<Vec<CourseId>, AppError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows = sqlx::query!(
+        r#"SELECT course AS "course: CourseId" FROM blueprint_course
+           WHERE blueprint = $1 ORDER BY course"#,
+        blueprint,
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.course).collect())
+}
+
+/// Join the stored course lists onto a batch of blueprint rows, one junction
+/// read for the lot.
+async fn with_courses(
+    db: &Database,
+    rows: Vec<BlueprintRow>,
+) -> Result<Vec<ClassBlueprint>, AppError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<uuid::Uuid> = rows.iter().map(|row| row.key).collect();
+    let links = sqlx::query!(
+        r#"SELECT blueprint, course AS "course: CourseId" FROM blueprint_course
+           WHERE blueprint = ANY($1) ORDER BY blueprint, course"#,
+        &keys,
+    )
+    .fetch_all(db)
+    .await?;
+    let mut by_blueprint: HashMap<uuid::Uuid, Vec<CourseId>> = HashMap::new();
+    for link in links {
+        by_blueprint
+            .entry(link.blueprint)
+            .or_default()
+            .push(link.course);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let courses = by_blueprint.remove(&row.key).unwrap_or_default();
+            row.into_blueprint(courses)
+        })
+        .collect())
+}
 
 /// One `class_course` row, projected down to the pair that answers "does this
 /// section carry that course". `source` is deliberately not read: a link of any
@@ -67,11 +149,12 @@ fn no_such_course() -> AppError {
     })
 }
 
-/// Write the blueprint's row. A second one for the same grade is a 409 the
-/// store itself decides — the grade carries a UNIQUE constraint, so the
-/// duplicate is seen rather than raced (`23505` on
-/// `class_blueprint_grade_key`, mapped right here: a duplicate is a
-/// decision, never a retry). The surrogate `id` is minted here and never
+/// Write the blueprint's row — and its `blueprint_course` rows, in the same
+/// transaction, under the same per-course proof ([`courses_alive`]). A second
+/// blueprint for the same grade is a 409 the store itself decides — the grade
+/// carries a UNIQUE constraint, so the duplicate is seen rather than raced
+/// (`23505` on `class_blueprint_grade_key`, mapped right here: a duplicate is
+/// a decision, never a retry). The surrogate `id` is minted here and never
 /// read back: the grade label stays the only identity the API speaks.
 pub async fn create(
     db: &Database,
@@ -90,17 +173,27 @@ pub async fn create(
     tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &courses).await?;
         let inserted = sqlx::query!(
-            r#"INSERT INTO class_blueprint (id, grade, courses, creator)
-               VALUES ($1, $2, $3, $4)"#,
+            r#"INSERT INTO class_blueprint (id, grade, creator)
+               VALUES ($1, $2, $3)"#,
             id,
             grade as _,
-            courses as _,
             creator as _
         )
         .execute(&mut *tx)
         .await;
         match inserted {
-            Ok(_) => Ok(blueprint.clone()),
+            Ok(_) => {
+                sqlx::query!(
+                    r#"INSERT INTO blueprint_course (blueprint, course)
+                       SELECT $1, x FROM unnest($2::uuid[]) AS t(x)
+                       ON CONFLICT DO NOTHING"#,
+                    id,
+                    courses as _,
+                )
+                .execute(&mut *tx)
+                .await?;
+                Ok(blueprint.clone())
+            }
             Err(e) if unique_violation(&e) == Some("class_blueprint_grade_key") => Err(
                 AppError::Conflict("a blueprint already exists for that grade"),
             ),
@@ -114,20 +207,22 @@ pub async fn read(
     db: &Database,
     id: &ClassBlueprintId,
 ) -> Result<Option<ClassBlueprint>, AppError> {
-    let row = sqlx::query!(
-        r#"SELECT grade AS "id: ClassBlueprintId", grade AS "grade: ClassGrade",
-                  courses AS "courses: Vec<CourseId>", creator AS "creator: UserId"
+    let row = sqlx::query_as!(
+        BlueprintRow,
+        r#"SELECT id AS "key: uuid::Uuid", grade AS "grade: ClassGrade",
+                  creator AS "creator: UserId"
            FROM class_blueprint WHERE grade = $1"#,
         id as _
     )
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|row| ClassBlueprint {
-        id: row.id,
-        grade: row.grade,
-        courses: row.courses,
-        creator: row.creator,
-    }))
+    match row {
+        Some(row) => {
+            let courses = junction_courses(db, row.key).await?;
+            Ok(Some(row.into_blueprint(courses)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Every blueprint, by grade label — the id *is* the label, so this is the
@@ -137,17 +232,26 @@ pub async fn list_all(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ClassBlueprint>, i64), AppError> {
-    PagedList::new(CLASS_BLUEPRINT_TABLE, "ORDER BY grade ASC")
-        .run(limit, offset, db)
-        .await
+    let (rows, total) = PagedList::new(CLASS_BLUEPRINT_TABLE, "ORDER BY grade ASC")
+        .run::<BlueprintRow>(limit, offset, db)
+        .await?;
+    Ok((with_courses(db, rows).await?, total))
 }
 
-/// Write the course list only while the stored row still carries the list
+/// Write the course list only while the stored rows still answer to the list
 /// this caller read: two managers editing the same grade cannot have one's
-/// list silently pump the other's diff. `None` means the conditional write
-/// matched nothing — the row is gone, or its list moved since the caller read
-/// it, and only the caller can tell those apart (the workflow re-reads and
-/// answers a `409` or a `404`).
+/// list silently pump the other's diff. `None` means the claim matched
+/// nothing — the row is gone, or its list moved since the caller read it, and
+/// only the caller can tell those apart (the workflow re-reads and answers a
+/// `409` or a `404`).
+///
+/// The write is a claim (`FOR UPDATE` on the row), a comparison (the stored
+/// `blueprint_course` rows, read under that lock, against `held` — both
+/// sorted the same way, so the comparison is a plain vector equality), then
+/// the diff: rows `wanted` dropped are deleted, rows it added are inserted.
+/// All of it rides one transaction, and the row lock it holds is the same
+/// strength the blueprint delete takes, so a pump's `FOR KEY SHARE` claim on
+/// this row waits out the whole write exactly as it waits out a delete.
 ///
 /// A template naming a course that is gone refuses inside the transaction
 /// with the pre-flight `400` ([`courses_alive`]).
@@ -157,21 +261,49 @@ pub async fn set_courses_if_unchanged(
     held: Vec<CourseId>,
     wanted: Vec<CourseId>,
 ) -> Result<Option<ClassBlueprint>, AppError> {
-    let id = id.clone();
+    let grade = id.clone();
+    let mut held = held;
+    held.sort_by_key(|course| course.uuid());
+    let keys: Vec<uuid::Uuid> = wanted.iter().map(CourseId::uuid).collect();
     tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &wanted).await?;
-        let updated = sqlx::query!(
-            r#"UPDATE class_blueprint SET courses = $2
-               WHERE grade = $1 AND courses = $3
-               RETURNING grade AS "grade: ClassGrade", creator AS "creator: UserId""#,
-            id as _,
-            wanted as _,
-            held as _
+        let row = sqlx::query!(
+            r#"SELECT id AS "key: uuid::Uuid", grade AS "grade: ClassGrade",
+                      creator AS "creator: UserId"
+               FROM class_blueprint WHERE grade = $1 FOR UPDATE"#,
+            grade.key(),
         )
         .fetch_optional(&mut *tx)
         .await?;
-        Ok(updated.map(|row| ClassBlueprint {
-            id: id.clone(),
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored = junction_courses(&mut *tx, row.key).await?;
+        if stored != held {
+            return Ok(None);
+        }
+        // The diff, from the list this caller stored: rows it dropped go,
+        // rows it added come (a duplicate in `wanted` is one row — the
+        // workflow deduplicates, and the key does the rest).
+        sqlx::query!(
+            r#"DELETE FROM blueprint_course
+               WHERE blueprint = $1 AND NOT (course = ANY($2))"#,
+            row.key,
+            &keys,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"INSERT INTO blueprint_course (blueprint, course)
+               SELECT $1, x FROM unnest($2::uuid[]) AS t(x)
+               ON CONFLICT DO NOTHING"#,
+            row.key,
+            &keys,
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(ClassBlueprint {
+            id: ClassBlueprintId::for_grade(&row.grade),
             grade: row.grade,
             courses: wanted.clone(),
             creator: row.creator,
@@ -180,10 +312,10 @@ pub async fn set_courses_if_unchanged(
     .await
 }
 
-/// Delete the row, but only while it still carries the list this caller read
-/// — the edit race answers the caller, not a silent delete of somebody
-/// else's additions. `false` means the conditional delete matched nothing:
-/// the row is gone, or its list moved since the caller read it, and only the
+/// Delete the row — but only while its stored list is still the one this
+/// caller read; the edit race answers the caller, not a silent delete of
+/// somebody else's additions. `false` means the claim matched nothing: the
+/// row is gone, or its list moved since the caller read it, and only the
 /// caller can tell those apart.
 ///
 /// The `DELETE` is also the whole of the serialization against the attaches
@@ -196,32 +328,60 @@ pub async fn delete_if_unchanged(
     id: &ClassBlueprintId,
     held: Vec<CourseId>,
 ) -> Result<bool, AppError> {
-    let deleted = sqlx::query!(
-        r#"DELETE FROM class_blueprint WHERE grade = $1 AND courses = $2"#,
-        id as _,
-        held as _
-    )
-    .execute(db)
-    .await?;
-    Ok(deleted.rows_affected() > 0)
+    let grade = id.clone();
+    tx_with_retry(db, false, async move |tx| {
+        delete_claimed(&mut *tx, &grade, &held).await
+    })
+    .await
 }
 
 /// [`delete_if_unchanged`] inside the caller's transaction — the blueprint
 /// delete rides the row lock its claim took, so the sourced links are swept
-/// while the window the claim opened is still closed.
+/// while the window the claim opened is still closed. The claim and the
+/// comparison re-run here: in the delete workflow's own transaction the
+/// [`held_courses_for_update`] claim has already settled both, so they are a
+/// formality; the standalone path above gets its whole CAS from this one
+/// body.
 pub(crate) async fn delete_if_unchanged_in(
     tx: &mut sqlx::PgConnection,
     id: &ClassBlueprintId,
     held: &[CourseId],
 ) -> Result<bool, AppError> {
-    let deleted = sqlx::query!(
-        r#"DELETE FROM class_blueprint WHERE grade = $1 AND courses = $2"#,
+    delete_claimed(tx, id, held).await
+}
+
+/// The delete's core: claim the row, compare the stored junction rows with
+/// `held`, and take the junction rows before the blueprint row they
+/// reference — the `NO ACTION` foreign key is checked the moment the final
+/// `DELETE` runs.
+async fn delete_claimed(
+    tx: &mut PgConnection,
+    id: &ClassBlueprintId,
+    held: &[CourseId],
+) -> Result<bool, AppError> {
+    let row = sqlx::query!(
+        r#"SELECT id AS "key: uuid::Uuid" FROM class_blueprint
+           WHERE grade = $1 FOR UPDATE"#,
         id as _,
-        held as _
     )
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(deleted.rows_affected() > 0)
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let mut held = held.to_vec();
+    held.sort_by_key(|course| course.uuid());
+    let stored = junction_courses(&mut *tx, row.key).await?;
+    if stored != held {
+        return Ok(false);
+    }
+    sqlx::query!(r#"DELETE FROM blueprint_course WHERE blueprint = $1"#, row.key)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query!(r#"DELETE FROM class_blueprint WHERE id = $1"#, row.key)
+        .execute(&mut *tx)
+        .await?;
+    Ok(true)
 }
 
 /// The stored course list of one blueprint, read `FOR UPDATE` — the claim
@@ -234,13 +394,16 @@ pub(crate) async fn held_courses_for_update(
     id: &ClassBlueprintId,
 ) -> Result<Option<Vec<CourseId>>, AppError> {
     let row = sqlx::query!(
-        r#"SELECT courses AS "courses: Vec<CourseId>"
-           FROM class_blueprint WHERE grade = $1 FOR UPDATE"#,
-        id as _
+        r#"SELECT id AS "key: uuid::Uuid" FROM class_blueprint
+           WHERE grade = $1 FOR UPDATE"#,
+        id as _,
     )
     .fetch_optional(&mut *tx)
     .await?;
-    Ok(row.map(|row| row.courses))
+    match row {
+        Some(row) => Ok(Some(junction_courses(&mut *tx, row.key).await?)),
+        None => Ok(None),
+    }
 }
 
 /// Every `class_course` row held by any of `classes`, projected down to the
@@ -265,15 +428,15 @@ pub async fn held_links(db: &Database, classes: Vec<ClassGroupId>) -> Result<Vec
 
 /// Drop a course that no longer exists out of a blueprint's list.
 ///
-/// The delete does this itself now: the course's own cascade sweeps
-/// `class_blueprint` in the same transaction that takes the course's
-/// `class_course` links, so a template stops naming a course the instant that
-/// course goes. This used to be the *only* thing that could remove such an id,
-/// and that was the bug: it fires only while walking a section, so a grade
-/// with no sections could never reach it, and the repair every doc surface
-/// pointed at (`PATCH` the list back as it stands) is a `400` for naming a
-/// course that does not exist. A permanent dangling id, and no call that could
-/// clear it.
+/// The delete does this itself now — twice over: the course's own cascade
+/// sweeps `blueprint_course` (the junction row is a foreign key now, so a
+/// template physically cannot keep naming a course whose row is gone) in the
+/// same transaction that takes the course's `class_course` links. This used
+/// to be the *only* thing that could remove such an id, and that was the bug:
+/// it fires only while walking a section, so a grade with no sections could
+/// never reach it, and the repair every doc surface pointed at (`PATCH` the
+/// list back as it stands) is a `400` for naming a course that does not
+/// exist. A permanent dangling id, and no call that could clear it.
 ///
 /// What is left for this to do is the **window** the sweep cannot cover: a
 /// pump walks a snapshot of the list it read, so a course deleted after
@@ -298,9 +461,11 @@ pub async fn prune(
     course: &CourseId,
 ) -> Result<(), AppError> {
     sqlx::query!(
-        r#"UPDATE class_blueprint SET courses = array_remove(courses, $2) WHERE grade = $1"#,
+        r#"DELETE FROM blueprint_course
+           WHERE course = $2
+             AND blueprint = (SELECT id FROM class_blueprint WHERE grade = $1)"#,
         id as _,
-        course as _
+        course as _,
     )
     .execute(db)
     .await?;

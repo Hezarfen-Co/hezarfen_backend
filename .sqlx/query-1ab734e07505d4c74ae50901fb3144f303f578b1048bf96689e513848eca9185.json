@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT course AS \"course: CourseId\", teacher AS \"teacher: UserId\"\n           FROM course_teacher WHERE course = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_teacher",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "teacher: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_teacher",
+            "name": "teacher"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1ab734e07505d4c74ae50901fb3144f303f578b1048bf96689e513848eca9185"
+}

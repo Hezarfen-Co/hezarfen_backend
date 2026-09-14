@@ -1,0 +1,37 @@
+# CI-only runtime image: built from the gnu binary the workflow already
+# compiled and stripped on ubuntu-24.04 — never from source here (a second
+# rust compile blows the runner's disk; the source `Containerfile` stays for
+# laptop `podman compose up --build`).
+#
+# Build context is stage/, populated by CI:
+#   docker build -f deploy/Containerfile.runtime \
+#     -t localhost/hezarfen-backend:$GITHUB_SHA stage/
+# with stage/hezarfen_backend (the binary) and stage/migrations/.
+FROM docker.io/library/debian:trixie-slim
+
+# curl answers the compose healthcheck; ca-certificates for TLS the backend
+# may dial (OTLP endpoints, the AI bridge).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --uid 10001 hezarfen && \
+    mkdir /data && chown hezarfen:hezarfen /data
+
+# Migrations MUST sit beside the binary at /app/hezarfen_backend: the CI
+# runner's CARGO_MANIFEST_DIR does not exist in the image, so the app resolves
+# the schema next to the executable (migrations_path in the source).
+COPY hezarfen_backend /app/hezarfen_backend
+COPY migrations /app/migrations
+
+WORKDIR /app
+USER hezarfen
+
+# DATABASE_URL is deliberately not baked in: compose constructs it in
+# `environment:` from POSTGRES_* (see compose.yaml), which also wins over the
+# operator's env_file.
+ENV HOST=0.0.0.0 \
+    PORT=7656
+
+EXPOSE 7656
+
+ENTRYPOINT ["/app/hezarfen_backend"]
