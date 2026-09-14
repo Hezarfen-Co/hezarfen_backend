@@ -1,9 +1,9 @@
 # The systemd user unit the deploy installs to ~/.config/systemd/user/ and
-# restarts. The release layout: ~/hezarfen/current/hezarfen_backend with
+# restarts. The release layout: ~/hezarfen_backend/current/hezarfen_backend with
 # migrations/ beside the binary (the app resolves the schema there when the
 # compile-time checkout path is absent — see migrations_path in the source).
 #
-# ~/hezarfen/hezarfen.env (0600, written once by hand, never by the deploy)
+# ~/hezarfen_backend/hezarfen_backend.env (0600, written once by hand, never by the deploy)
 # carries the deployment's own values and overrides the Environment= lines
 # below:
 #   DATABASE_URL               required — a Postgres with the control database
@@ -27,13 +27,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/hezarfen/current/hezarfen_backend
-WorkingDirectory=%h/hezarfen/current
+ExecStart=%h/hezarfen_backend/current/hezarfen_backend
+WorkingDirectory=%h/hezarfen_backend/current
 Environment=HOST=127.0.0.1
 Environment=PORT=7656
-Environment=FILES_PATH=%h/hezarfen/data/files
+Environment=FILES_PATH=%h/hezarfen_backend/data/files
 Environment=RUST_LOG=info,hezarfen_backend=debug
-EnvironmentFile=%h/hezarfen/hezarfen.env
+EnvironmentFile=%h/hezarfen_backend/hezarfen_backend.env
 Restart=on-failure
 RestartSec=2
 

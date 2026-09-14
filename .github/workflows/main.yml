@@ -23,7 +23,7 @@
 #     work if this deploys as the same user);
 #   * `loginctl enable-linger <user>` on the server unless the deploy user
 #     already has it (im's does) — user units need a running user manager;
-#   * a Postgres the backend can reach, and ~/hezarfen/hezarfen.env (0600)
+#   * a Postgres the backend can reach, and ~/hezarfen_backend/hezarfen_backend.env (0600)
 #     with at least DATABASE_URL — see deploy/hezarfen.service for the keys.
 
 name: VPS deploy
@@ -56,10 +56,10 @@ env:
   # itself is resolved on the server ($HOME), so switching the deploy user
   # moves the path with it — a baked-in absolute path once kept pointing at
   # the previous user's home and failed the deploy on permissions.
-  DEPLOY_SUBDIR: hezarfen
+  DEPLOY_SUBDIR: hezarfen_backend
   # The unit reads its secrets from this file on the server; the deploy
   # never writes it, only checks it exists and holds DATABASE_URL.
-  ENV_FILE_NAME: hezarfen.env
+  ENV_FILE_NAME: hezarfen_backend.env
   # The Postgres the test suite mints its per-test databases on. Credentials
   # and port match the harness default (HEZARFEN_TEST_DATABASE_URL), so the
   # tests need no extra environment — only the server, with the raised
@@ -260,7 +260,7 @@ jobs:
               ;;
           esac
           deploy_path=$HOME/$1
-          # The deploy path is the service's working tree: hezarfen.env and
+          # The deploy path is the service's working tree: hezarfen_backend.env and
           # data/ live there and are never touched from here. Only 'current'
           # is replaced.
           mkdir -p -- "$deploy_path"
