@@ -1592,7 +1592,7 @@ async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
     let teacher_id = me_id(&app, &teacher).await;
     let course = create_course(&app, &manager, "algebra").await;
 
-    demote_during_writes_to("course", "UPDATE", &teacher_id, &db).await;
+    demote_during_writes_to("course_teacher", "CREATE", &teacher_id, &db).await;
     let res = send(
         &app,
         "POST",

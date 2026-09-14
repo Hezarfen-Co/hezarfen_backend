@@ -73,25 +73,32 @@ pub async fn upsert(
         // submission goes through its homework). `Err(NotFound)` means the
         // homework is gone, which is the 404 the web layer's own lookup
         // would have answered.
-        let was_due = sqlx::query!(
-            // The audience re-checks UNDER the lock: a narrowing PATCH commits
-            // between the web layer's pre-flight read and this write, and a
-            // student the homework no longer names must read as gone — the
-            // same 404 their own lookup answers.
+        let due = sqlx::query!(
             r#"SELECT due_at AS "due_at: Timestamp" FROM homework
-               WHERE id = $1
-                 AND (NOT EXISTS (SELECT 1 FROM homework_assignment a
-                                   WHERE a.homework = homework.id)
-                      OR EXISTS (SELECT 1 FROM homework_assignment a
-                                  WHERE a.homework = homework.id AND a.student = $2))
-               FOR UPDATE"#,
+               WHERE id = $1 FOR UPDATE"#,
             homework_id.uuid(),
-            user.uuid()
         )
         .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| row.due_at);
-        let Some(was_due) = was_due else {
+        .await?;
+        let Some(due) = due else {
+            return Err(AppError::NotFound);
+        };
+        let was_due = due.due_at;
+        // Re-read the audience after the lock: a narrowing PATCH that held
+        // this row may have committed while we waited, and SELECT FOR UPDATE
+        // does not re-evaluate a subquery on another table.
+        let named: bool = sqlx::query_scalar!(
+            r#"SELECT (NOT EXISTS (
+                    SELECT 1 FROM homework_assignment a WHERE a.homework = $1)
+                OR EXISTS (
+                    SELECT 1 FROM homework_assignment a
+                    WHERE a.homework = $1 AND a.student = $2)) AS "named!""#,
+            homework_id.uuid(),
+            user.uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !named {
             return Err(AppError::NotFound);
         };
         // Equal counts as on time, exactly as the deadline has always been

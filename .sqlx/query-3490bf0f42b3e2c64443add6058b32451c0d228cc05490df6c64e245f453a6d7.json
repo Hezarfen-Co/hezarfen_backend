@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (NOT EXISTS (\n                    SELECT 1 FROM homework_assignment a WHERE a.homework = $1)\n                OR EXISTS (\n                    SELECT 1 FROM homework_assignment a\n                    WHERE a.homework = $1 AND a.student = $2)) AS \"named!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "named!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3490bf0f42b3e2c64443add6058b32451c0d228cc05490df6c64e245f453a6d7"
+}

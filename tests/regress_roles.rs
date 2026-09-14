@@ -98,7 +98,11 @@ async fn a_demotion_frees_the_event_seat_nothing_else_could_free() {
     let res = seat(&app, &teacher, &event, &ali_id).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         1
     );
 
@@ -120,7 +124,11 @@ async fn a_demotion_frees_the_event_seat_nothing_else_could_free() {
         "a non-student may hold no signup row"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         0,
         "the seat must be handed back, or the event is full forever"
     );
@@ -173,7 +181,11 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
         "a promotion must not destroy a signup its holder can still free"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         1,
         "…and the seat it holds stays claimed with it"
     );
@@ -193,7 +205,11 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     assert_eq!(rows("SELECT count(*) FROM registration", &db).await, 0);
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         0
     );
 }
@@ -238,7 +254,11 @@ async fn a_demotion_leaves_a_frozen_signup_list_exactly_as_it_stands() {
         "a closed roster must not be rewritten by a role change"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         1,
         "…and its seat stays claimed with it — the row is the seat"
     );
@@ -303,7 +323,11 @@ async fn the_sweep_deletes_an_orphan_signup_instead_of_stranding_it() {
         "an orphan signup must go with the rest — nothing else can ever remove it"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            &db
+        )
+        .await,
         0,
         "and the surviving event still gets its seat back"
     );
@@ -311,7 +335,7 @@ async fn the_sweep_deletes_an_orphan_signup_instead_of_stranding_it() {
 
 /// How many boards list `user` as a participant, read out of the store.
 async fn boards_listing(user: &str, db: &Database) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM board WHERE $1 = ANY(participants)")
+    sqlx::query_scalar("SELECT count(*) FROM board_participant WHERE participant = $1")
         .bind(uuid::Uuid::parse_str(user).expect("a uuid user id"))
         .fetch_one(db)
         .await
@@ -486,7 +510,11 @@ async fn nothing_was_swept(ali_id: &str, db: &Database) {
         "the enrollment must survive a failed cascade"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", db).await,
+        counter(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course",
+            db
+        )
+        .await,
         1,
         "…and so must its seat, or the roster and the count disagree forever"
     );
@@ -501,7 +529,11 @@ async fn nothing_was_swept(ali_id: &str, db: &Database) {
         "the signup must survive a failed cascade"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            db
+        )
+        .await,
         1,
         "…with its seat still claimed"
     );
@@ -546,11 +578,19 @@ async fn the_retry_takes_everything(
     }
     assert_eq!(boards_listing(ali_id, db).await, 0);
     assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", db).await,
+        counter(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course",
+            db
+        )
+        .await,
         0
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", db).await,
+        counter(
+            "SELECT COALESCE(sum(registration_count), 0)::bigint FROM event",
+            db
+        )
+        .await,
         0
     );
     // The seat is usable, which is the whole point of freeing it: the one-seat
@@ -585,7 +625,7 @@ async fn a_failure_late_in_the_cascade_leaves_the_old_role_and_every_grant_stand
     let (app, db) = app_and_db().await;
     let (admin, teacher, ali_id) = a_student_holding_every_grant(&app, &db).await;
 
-    poison("board", "UPDATE", &db).await;
+    poison("board_participant", "DELETE", &db).await;
     let res = send(
         &app,
         "PATCH",
@@ -602,7 +642,7 @@ async fn a_failure_late_in_the_cascade_leaves_the_old_role_and_every_grant_stand
     );
     nothing_was_swept(&ali_id, &db).await;
 
-    unpoison("board", &db).await;
+    unpoison("board_participant", &db).await;
     the_retry_takes_everything(&app, &db, &admin, &teacher, &ali_id).await;
 }
 

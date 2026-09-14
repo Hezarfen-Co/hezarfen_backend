@@ -57,11 +57,11 @@ async fn attached(class: &str, course: &str, db: &Database) -> bool {
         == 1
 }
 
-/// The blueprint key stored on one attachment, or `None` when the row carries
+/// The blueprint id stored on one attachment, or `None` when the row carries
 /// no such key at all — which is the whole provenance rule: absent means a
 /// human attached it.
-async fn source_of(class: &str, course: &str, db: &Database) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
+async fn source_of(class: &str, course: &str, db: &Database) -> Option<uuid::Uuid> {
+    sqlx::query_scalar::<_, Option<uuid::Uuid>>(
         "SELECT source FROM class_course WHERE class = $1 AND course = $2",
     )
     .bind(uuid::Uuid::parse_str(class).expect("a uuid class id"))
@@ -69,6 +69,14 @@ async fn source_of(class: &str, course: &str, db: &Database) -> Option<String> {
     .fetch_one(db)
     .await
     .unwrap()
+}
+
+async fn blueprint_id(grade: &str, db: &Database) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM class_blueprint WHERE grade = $1")
+        .bind(grade)
+        .fetch_one(db)
+        .await
+        .unwrap()
 }
 
 /// Does that grade's template still name that course, in the store?
@@ -306,7 +314,7 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
         assert!(attached(&class, course, &db).await);
         assert_eq!(
             source_of(&class, course, &db).await,
-            Some("9".to_string()),
+            Some(blueprint_id("9", &db).await),
             "the blueprint must own what it attached"
         );
         assert_eq!(
@@ -323,8 +331,7 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
         );
     }
     assert_eq!(
-        count_on("class_course_count", "class_group", &class, &db)
-        .await,
+        count_on("class_course_count", "class_group", &class, &db).await,
         2
     );
 
@@ -400,13 +407,12 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         assert!(attached(&class, course, &db).await, "{course} is attached");
         assert_eq!(
             source_of(&class, course, &db).await,
-            Some("9".to_string()),
+            Some(blueprint_id("9", &db).await),
             "the blueprint must own what a create attached, exactly as a pump does"
         );
     }
     assert_eq!(
-        count_on("class_course_count", "class_group", &class, &db)
-        .await,
+        count_on("class_course_count", "class_group", &class, &db).await,
         2
     );
 
@@ -445,13 +451,11 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         assert!(skips(&res).is_empty(), "{:?}", res.body);
         let bare = res.body["class"]["id"].as_str().unwrap();
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM class_course WHERE class = $1",
-            )
-            .bind(uuid::Uuid::parse_str(bare).expect("a uuid class id"))
-            .fetch_one(&db)
-            .await
-            .unwrap(),
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM class_course WHERE class = $1",)
+                .bind(uuid::Uuid::parse_str(bare).expect("a uuid class id"))
+                .fetch_one(&db)
+                .await
+                .unwrap(),
             0,
             "nothing may be attached to a section no template reached"
         );
@@ -608,19 +612,16 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
     // grade.
     for class in [&a, &b] {
         assert_eq!(
-            count_on("class_course_count", "class_group", class, &db)
-            .await,
+            count_on("class_course_count", "class_group", class, &db).await,
             1
         );
     }
     assert_eq!(
-        count_on("class_course_count", "class_group", &ten, &db)
-        .await,
+        count_on("class_course_count", "class_group", &ten, &db).await,
         0
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db)
-        .await,
+        count_on("enrollment_count", "course", &algebra, &db).await,
         1,
         "one student at the grade, one seat"
     );
@@ -681,13 +682,11 @@ async fn a_class_that_does_not_fit_is_reported_not_aborted() {
     // Nothing moved on the skipped class: not its attachment counter, and not
     // one of the seats the refused attach touched on its way to the refusal.
     assert_eq!(
-        count_on("class_course_count", "class_group", &full, &db)
-        .await,
+        count_on("class_course_count", "class_group", &full, &db).await,
         0
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &tight, &db)
-        .await,
+        count_on("enrollment_count", "course", &tight, &db).await,
         0,
         "the empty class took no seat, and the refused one gave every seat back"
     );
@@ -814,7 +813,10 @@ async fn a_removal_spares_a_hand_attached_course() {
         None,
         "a pump may not adopt an attachment it did not make"
     );
-    assert_eq!(source_of(&pumped, &algebra, &db).await, Some("9".into()));
+    assert_eq!(
+        source_of(&pumped, &algebra, &db).await,
+        Some(blueprint_id("9", &db).await),
+    );
 
     // Drop it from the template.
     let patched = send(
@@ -836,14 +838,12 @@ async fn a_removal_spares_a_hand_attached_course() {
         "…and nothing else — a hand attach survives"
     );
     assert_eq!(
-        count_on("class_course_count", "class_group", &pumped, &db)
-        .await,
+        count_on("class_course_count", "class_group", &pumped, &db).await,
         0,
         "the detach gives the class its count back"
     );
     assert_eq!(
-        count_on("class_course_count", "class_group", &byhand, &db)
-        .await,
+        count_on("class_course_count", "class_group", &byhand, &db).await,
         1
     );
     assert_eq!(
@@ -856,8 +856,7 @@ async fn a_removal_spares_a_hand_attached_course() {
         "the enrollments the blueprint pumped go with it"
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db)
-        .await,
+        count_on("enrollment_count", "course", &algebra, &db).await,
         1,
         "the hand-attached class keeps its student's seat"
     );
@@ -939,8 +938,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
         "a pre-migration row is hand-attached and unreachable by any blueprint sweep"
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db)
-        .await,
+        count_on("enrollment_count", "course", &algebra, &db).await,
         1
     );
 }
@@ -996,8 +994,10 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     // The stranded state: the link row committed, the blueprint it names did
     // not survive. Real FKs refuse that state, so it is written with FK
     // triggers suspended — the manager id is real, the `source` FK is the one
-    // the strand consists of.
+    // the strand consists of. Capture the uuid before the delete: the grade
+    // label is UNIQUE, not the FK.
     let manager_id = UserId::from_key(&me_id(&app, &manager).await);
+    let stranded = blueprint_id("9", &db).await;
     let mut tx = db.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
         .execute(&mut *tx)
@@ -1009,12 +1009,13 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
         .unwrap();
     sqlx::query(
         "INSERT INTO class_course (class, course, attached_by, attached_at, source) \
-         VALUES ($1, $2, $3, $4, '9')",
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
     .bind(CourseId::from_key(&algebra))
     .bind(manager_id)
     .bind(Timestamp::now().as_millis())
+    .bind(stranded)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -1035,7 +1036,7 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
         "the link stands after its blueprint was gone: this is the stranded \
          row, tagged with a record no sweep can ever reach"
     );
-    assert_eq!(source_of(&class, &algebra, &db).await, Some("9".into()));
+    assert_eq!(source_of(&class, &algebra, &db).await, Some(stranded));
 
     // The documented recovery: a human detaches it one course at a time, and
     // the counters come back exact.
@@ -1055,8 +1056,7 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     );
     assert!(!attached(&class, &algebra, &db).await);
     assert_eq!(
-        count_on("class_course_count", "class_group", &class, &db)
-        .await,
+        count_on("class_course_count", "class_group", &class, &db).await,
         0,
         "a stranded row still releases its counter when it is detached"
     );
@@ -1479,8 +1479,7 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
         "…enrollments and all"
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &history, &db)
-        .await,
+        count_on("enrollment_count", "course", &history, &db).await,
         0,
         "…with the seat given back"
     );
