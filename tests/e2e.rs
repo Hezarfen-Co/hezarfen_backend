@@ -2591,15 +2591,24 @@ async fn a_parent_cannot_enter_the_room_or_draw() {
         .unwrap();
     // Beside `veli`, who stays: the two differ only by role, so the refusal
     // below cannot be blamed on the roster.
-    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
-        .bind(vec![
-            Uuid::parse_str(&room.veli_id).unwrap(),
-            Uuid::parse_str(me["id"].as_str().unwrap()).unwrap(),
-        ])
-        .bind(Uuid::parse_str(board).unwrap())
+    let board_uuid = Uuid::parse_str(board).unwrap();
+    sqlx::query("DELETE FROM board_participant WHERE board = $1")
+        .bind(board_uuid)
         .execute(&room.db)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO board_participant (board, participant)
+         SELECT $1, t.x FROM unnest($2::uuid[]) AS t(x)",
+    )
+    .bind(board_uuid)
+    .bind(vec![
+        Uuid::parse_str(&room.veli_id).unwrap(),
+        Uuid::parse_str(me["id"].as_str().unwrap()).unwrap(),
+    ])
+    .execute(&room.db)
+    .await
+    .unwrap();
 
     assert_eq!(
         board_open(base, board, Some(&cookie)).await.err(),
@@ -2642,8 +2651,7 @@ async fn a_removed_participant_can_no_longer_draw() {
 
     // The silent removal first: write the roster straight into the database,
     // so no frame is published and only the per-stroke gate can catch it.
-    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
-        .bind(Vec::<Uuid>::new())
+    sqlx::query("DELETE FROM board_participant WHERE board = $1")
         .bind(Uuid::parse_str(board).unwrap())
         .execute(&room.db)
         .await

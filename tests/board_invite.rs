@@ -328,17 +328,24 @@ async fn an_over_cap_invite_is_refused_whole_and_changes_nothing() {
 
     // Fill the roster to the brim directly: reaching the cap through the API
     // would mean registering two hundred accounts to prove an arithmetic guard.
-    // The ids need not resolve — the roster is only repaired at boot, and the
-    // guard under test counts entries.
-    let full: Vec<_> = (0..MAX_BOARD_PARTICIPANTS)
-        .map(|_| UserId::generate())
-        .collect();
-    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
-        .bind(&full)
-        .bind(BoardId::from_key(&board))
-        .execute(&db)
-        .await
-        .unwrap();
+    // Participants FK to app_user, so the rows are minted here in one statement.
+    let board_id = BoardId::from_key(&board);
+    sqlx::query(
+        "WITH u AS (
+            INSERT INTO app_user (id, username, created_at, role)
+            SELECT gen_random_uuid(), 'bcap-' || $1::text || '-' || g::text, 0, 'student'
+            FROM generate_series(1, $2) AS g
+            RETURNING id
+         )
+         INSERT INTO board_participant (board, participant)
+         SELECT $3, id FROM u",
+    )
+    .bind(board_id.uuid())
+    .bind(MAX_BOARD_PARTICIPANTS as i32)
+    .bind(board_id.uuid())
+    .execute(&db)
+    .await
+    .unwrap();
     let before = roster(&app, &teacher, &board).await;
     assert_eq!(before.len(), MAX_BOARD_PARTICIPANTS);
 
@@ -493,18 +500,9 @@ async fn an_unknown_source_is_a_400_and_not_the_boards_404() {
     let board = a_board(&app, &teacher).await;
 
     for (source, field) in [
-        (
-            json!({"kind": "class", "class": ABSENT_ID}),
-            "class",
-        ),
-        (
-            json!({"kind": "course", "course": ABSENT_ID}),
-            "course",
-        ),
-        (
-            json!({"kind": "event", "event": ABSENT_ID}),
-            "event",
-        ),
+        (json!({"kind": "class", "class": ABSENT_ID}), "class"),
+        (json!({"kind": "course", "course": ABSENT_ID}), "course"),
+        (json!({"kind": "event", "event": ABSENT_ID}), "event"),
     ] {
         let res = invite(&app, &teacher, &board, source).await;
         assert_eq!(

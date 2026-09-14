@@ -425,8 +425,9 @@ mod tests {
 
         let locked = set_locked(&db, &board, true, &creator).await.unwrap();
         assert!(locked.is_locked());
-
-        let roster = vec![UserId::generate()];
+        let member =
+            crate::db::class_member::tests::fixture_user(&db, "board-member").await;
+        let roster = vec![member];
         let re_rostered = set_participants(&db, &board, roster).await.unwrap();
         assert_eq!(re_rostered.get_participants().len(), 1);
 

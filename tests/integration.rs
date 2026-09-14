@@ -25220,12 +25220,21 @@ async fn a_parent_gets_no_whiteboard_at_all() {
     // 3. The stale row: a parent already on a roster, written before this rule.
     //    Every id-scoped route must still answer exactly like a board that was
     //    never minted — a 403 anywhere here leaks the board's existence.
-    sqlx::query("UPDATE board SET participants = $2 WHERE id = $1")
-        .bind(Uuid::parse_str(&board).expect("board id"))
-        .bind(vec![Uuid::parse_str(&anne_id).expect("user id")])
+    let board_uuid = Uuid::parse_str(&board).expect("board id");
+    sqlx::query("DELETE FROM board_participant WHERE board = $1")
+        .bind(board_uuid)
         .execute(&db)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO board_participant (board, participant)
+         SELECT $1, t.x FROM unnest($2::uuid[]) AS t(x)",
+    )
+    .bind(board_uuid)
+    .bind(vec![Uuid::parse_str(&anne_id).expect("user id")])
+    .execute(&db)
+    .await
+    .unwrap();
     let ghost = board_routes("nosuchboard");
     for (n, (method, uri, body)) in board_routes(&board).into_iter().enumerate() {
         let res = send(&app, method, &uri, Some(&anne), body).await;
