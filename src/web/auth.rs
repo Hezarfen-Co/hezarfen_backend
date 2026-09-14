@@ -99,7 +99,7 @@ struct SchoolChoiceResponse {
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 enum LoginResponse {
-    LoggedIn(UserResponse),
+    LoggedIn(Box<UserResponse>),
     ChooseSchool(SchoolChoiceResponse),
 }
 
@@ -296,7 +296,7 @@ async fn login(
             );
             Ok((
                 jar.add(cookie),
-                Json(LoginResponse::LoggedIn(UserResponse::new(&user))),
+                Json(LoginResponse::LoggedIn(Box::new(UserResponse::new(&user)))),
             ))
         }
         many => {

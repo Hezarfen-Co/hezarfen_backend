@@ -233,7 +233,7 @@ pub async fn login_as_school(
     // The account is a person: if `username` already belongs to another
     // school, login answers a choice list and never names a school — bind
     // the school this helper was called for.
-    let cookie = if res.body["schools"].is_array() {
+    if res.body["schools"].is_array() {
         let selected = send(
             app,
             "POST",
@@ -251,8 +251,7 @@ pub async fn login_as_school(
         selected.cookie.expect("school cookie after selection")
     } else {
         res.cookie.expect("session cookie set on login")
-    };
-    cookie
+    }
 }
 
 /// Send one request through `app`. `cookie` is a raw `Cookie` header value.
