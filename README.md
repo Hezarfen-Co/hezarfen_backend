@@ -214,7 +214,7 @@ cp .env.example .env      # recommended: DATABASE_URL feeds the build too
 cargo run
 ```
 
-Boots on `http://127.0.0.1:8080`, talking to PostgreSQL at `DATABASE_URL`
+Boots on `http://127.0.0.1:7656`, talking to PostgreSQL at `DATABASE_URL`
 (default `postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control` —
 the control database) and storing uploaded note files in `./data/files/`
 (`FILES_PATH`, created at startup). `DATABASE_URL` is also read by sqlx's
@@ -230,7 +230,7 @@ the same way at mint. Interactive API docs (Swagger UI) are served at
 ## Run in a container (podman)
 
 ```sh
-podman compose up -d --build   # build + start, http://127.0.0.1:8080
+podman compose up -d --build   # build + start, http://127.0.0.1:7656
 podman compose logs -f backend
 podman compose down            # stop (data survives in the volume)
 ```
@@ -287,7 +287,7 @@ Without compose:
 
 ```sh
 podman build -t hezarfen-backend .
-podman run -d --name hezarfen -p 8080:8080 -v hezarfen-data:/data hezarfen-backend
+podman run -d --name hezarfen -p 7656:7656 -v hezarfen-data:/data hezarfen-backend
 ```
 
 ## Multi-school (SaaS)
@@ -3647,7 +3647,7 @@ non-empty and contain none of `/ \ ? # %`.
 ## Quick tour (curl)
 
 ```sh
-BASE=http://127.0.0.1:8080
+BASE=http://127.0.0.1:7656
 JAR=/tmp/hz.cookies
 
 # SCHOOL is the slug a builder gave this school (see "Multi-school (SaaS)").

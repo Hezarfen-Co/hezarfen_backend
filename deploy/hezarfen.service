@@ -18,7 +18,7 @@
 #   TRUST_PROXY=true           client IPs from X-Forwarded-For behind a proxy
 #
 # The service binds loopback only by default — terminate TLS on a reverse
-# proxy and forward to 127.0.0.1:8080.
+# proxy and forward to 127.0.0.1:7656.
 
 [Unit]
 Description=Hezarfen backend (school management API)
@@ -30,7 +30,7 @@ Type=simple
 ExecStart=%h/hezarfen/current/hezarfen_backend
 WorkingDirectory=%h/hezarfen/current
 Environment=HOST=127.0.0.1
-Environment=PORT=8080
+Environment=PORT=7656
 Environment=FILES_PATH=%h/hezarfen/data/files
 Environment=RUST_LOG=info,hezarfen_backend=debug
 EnvironmentFile=%h/hezarfen/hezarfen.env

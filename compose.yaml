@@ -28,12 +28,12 @@ services:
     image: localhost/hezarfen-backend:latest
     container_name: hezarfen-backend
     ports:
-      - "8080:8080"
+      - "7656:7656"
       # AI bridge (QUIC = UDP). Paired with AI_QUIC_ADDR below.
       - "8090:8090/udp"
     environment:
       HOST: 0.0.0.0
-      PORT: "8080"
+      PORT: "7656"
       # The control database: the school registry + the builder accounts. Each
       # school lives in a Postgres database of its own, named from its slug.
       DATABASE_URL: postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control
@@ -78,7 +78,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7656/"]
       interval: 30s
       timeout: 5s
       retries: 3

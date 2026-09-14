@@ -42,9 +42,9 @@ USER hezarfen
 # HOST must be 0.0.0.0 so the port mapping can reach the listener. DATABASE_URL
 # points at the compose Postgres (the control database); /data holds uploads.
 ENV HOST=0.0.0.0 \
-    PORT=8080 \
+    PORT=7656 \
     DATABASE_URL=postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control
 
-EXPOSE 8080
+EXPOSE 7656
 
 ENTRYPOINT ["/usr/local/bin/hezarfen_backend"]

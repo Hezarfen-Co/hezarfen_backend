@@ -298,9 +298,9 @@ jobs:
             echo "no DATABASE_URL in $env_file" >&2
             exit 1
           fi
-          # The unit defaults to 8080; the env file may override.
+          # The unit defaults to 7656; the env file may override.
           port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
-          port=${port:-8080}
+          port=${port:-7656}
           mkdir -p -- "$deploy_path/data/files"
           chmod +x -- "$deploy_path/current.new/hezarfen_backend"
           rm -rf -- "$deploy_path/current.previous"
@@ -365,7 +365,7 @@ jobs:
           env_file=$deploy_path/$3
           export XDG_RUNTIME_DIR=/run/user/$(id -u)
           port=$(sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' "$env_file" | tail -n1)
-          port=${port:-8080}
+          port=${port:-7656}
           pid=$(systemctl --user show -p MainPID --value "$service")
           exe=$(readlink "/proc/$pid/exe")
           [ "$exe" = "$deploy_path/current/hezarfen_backend" ] || {

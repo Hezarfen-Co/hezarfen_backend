@@ -149,9 +149,9 @@ fn parse_timeout(value: Option<String>, default: u64) -> u64 {
     asked
 }
 
-/// Parse the `PORT` value, falling back to 8080 when unset or unparseable.
+/// Parse the `PORT` value, falling back to 7656 when unset or unparseable.
 fn parse_port(value: Option<String>) -> u16 {
-    value.and_then(|p| p.parse().ok()).unwrap_or(8080)
+    value.and_then(|p| p.parse().ok()).unwrap_or(7656)
 }
 
 /// Parse a boolean toggle: `1` / `true` / `yes` / `on` (any case, trimmed) are
@@ -223,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn defaults_when_absent() {
-        assert_eq!(parse_port(None), 8080);
+        assert_eq!(parse_port(None), 7656);
     }
 
     #[tokio::test]
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_on_garbage() {
-        assert_eq!(parse_port(Some("not-a-port".into())), 8080);
-        assert_eq!(parse_port(Some(String::new())), 8080);
+        assert_eq!(parse_port(Some("not-a-port".into())), 7656);
+        assert_eq!(parse_port(Some(String::new())), 7656);
     }
 }
