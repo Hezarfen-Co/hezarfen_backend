@@ -286,11 +286,12 @@ set on the service (`admin@hezarfen.local` / `Hezarfen_dev1!` for local dev —
 OpenObserve rejects a weaker password at boot). Retention is per stream in
 days, defaulted globally to 90 by `ZO_COMPACT_DATA_RETENTION_DAYS`. Traces,
 metrics and logs start landing when the backend's environment carries
-`OTEL_EXPORTER_OTLP_ENDPOINT` (`http://openobserve:5081`) and
-`OTEL_EXPORTER_OTLP_HEADERS` (`Authorization=Basic <base64 email:password>`
-plus `organization=default,stream-name=default`) — those keys belong in the
-env file (production: `hezarfen_backend.env`; locally: an optional file of
-the same name beside `compose.yaml`), never in `compose.yaml` itself, where
+`OTEL_EXPORTER_OTLP_ENDPOINT` (`http://openobserve:5081`) — auth is minted
+from the same `ZO_ROOT_USER_EMAIL` / `ZO_ROOT_USER_PASSWORD` the OpenObserve
+container already has, so there is no hand-rolled base64 header. Set
+`OTEL_EXPORTER_OTLP_HEADERS` only for a different collector. Those keys belong
+in the env file (production: `hezarfen_backend.env`; locally: an optional file
+of the same name beside `compose.yaml`), never in `compose.yaml` itself, where
 an empty OTEL value would switch export on and fail the boot. The OTLP/HTTP
 variant (`http://openobserve:5080/api/default` with
 `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`) is the alternative.

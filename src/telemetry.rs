@@ -19,6 +19,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use base64::Engine;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
@@ -340,6 +341,10 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
             publish(Metrics::new()),
         ));
     };
+    // SDK reads OTEL_EXPORTER_OTLP_HEADERS itself. If the operator left it
+    // unset, mint HTTP Basic from the same ZO_ROOT_USER_* the OpenObserve
+    // container already has — no hand-rolled base64 in the env file.
+    fill_otlp_headers_from_zo();
 
     let resource = resource();
     let protocol = Protocol::from_env()?;
@@ -516,6 +521,39 @@ impl Protocol {
         })
     }
 }
+/// When `OTEL_EXPORTER_OTLP_HEADERS` is unset, mint OpenObserve's gRPC Basic
+/// header from `ZO_ROOT_USER_EMAIL` / `ZO_ROOT_USER_PASSWORD`. An explicit
+/// headers value always wins (a different collector, a hand-set token).
+fn fill_otlp_headers_from_zo() {
+    if env_present("OTEL_EXPORTER_OTLP_HEADERS") {
+        return;
+    }
+    let Some(email) = env_nonempty("ZO_ROOT_USER_EMAIL") else {
+        return;
+    };
+    let Some(password) = env_nonempty("ZO_ROOT_USER_PASSWORD") else {
+        return;
+    };
+    let headers = openobserve_otlp_headers(&email, &password);
+    // SAFETY: `init` runs once from `main` before any exporter is built.
+    // The SDK reads this key on the next lines; no other thread has.
+    unsafe {
+        std::env::set_var("OTEL_EXPORTER_OTLP_HEADERS", headers);
+    }
+}
+
+fn env_present(key: &str) -> bool {
+    env_nonempty(key).is_some()
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn openobserve_otlp_headers(email: &str, password: &str) -> String {
+    let token = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{password}"));
+    format!("Authorization=Basic {token},organization=default,stream-name=default")
+}
 
 /// What every exported signal says it came from. `OTEL_SERVICE_NAME` wins when
 /// set (the SDK's own default detector reads it); `DEPLOY_ENV` names the
@@ -545,7 +583,7 @@ mod tests {
     use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
     use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
 
-    use super::{LogFormat, StampTimestamp, TelemetryError};
+    use super::{LogFormat, StampTimestamp, TelemetryError, openobserve_otlp_headers};
 
     #[tokio::test]
     async fn log_format_parses_the_two_spellings_and_rejects_the_rest() {
@@ -589,5 +627,15 @@ mod tests {
         // Not 1970, and not a freshly invented clock read either.
         assert!(exported.timestamp().is_some());
         assert_eq!(exported.timestamp(), exported.observed_timestamp());
+    }
+
+    #[test]
+    fn openobserve_headers_are_basic_auth_of_email_and_password() {
+        // The pair compose.yaml used as local-dev OpenObserve credentials;
+        // the encoded value is what a collector would have accepted then.
+        assert_eq!(
+            openobserve_otlp_headers("admin@hezarfen.local", "Hezarfen_dev1!"),
+            "Authorization=Basic YWRtaW5AaGV6YXJmZW4ubG9jYWw6SGV6YXJmZW5fZGV2MSE=,organization=default,stream-name=default"
+        );
     }
 }
