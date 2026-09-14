@@ -204,8 +204,8 @@ mod tests {
         // The stint's owner is a foreign key now: a real `app_user` row.
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, 'work-fixture', 'x')",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, 'work-fixture', 0)",
         )
         .bind(user.uuid())
         .execute(&db)

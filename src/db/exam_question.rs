@@ -450,8 +450,8 @@ mod tests {
             // the fixture's fixed key.
             let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
             sqlx::query(
-                "INSERT INTO app_user (id, username, password_hash) \
-                 VALUES ($1, 'acdc-fixture', 'x')",
+                "INSERT INTO app_user (id, username, created_at) \
+                 VALUES ($1, 'acdc-fixture', 0)",
             )
             .bind(creator.uuid())
             .execute(db)
@@ -547,15 +547,10 @@ mod tests {
             // A real user row: starting a sitting moves that student's badge
             // counter in the same transaction, and an `UPDATE` has nothing to
             // write to without one.
-            let hash = crate::domain::user::Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap();
             let student = crate::db::user::create(
                 &db,
                 crate::domain::user::Username::try_new("ogrenci").unwrap(),
-                hash,
+                None,
             )
             .await
             .unwrap();

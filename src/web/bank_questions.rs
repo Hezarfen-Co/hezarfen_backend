@@ -923,16 +923,11 @@ mod tests {
     use super::*;
     use crate::database::{Database, init_test_db};
     use crate::domain::role::Role;
-    use crate::domain::user::{Password, Username};
+    use crate::domain::user::Username;
 
     /// A user at `role`, minted through the real create path.
     async fn user(username: &str, role: Role, db: &Database) -> User {
-        let hash = Password::try_new("secret1")
-            .unwrap()
-            .hash_async()
-            .await
-            .unwrap();
-        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
+        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), None)
             .await
             .unwrap();
         crate::service::user::set_role(db, user.get_id(), role)

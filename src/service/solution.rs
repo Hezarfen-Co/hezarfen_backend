@@ -57,24 +57,35 @@ pub async fn set_body(
     solution::set_body(db, id, body).await
 }
 
-/// Point the solution at a freshly written image blob; the *before* row names
-/// the replaced blob the caller must remove.
+/// Point the solution at a freshly written image blob; `None` means the row
+/// was deleted mid-flight (the fresh blob is the caller's orphan to take
+/// back off disk). `Some(replaced)` names the blob this upload displaced —
+/// the caller's to remove.
 pub async fn set_image(
     db: &Database,
     id: &SolutionId,
     file: &str,
     content_type: &FileContentType,
     size: i64,
-) -> Result<Option<Solution>, AppError> {
+) -> Result<Option<Option<String>>, AppError> {
     solution::set_image(db, id, file, content_type, size).await
 }
 
-/// Detach the solution's image; the *before* row names the blob the caller
-/// must remove.
-pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Solution>, AppError> {
+/// Detach the solution's image; `None` means the row was deleted mid-flight.
+/// `Some(detached)` names the removed blob — `None` inside when there was no
+/// image.
+pub async fn clear_image(
+    db: &Database,
+    id: &SolutionId,
+) -> Result<Option<Option<String>>, AppError> {
     solution::clear_image(db, id).await
 }
 
-pub async fn delete(db: &Database, target: Solution) -> Result<Solution, AppError> {
+/// Delete a solution; the pair carries the row and the blob name of the
+/// photo it carried (the caller's disk-GC list). `None` = already gone.
+pub async fn delete(
+    db: &Database,
+    target: Solution,
+) -> Result<Option<(Solution, Option<String>)>, AppError> {
     solution::delete(db, target).await
 }

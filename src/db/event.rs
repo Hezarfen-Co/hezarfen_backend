@@ -296,8 +296,8 @@ mod tests {
     async fn a_person(db: &Database, label: &str) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(user.uuid())
         .bind(format!("{label}-{}", &user.key()[30..]))

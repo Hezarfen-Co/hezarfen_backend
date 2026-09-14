@@ -100,9 +100,8 @@ pub async fn delete_sessions_by_person(
     person::delete_sessions_by_person(control, person).await
 }
 
-/// The school-user password writes mirror the person credential: login reads
-/// `person.password_hash` and nothing else, so a reset that moved only the
-/// school row would reset nothing.
+/// Move the credential — the one login reads. The school-side row carries no
+/// password at all, so this is the whole credential move.
 pub async fn set_password_hash(
     control: &Database,
     username: &Username,

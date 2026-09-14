@@ -537,8 +537,8 @@ mod tests {
         // (the subject's own fixture path mints one) and a real teacher.
         let teacher = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(teacher.uuid())
         .bind(format!("homework-fixture-{}", &teacher.key()[30..]))

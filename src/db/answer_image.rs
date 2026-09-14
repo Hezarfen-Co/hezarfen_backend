@@ -243,7 +243,7 @@ mod tests {
     /// foreign key now.
     async fn a_student(db: &Database) -> UserId {
         let user = UserId::from_key("019732e3-7b00-7000-8000-00000000a11a");
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'a11a', 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, 'a11a', 0)")
             .bind(user.uuid())
             .execute(db)
             .await
@@ -327,7 +327,7 @@ mod tests {
 
         // Another student's drawing for the same question/sitting is its own row.
         let other = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'b22b', 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, 'b22b', 0)")
             .bind(other.uuid())
             .execute(&db)
             .await

@@ -446,8 +446,8 @@ mod tests {
         // The creator is a foreign key now: a real `app_user` row under the
         // fixture's fixed key.
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, 'acdc-fixture', 'x') ON CONFLICT DO NOTHING",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, 'acdc-fixture', 0) ON CONFLICT DO NOTHING",
         )
         .bind(creator.uuid())
         .execute(db)
@@ -513,15 +513,10 @@ mod tests {
     /// A real user row: the sitting counter lives on it, and the claim that
     /// rides the attempt's create has nothing to write to without one.
     async fn student(db: &Database) -> UserId {
-        let hash = crate::domain::user::Password::try_new("secret1")
-            .unwrap()
-            .hash_async()
-            .await
-            .unwrap();
         *crate::db::user::create(
             db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
-            hash,
+            None,
         )
         .await
         .unwrap()

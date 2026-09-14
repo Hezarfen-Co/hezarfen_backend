@@ -242,6 +242,10 @@ fn refusal_of<T>(early: Early) -> Attached<T> {
 ///    is the weakest strength that blocks the delete, so two sourced attaches
 ///    still run concurrently, exactly as they did under the old shared read
 ///    lease.
+///
+///    The same locked read resolves the surrogate `id` the link row will
+///    store: the stored tag is that uuid, not the grade label the API
+///    speaks, and it rides out of this gate to the insert below.
 /// 3. **Pivot** — the member axis takes the [`cap` role-claim
 ///    recipe](crate::db::cap)'s `FOR NO KEY UPDATE` handshake on the user row:
 ///    a role change away from `student` sweeps this membership, and demotion
@@ -258,7 +262,7 @@ async fn early_verdicts(
     axis: Axis,
     pivot: Pivot<'_>,
     source: Option<&ClassBlueprintId>,
-) -> Result<Option<Early>, AppError> {
+) -> Result<(Option<Early>, Option<uuid::Uuid>), AppError> {
     let held = match pivot {
         Pivot::User(user) => sqlx::query_scalar!(
             r#"SELECT 1 AS "one" FROM class_member WHERE class = $1 AND app_user = $2"#,
@@ -278,19 +282,23 @@ async fn early_verdicts(
         .is_some(),
     };
     if held {
-        return Ok(Some(Early::Duplicate));
+        return Ok((Some(Early::Duplicate), None));
     }
+    // The lock and the resolution are one read: the stored `source` is the
+    // blueprint's surrogate uuid, and the row this read returns it from is
+    // the very row the KEY SHARE lock holds against the blueprint's delete.
+    let mut source_id = None;
     if let Some(source) = source {
-        let alive = sqlx::query_scalar!(
-            r#"SELECT 1 AS "one" FROM class_blueprint WHERE grade = $1 FOR KEY SHARE"#,
+        let locked = sqlx::query_scalar!(
+            r#"SELECT id FROM class_blueprint WHERE grade = $1 FOR KEY SHARE"#,
             source as _
         )
         .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !alive {
-            return Ok(Some(Early::SourceGone));
-        }
+        .await?;
+        let Some(id) = locked else {
+            return Ok((Some(Early::SourceGone), None));
+        };
+        source_id = Some(id);
     }
     match pivot {
         Pivot::User(user) => {
@@ -301,7 +309,7 @@ async fn early_verdicts(
             .fetch_optional(&mut *tx)
             .await?;
             if row.map(|row| row.role) != Some(Role::Student) {
-                return Ok(Some(Early::PivotGone));
+                return Ok((Some(Early::PivotGone), None));
             }
         }
         Pivot::Course(course) => {
@@ -313,7 +321,7 @@ async fn early_verdicts(
             .await?
             .is_some();
             if !alive {
-                return Ok(Some(Early::PivotGone));
+                return Ok((Some(Early::PivotGone), None));
             }
         }
     }
@@ -339,7 +347,7 @@ async fn early_verdicts(
         .await?
         .is_some(),
     };
-    Ok(over.then_some(Early::Overloaded))
+    Ok((over.then_some(Early::Overloaded), source_id))
 }
 
 /// Write the member link and enroll the student into every course the class is
@@ -368,9 +376,9 @@ pub(crate) async fn add_member(
     let class = class.clone();
     let (user, by) = (*user, *by);
     let outcome = tx_with_retry(db, false, async move |tx| {
-        if let Some(early) =
-            early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?
-        {
+        let (early, _) =
+            early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?;
+        if let Some(early) = early {
             return Ok(refusal_of(early));
         }
         // The claim and the link are one statement (the cap recipe's CTE): the
@@ -463,15 +471,15 @@ pub(crate) async fn attach_course(
     let by = *by;
     let source = source.cloned();
     let outcome = tx_with_retry(db, false, async move |tx| {
-        if let Some(early) = early_verdicts(
+        let (early, source_id) = early_verdicts(
             tx,
             &class,
             Axis::Course,
             Pivot::Course(&course),
             source.as_ref(),
         )
-        .await?
-        {
+        .await?;
+        if let Some(early) = early {
             return Ok(refusal_of(early));
         }
         let inserted = match sqlx::query_scalar!(
@@ -487,7 +495,7 @@ pub(crate) async fn attach_course(
             course as _,
             by as _,
             attached_at as _,
-            source as _
+            source_id,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -577,6 +585,7 @@ async fn enroll_pairs(
     pairs: impl Iterator<Item = (uuid::Uuid, uuid::Uuid)>,
     by: &UserId,
 ) -> Result<(), AppError> {
+    let now = Timestamp::now();
     for (course, user) in pairs {
         let held = sqlx::query_scalar!(
             r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
@@ -610,14 +619,15 @@ async fn enroll_pairs(
             return Err(AppError::Internal(format!("{COURSE_FULL_MARK}{course}")));
         }
         let wrote = sqlx::query_scalar!(
-            r#"INSERT INTO enrollment (course, app_user, enrolled_by, source)
-               VALUES ($1, $2, $3, $4)
+            r#"INSERT INTO enrollment (course, app_user, enrolled_by, source, created_at)
+               VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (course, app_user) DO NOTHING
                RETURNING 1 AS "one""#,
             course,
             user,
             by as _,
-            class as _
+            class as _,
+            now.as_millis()
         )
         .fetch_optional(&mut *tx)
         .await;
@@ -757,7 +767,8 @@ pub(crate) async fn detach_course(
         let gone = match &source {
             Some(source) => {
                 sqlx::query_scalar!(
-                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2 AND source = $3
+                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2
+                         AND source = (SELECT id FROM class_blueprint WHERE grade = $3)
                        RETURNING 1 AS "one""#,
                     class as _,
                     course as _,

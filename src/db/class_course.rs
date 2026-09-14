@@ -49,8 +49,17 @@ pub async fn list_for_class(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ClassCourse>, i64), AppError> {
+    // The stored `source` is the blueprint's surrogate uuid; the domain row
+    // speaks the grade label, so the projection joins it back (a hand attach,
+    // source NULL, survives the LEFT JOIN as NULL).
     PagedList::new(
-        format!("{CLASS_COURSE_TABLE} WHERE class = $1"),
+        format!(
+            "(SELECT cc.class, cc.course, cc.attached_by, cc.attached_at, \
+             b.grade AS source \
+             FROM {CLASS_COURSE_TABLE} cc \
+             LEFT JOIN class_blueprint b ON b.id = cc.source) \
+             AS {CLASS_COURSE_TABLE} WHERE class = $1"
+        ),
         "ORDER BY attached_at DESC NULLS LAST, class DESC, course DESC",
     )
     .bind(class.uuid())

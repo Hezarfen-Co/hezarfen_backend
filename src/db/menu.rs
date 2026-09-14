@@ -296,8 +296,8 @@ mod tests {
     async fn school() -> (Database, crate::database::TestDatabases) {
         let (db, leases) = init_test_db().await;
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 'teacher', 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, 'teacher', 0, 'teacher')",
         )
         .bind(UserId::from_key(TEACHER).uuid())
         .execute(&db)

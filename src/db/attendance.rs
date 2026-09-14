@@ -7,6 +7,7 @@ use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::EventId;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use sqlx::query_as;
@@ -53,15 +54,16 @@ pub async fn mark(
         }
         let row = query_as!(
             Attendance,
-            "INSERT INTO attendance (event, app_user, status, marked_by)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
+            "INSERT INTO attendance (event, app_user, status, marked_by, marked_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4, marked_at = $5
              RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
                       status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
             event.uuid(),
             user.uuid(),
             status.as_str(),
-            marked_by.uuid()
+            marked_by.uuid(),
+            Timestamp::now().as_millis(),
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -148,8 +150,8 @@ mod tests {
         async fn a_person(db: &Database, label: &str) -> UserId {
             let user = UserId::generate();
             sqlx::query(
-                "INSERT INTO app_user (id, username, password_hash, role) \
-                 VALUES ($1, $2, 'x', 'teacher')",
+                "INSERT INTO app_user (id, username, created_at, role) \
+                 VALUES ($1, $2, 0, 'teacher')",
             )
             .bind(user.uuid())
             .bind(format!("{label}-{}", &user.key()[30..]))

@@ -314,8 +314,8 @@ mod tests {
         // The menu's creator is a foreign key now: a real `app_user` row.
         let creator = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(creator.uuid())
         .bind(format!("menu-fixture-{}", &creator.key()[30..]))

@@ -419,8 +419,8 @@ mod tests {
     async fn a_teacher(db: &Database) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(user.uuid())
         .bind(format!("t-{}", &user.key()[30..]))
@@ -439,15 +439,10 @@ mod tests {
     /// A real user row: the counters live on it, and an `UPDATE` has nothing to
     /// write to without one.
     async fn a_student(username: &str, db: &Database) -> UserId {
-        let hash = crate::domain::user::Password::try_new("secret1")
-            .unwrap()
-            .hash_async()
-            .await
-            .unwrap();
         *crate::db::user::create(
             db,
             crate::domain::user::Username::try_new(username).unwrap(),
-            hash,
+            None,
         )
         .await
         .unwrap()

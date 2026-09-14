@@ -203,17 +203,9 @@ mod tests {
             .await
             .expect("the demo school");
 
-        let user = crate::service::user::create(
-            &school,
-            Username::try_new("ada").unwrap(),
-            Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let user = crate::service::user::create(&school, Username::try_new("ada").unwrap(), None)
+            .await
+            .unwrap();
         let session = session::create(&school, user.get_id()).await.unwrap();
         let school_cookie = format!("session={DEMO_SLUG}.{}", session.token().as_str());
 

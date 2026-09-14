@@ -378,21 +378,13 @@ mod tests {
     async fn undo_if_demoted_repairs_both_assignments_or_neither() {
         use crate::domain::class_group::ClassName;
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
-        use crate::domain::user::{Password, Username};
+        use crate::domain::user::Username;
 
         let (db, _leases) = crate::database::init_test_db().await;
         let office = crate::db::class_member::tests::fixture_user(&db, "office").await;
-        let teacher = crate::service::user::create(
-            &db,
-            Username::try_new("ada").unwrap(),
-            Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let teacher = crate::service::user::create(&db, Username::try_new("ada").unwrap(), None)
+            .await
+            .unwrap();
         crate::service::user::set_role(&db, teacher.get_id(), Role::Teacher)
             .await
             .unwrap();

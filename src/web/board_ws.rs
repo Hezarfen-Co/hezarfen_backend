@@ -672,24 +672,15 @@ mod tests {
     #[tokio::test]
     async fn a_demotion_bars_the_open_socket_from_every_write() {
         use crate::domain::board::BoardTitle;
-        use crate::domain::user::{Password, Username};
+        use crate::domain::user::Username;
 
         let (db, _leases) = crate::database::init_test_db().await;
-        let password = Password::try_new("secret1").unwrap();
-        let creator = crate::service::user::create(
-            &db,
-            Username::try_new("ogretmen").unwrap(),
-            password.hash_async().await.unwrap(),
-        )
-        .await
-        .unwrap();
-        let mate = crate::service::user::create(
-            &db,
-            Username::try_new("ogrenci").unwrap(),
-            password.hash_async().await.unwrap(),
-        )
-        .await
-        .unwrap();
+        let creator = crate::service::user::create(&db, Username::try_new("ogretmen").unwrap(), None)
+            .await
+            .unwrap();
+        let mate = crate::service::user::create(&db, Username::try_new("ogrenci").unwrap(), None)
+            .await
+            .unwrap();
         let mate_id = *mate.get_id();
         let board = board::create(
             &db,

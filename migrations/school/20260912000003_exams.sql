@@ -67,7 +67,11 @@ CREATE TABLE exam_question (
     -- question was inserted from, banked_as = the template most recently
     -- minted by saving it into the bank.
     from_bank uuid NULL REFERENCES bank_question(id) ON DELETE NO ACTION,
-    banked_as uuid NULL REFERENCES bank_question(id) ON DELETE NO ACTION
+    banked_as uuid NULL REFERENCES bank_question(id) ON DELETE NO ACTION,
+    -- The composite target of every (exam, question) foreign key below: an
+    -- answer or image pair can only name a question that belongs to that
+    -- exam, so the two columns can never disagree about the owner.
+    CONSTRAINT exam_question_id_exam UNIQUE (id, exam)
 );
 
 CREATE INDEX exam_question_exam ON exam_question (exam);
@@ -87,8 +91,8 @@ CREATE TABLE bank_question_image (
 );
 
 CREATE TABLE question_image (
-    exam         uuid NOT NULL REFERENCES exam(id) ON DELETE NO ACTION,
-    question     uuid NOT NULL REFERENCES exam_question(id) ON DELETE NO ACTION,
+    exam         uuid NOT NULL,
+    question     uuid NOT NULL,
     -- NULL = the question's own illustration; otherwise the choice's id. A
     -- (question, slot) pair holds at most one picture, and a question holds
     -- at most one illustration — NULLS NOT DISTINCT is what makes the NULL
@@ -97,7 +101,11 @@ CREATE TABLE question_image (
     file         TEXT NOT NULL,
     content_type TEXT NOT NULL,
     size         BIGINT NOT NULL,
-    CONSTRAINT question_image_question_slot UNIQUE NULLS NOT DISTINCT (question, slot)
+    CONSTRAINT question_image_question_slot UNIQUE NULLS NOT DISTINCT (question, slot),
+    -- One composite key instead of the old two single-column ones: the pair
+    -- must resolve to one exam_question row, not two that could disagree.
+    CONSTRAINT question_image_exam_question_fkey FOREIGN KEY (exam, question)
+        REFERENCES exam_question (exam, id) ON DELETE NO ACTION
 );
 
 CREATE INDEX question_image_exam ON question_image (exam);
@@ -113,31 +121,33 @@ CREATE TABLE exam_attempt (
     CONSTRAINT exam_attempt_exam_user_seq PRIMARY KEY (exam, app_user, seq)
 );
 
-CREATE INDEX exam_attempt_exam ON exam_attempt (exam);
 
 CREATE TABLE exam_answer (
-    exam       uuid NOT NULL REFERENCES exam(id) ON DELETE NO ACTION,
-    question   uuid NOT NULL REFERENCES exam_question(id) ON DELETE NO ACTION,
+    exam       uuid NOT NULL,
+    question   uuid NOT NULL,
     app_user   uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     selected   TEXT NULL,
     text       TEXT NULL,
     updated_at BIGINT NOT NULL,
     seq        BIGINT NOT NULL DEFAULT 1,
-    CONSTRAINT exam_answer_question_user_seq PRIMARY KEY (question, app_user, seq)
+    CONSTRAINT exam_answer_question_user_seq PRIMARY KEY (question, app_user, seq),
+    CONSTRAINT exam_answer_exam_question_fkey FOREIGN KEY (exam, question)
+        REFERENCES exam_question (exam, id) ON DELETE NO ACTION
 );
 
 CREATE INDEX exam_answer_exam_user ON exam_answer (exam, app_user);
-CREATE INDEX exam_answer_exam ON exam_answer (exam);
 
 CREATE TABLE answer_image (
-    exam         uuid NOT NULL REFERENCES exam(id) ON DELETE NO ACTION,
-    question     uuid NOT NULL REFERENCES exam_question(id) ON DELETE NO ACTION,
+    exam         uuid NOT NULL,
+    question     uuid NOT NULL,
     app_user     uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     file         TEXT NOT NULL,
     content_type TEXT NOT NULL,
     size         BIGINT NOT NULL,
     seq          BIGINT NOT NULL DEFAULT 1,
-    CONSTRAINT answer_image_question_user_seq PRIMARY KEY (question, app_user, seq)
+    CONSTRAINT answer_image_question_user_seq PRIMARY KEY (question, app_user, seq),
+    CONSTRAINT answer_image_exam_question_fkey FOREIGN KEY (exam, question)
+        REFERENCES exam_question (exam, id) ON DELETE NO ACTION
 );
 
 CREATE INDEX answer_image_exam ON answer_image (exam);
@@ -148,6 +158,9 @@ CREATE TABLE exam_result (
     app_user  uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     mark      BIGINT NOT NULL,
     graded_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    -- When this mark was written (now-millis, stamped by the grader's own
+    -- transaction); a regrade of the sitting overwrites it.
+    graded_at BIGINT NOT NULL,
     seq       BIGINT NOT NULL DEFAULT 1,
     CONSTRAINT exam_result_exam_user_seq PRIMARY KEY (exam, app_user, seq)
 );
@@ -159,10 +172,7 @@ CREATE TABLE pool_question (
     body              TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'pending',
     asked_at          BIGINT NOT NULL,
-    approved_by       uuid NULL REFERENCES app_user(id) ON DELETE NO ACTION,
-    image_file        TEXT NULL,
-    image_content_type TEXT NULL,
-    image_size        BIGINT NULL
+    approved_by       uuid NULL REFERENCES app_user(id) ON DELETE NO ACTION
 );
 
 CREATE INDEX pool_question_status ON pool_question (status);
@@ -173,13 +183,30 @@ CREATE TABLE solution (
     question           uuid NOT NULL REFERENCES pool_question(id) ON DELETE NO ACTION,
     author             uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     body               TEXT NOT NULL,
-    offered_at         BIGINT NOT NULL,
-    image_file         TEXT NULL,
-    image_content_type TEXT NULL,
-    image_size         BIGINT NULL
+    offered_at         BIGINT NOT NULL
 );
 
 CREATE INDEX solution_question ON solution (question);
+
+-- The pool photos, one row per question/solution — the single-slot spelling
+-- of question_image's child-table shape: the parent rows carry no image
+-- columns, the metadata lives here, and the bytes live on disk under the
+-- `file` name. The primary key IS the "one image" rule; a replace is a
+-- plain upsert.
+CREATE TABLE pool_question_image (
+    question     uuid PRIMARY KEY REFERENCES pool_question(id) ON DELETE NO ACTION,
+    file         TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size         BIGINT NOT NULL
+);
+
+CREATE TABLE solution_image (
+    solution     uuid PRIMARY KEY REFERENCES solution(id) ON DELETE NO ACTION,
+    file         TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size         BIGINT NOT NULL
+);
+
 
 CREATE TABLE homework (
     id          uuid PRIMARY KEY,
@@ -222,6 +249,8 @@ CREATE TABLE homework_submission (
     -- The on-time verdict credited at the first hand-in, never re-judged.
     counted_on_time  BOOLEAN NULL,
     -- The grade that froze this submission; NULL while it is still open.
+    -- NO ACTION orders the deletes: this row must be removed before the
+    -- homework_result it points at.
     graded_by_result uuid NULL REFERENCES homework_result(id) ON DELETE NO ACTION,
     -- Same deterministic pair as homework_result: one submission per
     -- (homework, user) by construction.

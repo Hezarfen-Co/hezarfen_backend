@@ -33,10 +33,14 @@
 -- statuses / exam kinds are school-configurable at runtime, which a DDL
 -- CHECK could not survive.
 
+-- The school-side identity row. The password hash is NOT here: the credential
+-- lives on the control database's `person` row, and `app_user.person` is the
+-- join key to it (uuid, no FK — the two halves are separate databases). The
+-- `username` copy stays for display and for the school-scoped unique name.
 CREATE TABLE app_user (
     id                        uuid PRIMARY KEY,
     username                  TEXT NOT NULL,
-    password_hash             TEXT NOT NULL,
+    person                    uuid NULL,
     role                      TEXT NOT NULL DEFAULT 'student'
         CHECK (role IN ('ai', 'parent', 'student', 'teacher', 'manager', 'admin')),
     name                      TEXT NULL,
@@ -74,8 +78,14 @@ CREATE TABLE app_user (
     study_streak_last_day     BIGINT NULL,
     pomodoro_counted_today    BIGINT NOT NULL DEFAULT 0,
     pomodoro_counted_day      BIGINT NULL,
+    created_at                BIGINT NOT NULL,
     CONSTRAINT app_user_username UNIQUE (username)
 );
+
+-- At most one school identity per person: the join key is 1:1. Partial
+-- because a school row minted before its person was known (boot seed order)
+-- legally reads NULL.
+CREATE UNIQUE INDEX app_user_person ON app_user (person) WHERE person IS NOT NULL;
 
 CREATE TABLE user_session (
     id         uuid PRIMARY KEY,

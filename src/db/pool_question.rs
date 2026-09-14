@@ -23,9 +23,7 @@ pub async fn insert(db: &Database, question: PoolQuestion) -> Result<PoolQuestio
            RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
                title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
                status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
+               approved_by AS "approved_by: UserId""#,
         question.id.uuid(),
         question.asker.uuid(),
         question.title.as_str(),
@@ -44,9 +42,7 @@ pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuest
         r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
                title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
                status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size
+               approved_by AS "approved_by: UserId"
            FROM pool_question WHERE id = $1"#,
         id.uuid()
     )
@@ -63,9 +59,7 @@ pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
         r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
                title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
                status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size
+               approved_by AS "approved_by: UserId"
            FROM pool_question ORDER BY asked_at DESC, id DESC"#,
     )
     .fetch_all(db)
@@ -81,9 +75,7 @@ pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQue
         r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
                title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
                status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size
+               approved_by AS "approved_by: UserId"
            FROM pool_question
            WHERE status = $1 OR asker = $2
            ORDER BY asked_at DESC, id DESC"#,
@@ -142,9 +134,7 @@ pub async fn approve(
                RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
                    title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
                    status, asked_at AS "asked_at: Timestamp",
-                   approved_by AS "approved_by: UserId", image_file,
-                   image_content_type AS "image_content_type: FileContentType",
-                   image_size"#,
+                   approved_by AS "approved_by: UserId""#,
             id.uuid(),
             STATUS_APPROVED,
             approver.uuid(),
@@ -153,59 +143,59 @@ pub async fn approve(
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(question) = &approved
-            && question.asker != approver {
-                // The counter columns are NOT NULL DEFAULT 0 — the old
-                // absent-reads-as-zero coalesce is gone with the schema.
-                sqlx::query!(
-                    "UPDATE app_user SET pool_approved_total = pool_approved_total + 1
+            && question.asker != approver
+        {
+            // The counter columns are NOT NULL DEFAULT 0 — the old
+            // absent-reads-as-zero coalesce is gone with the schema.
+            sqlx::query!(
+                "UPDATE app_user SET pool_approved_total = pool_approved_total + 1
                      WHERE id = $1",
-                    approver.uuid()
-                )
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query!(
-                    "UPDATE app_user SET pool_published_total = pool_published_total + 1
+                approver.uuid()
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!(
+                "UPDATE app_user SET pool_published_total = pool_published_total + 1
                      WHERE id = $1",
-                    question.asker.uuid()
-                )
-                .execute(&mut *tx)
-                .await?;
-            }
+                question.asker.uuid()
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         Ok(approved)
     })
     .await
 }
 
-/// Point the question at a freshly written image blob. Guarded on
-/// `pending` for the same reason approval is: an image landing after
-/// approval would put unmoderated bytes in the pool, so an upload that
-/// loses the race gets `None` (and the caller takes the orphan blob back
-/// off disk). Returns the *before* row — its `image_file` is the replaced
-/// blob the caller must remove.
+/// Point the question at a freshly written image blob. Guarded on `pending`
+/// for the same reason approval is: an image landing after approval would
+/// put unmoderated bytes in the pool, so an upload that loses the race gets
+/// `Ok(None)` (and the caller takes the orphan blob back off disk).
+/// `Ok(Some(replaced))` names the blob this upload displaced — the caller's
+/// to remove, `None` inside when nothing was there before.
 ///
-/// The row lock makes the before-read and the guarded write one switch; a
-/// racing approve either predates this transaction's snapshot or waits on
-/// the lock, so a fresh image can never straddle an approval.
+/// The photo is its own row in `pool_question_image` (the child-table shape
+/// of `question_image`), so the write is that row's upsert; the parent's
+/// `FOR UPDATE` row lock still makes the pending check and the write one
+/// switch — a racing approve either predates this transaction's snapshot or
+/// waits on the lock, so a fresh image can never straddle an approval. The
+/// replaced name is read *inside the same transaction*, not by the caller
+/// before it: two uploads to one question both write this row, so they
+/// contend on it and the loser re-reads the winner's blob name — the
+/// discipline `crate::db::question_image::upsert` documents.
 pub async fn set_image(
     db: &Database,
     id: &PoolQuestionId,
     file: &str,
     content_type: &FileContentType,
     size: i64,
-) -> Result<Option<PoolQuestion>, AppError> {
+) -> Result<Option<Option<String>>, AppError> {
     let id = *id;
     let file = file.to_owned();
     let content_type = content_type.clone();
     tx_with_retry(db, false, async move |tx| {
-        let before = sqlx::query_as!(
-            PoolQuestion,
-            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
-                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
-                   status, asked_at AS "asked_at: Timestamp",
-                   approved_by AS "approved_by: UserId", image_file,
-                   image_content_type AS "image_content_type: FileContentType",
-                   image_size
-                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+        let before = sqlx::query!(
+            r#"SELECT status FROM pool_question WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
         .fetch_optional(&mut *tx)
@@ -213,43 +203,45 @@ pub async fn set_image(
         let Some(before) = before else {
             return Ok(None);
         };
-        let written = sqlx::query!(
-            r#"UPDATE pool_question
-               SET image_file = $2, image_content_type = $3, image_size = $4
-               WHERE id = $1 AND status = $5"#,
+        if before.status != STATUS_PENDING {
+            return Ok(None);
+        }
+        let replaced = sqlx::query_scalar!(
+            r#"SELECT file FROM pool_question_image WHERE question = $1"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"INSERT INTO pool_question_image (question, file, content_type, size)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (question) DO UPDATE
+                   SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,
+                       size = EXCLUDED.size"#,
             id.uuid(),
             file,
             content_type.as_str(),
             size,
-            STATUS_PENDING,
         )
         .execute(&mut *tx)
         .await?;
-        if written.rows_affected() == 0 {
-            return Ok(None);
-        }
-        Ok(Some(before))
+        Ok(Some(replaced))
     })
     .await
 }
 
-/// Detach the question's image (pending only, like `set_image`). Returns
-/// the *before* row — its `image_file` is the blob the caller must remove.
+/// Detach the question's image (pending only, like [`set_image`]).
+/// `Ok(None)` = the question is gone or no longer pending;
+/// `Ok(Some(detached))` names the blob the caller removes — `None` inside
+/// when the question carried no image (the route answers that 404).
 pub async fn clear_image(
     db: &Database,
     id: &PoolQuestionId,
-) -> Result<Option<PoolQuestion>, AppError> {
+) -> Result<Option<Option<String>>, AppError> {
     let id = *id;
     tx_with_retry(db, false, async move |tx| {
-        let before = sqlx::query_as!(
-            PoolQuestion,
-            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
-                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
-                   status, asked_at AS "asked_at: Timestamp",
-                   approved_by AS "approved_by: UserId", image_file,
-                   image_content_type AS "image_content_type: FileContentType",
-                   image_size
-                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+        let before = sqlx::query!(
+            r#"SELECT status FROM pool_question WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
         .fetch_optional(&mut *tx)
@@ -257,66 +249,90 @@ pub async fn clear_image(
         let Some(before) = before else {
             return Ok(None);
         };
-        let written = sqlx::query!(
-            r#"UPDATE pool_question
-               SET image_file = NULL, image_content_type = NULL, image_size = NULL
-               WHERE id = $1 AND status = $2"#,
-            id.uuid(),
-            STATUS_PENDING,
-        )
-        .execute(&mut *tx)
-        .await?;
-        if written.rows_affected() == 0 {
+        if before.status != STATUS_PENDING {
             return Ok(None);
         }
-        Ok(Some(before))
+        let detached = sqlx::query_scalar!(
+            r#"DELETE FROM pool_question_image WHERE question = $1 RETURNING file"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(Some(detached))
     })
     .await
 }
 
-/// Delete the question and its solutions in one transaction, returning
-/// the removed rows — the question's *and* the swept solutions' — so the
-/// caller can take every image blob off disk (solutions carry photos too,
-/// and a row-only sweep would strand theirs forever).
+/// What [`delete`] took with the question: the rows ride back for their
+/// ids, and `image_files` is the caller's disk-GC list — the question's
+/// photo and every swept solution's.
+pub struct Deleted {
+    pub question: PoolQuestion,
+    pub solutions: Vec<Solution>,
+    pub image_files: Vec<String>,
+}
+
+/// Delete the question and its solutions in one transaction, returning the
+/// removed rows plus every image blob key the two kinds of rows named, so
+/// the caller can take every blob off disk (solutions carry photos too, and
+/// a row-only sweep would strand theirs forever).
 ///
 /// Children before the parent, so the foreign keys never refuse the parent
-/// delete. `cascade = true` because a solution offer committing inside this
-/// window makes the parent delete answer 23503 — a mid-cascade race the
-/// retry loop re-runs, sweeping the latecomer with it. That foreign key is
-/// also what keeps a solution from outliving its question on the insert
-/// side, so the old existence-move transaction is simply gone.
-pub async fn delete(
-    db: &Database,
-    id: &PoolQuestionId,
-) -> Result<Option<(PoolQuestion, Vec<Solution>)>, AppError> {
+/// delete — the photo rows first (they name their parents), then the
+/// solutions, then the question. `cascade = true` because a solution offer
+/// committing inside this window makes the parent delete answer 23503 — a
+/// mid-cascade race the retry loop re-runs, sweeping the latecomer with it.
+/// That foreign key is also what keeps a solution from outliving its
+/// question on the insert side, so the old existence-move transaction is
+/// simply gone.
+pub async fn delete(db: &Database, id: &PoolQuestionId) -> Result<Option<Deleted>, AppError> {
     let id = *id;
     tx_with_retry(db, true, async move |tx| {
+        let solution_files = sqlx::query_scalar!(
+            r#"DELETE FROM solution_image si
+               USING solution s
+               WHERE si.solution = s.id AND s.question = $1
+               RETURNING si.file"#,
+            id.uuid()
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         let solutions = sqlx::query_as!(
             Solution,
             r#"DELETE FROM solution WHERE question = $1
                RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
-               author AS "author: UserId", body AS "body: SolutionBody",
-               offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp""#,
             id.uuid()
         )
         .fetch_all(&mut *tx)
+        .await?;
+        let question_file = sqlx::query_scalar!(
+            r#"DELETE FROM pool_question_image WHERE question = $1 RETURNING file"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
         .await?;
         let question = sqlx::query_as!(
             PoolQuestion,
             r#"DELETE FROM pool_question WHERE id = $1
                RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
-               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
-               status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: UserId""#,
             id.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
-        Ok(question.map(|question| (question, solutions)))
+        Ok(question.map(|question| {
+            let mut image_files = solution_files;
+            image_files.extend(question_file);
+            Deleted {
+                question,
+                solutions,
+                image_files,
+            }
+        }))
     })
     .await
 }
@@ -332,7 +348,7 @@ mod tests {
     /// the question, and the counters are plain `NOT NULL DEFAULT 0` columns.
     async fn a_user(db: &Database) -> UserId {
         let user = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
             .bind(user.uuid())
             .bind(format!("u{}", &user.key()[30..]))
             .execute(db)
@@ -483,31 +499,32 @@ mod tests {
         let png = FileContentType::try_new("image/png").unwrap();
 
         let q = insert(&db, question(&asker)).await.unwrap();
-        let before = set_image(&db, q.get_id(), "blob_a", &png, 3)
+        let replaced = set_image(&db, q.get_id(), "blob_a", &png, 3)
             .await
             .unwrap()
             .unwrap();
-        assert!(before.get_image_file().is_none());
+        assert!(replaced.is_none());
 
         // A replace reports the old blob for cleanup.
-        let before = set_image(&db, q.get_id(), "blob_b", &png, 5)
+        let replaced = set_image(&db, q.get_id(), "blob_b", &png, 5)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(before.get_image_file(), Some("blob_a"));
-        let stored = read(&db, q.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_image_file(), Some("blob_b"));
-        assert_eq!(stored.get_image_size(), Some(5));
+        assert_eq!(replaced.as_deref(), Some("blob_a"));
+        let stored = crate::db::pool_question_image::read(&db, q.get_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.get_file(), "blob_b");
+        assert_eq!(stored.get_size(), 5);
 
-        // Clearing reports the detached blob and empties the fields.
-        let before = clear_image(&db, q.get_id()).await.unwrap().unwrap();
-        assert_eq!(before.get_image_file(), Some("blob_b"));
+        // Clearing reports the detached blob and drops the row.
+        let detached = clear_image(&db, q.get_id()).await.unwrap().unwrap();
+        assert_eq!(detached.as_deref(), Some("blob_b"));
         assert!(
-            read(&db, q.get_id())
+            crate::db::pool_question_image::read(&db, q.get_id())
                 .await
                 .unwrap()
-                .unwrap()
-                .get_image_file()
                 .is_none()
         );
 
@@ -527,6 +544,7 @@ mod tests {
         let (db, _leases) = database::init_test_db().await;
         let asker = a_user(&db).await;
         let helper = a_user(&db).await;
+        let png = FileContentType::try_new("image/png").unwrap();
 
         let q = insert(&db, question(&asker)).await.unwrap();
         let offered = crate::db::solution::insert(
@@ -539,13 +557,26 @@ mod tests {
         )
         .await
         .unwrap();
+        // Photos on both rows: their blob names must ride out with the
+        // delete, or the files strand on disk forever.
+        set_image(&db, q.get_id(), "q_blob", &png, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::db::solution::set_image(&db, offered.get_id(), "s_blob", &png, 2)
+            .await
+            .unwrap()
+            .unwrap();
 
         // The swept solutions ride back with the question so the caller can
-        // take their image blobs off disk.
-        let (removed, swept) = delete(&db, q.get_id()).await.unwrap().unwrap();
-        assert_eq!(removed.get_id(), q.get_id());
-        assert_eq!(swept.len(), 1);
-        assert_eq!(swept[0].get_id(), offered.get_id());
+        // take every image blob off disk.
+        let removed = delete(&db, q.get_id()).await.unwrap().unwrap();
+        assert_eq!(removed.question.get_id(), q.get_id());
+        assert_eq!(removed.solutions.len(), 1);
+        assert_eq!(removed.solutions[0].get_id(), offered.get_id());
+        assert_eq!(removed.image_files.len(), 2);
+        assert!(removed.image_files.contains(&"q_blob".to_string()));
+        assert!(removed.image_files.contains(&"s_blob".to_string()));
         assert!(read(&db, q.get_id()).await.unwrap().is_none());
         assert!(
             crate::db::solution::list_for(&db, q.get_id(), None, 0)

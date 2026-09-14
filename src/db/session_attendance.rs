@@ -130,10 +130,11 @@ pub async fn mark(
         .unwrap_or(false);
         let row = sqlx::query_as!(
             SessionAttendance,
-            r#"INSERT INTO session_attendance (session, app_user, course, status, marked_by)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO session_attendance (session, app_user, course, status, marked_by, marked_at)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (session, app_user) DO UPDATE
-                 SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by
+                 SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by,
+                     marked_at = EXCLUDED.marked_at
                RETURNING session AS "session: CourseSessionId", app_user AS "user: UserId",
                          course AS "course: CourseId", status AS "status: AttendanceStatus",
                          marked_by AS "marked_by: UserId""#,
@@ -142,6 +143,7 @@ pub async fn mark(
             session.course.uuid(),
             status.as_str(),
             marked_by.uuid(),
+            now.as_millis(),
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -311,8 +313,8 @@ mod tests {
         // keeps repeated calls (same label, new person) collision-free.
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', $3)",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, $3)",
         )
         .bind(user.uuid())
         .bind(format!("{key}-{}", &user.key()[30..]))

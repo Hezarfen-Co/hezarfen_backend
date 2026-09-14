@@ -60,8 +60,8 @@ async fn teacher(db: &Database) -> UserId {
     // Creator columns are foreign keys now, so the fixture teacher is a row,
     // not a fabricated id. It never logs in, so the hash is a stub.
     sqlx::query(
-        "INSERT INTO app_user (id, username, password_hash, role) \
-         VALUES ($1, 'doktor', 'x', 'teacher') ON CONFLICT DO NOTHING",
+        "INSERT INTO app_user (id, username, created_at, role) \
+         VALUES ($1, 'doktor', 0, 'teacher') ON CONFLICT DO NOTHING",
     )
     .bind(UserId::generate().uuid())
     .execute(db)

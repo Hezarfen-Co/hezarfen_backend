@@ -22,7 +22,22 @@ CREATE TABLE term (
     course_count BIGINT NOT NULL DEFAULT 0,
     class_count  BIGINT NOT NULL DEFAULT 0
 );
+-- A term is dropped, not cascaded: the nullable `term` FKs on course and
+-- class_group (ON DELETE NO ACTION) must be cleared to NULL first — a delete
+-- with a reference still standing is a 23503, not a sweep. The stored
+-- course_count/class_count are the pre-flight counters that refuse the drop
+-- before the FKs get the chance.
 
+-- db::course::delete sweeps every child in ONE transaction — a crash between
+-- statements must orphan nothing — so the guard is the course row itself:
+-- locked FOR UPDATE and refused while its enrollment_count is non-zero. The
+-- child order is the FK-safest one: exam results/attempts/answers/images and
+-- questions, homework files/submissions/results, rag output, note files and
+-- notes, class_course links (each class gets its class_course_count back and
+-- every blueprint drops the id from its list), session_attendance and
+-- course_session, enrollment (each seat given back), then the exam, homework
+-- and subject rows themselves. Bank questions keep their templates; only
+-- their subject/source_exam links are cleared.
 CREATE TABLE course (
     id               uuid PRIMARY KEY,
     creator          uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
@@ -106,10 +121,10 @@ CREATE TABLE session_attendance (
     course    uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
     status    TEXT NOT NULL,
     marked_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    marked_at BIGINT NOT NULL,
     CONSTRAINT session_attendance_session_user PRIMARY KEY (session, app_user)
 );
 
-CREATE INDEX session_attendance_session ON session_attendance (session);
 CREATE INDEX session_attendance_user ON session_attendance (app_user);
 CREATE INDEX session_attendance_course ON session_attendance (course);
 
@@ -126,12 +141,17 @@ CREATE TABLE class_group (
 
 CREATE INDEX class_group_grade ON class_group (grade);
 
--- A grade's course template. The grade label IS the record key in Surreal, so
--- the PK here is TEXT on grade itself (no id column, no uuid).
+-- A grade's course template. The grade label is the identity the whole API
+-- speaks and it stays UNIQUE, but the row carries a surrogate uuid PK: it is
+-- what class_course.source references, and a delete-and-recreate of the same
+-- grade mints a new id, so links tagged by the old one were swept by that
+-- delete instead of being adopted by the new blueprint (a TEXT grade tag
+-- made the two indistinguishable).
 CREATE TABLE class_blueprint (
-    grade    TEXT PRIMARY KEY,
-    courses  uuid[] NOT NULL DEFAULT '{}',
-    creator  uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION
+    id      uuid PRIMARY KEY,
+    grade   TEXT NOT NULL CONSTRAINT class_blueprint_grade_key UNIQUE,
+    courses uuid[] NOT NULL DEFAULT '{}',
+    creator uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION
 );
 
 CREATE TABLE class_member (
@@ -143,7 +163,6 @@ CREATE TABLE class_member (
     CONSTRAINT class_member_class_user PRIMARY KEY (class, app_user)
 );
 
-CREATE INDEX class_member_class ON class_member (class);
 CREATE INDEX class_member_user ON class_member (app_user);
 
 CREATE TABLE class_course (
@@ -153,17 +172,17 @@ CREATE TABLE class_course (
     attached_at BIGINT NULL,
     -- The blueprint that attached this course; NULL = attached by hand, which
     -- keeps a hand-attached course unreachable by every blueprint sweep.
-    source      TEXT NULL REFERENCES class_blueprint(grade) ON DELETE NO ACTION,
+    source      uuid NULL REFERENCES class_blueprint(id) ON DELETE NO ACTION,
     CONSTRAINT class_course_class_course PRIMARY KEY (class, course)
 );
 
-CREATE INDEX class_course_class ON class_course (class);
 CREATE INDEX class_course_course ON class_course (course);
 
 CREATE TABLE enrollment (
     course      uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
     app_user    uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     enrolled_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    created_at  BIGINT NOT NULL,
     -- The class that pumped this row; NULL when a human placed the student.
     source      uuid NULL REFERENCES class_group(id) ON DELETE NO ACTION,
     CONSTRAINT enrollment_course_user PRIMARY KEY (course, app_user)
@@ -193,6 +212,7 @@ CREATE TABLE attendance (
     app_user  uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     status    TEXT NOT NULL,
     marked_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    marked_at BIGINT NOT NULL,
     CONSTRAINT attendance_event_user PRIMARY KEY (event, app_user)
 );
 
@@ -202,6 +222,7 @@ CREATE TABLE registration (
     event         uuid NOT NULL REFERENCES event(id) ON DELETE NO ACTION,
     app_user      uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     registered_by uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    created_at    BIGINT NOT NULL,
     CONSTRAINT registration_event_user PRIMARY KEY (event, app_user)
 );
 

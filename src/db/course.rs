@@ -577,8 +577,8 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
     // repeated calls are new people, not the same one.
     let creator = UserId::generate();
     sqlx::query(
-        "INSERT INTO app_user (id, username, password_hash, role) \
-         VALUES ($1, $2, 'x', 'teacher')",
+        "INSERT INTO app_user (id, username, created_at, role) \
+         VALUES ($1, $2, 0, 'teacher')",
     )
     .bind(creator.uuid())
     .bind(format!("course-fixture-{}", &creator.key()[30..]))
@@ -717,8 +717,8 @@ mod tests {
     async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', $3)",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, $3)",
         )
         .bind(user.uuid())
         .bind(format!("{label}-{}", &user.key()[30..]))

@@ -398,7 +398,7 @@ mod tests {
     /// minted per call, so repeated calls are new people, not the same row.
     async fn a_person(db: &Database, label: &str) -> UserId {
         let user = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
             .bind(user.uuid())
             .bind(format!("{label}-{}", &user.key()[30..]))
             .execute(db)

@@ -244,7 +244,7 @@ mod tests {
     /// nothing. The tests above need no row — they read only the stint log.
     async fn a_user(db: &Database) -> UserId {
         let user = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
             .bind(user.uuid())
             .bind(format!("u{}", &user.key()[30..]))
             .execute(db)

@@ -2,7 +2,6 @@ use uuid::Uuid;
 
 use crate::constant::MAX_SOLUTION_BODY_LEN;
 use crate::domain::monotonic_id::next_uuid;
-use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -66,11 +65,6 @@ pub struct Solution {
     pub(crate) author: UserId,
     pub(crate) body: SolutionBody,
     pub(crate) offered_at: Timestamp,
-    /// The photo's on-disk blob name — a fresh server-generated id every
-    /// upload; `None` when the solution carries no image.
-    pub(crate) image_file: Option<String>,
-    pub(crate) image_content_type: Option<FileContentType>,
-    pub(crate) image_size: Option<i64>,
 }
 
 impl Solution {
@@ -81,9 +75,6 @@ impl Solution {
             author: *author,
             body,
             offered_at: Timestamp::now(),
-            image_file: None,
-            image_content_type: None,
-            image_size: None,
         }
     }
 
@@ -107,17 +98,6 @@ impl Solution {
         self.offered_at
     }
 
-    pub fn get_image_file(&self) -> Option<&str> {
-        self.image_file.as_deref()
-    }
-
-    pub fn get_image_content_type(&self) -> Option<&FileContentType> {
-        self.image_content_type.as_ref()
-    }
-
-    pub fn get_image_size(&self) -> Option<i64> {
-        self.image_size
-    }
 }
 
 #[cfg(test)]

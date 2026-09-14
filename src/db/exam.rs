@@ -486,8 +486,8 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
     // The creator is a foreign key now: a real `app_user` row, minted per call.
     let creator = UserId::generate();
     sqlx::query(
-        "INSERT INTO app_user (id, username, password_hash, role) \
-         VALUES ($1, $2, 'x', 'teacher')",
+        "INSERT INTO app_user (id, username, created_at, role) \
+         VALUES ($1, $2, 0, 'teacher')",
     )
     .bind(creator.uuid())
     .bind(format!("exam-fixture-{}", &creator.key()[30..]))
@@ -544,8 +544,8 @@ mod tests {
                     .to_vec();
                 let creator = UserId::generate();
                 sqlx::query(
-                    "INSERT INTO app_user (id, username, password_hash, role) \
-                     VALUES ($1, $2, 'x', 'teacher')",
+                    "INSERT INTO app_user (id, username, created_at, role) \
+                     VALUES ($1, $2, 0, 'teacher')",
                 )
                 .bind(creator.uuid())
                 .bind(format!("orphan-race-{}", &creator.key()[30..]))
@@ -578,8 +578,8 @@ mod tests {
     async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', $3)",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, $3)",
         )
         .bind(user.uuid())
         .bind(format!("{label}-{}", &user.key()[30..]))

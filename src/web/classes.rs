@@ -1494,24 +1494,16 @@ mod tests {
     #[tokio::test]
     async fn an_empty_teacher_is_no_teacher_and_a_student_is_never_one() {
         use crate::domain::role::Role;
-        use crate::domain::user::{Password, Username};
+        use crate::domain::user::Username;
 
         let (db, _leases) = crate::database::init_test_db().await;
         assert!(teacher_or_none(None, &db).await.unwrap().is_none());
         assert!(teacher_or_none(Some(""), &db).await.unwrap().is_none());
 
         let make = async |name: &str, role: Role| {
-            let user = crate::service::user::create(
-                &db,
-                Username::try_new(name).unwrap(),
-                Password::try_new("secret1")
-                    .unwrap()
-                    .hash_async()
-                    .await
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let user = crate::service::user::create(&db, Username::try_new(name).unwrap(), None)
+                .await
+                .unwrap();
             crate::service::user::set_role(&db, user.get_id(), role)
                 .await
                 .unwrap()

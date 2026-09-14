@@ -371,7 +371,8 @@ async fn create_school(
 
     let db = st.tenants.create(&slug, &name, modules).await?;
     let seeded = async {
-        crate::service::user::create_with_role(&db, username, password_hash, Role::Admin).await?;
+        crate::service::user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin)
+            .await?;
         // The admin's person gets the membership the school row answers for —
         // idempotent, so a retried create after a torn pair completes it.
         service::person::link_school(&st.db, person.get_id(), &slug).await?;
@@ -774,12 +775,8 @@ async fn reset_admin_password(
     let user = school_admin(&req.username, &db).await?;
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
 
-    crate::service::user::set_password_hash(&db, user.get_id(), password_hash.clone())
-        .await?
-        .ok_or(AppError::NotFound)?;
-    // The person credential is the one login reads; the school row's copy
-    // exists so school-side queries keep compiling. Both move together, or a
-    // reset would leave the old password working everywhere.
+    // The credential is the control person's — the one login reads. The
+    // school row carries no password at all.
     service::person::set_password_hash(&st.db, user.get_username(), &password_hash).await?;
     // The other half: the new password means nothing while a cookie minted
     // under the old one still authenticates — school sessions *and* any

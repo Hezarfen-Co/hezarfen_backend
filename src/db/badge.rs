@@ -125,20 +125,12 @@ mod tests {
     use super::*;
     use crate::constant::BADGE_AWARD_TABLE;
     use crate::database::init_test_db;
-    use crate::domain::user::{Password, Username};
+    use crate::domain::user::Username;
 
     async fn a_user(username: &str, db: &Database) -> crate::domain::user::User {
-        crate::db::user::create(
-            db,
-            Username::try_new(username).unwrap(),
-            Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+        crate::db::user::create(db, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap()
     }
 
     async fn count_awards(db: &Database, user: &UserId) -> i64 {

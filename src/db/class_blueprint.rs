@@ -13,6 +13,7 @@ use crate::db::page::PagedList;
 use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId};
 use crate::domain::class_group::{ClassGrade, ClassGroupId};
 use crate::domain::course::CourseId;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -67,9 +68,11 @@ fn no_such_course() -> AppError {
 }
 
 /// Write the blueprint's row. A second one for the same grade is a 409 the
-/// store itself decides — the grade is the primary key, so the duplicate is
-/// seen rather than raced (`23505` on `class_blueprint_pkey`, mapped right
-/// here: a duplicate is a decision, never a retry).
+/// store itself decides — the grade carries a UNIQUE constraint, so the
+/// duplicate is seen rather than raced (`23505` on
+/// `class_blueprint_grade_key`, mapped right here: a duplicate is a
+/// decision, never a retry). The surrogate `id` is minted here and never
+/// read back: the grade label stays the only identity the API speaks.
 pub async fn create(
     db: &Database,
     creator: &UserId,
@@ -83,11 +86,13 @@ pub async fn create(
         creator: *creator,
     };
     let creator = *creator;
+    let id = next_uuid();
     tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &courses).await?;
         let inserted = sqlx::query!(
-            r#"INSERT INTO class_blueprint (grade, courses, creator)
-               VALUES ($1, $2, $3)"#,
+            r#"INSERT INTO class_blueprint (id, grade, courses, creator)
+               VALUES ($1, $2, $3, $4)"#,
+            id,
             grade as _,
             courses as _,
             creator as _
@@ -96,7 +101,7 @@ pub async fn create(
         .await;
         match inserted {
             Ok(_) => Ok(blueprint.clone()),
-            Err(e) if unique_violation(&e) == Some("class_blueprint_pkey") => Err(
+            Err(e) if unique_violation(&e) == Some("class_blueprint_grade_key") => Err(
                 AppError::Conflict("a blueprint already exists for that grade"),
             ),
             Err(e) => Err(e.into()),
@@ -315,6 +320,9 @@ pub async fn prune(
 /// it. The rows are read rather than derived from the classes at this grade:
 /// a class whose grade was edited after the pump still carries this
 /// blueprint's attachments, and only the tag can find it.
+///
+/// The stored tag is the blueprint's surrogate uuid, not the grade label the
+/// API speaks — the query translates the label to it.
 pub async fn sourced_links(
     db: &Database,
     id: &ClassBlueprintId,
@@ -324,7 +332,8 @@ pub async fn sourced_links(
     let rows = sqlx::query!(
         r#"SELECT class AS "class: ClassGroupId", course AS "course: CourseId"
            FROM class_course
-           WHERE source = $1 AND course <> ALL($2)"#,
+           WHERE source = (SELECT id FROM class_blueprint WHERE grade = $1)
+             AND course <> ALL($2)"#,
         id as _,
         keep as _
     )

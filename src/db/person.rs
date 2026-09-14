@@ -18,10 +18,11 @@ use crate::tenant::{SchoolStatus, Slug};
 /// of a race gets the same `Conflict` a sequential duplicate would.
 pub async fn create(db: &Database, person: Person) -> Result<(), AppError> {
     match sqlx::query!(
-        "INSERT INTO person (id, username, password_hash) VALUES ($1, $2, $3)",
+        "INSERT INTO person (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
         person.id.uuid(),
         person.username.as_str(),
         person.password_hash.as_str(),
+        Timestamp::now().as_millis(),
     )
     .execute(db)
     .await
@@ -112,9 +113,10 @@ pub async fn membership_of(
 /// repeated join is a no-op, not an error.
 pub async fn add_membership(db: &Database, person: &PersonId, slug: &Slug) -> Result<(), AppError> {
     sqlx::query!(
-        "INSERT INTO person_school (person, school) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        "INSERT INTO person_school (person, school, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         person.uuid(),
-        slug.as_str()
+        slug.as_str(),
+        Timestamp::now().as_millis()
     )
     .execute(db)
     .await?;
@@ -193,9 +195,8 @@ pub async fn delete_sessions_by_person(db: &Database, person: &PersonId) -> Resu
     Ok(())
 }
 
-/// Move the person credential — the one login reads. The school-side
-/// `app_user` copy is rewritten separately by the same caller, so the two
-/// stay in step.
+/// Move the person credential — the one login reads. The school-side row
+/// carries no password at all, so this is the whole credential move.
 pub async fn set_password_hash(
     db: &Database,
     username: &Username,

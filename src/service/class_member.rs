@@ -353,15 +353,10 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         // A real row, because the sweep now rides on the role write.
-        let hash = crate::domain::user::Password::try_new("secret1")
-            .unwrap()
-            .hash_async()
-            .await
-            .unwrap();
         let account = crate::db::user::create(
             &db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
-            hash,
+            None,
         )
         .await
         .unwrap();

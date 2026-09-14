@@ -8,7 +8,8 @@
 //! opposite: unmoderated, so their author may edit the body and attach,
 //! replace, or drop one photo at any time — moderation there is delete-only.
 
-use crate::web::tenant_state::State;
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::StatusCode;
@@ -22,13 +23,18 @@ use crate::constant::{MAX_MAX_FILE_BYTES, POOL_QUESTION_STATUSES, UPLOAD_BODY_OV
 use crate::domain::pool_question::{
     PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
 };
+use crate::domain::pool_question_image::PoolQuestionImage;
 use crate::domain::role::Role;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
+use crate::domain::solution_image::SolutionImage;
 use crate::domain::user::User;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::pool_question;
+use crate::service::pool_question_image;
 use crate::service::solution;
+use crate::service::solution_image;
 use crate::state::AppState;
+use crate::web::tenant_state::State;
 
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireStudent, RequireTeacher, UploadFileForm,
@@ -157,6 +163,7 @@ impl PoolQuestionResponse {
         question: &PoolQuestion,
         people: &std::collections::HashMap<String, PersonRef>,
         solution_count: i64,
+        image: Option<&PoolQuestionImage>,
     ) -> Self {
         Self {
             id: question.get_id().key().to_string(),
@@ -168,12 +175,10 @@ impl PoolQuestionResponse {
             approved_by: question
                 .get_approved_by()
                 .map(|approver| PersonRef::resolve(people, approver)),
-            image: question
-                .get_image_content_type()
-                .map(|content_type| PoolImageMeta {
-                    content_type: content_type.as_str().to_string(),
-                    size: question.get_image_size().unwrap_or(0),
-                }),
+            image: image.map(|image| PoolImageMeta {
+                content_type: image.get_content_type().as_str().to_string(),
+                size: image.get_size(),
+            }),
             solution_count,
         }
     }
@@ -196,19 +201,21 @@ struct SolutionResponse {
 }
 
 impl SolutionResponse {
-    fn new(solution: &Solution, people: &std::collections::HashMap<String, PersonRef>) -> Self {
+    fn new(
+        solution: &Solution,
+        people: &std::collections::HashMap<String, PersonRef>,
+        image: Option<&SolutionImage>,
+    ) -> Self {
         Self {
             id: solution.get_id().key().to_string(),
             question: solution.get_question().key().to_string(),
             author: PersonRef::resolve(people, solution.get_author()),
             body: solution.get_body().as_str().to_string(),
             offered_at: solution.get_offered_at().as_millis(),
-            image: solution
-                .get_image_content_type()
-                .map(|content_type| PoolImageMeta {
-                    content_type: content_type.as_str().to_string(),
-                    size: solution.get_image_size().unwrap_or(0),
-                }),
+            image: image.map(|image| PoolImageMeta {
+                content_type: image.get_content_type().as_str().to_string(),
+                size: image.get_size(),
+            }),
         }
     }
 }
@@ -229,11 +236,19 @@ async fn question_responses(
         .map(|question| *question.get_id())
         .collect();
     let counts = solution::counts_for(&st.db, &question_ids).await?;
+    // The photos bucket onto the page in one query, exactly like the
+    // solution tallies — never an image read per row.
+    let image_refs: Vec<&PoolQuestionId> = questions.iter().map(|q| q.get_id()).collect();
+    let mut images: HashMap<String, PoolQuestionImage> = HashMap::new();
+    for image in pool_question_image::list_for_questions(&st.db, &image_refs).await? {
+        images.insert(image.get_question().key(), image);
+    }
     Ok(questions
         .iter()
         .map(|question| {
             let count = counts.get(&question.get_id().key()).copied().unwrap_or(0);
-            PoolQuestionResponse::new(question, &people, count)
+            let image = images.get(question.get_id().key().as_str());
+            PoolQuestionResponse::new(question, &people, count, image)
         })
         .collect())
 }
@@ -426,18 +441,13 @@ async fn delete_question(
             "only the asker or a teacher+ may delete a question",
         ));
     }
-    let (removed, swept) = pool_question::delete(&st.db, question.get_id())
+    let removed = pool_question::delete(&st.db, question.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    // Rows went first (in one transaction); now every blob they pointed at —
-    // the question's photo and each swept solution's — comes off disk.
-    if let Some(file) = removed.get_image_file() {
+    // Rows went first (in one transaction); now every blob they named — the
+    // question's photo and each swept solution's — comes off disk.
+    for file in &removed.image_files {
         remove_blob(&st.files_path, file).await;
-    }
-    for solution in &swept {
-        if let Some(file) = solution.get_image_file() {
-            remove_blob(&st.files_path, file).await;
-        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -489,7 +499,7 @@ async fn upload_image(
         {
             // The guarded UPDATE found the question still pending: point-of-truth
             // write done; the replaced blob (if any) comes off disk.
-            Some(before) => Ok(((), before.get_image_file().map(str::to_string))),
+            Some(replaced) => Ok(((), replaced)),
             // Approved or deleted mid-upload — the fresh blob is an orphan.
             None => Err(AppError::Conflict("the question is no longer pending")),
         }
@@ -526,11 +536,12 @@ async fn get_image(
 ) -> Result<Response, AppError> {
     let question = question_or_404(&st, &id).await?;
     ensure_visible(&question, &user)?;
-    match (question.get_image_file(), question.get_image_content_type()) {
-        (Some(file), Some(content_type)) => {
-            serve_inline_blob(&st.files_path, file, content_type).await
+    let image = pool_question_image::read(&st.db, question.get_id()).await?;
+    match image {
+        Some(image) => {
+            serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
         }
-        _ => Err(AppError::NotFound),
+        None => Err(AppError::NotFound),
     }
 }
 
@@ -557,16 +568,17 @@ async fn delete_image(
 ) -> Result<StatusCode, AppError> {
     let question = question_or_404(&st, &id).await?;
     ensure_asker_editable(&question, &user)?;
-    if question.get_image_file().is_none() {
-        return Err(AppError::NotFound);
+    match pool_question::clear_image(&st.db, question.get_id()).await? {
+        // Detached: the blob comes off disk.
+        Some(Some(file)) => {
+            remove_blob(&st.files_path, &file).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        // Still pending, but there was no image to remove.
+        Some(None) => Err(AppError::NotFound),
+        // Approved or deleted mid-flight — content is frozen or gone.
+        None => Err(AppError::Conflict("the question is no longer pending")),
     }
-    let before = pool_question::clear_image(&st.db, question.get_id())
-        .await?
-        .ok_or(AppError::Conflict("the question is no longer pending"))?;
-    if let Some(file) = before.get_image_file() {
-        remove_blob(&st.files_path, file).await;
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- solutions --------------------------------------------------------------
@@ -647,7 +659,7 @@ async fn offer_solution(
     let people = person_map([*user.get_id()], &st.db).await?;
     Ok((
         StatusCode::CREATED,
-        Json(SolutionResponse::new(&solution, &people)),
+        Json(SolutionResponse::new(&solution, &people, None)),
     ))
 }
 
@@ -678,14 +690,18 @@ async fn list_solutions(
     ensure_visible(&question, &user)?;
     let (solutions, total) = solution::list_for(&st.db, question.get_id(), limit, offset).await?;
     let slice = solutions.as_slice();
-    let people = person_map(
-        slice.iter().map(|solution| *solution.get_author()),
-        &st.db,
-    )
-    .await?;
+    let people = person_map(slice.iter().map(|solution| *solution.get_author()), &st.db).await?;
+    let solution_refs: Vec<&SolutionId> = slice.iter().map(|s| s.get_id()).collect();
+    let mut images: HashMap<String, SolutionImage> = HashMap::new();
+    for image in solution_image::list_for_solutions(&st.db, &solution_refs).await? {
+        images.insert(image.get_solution().key(), image);
+    }
     let items = slice
         .iter()
-        .map(|solution| SolutionResponse::new(solution, &people))
+        .map(|solution| {
+            let image = images.get(solution.get_id().key().as_str());
+            SolutionResponse::new(solution, &people, image)
+        })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -721,9 +737,11 @@ async fn delete_solution(
     }
     // Row first, blob after — a crash in between strands at worst an
     // unreachable file.
-    let deleted = solution::delete(&st.db, solution).await?;
-    if let Some(file) = deleted.get_image_file() {
-        remove_blob(&st.files_path, file).await;
+    let (_, image) = solution::delete(&st.db, solution)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(file) = image {
+        remove_blob(&st.files_path, &file).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -764,7 +782,12 @@ async fn edit_solution(
         .await?
         .ok_or(AppError::NotFound)?;
     let people = person_map([*user.get_id()], &st.db).await?;
-    Ok(Json(SolutionResponse::new(&updated, &people)))
+    let image = solution_image::read(&st.db, updated.get_id()).await?;
+    Ok(Json(SolutionResponse::new(
+        &updated,
+        &people,
+        image.as_ref(),
+    )))
 }
 
 // ---- the solution's photo ---------------------------------------------------
@@ -814,7 +837,7 @@ async fn upload_solution_image(
             .await?
         {
             // Row write done; the replaced blob (if any) comes off disk.
-            Some(before) => Ok(((), before.get_image_file().map(str::to_string))),
+            Some(replaced) => Ok(((), replaced)),
             // Deleted mid-upload — the fresh blob is an orphan.
             None => Err(AppError::NotFound),
         }
@@ -854,11 +877,12 @@ async fn get_solution_image(
     Path((id, sid)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let solution = visible_solution(&st, &user, &id, &sid).await?;
-    match (solution.get_image_file(), solution.get_image_content_type()) {
-        (Some(file), Some(content_type)) => {
-            serve_inline_blob(&st.files_path, file, content_type).await
+    let image = solution_image::read(&st.db, solution.get_id()).await?;
+    match image {
+        Some(image) => {
+            serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
         }
-        _ => Err(AppError::NotFound),
+        None => Err(AppError::NotFound),
     }
 }
 
@@ -886,14 +910,13 @@ async fn delete_solution_image(
     Path((id, sid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let solution = author_solution(&st, &user, &id, &sid).await?;
-    if solution.get_image_file().is_none() {
-        return Err(AppError::NotFound);
+    match solution::clear_image(&st.db, solution.get_id()).await? {
+        // Detached: the blob comes off disk.
+        Some(Some(file)) => {
+            remove_blob(&st.files_path, &file).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        // Gone, or there was no image to remove.
+        _ => Err(AppError::NotFound),
     }
-    let before = solution::clear_image(&st.db, solution.get_id())
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if let Some(file) = before.get_image_file() {
-        remove_blob(&st.files_path, file).await;
-    }
-    Ok(StatusCode::NO_CONTENT)
 }

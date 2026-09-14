@@ -92,8 +92,8 @@ mod tests {
         // under the fixture's fixed key, then two rows either side of `now`.
         let user = UserId::from_key("019732e3-7b00-7000-8000-00000000cab0");
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, 'purge-fixture', 'x')",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, 'purge-fixture', 0)",
         )
         .bind(user.uuid())
         .execute(&db)

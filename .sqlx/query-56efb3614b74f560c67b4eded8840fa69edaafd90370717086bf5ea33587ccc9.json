@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT question AS \"question: PoolQuestionId\", file,\n               content_type AS \"content_type: FileContentType\", size\n           FROM pool_question_image WHERE question = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "question: PoolQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "pool_question_image",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pool_question_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pool_question_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "pool_question_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "56efb3614b74f560c67b4eded8840fa69edaafd90370717086bf5ea33587ccc9"
+}

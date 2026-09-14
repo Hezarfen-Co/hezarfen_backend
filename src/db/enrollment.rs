@@ -11,6 +11,7 @@ use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -62,6 +63,7 @@ pub async fn enroll(
     }
     let course_id = course.clone();
     let (user_id, enrolled_by_id) = (*user, *enrolled_by);
+    let created_at = Timestamp::now();
     let verdict = tx_with_retry(db, false, async move |tx| {
         // The duplicate gate rides ahead of the role check, so "you are
         // already in" still outranks everything.
@@ -99,14 +101,15 @@ pub async fn enroll(
                   WHERE id = $1
                     AND enrollment_count < COALESCE(capacity, $2)
                   RETURNING 1)
-               INSERT INTO enrollment (course, app_user, enrolled_by, source)
-               SELECT $1, $3, $4, NULL WHERE EXISTS (SELECT 1 FROM seat)
+               INSERT INTO enrollment (course, app_user, enrolled_by, source, created_at)
+               SELECT $1, $3, $4, NULL, $5 WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING course AS "course: CourseId", app_user AS "user: UserId",
                           enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId""#,
             course_id.uuid(),
             cap::UNLIMITED,
             user_id.uuid(),
             enrolled_by_id.uuid(),
+            created_at as _,
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -274,8 +277,8 @@ mod tests {
     async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', $3)",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, $3)",
         )
         .bind(user.uuid())
         .bind(format!("{label}-{}", &user.key()[30..]))
@@ -301,8 +304,8 @@ mod tests {
             .bind({
                 let mgr = UserId::generate();
                 sqlx::query(
-                    "INSERT INTO app_user (id, username, password_hash, role) \
-                     VALUES ($1, 'enroll-fixture', 'x', 'manager')",
+                    "INSERT INTO app_user (id, username, created_at, role) \
+                     VALUES ($1, 'enroll-fixture', 0, 'manager')",
                 )
                 .bind(mgr.uuid())
                 .execute(&db)

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM solution_image si\n               USING solution s\n               WHERE si.solution = s.id AND s.question = $1\n               RETURNING si.file",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "solution_image",
+            "name": "file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8bef59e3c15a1c19a23800bffe0dd2e43afa3a07509c593ac01828a9d511dcb3"
+}

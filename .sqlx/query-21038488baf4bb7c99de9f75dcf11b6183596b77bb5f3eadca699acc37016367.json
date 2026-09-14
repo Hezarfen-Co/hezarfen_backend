@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO exam_result (exam, app_user, seq, mark, graded_by, graded_at)\n               VALUES ($1, $2, $3, $4, $5, $6)\n               ON CONFLICT (exam, app_user, seq) DO UPDATE\n                   SET mark = EXCLUDED.mark, graded_by = EXCLUDED.graded_by,\n                       graded_at = EXCLUDED.graded_at\n               RETURNING exam AS \"exam: ExamId\", app_user AS \"user: UserId\", seq,\n                         mark AS \"mark: Mark\", graded_by AS \"graded_by: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mark: Mark",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "mark"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "graded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_result",
+            "name": "graded_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "21038488baf4bb7c99de9f75dcf11b6183596b77bb5f3eadca699acc37016367"
+}

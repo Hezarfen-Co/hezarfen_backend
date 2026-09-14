@@ -46,10 +46,11 @@ pub async fn read(db: &Database, id: &BuilderId) -> Result<Option<Builder>, AppE
 /// constraint stands guard regardless.
 pub async fn create(db: &Database, builder: Builder) -> Result<(), AppError> {
     sqlx::query!(
-        "INSERT INTO builder (id, username, password_hash) VALUES ($1, $2, $3)",
+        "INSERT INTO builder (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
         builder.id.uuid(),
         builder.username.as_str(),
         builder.password_hash.as_str(),
+        Timestamp::now().as_millis(),
     )
     .execute(db)
     .await?;

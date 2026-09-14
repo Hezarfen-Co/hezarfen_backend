@@ -302,8 +302,8 @@ mod tests {
         // The student is a foreign key now: a real row under the fixture's
         // fixed key.
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, 'aaaa-fixture', 'x')",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, 'aaaa-fixture', 0)",
         )
         .bind(student().uuid())
         .execute(&db)

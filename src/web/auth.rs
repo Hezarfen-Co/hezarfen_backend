@@ -200,7 +200,7 @@ async fn register(
         // each half is idempotent and a retry after a torn pair completes
         // it). A taken school username means the person is already a member
         // — the same 201.
-        match service::user::create(&db, username, password_hash).await {
+        match service::user::create(&db, username, Some(*person.get_id())).await {
             Ok(_) => {}
             Err(AppError::Conflict(_)) => {
                 tracing::info!("register: school username already taken, answering 201");

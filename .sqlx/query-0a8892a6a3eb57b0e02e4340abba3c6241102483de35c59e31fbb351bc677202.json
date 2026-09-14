@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT solution AS \"solution: SolutionId\", file,\n               content_type AS \"content_type: FileContentType\", size\n           FROM solution_image WHERE solution = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "solution: SolutionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "solution_image",
+            "name": "solution"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "solution_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "solution_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "solution_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0a8892a6a3eb57b0e02e4340abba3c6241102483de35c59e31fbb351bc677202"
+}

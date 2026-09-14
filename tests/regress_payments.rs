@@ -61,8 +61,8 @@ async fn ledger(app: &axum::Router, mgr: &str, student: &str) -> Vec<Value> {
 /// hash is a stub.
 async fn fixture_user(db: &Database, username: &str) -> UserId {
     sqlx::query(
-        "INSERT INTO app_user (id, username, password_hash, role) \
-         VALUES ($1, $2, 'x', 'student') ON CONFLICT DO NOTHING",
+        "INSERT INTO app_user (id, username, created_at, role) \
+         VALUES ($1, $2, 0, 'student') ON CONFLICT DO NOTHING",
     )
     .bind(UserId::generate().uuid())
     .bind(username)

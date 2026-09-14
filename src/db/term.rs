@@ -274,8 +274,8 @@ mod tests {
         // every create in every round.
         let teacher = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(teacher.uuid())
         .bind(format!("term-race-{}", &teacher.key()[30..]))

@@ -196,8 +196,8 @@ mod tests {
         let id = BankQuestionId::generate();
         let owner = crate::domain::user::UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(owner.uuid())
         .bind(format!("bqi-owner-{}", &owner.key()[30..]))

@@ -123,7 +123,7 @@ mod tests {
     /// A real `app_user` row: the note's owner is a foreign key now.
     async fn a_person(db: &Database) -> crate::domain::user::UserId {
         let user = crate::domain::user::UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
             .bind(user.uuid())
             .bind(format!("nf-{}", &user.key()[30..]))
             .execute(db)

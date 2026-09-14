@@ -324,8 +324,8 @@ mod tests {
         let user = UserId::from_key("019732e3-7b00-7000-8000-00000000cafe");
         let thread = ChatbotThreadId::from_key("019732e3-7b00-7000-8000-00000000beef");
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, 'chat-fixture', 'x')",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, 'chat-fixture', 0)",
         )
         .bind(user.uuid())
         .execute(&db)

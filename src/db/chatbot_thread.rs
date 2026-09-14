@@ -224,7 +224,7 @@ mod tests {
 
     async fn a_user_capped_at(threads: i64) -> (Database, crate::database::TestDatabases) {
         let (db, leases) = crate::database::init_test_db().await;
-        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'u', 'x')")
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, 'u', 0)")
             .bind(UserId::from_key(U).uuid())
             .execute(&db)
             .await

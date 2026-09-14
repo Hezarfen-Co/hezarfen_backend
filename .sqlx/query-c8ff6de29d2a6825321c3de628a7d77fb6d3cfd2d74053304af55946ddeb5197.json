@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE solution SET body = $2 WHERE id = $1\n           RETURNING id AS \"id: SolutionId\", question AS \"question: PoolQuestionId\",\n               author AS \"author: UserId\", body AS \"body: SolutionBody\",\n               offered_at AS \"offered_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SolutionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "solution",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "question: PoolQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "solution",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "author: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "solution",
+            "name": "author"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "body: SolutionBody",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "solution",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "offered_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "solution",
+            "name": "offered_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c8ff6de29d2a6825321c3de628a7d77fb6d3cfd2d74053304af55946ddeb5197"
+}

@@ -313,8 +313,8 @@ mod tests {
         // The username is unique: a second call for the same name must adopt
         // the existing row, not collide with it.
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher') ON CONFLICT DO NOTHING",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher') ON CONFLICT DO NOTHING",
         )
         .bind(UserId::generate().uuid())
         .bind(username)

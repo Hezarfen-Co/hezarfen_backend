@@ -11,6 +11,7 @@ use crate::domain::exam::ExamId;
 use crate::domain::exam_result::{
     ExamResult, Mark, draft_error, latest_per_pair, retired_kind_error,
 };
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -180,10 +181,11 @@ pub async fn grade(
         }
         let written = sqlx::query_as!(
             ExamResult,
-            r#"INSERT INTO exam_result (exam, app_user, seq, mark, graded_by)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO exam_result (exam, app_user, seq, mark, graded_by, graded_at)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (exam, app_user, seq) DO UPDATE
-                   SET mark = EXCLUDED.mark, graded_by = EXCLUDED.graded_by
+                   SET mark = EXCLUDED.mark, graded_by = EXCLUDED.graded_by,
+                       graded_at = EXCLUDED.graded_at
                RETURNING exam AS "exam: ExamId", app_user AS "user: UserId", seq,
                          mark AS "mark: Mark", graded_by AS "graded_by: UserId""#,
             exam.uuid(),
@@ -191,6 +193,7 @@ pub async fn grade(
             seq,
             mark.as_i64(),
             graded_by.uuid(),
+            Timestamp::now().as_millis(),
         )
         .fetch_one(&mut *conn)
         .await?;
@@ -518,8 +521,8 @@ mod tests {
         // too (the teacher idempotently — [`the_two_people`] re-runs it).
         let teacher = UserId::from_key(TEACHER);
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, 't', 'x', 'teacher') ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, 't', 0, 'teacher') ON CONFLICT (id) DO NOTHING",
         )
         .bind(teacher.uuid())
         .execute(db)
@@ -622,8 +625,8 @@ mod tests {
     async fn the_two_people(db: &Database) {
         for (role, key) in [("teacher", TEACHER), ("student", STUDENT)] {
             sqlx::query(
-                "INSERT INTO app_user (id, username, password_hash, role) \
-                 VALUES ($1, $2, 'x', $3) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO app_user (id, username, created_at, role) \
+                 VALUES ($1, $2, 0, $3) ON CONFLICT (id) DO NOTHING",
             )
             .bind(UserId::from_key(key).uuid())
             .bind(key)

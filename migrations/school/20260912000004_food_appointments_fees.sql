@@ -66,7 +66,10 @@ CREATE INDEX appointment_status ON appointment (status);
 
 -- A published menu per day+slot. `date` is a calendar day as YYYY-MM-DD
 -- text (an equality key, not a timestamp); `slot` is snapshotted text, so
--- retiring a slot in settings never rewrites a past menu.
+-- retiring a slot in settings never rewrites a past menu. Deleting a menu
+-- sweeps its menu_dish and meal_attendance rows (the children go first —
+-- both FKs are NO ACTION) and never meal_booking: those rows carry no FK
+-- and survive the delete, auditable against the ledger lines they charged.
 CREATE TABLE menu (
     -- The {date}_{slot} derived key — it IS the URL segment — with the two
     -- components kept as their own columns (the unique pair keeps the old
@@ -130,7 +133,6 @@ CREATE TABLE meal_booking (
     CONSTRAINT meal_booking_menu_student PRIMARY KEY (menu, student)
 );
 
-CREATE INDEX meal_booking_menu ON meal_booking (menu);
 CREATE INDEX meal_booking_student ON meal_booking (student);
 
 CREATE TABLE meal_attendance (

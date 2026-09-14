@@ -4,11 +4,13 @@
 //! the whole school for everyone to read and offer solutions on. Approved
 //! content is frozen — edits after approval would bypass moderation — so the
 //! only post-approval change is deletion (asker or teacher+), which takes the
-//! question's solutions with it. An optional photo of the problem rides on
-//! the row as metadata (`image_*`); the bytes live on disk under
-//! [`crate::config::Config::files_path`] in a file named by `image_file` — a
-//! fresh server-generated id per upload. The web layer owns the blob I/O;
-//! the queries live in [`crate::db::pool_question`], the workflows in
+//! question's solutions with it. An optional photo of the problem is its own
+//! row in `pool_question_image` — the child-table shape of
+//! [`crate::domain::question_image`] with a single (implicit) slot — and the
+//! bytes live on disk under [`crate::config::Config::files_path`] in a file
+//! named by that row's `file` — a fresh server-generated id per upload. The
+//! web layer owns the blob I/O; the queries live in
+//! [`crate::db::pool_question`], the workflows in
 //! [`crate::service::pool_question`].
 
 use uuid::Uuid;
@@ -17,7 +19,6 @@ use crate::constant::{
     MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN, STATUS_APPROVED, STATUS_PENDING,
 };
 use crate::domain::monotonic_id::next_uuid;
-use crate::domain::note_file::FileContentType;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
@@ -97,11 +98,6 @@ pub struct PoolQuestion {
     pub(crate) status: String,
     pub(crate) asked_at: Timestamp,
     pub(crate) approved_by: Option<UserId>,
-    /// The photo's on-disk blob name — a fresh server-generated id every
-    /// upload; `None` when the question carries no image.
-    pub(crate) image_file: Option<String>,
-    pub(crate) image_content_type: Option<FileContentType>,
-    pub(crate) image_size: Option<i64>,
 }
 
 impl PoolQuestion {
@@ -114,9 +110,6 @@ impl PoolQuestion {
             status: STATUS_PENDING.to_string(),
             asked_at: Timestamp::now(),
             approved_by: None,
-            image_file: None,
-            image_content_type: None,
-            image_size: None,
         }
     }
 
@@ -151,16 +144,5 @@ impl PoolQuestion {
     pub fn get_approved_by(&self) -> Option<&UserId> {
         self.approved_by.as_ref()
     }
-
-    pub fn get_image_file(&self) -> Option<&str> {
-        self.image_file.as_deref()
-    }
-
-    pub fn get_image_content_type(&self) -> Option<&FileContentType> {
-        self.image_content_type.as_ref()
-    }
-
-    pub fn get_image_size(&self) -> Option<i64> {
-        self.image_size
-    }
 }
+

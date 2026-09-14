@@ -8,10 +8,11 @@ use crate::tenant::{Slug, Tenants};
 use crate::db::user;
 use crate::domain::board::Board;
 use crate::domain::note_file::FileContentType;
+use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
-use crate::domain::user::{Password, PasswordHash, User, UserId, Username};
+use crate::domain::user::{Password, User, UserId, Username};
 use crate::error::AppError;
 
 /// Idempotent startup seed: guarantee an admin account with this username.
@@ -27,6 +28,19 @@ pub async fn ensure_admin(
     password: Password,
 ) -> Result<(), AppError> {
     let db = tenants.get(slug).await?;
+    // The person half runs first, so the school row can carry the person id
+    // it is the join key to. Login reads the control-plane credential, so the
+    // seeded admin needs their `person` row and the membership too. Both
+    // writes are idempotent (create-or-load never re-keys an existing
+    // person's password; the membership insert is `ON CONFLICT DO NOTHING`),
+    // so every boot re-runs them — and a school whose seed predates the
+    // person half heals on the next boot instead of stranding an admin who
+    // cannot log in.
+    let password_hash = password.hash_async().await?;
+    let person =
+        crate::service::person::create_or_load(tenants.control(), username.clone(), password_hash)
+            .await?;
+    crate::service::person::link_school(tenants.control(), person.get_id(), slug).await?;
     match user::find_by_username(&db, username.as_str()).await? {
         Some(user) if user.role == Role::Admin => {}
         Some(_) => {
@@ -36,37 +50,20 @@ pub async fn ensure_admin(
             );
             return Ok(());
         }
+        // One statement, admin from birth. Never create-then-promote:
+        // an interruption between those two writes leaves a student row
+        // holding ADMIN_USERNAME, which the `Some(_)` arm above then
+        // refuses to promote — forever, on every subsequent boot. There
+        // is no marker that could tell such a row apart from a stranger
+        // who registered the name first, so the hole cannot be healed
+        // later; it has to be impossible to open.
         None => {
-            // One statement, admin from birth. Never create-then-promote:
-            // an interruption between those two writes leaves a student row
-            // holding ADMIN_USERNAME, which the `Some(_)` arm above then
-            // refuses to promote — forever, on every subsequent boot. There
-            // is no marker that could tell such a row apart from a stranger
-            // who registered the name first, so the hole cannot be healed
-            // later; it has to be impossible to open.
-            user::create_with_role(
-                &db,
-                username.clone(),
-                password.hash_async().await?,
-                Role::Admin,
-            )
-            .await?;
+            user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin).await?;
             // No `username` field: with OTLP on every event is exported as a
             // log record, so an account name here leaves the process.
             tracing::info!("seeded the admin account named by ADMIN_USERNAME");
         }
     }
-    // The person half: login reads the control-plane credential, so the
-    // seeded admin needs their `person` row and the membership too. Both
-    // writes are idempotent (create-or-load never re-keys an existing
-    // person's password; the membership insert is `ON CONFLICT DO NOTHING`),
-    // so every boot re-runs them — and a school whose seed predates the
-    // person half heals on the next boot instead of stranding an admin who
-    // cannot log in.
-    let password_hash = password.hash_async().await?;
-    let person =
-        crate::service::person::create_or_load(tenants.control(), username, password_hash).await?;
-    crate::service::person::link_school(tenants.control(), person.get_id(), slug).await?;
     Ok(())
 }
 
@@ -101,15 +98,15 @@ pub async fn set_role(
     user::set_role_cascade(db, target, role).await
 }
 
-/// Register a new account — the web layer's row mint. New users always start
-/// as [`Role::Student`]; elevation is a separate, admin-only action
-/// (see [`set_role`]).
+/// Register a new school account for `person` — the web layer's row mint.
+/// New users always start as [`Role::Student`]; elevation is a separate,
+/// admin-only action (see [`set_role`]).
 pub async fn create(
     db: &Database,
     username: Username,
-    password_hash: PasswordHash,
+    person: Option<PersonId>,
 ) -> Result<User, AppError> {
-    user::create(db, username, password_hash).await
+    user::create(db, username, person).await
 }
 
 /// Mint a row holding `role` outright — the school-creation path, whose
@@ -117,10 +114,10 @@ pub async fn create(
 pub async fn create_with_role(
     db: &Database,
     username: Username,
-    password_hash: PasswordHash,
+    person: Option<PersonId>,
     role: Role,
 ) -> Result<User, AppError> {
-    user::create_with_role(db, username, password_hash, role).await
+    user::create_with_role(db, username, person, role).await
 }
 
 /// One user row, for callers that only inspect it — the web layer's reads go
@@ -207,15 +204,6 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
     user::clear_avatar(db, id).await
 }
 
-/// Rewrite the credential — the admin-password reset's store half.
-pub async fn set_password_hash(
-    db: &Database,
-    id: &UserId,
-    password_hash: PasswordHash,
-) -> Result<Option<User>, AppError> {
-    user::set_password_hash(db, id, password_hash).await
-}
-
 /// Persist the UI-preference fields a PATCH carried.
 pub async fn set_preferences(
     db: &Database,
@@ -231,20 +219,11 @@ pub async fn set_preferences(
 mod tests {
     use super::*;
     use crate::database::{Database, init_test_db};
-    use crate::domain::user::Password;
 
     async fn a_user(username: &str, db: &Database) -> User {
-        user::create(
-            db,
-            Username::try_new(username).unwrap(),
-            Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+        user::create(db, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap()
     }
 
     /// The board result slot is an *index* into a batch whose length depends on

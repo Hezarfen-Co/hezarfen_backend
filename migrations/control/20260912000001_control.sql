@@ -23,9 +23,12 @@
 -- `tier:client:window` key, so the PK is TEXT.
 
 CREATE TABLE school (
+    -- Immutable: a rename is blocked by the school_slug primary key below and
+    -- by the per-school database name ({control}_school_{slug}) minted from
+    -- it — a slug change would orphan the database.
     slug       TEXT NOT NULL,
     name       TEXT NOT NULL,
-    status     TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+    status     TEXT NOT NULL CONSTRAINT school_status CHECK (status IN ('active', 'suspended')),
     created_at BIGINT NOT NULL,
     -- Which product modules this school has bought; names bound from
     -- Module::ALL at write time, never spelled here.
@@ -37,6 +40,7 @@ CREATE TABLE builder (
     id            uuid PRIMARY KEY,
     username      TEXT NOT NULL,
     password_hash TEXT NOT NULL,
+    created_at    BIGINT NOT NULL,
     CONSTRAINT builder_username UNIQUE (username)
 );
 

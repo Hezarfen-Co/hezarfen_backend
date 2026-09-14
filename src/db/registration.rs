@@ -7,6 +7,7 @@ use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::cap::Claimed;
 use crate::domain::event::EventId;
 use crate::domain::registration::Registration;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use sqlx::query_as;
@@ -67,6 +68,7 @@ pub(crate) async fn claim_seat(
     user: &UserId,
     registered_by: &UserId,
 ) -> Result<Claimed<Registration>, AppError> {
+    let created_at = Timestamp::now().as_millis();
     match query_as!(
         Registration,
         "WITH person AS (
@@ -83,13 +85,14 @@ pub(crate) async fn claim_seat(
                AND (audience_capacity IS NULL OR registration_count < audience_capacity)
                AND EXISTS (SELECT 1 FROM person)
              RETURNING 1)
-         INSERT INTO registration (event, app_user, registered_by)
-         SELECT $1, $2, $3
+         INSERT INTO registration (event, app_user, registered_by, created_at)
+         SELECT $1, $2, $3, $4
          WHERE EXISTS (SELECT 1 FROM seat)
          RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\"",
         event.uuid(),
         user.uuid(),
-        registered_by.uuid()
+        registered_by.uuid(),
+        created_at,
     )
     .fetch_optional(db)
     .await

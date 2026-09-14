@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::constant::{AI_PRINCIPAL_KEY, DECOY_PASSWORD};
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
+use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
@@ -103,7 +104,9 @@ impl Password {
     fn hash(&self) -> Result<PasswordHash, AppError> {
         // password-hash 0.6 generates the salt internally (its own CSPRNG);
         // the explicit SaltString step is gone.
-        let hash = Argon2::default().hash_password(self.0.as_bytes())?.to_string();
+        let hash = Argon2::default()
+            .hash_password(self.0.as_bytes())?
+            .to_string();
         Ok(PasswordHash(hash))
     }
 
@@ -204,7 +207,10 @@ impl PasswordHash {
 pub struct User {
     pub(crate) id: UserId,
     pub(crate) username: Username,
-    pub(crate) password_hash: PasswordHash,
+    /// The control-plane person this school row belongs to — the join key to
+    /// the credential. No FK: the two halves are separate databases. `None`
+    /// on rows minted before their person was known (boot seed order, tests).
+    pub(crate) person: Option<PersonId>,
     pub(crate) role: Role,
     // Personal info, identical for every role. All optional: accounts are
     // created from bare credentials and filled in later, and rows from before
@@ -237,14 +243,14 @@ impl User {
     ///
     /// Never written to the database, and never read back from one: the id is
     /// the nil UUID, which no minted id (always a v7) can ever equal. Every
-    /// other field is inert — the empty password hash parses as no argon2 hash,
-    /// so it verifies against nothing, and [`Role::Ai`] clears no `at_least`
-    /// bar and fails every exact `== Role::Student` / `== Role::Parent` gate.
+    /// other field is inert — `person` is `None`, and [`Role::Ai`] clears no
+    /// `at_least` bar and fails every exact `== Role::Student` /
+    /// `== Role::Parent` gate.
     pub(crate) fn ai_principal() -> User {
         User {
             id: UserId(Uuid::nil()),
             username: Username(AI_PRINCIPAL_KEY.to_string()),
-            password_hash: PasswordHash(String::new()),
+            person: None,
             role: Role::Ai,
             name: None,
             surname: None,
@@ -269,9 +275,8 @@ impl User {
     pub fn get_username(&self) -> &Username {
         &self.username
     }
-
-    pub fn get_password_hash(&self) -> &PasswordHash {
-        &self.password_hash
+    pub fn get_person(&self) -> Option<&PersonId> {
+        self.person.as_ref()
     }
 
     pub fn get_role(&self) -> Role {
@@ -329,7 +334,6 @@ impl User {
     pub fn get_avatar_size(&self) -> Option<i64> {
         self.avatar_size
     }
-
 }
 
 #[cfg(test)]

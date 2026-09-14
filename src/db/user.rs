@@ -13,23 +13,27 @@ use crate::db::field_update::FieldUpdate;
 use crate::db::page::{PagedList, Param};
 use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::note_file::FileContentType;
+use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{PasswordHash, User, UserId, Username};
+use crate::domain::user::{User, UserId, Username};
 use crate::error::AppError;
 
-/// Register a new account. New users always start as [`Role::Student`];
-/// elevation is a separate, admin-only action
+/// Register a new school account for the control-plane `person` whose
+/// credential login verifies — `person` is the join key, `None` only where the
+/// caller cannot know it yet (tests, the boot seed's row-first order — see
+/// [`crate::service::user::ensure_admin`]). New users always start as
+/// [`Role::Student`]; elevation is a separate, admin-only action
 /// (see [`crate::service::user::set_role`]).
 pub async fn create(
     db: &Database,
     username: Username,
-    password_hash: PasswordHash,
+    person: Option<PersonId>,
 ) -> Result<User, AppError> {
-    create_with_role(db, username, password_hash, Role::Student).await
+    create_with_role(db, username, person, Role::Student).await
 }
 
 /// The one row-minting path. `role` is written *with* the row rather than
@@ -44,20 +48,23 @@ pub async fn create(
 /// the constraint a racing insert had violated; here the violated
 /// constraint's name answers directly (`app_user_username`), and the loser
 /// of a race gets the same 409 the sequential duplicate always got.
+///
+/// The row carries its `created_at` mint stamp and, when the caller knows it,
+/// the `person` id the credential lives on.
 pub async fn create_with_role(
     db: &Database,
     username: Username,
-    password_hash: PasswordHash,
+    person: Option<PersonId>,
     role: Role,
 ) -> Result<User, AppError> {
     let id = UserId::generate();
     match sqlx::query_as!(
         User,
-        r#"INSERT INTO app_user (id, username, password_hash, role)
-           VALUES ($1, $2, $3, $4)
+        r#"INSERT INTO app_user (id, username, person, role, created_at)
+           VALUES ($1, $2, $3, $4, $5)
            RETURNING id AS "id: UserId",
                      username AS "username: Username",
-                     password_hash AS "password_hash: PasswordHash",
+                     person AS "person: PersonId",
                      role AS "role: Role",
                      name AS "name: PersonName",
                      surname AS "surname: PersonName",
@@ -74,13 +81,20 @@ pub async fn create_with_role(
                      avatar_size"#,
         id.uuid(),
         username.as_str(),
-        password_hash.as_str(),
+        person.as_ref().map(PersonId::uuid),
         role.as_str(),
+        Timestamp::now().as_millis(),
     )
     .fetch_one(db)
     .await
     {
-        Ok(user) => Ok(user),
+        Ok(user) => {
+            debug_assert_eq!(
+                user.get_person().map(PersonId::uuid),
+                person.as_ref().map(PersonId::uuid)
+            );
+            Ok(user)
+        }
         Err(err) if crate::database::unique_violation(&err) == Some("app_user_username") => {
             Err(AppError::Conflict("username already taken"))
         }
@@ -93,7 +107,7 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
         User,
         r#"SELECT id AS "id: UserId",
                   username AS "username: Username",
-                  password_hash AS "password_hash: PasswordHash",
+                  person AS "person: PersonId",
                   role AS "role: Role",
                   name AS "name: PersonName",
                   surname AS "surname: PersonName",
@@ -137,7 +151,7 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
         User,
         r#"SELECT id AS "id: UserId",
                   username AS "username: Username",
-                  password_hash AS "password_hash: PasswordHash",
+                  person AS "person: PersonId",
                   role AS "role: Role",
                   name AS "name: PersonName",
                   surname AS "surname: PersonName",
@@ -168,7 +182,7 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
         User,
         r#"SELECT id AS "id: UserId",
                   username AS "username: Username",
-                  password_hash AS "password_hash: PasswordHash",
+                  person AS "person: PersonId",
                   role AS "role: Role",
                   name AS "name: PersonName",
                   surname AS "surname: PersonName",
@@ -389,7 +403,7 @@ pub async fn set_role_cascade(
                                WHERE role = 'admin' AND id <> $1) = 0)
                RETURNING id AS "id: UserId",
                          username AS "username: Username",
-                         password_hash AS "password_hash: PasswordHash",
+                         person AS "person: PersonId",
                          role AS "role: Role",
                          name AS "name: PersonName",
                          surname AS "surname: PersonName",
@@ -622,13 +636,38 @@ pub async fn set_profile(
         value.map(|inner| Param::OptText(inner.map(str::to_string)))
     }
     FieldUpdate::new("app_user", id.uuid())
-        .set("name", text(name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("surname", text(surname.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("email", text(email.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("phone", text(phone.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("birth_date", text(birth_date.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("display_name", text(display_name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
-        .set("bio", text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set(
+            "name",
+            text(name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "surname",
+            text(surname.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "email",
+            text(email.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "phone",
+            text(phone.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "birth_date",
+            text(birth_date.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "display_name",
+            text(
+                display_name
+                    .as_ref()
+                    .map(|n| n.as_ref().map(|x| x.as_str())),
+            ),
+        )
+        .set(
+            "bio",
+            text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
         .run(db)
         .await
 }
@@ -662,7 +701,7 @@ pub async fn set_avatar(
             User,
             r#"SELECT id AS "id: UserId",
                       username AS "username: Username",
-                      password_hash AS "password_hash: PasswordHash",
+                      person AS "person: PersonId",
                       role AS "role: Role",
                       name AS "name: PersonName",
                       surname AS "surname: PersonName",
@@ -710,7 +749,7 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
             User,
             r#"SELECT id AS "id: UserId",
                       username AS "username: Username",
-                      password_hash AS "password_hash: PasswordHash",
+                      person AS "person: PersonId",
                       role AS "role: Role",
                       name AS "name: PersonName",
                       surname AS "surname: PersonName",
@@ -746,44 +785,6 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
     .await
 }
 
-/// Replace a user's password hash — the builder's admin-password reset
-/// (`POST /schools/{slug}/admin-password`). Only the credential is
-/// rewritten; revoking the sessions minted under the old one is the
-/// caller's second half ([`crate::db::session::delete_by_user`]), because a
-/// reset that leaves a stolen cookie working resets nothing.
-pub async fn set_password_hash(
-    db: &Database,
-    id: &UserId,
-    password_hash: PasswordHash,
-) -> Result<Option<User>, AppError> {
-    let user = sqlx::query_as!(
-        User,
-        r#"UPDATE app_user SET password_hash = $2 WHERE id = $1
-           RETURNING id AS "id: UserId",
-                     username AS "username: Username",
-                     password_hash AS "password_hash: PasswordHash",
-                     role AS "role: Role",
-                     name AS "name: PersonName",
-                     surname AS "surname: PersonName",
-                     email AS "email: Email",
-                     phone AS "phone: Phone",
-                     birth_date AS "birth_date: BirthDate",
-                     theme AS "theme: Theme",
-                     language AS "language: Language",
-                     palette_color AS "palette_color: PaletteColor",
-                     display_name AS "display_name: DisplayName",
-                     bio AS "bio: Bio",
-                     avatar_file,
-                     avatar_content_type AS "avatar_content_type: FileContentType",
-                     avatar_size"#,
-        id.uuid(),
-        password_hash.as_str(),
-    )
-    .fetch_optional(db)
-    .await?;
-    Ok(user)
-}
-
 /// Write the UI-preference fields the request actually carried. Same
 /// contract as [`set_profile`]: `None` = omitted (not written),
 /// `Some(None)` = cleared back to "never chose", `Some(Some(v))` = set.
@@ -810,7 +811,7 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
         User,
         r#"SELECT id AS "id: UserId",
                   username AS "username: Username",
-                  password_hash AS "password_hash: PasswordHash",
+                  person AS "person: PersonId",
                   role AS "role: Role",
                   name AS "name: PersonName",
                   surname AS "surname: PersonName",
@@ -837,24 +838,15 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
 mod tests {
     use super::*;
     use crate::database::init_test_db;
-    use crate::domain::user::Password;
 
     fn png() -> FileContentType {
         FileContentType::try_new("image/png").unwrap()
     }
 
     async fn a_user(username: &str, db: &Database) -> User {
-        create(
-            db,
-            Username::try_new(username).unwrap(),
-            Password::try_new("secret1")
-                .unwrap()
-                .hash_async()
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+        create(db, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

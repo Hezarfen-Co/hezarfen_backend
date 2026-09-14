@@ -333,8 +333,8 @@ mod tests {
     async fn a_teacher(db: &Database) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'teacher')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
         )
         .bind(user.uuid())
         .bind(format!("t-{}", &user.key()[30..]))
@@ -348,8 +348,8 @@ mod tests {
     async fn a_student(db: &Database) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash, role) \
-             VALUES ($1, $2, 'x', 'student')",
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'student')",
         )
         .bind(user.uuid())
         .bind(format!("s-{}", &user.key()[30..]))

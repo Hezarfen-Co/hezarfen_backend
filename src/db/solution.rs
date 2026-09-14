@@ -33,9 +33,7 @@ pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppEr
            VALUES ($1, $2, $3, $4, $5)
            RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
-               offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
+               offered_at AS "offered_at: Timestamp""#,
         solution.id.uuid(),
         solution.question.uuid(),
         solution.author.uuid(),
@@ -68,9 +66,7 @@ pub async fn read_for(
         Solution,
         r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
-               offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size
+               offered_at AS "offered_at: Timestamp"
            FROM solution WHERE id = $1 AND question = $2"#,
         id.uuid(),
         question.uuid()
@@ -140,9 +136,7 @@ pub async fn set_body(
         r#"UPDATE solution SET body = $2 WHERE id = $1
            RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
-               offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
+               offered_at AS "offered_at: Timestamp""#,
         id.uuid(),
         body.as_str()
     )
@@ -152,104 +146,124 @@ pub async fn set_body(
 }
 
 /// Point the solution at a freshly written image blob. Unconditional for
-/// the same reason as [`set_body`]. Returns the *before* row — its
-/// `image_file` is the replaced blob the caller must remove; `None` means
-/// the row was deleted mid-flight (the fresh blob is the caller's orphan
-/// to take back off disk).
+/// the same reason as [`set_body`]. `Ok(None)` means the row was deleted
+/// mid-flight (the fresh blob is the caller's orphan to take back off
+/// disk); `Ok(Some(replaced))` names the blob this upload displaced — the
+/// caller's to remove, `None` inside when nothing was there before.
 ///
-/// The row lock makes the before-read and the write one switch, so two
-/// racing uploads can never both be told they replaced the same blob.
+/// The photo is its own row in `solution_image` (the child-table shape of
+/// `question_image`), so the write is that row's upsert; the parent's
+/// `FOR UPDATE` row lock still makes the before-read and the write one
+/// switch, so two racing uploads can never both be told they replaced the
+/// same blob — the loser re-reads the winner's blob name, the discipline
+/// `crate::db::question_image::upsert` documents.
 pub async fn set_image(
     db: &Database,
     id: &SolutionId,
     file: &str,
     content_type: &FileContentType,
     size: i64,
-) -> Result<Option<Solution>, AppError> {
+) -> Result<Option<Option<String>>, AppError> {
     // Owned captures (`Send` rule of `tx_with_retry` closures).
     let id = *id;
     let file = file.to_owned();
     let content_type = content_type.clone();
     tx_with_retry(db, false, async move |tx| {
-        let before = sqlx::query_as!(
-            Solution,
-            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
-                   author AS "author: UserId", body AS "body: SolutionBody",
-                   offered_at AS "offered_at: Timestamp", image_file,
-                   image_content_type AS "image_content_type: FileContentType",
-                   image_size
-                   FROM solution WHERE id = $1 FOR UPDATE"#,
+        let before = sqlx::query!(
+            r#"SELECT id FROM solution WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(before) = before else {
+        if before.is_none() {
             return Ok(None);
-        };
+        }
+        let replaced = sqlx::query_scalar!(
+            r#"SELECT file FROM solution_image WHERE solution = $1"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
         sqlx::query!(
-            r#"UPDATE solution
-               SET image_file = $2, image_content_type = $3, image_size = $4
-               WHERE id = $1"#,
+            r#"INSERT INTO solution_image (solution, file, content_type, size)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (solution) DO UPDATE
+                   SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,
+                       size = EXCLUDED.size"#,
             id.uuid(),
-            file.as_str(),
+            file,
             content_type.as_str(),
             size,
         )
         .execute(&mut *tx)
         .await?;
-        Ok(Some(before))
+        Ok(Some(replaced))
     })
     .await
 }
 
-/// Detach the solution's image. Returns the *before* row — its
-/// `image_file` is the blob the caller must remove.
-pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Solution>, AppError> {
+/// Detach the solution's image. `Ok(None)` = the row was deleted mid-flight;
+/// `Ok(Some(detached))` names the blob the caller removes — `None` inside
+/// when the solution carried no image (the route answers that 404).
+pub async fn clear_image(
+    db: &Database,
+    id: &SolutionId,
+) -> Result<Option<Option<String>>, AppError> {
     // Owned capture (`Send` rule of `tx_with_retry` closures).
     let id = *id;
     tx_with_retry(db, false, async move |tx| {
-        let before = sqlx::query_as!(
-            Solution,
-            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
-                   author AS "author: UserId", body AS "body: SolutionBody",
-                   offered_at AS "offered_at: Timestamp", image_file,
-                   image_content_type AS "image_content_type: FileContentType",
-                   image_size
-                   FROM solution WHERE id = $1 FOR UPDATE"#,
+        let before = sqlx::query!(
+            r#"SELECT id FROM solution WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(before) = before else {
+        if before.is_none() {
             return Ok(None);
-        };
-        sqlx::query!(
-            r#"UPDATE solution
-               SET image_file = NULL, image_content_type = NULL, image_size = NULL
-               WHERE id = $1"#,
-            id.uuid(),
+        }
+        let detached = sqlx::query_scalar!(
+            r#"DELETE FROM solution_image WHERE solution = $1 RETURNING file"#,
+            id.uuid()
         )
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(Some(before))
+        Ok(Some(detached))
     })
     .await
 }
 
-pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppError> {
-    let deleted = sqlx::query_as!(
-        Solution,
-        r#"DELETE FROM solution WHERE id = $1
-           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
-               author AS "author: UserId", body AS "body: SolutionBody",
-               offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: FileContentType",
-               image_size"#,
-        solution.id.uuid()
-    )
-    .fetch_optional(db)
-    .await?;
-    deleted.ok_or(AppError::NotFound)
+/// Delete a solution, returning the row plus the blob name of the photo it
+/// carried (the caller's disk-GC list — one entry at most). The photo row
+/// goes first: its foreign key is `NO ACTION`, so it cannot outlive being
+/// pointed at, and its file name is read on the way out, under the same
+/// transaction — a photo uploaded by a racing `set_image` loses the row
+/// lock to this delete and comes back as the caller's orphan.
+pub async fn delete(
+    db: &Database,
+    solution: Solution,
+) -> Result<Option<(Solution, Option<String>)>, AppError> {
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let id = *solution.get_id();
+    tx_with_retry(db, false, async move |tx| {
+        let image = sqlx::query_scalar!(
+            r#"DELETE FROM solution_image WHERE solution = $1 RETURNING file"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let deleted = sqlx::query_as!(
+            Solution,
+            r#"DELETE FROM solution WHERE id = $1
+               RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp""#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(deleted.map(|deleted| (deleted, image)))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -264,8 +278,8 @@ mod tests {
     async fn a_person(db: &Database, label: &str) -> UserId {
         let user = UserId::generate();
         sqlx::query(
-            "INSERT INTO app_user (id, username, password_hash) \
-             VALUES ($1, $2, 'x')",
+            "INSERT INTO app_user (id, username, created_at) \
+             VALUES ($1, $2, 0)",
         )
         .bind(user.uuid())
         .bind(format!("{label}-{}", &user.key()[30..]))
@@ -345,7 +359,10 @@ mod tests {
                 .is_none()
         );
 
-        delete(&db, first).await.unwrap();
+        let first_id = *first.get_id();
+        let (deleted, image) = delete(&db, first).await.unwrap().unwrap();
+        assert_eq!(deleted.get_id(), &first_id);
+        assert!(image.is_none());
         assert_eq!(
             list_for(&db, &question_a, None, 0).await.unwrap().0.len(),
             1
@@ -370,40 +387,39 @@ mod tests {
         .await
         .unwrap();
 
-        let before = set_image(&db, solution.get_id(), "blob_a", &png, 3)
+        let replaced = set_image(&db, solution.get_id(), "blob_a", &png, 3)
             .await
             .unwrap()
             .unwrap();
-        assert!(before.get_image_file().is_none());
+        assert!(replaced.is_none());
 
         // A replace reports the old blob for cleanup.
-        let before = set_image(&db, solution.get_id(), "blob_b", &png, 5)
+        let replaced = set_image(&db, solution.get_id(), "blob_b", &png, 5)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(before.get_image_file(), Some("blob_a"));
-        let stored = read_for(&db, solution.get_id(), &question)
+        assert_eq!(replaced.as_deref(), Some("blob_a"));
+        let stored = crate::db::solution_image::read(&db, solution.get_id())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.get_image_file(), Some("blob_b"));
-        assert_eq!(stored.get_image_size(), Some(5));
+        assert_eq!(stored.get_file(), "blob_b");
+        assert_eq!(stored.get_size(), 5);
 
-        // Clearing reports the detached blob and empties the fields.
-        let before = clear_image(&db, solution.get_id()).await.unwrap().unwrap();
-        assert_eq!(before.get_image_file(), Some("blob_b"));
+        // Clearing reports the detached blob and drops the row.
+        let detached = clear_image(&db, solution.get_id()).await.unwrap().unwrap();
+        assert_eq!(detached.as_deref(), Some("blob_b"));
         assert!(
-            read_for(&db, solution.get_id(), &question)
+            crate::db::solution_image::read(&db, solution.get_id())
                 .await
                 .unwrap()
-                .unwrap()
-                .get_image_file()
                 .is_none()
         );
 
         // A row deleted mid-flight surfaces as None, not an error.
-        let deleted = delete(&db, solution.clone()).await.unwrap();
+        let (deleted, image) = delete(&db, solution.clone()).await.unwrap().unwrap();
         assert_eq!(deleted.get_id(), solution.get_id());
+        assert!(image.is_none());
         assert!(
             set_image(&db, solution.get_id(), "blob_c", &png, 7)
                 .await
@@ -473,9 +489,7 @@ mod tests {
             }
         }
 
-        let counts = counts_for(&db, &[two, one, none])
-            .await
-            .unwrap();
+        let counts = counts_for(&db, &[two, one, none]).await.unwrap();
         assert_eq!(counts.get(two.key().as_str()), Some(&2));
         assert_eq!(counts.get(one.key().as_str()), Some(&1));
         // No solutions = no entry; the caller reads the miss as zero.

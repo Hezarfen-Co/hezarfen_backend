@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO solution_image (solution, file, content_type, size)\n               VALUES ($1, $2, $3, $4)\n               ON CONFLICT (solution) DO UPDATE\n                   SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,\n                       size = EXCLUDED.size",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b21b7cead2c7a5737594f65d926b19d442328c17626b2a9766a48a3fba108de3"
+}
