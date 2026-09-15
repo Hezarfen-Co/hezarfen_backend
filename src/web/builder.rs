@@ -97,8 +97,10 @@ struct SchoolResponse {
     slug: String,
     #[schema(example = "Ata Koleji")]
     name: String,
-    /// `active` or `suspended`. A suspended school refuses every one of its own
-    /// users, login included.
+    /// `active` or `suspended` — plus `provisioning`, which a boot writes only
+    /// while it is finishing a school a previous boot left half-made (nothing
+    /// serves one, and the next boot retries it). A suspended school refuses
+    /// every one of its own users, login included.
     #[schema(example = "active")]
     status: String,
     /// Registered at, UTC unix-milliseconds.
@@ -148,7 +150,8 @@ struct CreateSchool {
 struct UpdateSchool {
     #[schema(example = "Ata Koleji", max_length = 120)]
     name: Option<String>,
-    /// `active` or `suspended`.
+    /// `active` or `suspended` — `provisioning` is the boot's own word and is
+    /// refused here.
     #[schema(example = "suspended")]
     status: Option<String>,
 }
@@ -449,9 +452,14 @@ async fn get_school(
 }
 
 /// Rename a school and/or flip it between `active` and `suspended`. Omitted
-/// fields keep their value. The slug itself is immutable in this cut — it is
-/// the cookie prefix and the blob directory — though it no longer names the
-/// database (the school's uuid does); a rename API is not offered yet.
+/// fields keep their value — both land in one statement, so a request that
+/// carries both is one write and never half a patch. The slug itself is
+/// immutable in this cut — it is the cookie prefix and the blob directory —
+/// though it no longer names the database (the school's uuid does); a rename
+/// API is not offered yet.
+///
+/// `provisioning` is not a status a client can ask for: it is the boot's word
+/// for a school that is still being made, and asking for it is a `400`.
 ///
 /// Suspending is immediate and total for the school's own users: their next
 /// request is a `403`, live session or not.
@@ -484,21 +492,16 @@ async fn update_school(
         .map(SchoolStatus::try_from_str)
         .transpose()?;
 
-    let control = st.tenants.control();
-    // An empty patch on an unknown school is still a 404, so the existence
-    // check is not left to whichever field happened to be present.
-    School::read(&slug, control)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if let Some(name) = name {
-        School::update_name(&slug, &name, control).await?;
+    // Both fields are one statement: an omitted one keeps its stored value, and
+    // a patch that carries both can never leave half of itself behind. An empty
+    // patch on an unknown school is still a 404 — the update answers it, rather
+    // than whichever field happened to be present.
+    let school = School::update(&slug, name.as_deref(), status, st.tenants.control()).await?;
+    if status == Some(SchoolStatus::Suspended) {
+        // A suspension evicts the pool so nothing that already resolved keeps
+        // serving; un-suspending needs no invalidation, the next request dials.
+        st.tenants.evict(school.get_id()).await;
     }
-    if let Some(status) = status {
-        st.tenants.set_status(&slug, status).await?;
-    }
-    let school = School::read(&slug, control)
-        .await?
-        .ok_or(AppError::NotFound)?;
     Ok(Json(SchoolResponse::new(&school)))
 }
 
@@ -766,7 +769,7 @@ async fn patch_school_modules(
         (status = 400, description = "Invalid password", body = ErrorResponse),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
         (status = 404, description = "No such school, or no such account in it", body = ErrorResponse),
-        (status = 409, description = "That account exists but is not an admin of this school", body = ErrorResponse),
+        (status = 409, description = "That account exists but is not an admin of this school, or the school is still being provisioned", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -813,7 +816,7 @@ async fn reset_admin_password(
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
         (status = 403, description = "The school is suspended", body = ErrorResponse),
         (status = 404, description = "No such school, or no such account in it", body = ErrorResponse),
-        (status = 409, description = "That account exists but is not an admin of this school", body = ErrorResponse),
+        (status = 409, description = "That account exists but is not an admin of this school, or the school is still being provisioned", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]

@@ -224,7 +224,10 @@ prepare database those checks run against, and the committed `.sqlx` cache
 lets a build run with `SQLX_OFFLINE=true` and no database at all. On boot
 the sqlx migrator applies `migrations/control` to the control database and
 ensures the school template; each school database runs `migrations/school`
-the same way at mint. Interactive API docs (Swagger UI) are served at
+the same way at mint. A school is registered as `provisioning` until that
+migration has run, so a boot cut short mid-create leaves a row the next boot
+finishes rather than a school that answers every request with a `500`.
+Interactive API docs (Swagger UI) are served at
 `/swagger`, the raw OpenAPI spec at `/api-docs/openapi.json`.
 
 ## Run in a container (podman)
@@ -1362,7 +1365,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/schools`                                                       | builder | Every school this deployment serves, newest first. Paged via `?limit=&offset=` (omit `limit` for the full list). |
 | POST   | `/schools`                                                       | builder | Create a school: its registry row, its database, its schema, and its first admin account — one call, or none of it. |
 | GET    | `/schools/{slug}`                                                | builder | One school by slug. |
-| PATCH  | `/schools/{slug}`                                                | builder | Rename a school and/or flip it between `active` and `suspended`. Omitted fields keep their value. The slug itself is immutable in this cut — it is the cookie prefix and the blob directory — though it no longer names the database (the school's uuid does); a rename API is not offered yet. |
+| PATCH  | `/schools/{slug}`                                                | builder | Rename a school and/or flip it between `active` and `suspended`. Omitted fields keep their value — both land in one statement, so a request that carries both is one write and never half a patch. The slug itself is immutable in this cut — it is the cookie prefix and the blob directory — though it no longer names the database (the school's uuid does); a rename API is not offered yet. |
 | DELETE | `/schools/{slug}`                                                | builder | Delete a school: its database, its registry row, and its uploaded files. Irreversible — suspension is the reversible door. |
 | POST   | `/schools/{slug}/admin-password`                                 | builder | Reset an admin's password inside a school — the "we are locked out" call. Every session that account held is revoked with it, so a stolen cookie does not survive the reset. Works on a suspended school. |
 | POST   | `/schools/{slug}/enter`                                          | builder | Enter a school as one of its admins — support access, with the school's own session cookie (`<slug>.<token>`) and no builder power inside it. |

@@ -929,6 +929,74 @@ async fn probe_control_migration_is_idempotent_over_aged_rows() {
     assert_eq!(before, after, "a re-run must not disturb school rows");
 }
 
+/// A boot cut short mid-create leaves a `provisioning` row and no school
+/// database. The next boot finishes it — the row goes `active` and the
+/// school's own doors answer — instead of leaving a school the API advertises
+/// as ready while its database has no tables (every request a `500`).
+///
+/// Both halves of the window are pinned: while the row says `provisioning` its
+/// own doors refuse it (`403`-class, not a `500` from a table-less database),
+/// and after reconciliation the schema is really there.
+#[tokio::test]
+async fn a_half_made_school_is_finished_by_the_next_boot() {
+    let tenants = database::init_test_tenants().await;
+    let control = tenants.control().clone();
+    let slug = Slug::try_new("half-made").unwrap();
+    let id = hezarfen_backend::tenant::SchoolId::generate();
+
+    // Exactly what `Tenants::create` commits before it mints a database: the
+    // registry row (as `provisioning`) and its entitlements.
+    sqlx::query(
+        "INSERT INTO school (id, slug, name, status, created_at) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id.uuid())
+    .bind(slug.as_str())
+    .bind("Half Made")
+    .bind("provisioning")
+    .bind(hezarfen_backend::domain::timestamp::Timestamp::now().as_millis())
+    .execute(&control)
+    .await
+    .expect("seed a half-made school row");
+
+    assert!(
+        tenants.get(&slug).await.is_err(),
+        "a school that is still being made must not serve"
+    );
+    assert_eq!(status_of(&control, "half-made").await, "provisioning");
+
+    tenants
+        .reconcile_provisioning()
+        .await
+        .expect("the boot finishes what the previous one started");
+
+    assert_eq!(status_of(&control, "half-made").await, "active");
+    let db = tenants
+        .get(&slug)
+        .await
+        .expect("the finished school answers");
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+        .fetch_one(&db)
+        .await
+        .expect("the school schema is really there, not merely the row's word");
+    assert_eq!(users, 0, "a finished school starts empty");
+
+    // The database the reconciliation minted is this test's, so it goes with
+    // the test (the harness only drops what `create` minted).
+    tenants
+        .drop(&slug)
+        .await
+        .expect("clean up the minted school");
+}
+
+/// One school's stored status, straight off the registry row.
+async fn status_of(control: &Database, slug: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM school WHERE slug = $1")
+        .bind(slug)
+        .fetch_one(control)
+        .await
+        .unwrap()
+}
+
 /// Every school row as `(slug, name, status, modules)`, in slug order — the
 /// modules aggregated off the `school_module` child table, as every read path
 /// assembles them.

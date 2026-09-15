@@ -83,7 +83,12 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
     let template = format!("{control_db}_school_template");
     ensure_template(&control, &base, &template).await?;
 
-    Ok(Tenants::new(control, base, control_db))
+    let tenants = Tenants::new(control, base, control_db);
+    // Schools a previous boot left half-made (its registry row committed, its
+    // database not yet there) are finished before this one serves anything.
+    tenants.reconcile_provisioning().await?;
+
+    Ok(tenants)
 }
 
 /// Parse `DATABASE_URL` into dial options plus the control database's name —
@@ -795,9 +800,10 @@ async fn ensure_test_template(maintenance: &PgPool, base: &PgConnectOptions) -> 
         )))
         .execute(&mut *session)
         .await
-            && !is_duplicate_database(&err) {
-                panic!("create the school template {name}: {err}");
-            }
+        && !is_duplicate_database(&err)
+    {
+        panic!("create the school template {name}: {err}");
+    }
     let pool = pool_options(1)
         .connect_with(base.clone().database(&name))
         .await

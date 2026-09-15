@@ -116,6 +116,13 @@ pub fn school_db_name(control_db: &str, id: Uuid) -> String {
 /// Whether a school may be reached at all. Suspension is immediate and total:
 /// [`Tenants::get`] refuses before any handler runs, and login is no exception.
 ///
+/// [`SchoolStatus::Provisioning`] is the boot's bookkeeping, not the vendor's:
+/// it marks the window between the registry row committing and the school's
+/// database carrying the schema (the two cannot be one write). A client can
+/// never ask for it — [`SchoolStatus::try_from_str`] refuses the word — and a
+/// boot closes the window by finishing the provisioning or leaving the row for
+/// the next one.
+///
 /// Stored as a bare lowercase string, like [`crate::domain::role::Role`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
@@ -123,6 +130,7 @@ pub fn school_db_name(control_db: &str, id: Uuid) -> String {
 pub enum SchoolStatus {
     Active,
     Suspended,
+    Provisioning,
 }
 
 impl SchoolStatus {
@@ -130,9 +138,13 @@ impl SchoolStatus {
         match self {
             SchoolStatus::Active => "active",
             SchoolStatus::Suspended => "suspended",
+            SchoolStatus::Provisioning => "provisioning",
         }
     }
 
+    /// The statuses a *client* may name. `provisioning` is deliberately absent:
+    /// it is the boot's word for a school that is being made, so a PATCH that
+    /// asks for it is a validation error rather than a state anyone can enter.
     pub fn try_from_str(value: &str) -> Result<Self, ValidationError> {
         match value {
             "active" => Ok(SchoolStatus::Active),
@@ -265,17 +277,27 @@ impl School {
         Ok((rows, total))
     }
 
-    /// Rename a school — its display `name`, not its slug. The slug is
-    /// immutable in this cut (it is the cookie prefix and the files
-    /// subdirectory), though it no longer names the database: the uuid does.
-    pub async fn update_name(
+    /// Rename a school and/or flip its status — its display `name`, not its
+    /// slug, which is immutable in this cut (it is the cookie prefix and the
+    /// files subdirectory), though it no longer names the database: the uuid
+    /// does.
+    ///
+    /// Both fields land in **one** statement, so a patch that carries both can
+    /// never leave half of itself behind, and an omitted field is kept by
+    /// `COALESCE` over the row being written — never over a snapshot the caller
+    /// read, so a concurrent patch of the other field cannot be reverted
+    /// either.
+    pub async fn update(
         slug: &Slug,
-        name: &str,
+        name: Option<&str>,
+        status: Option<SchoolStatus>,
         control: &Database,
     ) -> Result<School, AppError> {
         sqlx::query_as::<_, School>(
             "WITH updated AS (
-                 UPDATE school SET name = $1 WHERE slug = $2
+                 UPDATE school
+                 SET name = COALESCE($1, name), status = COALESCE($2, status)
+                 WHERE slug = $3
                  RETURNING id, slug, name, status, created_at
              )
              SELECT u.id, u.slug, u.name, u.status, u.created_at,
@@ -285,6 +307,7 @@ impl School {
              GROUP BY u.id, u.slug, u.name, u.status, u.created_at",
         )
         .bind(name)
+        .bind(status)
         .bind(slug.as_str())
         .fetch_optional(control)
         .await?
@@ -366,7 +389,8 @@ impl Tenants {
 
     /// The handle for a school a request may use, or the refusal a request
     /// gets: unknown → `401` (a wrong school is a wrong credential, and a `404`
-    /// would enumerate the customer list), suspended → `403`.
+    /// would enumerate the customer list), suspended → `403`, still being
+    /// provisioned → `403` as well (its database has no schema to serve yet).
     ///
     /// corner-cut: the registry row is read on every request, so a suspension
     /// takes effect on the next call with no invalidation protocol. That is one
@@ -387,6 +411,10 @@ impl Tenants {
                 self.evict(school.get_id()).await;
                 Err(AppError::Forbidden("school is suspended"))
             }
+            Some(school) if school.status == SchoolStatus::Provisioning => {
+                self.evict(school.get_id()).await;
+                Err(AppError::Forbidden("school is still being provisioned"))
+            }
             Some(school) => Ok(ResolvedTenant {
                 slug: slug.clone(),
                 db: self.handle(school.get_id()).await?,
@@ -397,11 +425,17 @@ impl Tenants {
 
     /// [`Tenants::get`] for builder tooling, which must still reach a suspended
     /// school to un-suspend or inspect it. Unknown → `404`, because a builder is
-    /// authenticated and there is nothing to hide from them.
+    /// authenticated and there is nothing to hide from them. A school that is
+    /// still being provisioned is a `409`: the two routes that come through
+    /// here (`enter`, `reset_admin_password`) need its database to answer, and a
+    /// table-less one would surface as a `500` instead of "not ready yet".
     pub async fn get_any_status(&self, slug: &Slug) -> Result<(Database, SchoolStatus), AppError> {
         let school = School::read(slug, &self.control)
             .await?
             .ok_or(AppError::NotFound)?;
+        if school.status == SchoolStatus::Provisioning {
+            return Err(AppError::Conflict("school is still being provisioned"));
+        }
         Ok((self.handle(school.get_id()).await?, school.status))
     }
 
@@ -431,7 +465,7 @@ impl Tenants {
         .bind(id.uuid())
         .bind(slug.as_str())
         .bind(name)
-        .bind(SchoolStatus::Active)
+        .bind(SchoolStatus::Provisioning)
         .bind(Timestamp::now().as_millis())
         .execute(&mut *tx)
         .await;
@@ -521,23 +555,26 @@ impl Tenants {
             pool.close().await;
             migrated?;
         }
+        // The schema is there, so the school stops saying it is being made
+        // (see [`SchoolStatus::Provisioning`]). Both callers want exactly this:
+        // the create that minted the row a moment ago, and the boot that is
+        // finishing one a previous boot left behind.
+        sqlx::query("UPDATE school SET status = $1 WHERE id = $2")
+            .bind(SchoolStatus::Active)
+            .bind(id.uuid())
+            .execute(&self.control)
+            .await?;
         Ok(pool)
     }
 
-    /// Flip a school between active and suspended. Suspending also drops the
-    /// cached pool, so nothing that already resolved keeps serving.
+    /// Flip a school between `active` and `suspended` — the one-field form of
+    /// [`School::update`], which is where the write itself lives. Suspending
+    /// also drops the cached pool, so nothing that already resolved keeps
+    /// serving.
     pub async fn set_status(&self, slug: &Slug, status: SchoolStatus) -> Result<(), AppError> {
-        let updated: Option<Uuid> =
-            sqlx::query_scalar("UPDATE school SET status = $1 WHERE slug = $2 RETURNING id")
-                .bind(status)
-                .bind(slug.as_str())
-                .fetch_optional(&self.control)
-                .await?;
-        let Some(id) = updated else {
-            return Err(AppError::NotFound);
-        };
+        let school = School::update(slug, None, Some(status), &self.control).await?;
         if status == SchoolStatus::Suspended {
-            self.evict(SchoolId(id)).await;
+            self.evict(school.get_id()).await;
         }
         Ok(())
     }
@@ -589,27 +626,79 @@ impl Tenants {
         // database is about to go away, and `WITH (FORCE)` should never find
         // one of our connections to kill.
         self.evict(id).await;
-        // The control-plane rows pointing at the school by uuid — membership
-        // and entitlement alike — go first: `ON DELETE NO ACTION` would refuse
-        // the registry delete while any stand. Person sessions carry no
-        // school, so only memberships go — the persons themselves survive (a
-        // person is a global account, not the school's).
-        crate::db::person::delete_memberships_by_school(&self.control, &id).await?;
-        sqlx::query("DELETE FROM school_module WHERE school = $1")
-            .bind(id.uuid())
-            .execute(&self.control)
-            .await?;
+        // The database goes first — it is the half that can fail on its own
+        // (`DROP DATABASE` cannot join a transaction) — and everything after it
+        // is one transaction. A failure can then only leave "database gone,
+        // registry rows intact", which re-running this same call completes,
+        // rather than a destroyed membership set on a school that still stands
+        // (every one of its people locked out, nothing able to put them back).
         let db_name = school_db_name(&self.control_db, id.uuid());
         sqlx::query(sqlx::AssertSqlSafe(
             create_database_sql("DROP DATABASE IF EXISTS", &db_name) + " WITH (FORCE)",
         ))
         .execute(&self.control)
         .await?;
+        // The control-plane rows pointing at the school by uuid — membership
+        // and entitlement alike — go as one write: `ON DELETE NO ACTION` would
+        // refuse the registry delete while any stand. Person sessions carry no
+        // school, so only memberships go — the persons themselves survive (a
+        // person is a global account, not the school's).
+        let mut tx = self.control.begin().await?;
+        crate::db::person::delete_memberships_by_school(&mut *tx, &id).await?;
+        sqlx::query("DELETE FROM school_module WHERE school = $1")
+            .bind(id.uuid())
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM school WHERE id = $1")
             .bind(id.uuid())
-            .execute(&self.control)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
 
+        Ok(())
+    }
+
+    /// Finish the schools a previous boot left half-made.
+    ///
+    /// A school's registry row commits before its database exists — the two
+    /// cannot be one write, `CREATE DATABASE` being the one statement Postgres
+    /// refuses inside a transaction — so a boot that dies in between leaves a
+    /// row marked [`SchoolStatus::Provisioning`] and no schema behind it. This
+    /// runs the half that boot could not: create the database, migrate it, and
+    /// take the row to `active` (all of it [`Tenants::bring_up`]). A school that
+    /// fails again stays `provisioning` and is retried on the next boot, and the
+    /// builder can always `DELETE` it.
+    ///
+    /// What it cannot do is seed a first admin — that only ever lived in the web
+    /// create path, after this point — so a finished school may have no account
+    /// anybody can log into. The builder sees it in the list and either
+    /// `DELETE`s it and creates it again, or uses an account it already has.
+    pub async fn reconcile_provisioning(&self) -> Result<(), AppError> {
+        let rows: Vec<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM school WHERE status = $1 ORDER BY created_at")
+                .bind(SchoolStatus::Provisioning)
+                .fetch_all(&self.control)
+                .await?;
+        for (id,) in rows {
+            let id = SchoolId(id);
+            match self.bring_up(id).await {
+                Ok(pool) => {
+                    // Nothing has dialled it: this boot's pool is the cache's
+                    // only candidate and no request exists yet, so closing it
+                    // costs nothing and keeps the gauge honest.
+                    pool.close().await;
+                    tracing::info!(
+                        school = %id.uuid(),
+                        "finished provisioning a school the previous boot left half-made — \
+                         its first admin was never seeded, so DELETE and re-create it if nobody can enter"
+                    );
+                }
+                Err(err) => tracing::warn!(
+                    school = %id.uuid(),
+                    "a school is still provisioning after a retry ({err}) — the next boot tries again"
+                ),
+            }
+        }
         Ok(())
     }
 

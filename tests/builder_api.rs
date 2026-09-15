@@ -295,7 +295,9 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     assert_eq!(renamed.body["status"], "active");
     assert_eq!(renamed.body["slug"], "beta");
     assert_eq!(renamed.body["created_at"], before.body["created_at"]);
-    // An empty patch is a no-op read, and a bad status is a 400.
+    // An empty patch is a no-op read, and a bad status is a 400 — including
+    // `provisioning`, which is the boot's own word for a school that is still
+    // being made and not a state a vendor can ask for.
     let untouched = send(
         &app,
         "PATCH",
@@ -305,18 +307,21 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     )
     .await;
     assert_eq!(untouched.body["name"], "Beta Koleji");
-    assert_eq!(
-        send(
-            &app,
-            "PATCH",
-            "/schools/beta",
-            Some(&builder),
-            Some(json!({ "status": "closed" })),
-        )
-        .await
-        .status,
-        StatusCode::BAD_REQUEST
-    );
+    for refused in ["closed", "provisioning"] {
+        assert_eq!(
+            send(
+                &app,
+                "PATCH",
+                "/schools/beta",
+                Some(&builder),
+                Some(json!({ "status": refused })),
+            )
+            .await
+            .status,
+            StatusCode::BAD_REQUEST,
+            "status {refused:?}"
+        );
+    }
 
     // A live cookie, taken out before the suspension.
     let live = school_login(&app, "beta", "admin", "secret1")

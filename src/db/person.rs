@@ -128,13 +128,17 @@ pub async fn add_membership(db: &Database, person: &PersonId, slug: &Slug) -> Re
     Ok(())
 }
 
-/// Drop every membership pointing at a school — [`crate::tenant::Tenants::drop`]'s
-/// first control-plane half, so `ON DELETE NO ACTION` never refuses the
-/// registry delete. Persons themselves survive: a person is a global
-/// account, not the school's.
-pub async fn delete_memberships_by_school(db: &Database, school: &SchoolId) -> Result<(), AppError> {
+/// Drop every membership pointing at a school — the control-plane half of
+/// [`crate::tenant::Tenants::drop`], inside the transaction that also drops the
+/// entitlements and the registry row, so `ON DELETE NO ACTION` never refuses
+/// the registry delete and a failure leaves none of the three behind. Persons
+/// themselves survive: a person is a global account, not the school's.
+pub async fn delete_memberships_by_school(
+    exe: impl sqlx::PgExecutor<'_>,
+    school: &SchoolId,
+) -> Result<(), AppError> {
     sqlx::query!("DELETE FROM person_school WHERE school = $1", school.uuid())
-        .execute(db)
+        .execute(exe)
         .await?;
     Ok(())
 }
