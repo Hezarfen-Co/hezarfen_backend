@@ -14,6 +14,7 @@
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam_question::ChoiceId;
 use crate::domain::key;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 
 /// The identity of one (question, slot) pair. Not a row column: the table's
@@ -70,7 +71,7 @@ impl BankQuestionImage {
         Self {
             bank_question: question.clone(),
             slot: slot.cloned(),
-            file: uuid::Uuid::new_v4().to_string(),
+            file: next_uuid().to_string(),
             content_type,
             size,
         }

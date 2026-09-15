@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
-use uuid::Uuid;
 
 use crate::config::Config;
 use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
@@ -890,13 +889,15 @@ fn sweep_candidate(name: &str) -> bool {
 /// `<11 hex of unix-ms><5 hex random>`: the mint time, so the janitor can
 /// tell a crashed run's leftovers from a parallel test's fresh databases,
 /// plus just enough randomness that two processes minting in the same
-/// millisecond never collide.
+/// millisecond never collide. The tail is not an id and is drawn straight from
+/// the OS rng: the leading hex digits of a v7 uuid *are* the mint time, which
+/// is exactly what two processes minting in one millisecond share.
 fn test_suffix() -> String {
     let minted_ms = Timestamp::now().as_millis() as u64;
-    format!(
-        "{minted_ms:011x}{}",
-        &Uuid::new_v4().simple().to_string()[..5]
-    )
+    let mut tail = [0_u8; 3];
+    getrandom::fill(&mut tail).expect("the OS rng");
+    let hex = format!("{:02x}{:02x}{:02x}", tail[0], tail[1], tail[2]);
+    format!("{minted_ms:011x}{}", &hex[..5])
 }
 
 /// `CREATE DATABASE` for a harness-minted name, optionally `TEMPLATE`-cloned.

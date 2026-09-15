@@ -16,6 +16,7 @@
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::ExamQuestionId;
 use crate::domain::key;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::user::UserId;
 
@@ -89,7 +90,7 @@ impl AnswerImage {
             question: question.clone(),
             user: *user,
             seq,
-            file: uuid::Uuid::new_v4().to_string(),
+            file: next_uuid().to_string(),
             content_type,
             size,
         }

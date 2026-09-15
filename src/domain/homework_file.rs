@@ -74,7 +74,7 @@ impl HomeworkFile {
             name,
             content_type,
             size,
-            file: uuid::Uuid::new_v4().to_string(),
+            file: next_uuid().to_string(),
             created_at: Timestamp::now(),
         }
     }

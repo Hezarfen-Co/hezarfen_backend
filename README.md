@@ -4748,7 +4748,9 @@ src/
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
     role.rs        Role enum (student < teacher < manager < admin), at_least()
     monotonic_id.rs next_uuid: UUIDv7 ids that sort in write order — one
-                   process-wide ContextV7, so same-millisecond rows never scramble
+                   process-wide ContextV7, so same-millisecond rows never scramble.
+                   Every id in the crate comes through here; a guard test fails on
+                   a stray v4 anywhere under src/
     key.rs         sitting(): the deterministic per-sitting record key shared by
                    attempts, answers, answer images and results (seq 1 stays bare)
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by

@@ -1,6 +1,9 @@
 //! Ids that sort in write order, for tables whose listings lean on `id` to
 //! break ties (or to mean "newest first" outright).
 //!
+//! Every id this crate mints is a v7 uuid from [`next_uuid`] — there is no
+//! second convention, and the guard test below scans `src/` for one.
+//!
 //! A bare `Uuid::new_v7()` redraws its random bits per id, so two ids minted
 //! in the *same millisecond* sort arbitrarily against each other —
 //! millisecond-accurate ordering only. That is not enough when a burst of
@@ -48,5 +51,32 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted);
+    }
+
+    /// No file under `src/` may mint a v4 — the whole crate mints v7 ids, and
+    /// a lone v4 at one site is the regression the module doc describes
+    /// (millisecond-accurate ordering, silently). The needle is assembled at
+    /// run time so this test's own source is not a hit.
+    #[test]
+    fn nothing_under_src_mints_a_v4_uuid() {
+        let needle = format!("new_{}", "v4");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        let mut hits = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read a source file");
+                    if text.contains(&needle) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        hits.sort();
+        assert!(hits.is_empty(), "these files mint a v4 uuid: {hits:?}");
     }
 }

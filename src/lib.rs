@@ -22,7 +22,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::request_id::{
+    MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+};
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -289,11 +291,30 @@ pub fn build_router(state: AppState) -> Router {
         // Outermost: every request has an id from here inward, its own or ours.
         .layer(SetRequestIdLayer::new(
             HeaderName::from_static(REQUEST_ID_HEADER),
-            MakeRequestUuid,
+            MakeRequestIdV7,
         ))
         // Above `SetRequestIdLayer`, which keeps a caller-supplied id verbatim:
         // an unusable one is dropped here so the layer below mints a UUID.
         .layer(axum::middleware::from_fn(drop_unusable_request_id))
+}
+
+/// The request id this crate's spans carry: minted by its own v7 generator
+/// ([`crate::domain::monotonic_id::next_uuid`]) instead of tower-http's
+/// `MakeRequestUuid`, so the process mints one kind of uuid rather than two.
+/// Same wire shape either way — `x-request-id` holds a uuid — and the same
+/// job: letting a caller name the one request they are reporting without us
+/// needing their address or their URL.
+#[derive(Clone, Copy)]
+struct MakeRequestIdV7;
+
+impl MakeRequestId for MakeRequestIdV7 {
+    fn make_request_id<B>(&mut self, _request: &Request<B>) -> Option<RequestId> {
+        // A hyphenated uuid is always a valid header value, so this never
+        // takes the trait's "could not mint one" arm.
+        HeaderValue::from_str(&crate::domain::monotonic_id::next_uuid().to_string())
+            .ok()
+            .map(RequestId::new)
+    }
 }
 
 /// Refuse a caller-supplied `x-request-id` that is not a short, boring token.

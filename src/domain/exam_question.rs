@@ -123,11 +123,13 @@ impl ChoiceText {
 pub struct ChoiceId(String);
 
 impl ChoiceId {
-    /// Plain `Uuid::new_v4()` deliberately: options are ordered by their
-    /// position in the stored `Vec`, never by id, so nothing here reads the id
-    /// as a clock — it only has to be unique.
+    /// The process-wide monotonic generator, like every other id in the crate.
+    /// Nothing here reads this one as a clock — options are ordered by their
+    /// position in the stored `Vec`, never by id — but a second id convention
+    /// is a second thing to get wrong, and a v4 is one no reader has to know
+    /// about.
     fn generate() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
+        Self(next_uuid().to_string())
     }
 
     pub fn as_str(&self) -> &str {
