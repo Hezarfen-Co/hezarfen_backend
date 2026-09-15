@@ -79,7 +79,7 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
     // outside any transaction (`CREATE DATABASE` cannot run inside one —
     // `Pool::execute` runs bare autocommit statements), migrated once, then
     // closed. A first boot lost to a concurrent boot of the same deployment
-    // adopts the winner's template via the duplicate-database swallow.
+    // adopts the winner's template — see [`ensure_database`].
     let template = format!("{control_db}_school_template");
     ensure_template(&control, &base, &template).await?;
 
@@ -142,6 +142,43 @@ pub(crate) async fn school_pool(
 /// query strings without it).
 pub(crate) fn create_database_sql(statement: &str, name: &str) -> String {
     format!("{statement} \"{}\"", name.replace('"', "\"\""))
+}
+
+/// Create `name` unless the server already has it.
+///
+/// Postgres has no `IF NOT EXISTS` for `CREATE DATABASE` — the clause is a
+/// syntax error there — so the "already there" case can only be settled by a
+/// probe or by swallowing the refusal. Swallowing alone is not enough: a
+/// refused create is *not* quiet, the server logs it as
+/// `ERROR: database "…" already exists`, and a boot that finds its template in
+/// place would print that line on every restart. The probe handles the common
+/// case; the [`is_database_exists`] swallow stays as the backstop for the
+/// window between probe and create, where rival boots win the race and the
+/// statement is issued anyway.
+pub(crate) async fn ensure_database(pool: &PgPool, name: &str) -> Result<(), sqlx::Error> {
+    let present =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_database WHERE datname = $1")
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+    if present > 0 {
+        tracing::debug!("database {name} already exists — adopting it");
+        return Ok(());
+    }
+    match sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
+        "CREATE DATABASE",
+        name,
+    )))
+    .execute(pool)
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if is_database_exists(&err) => {
+            tracing::debug!("database {name} was created by a rival boot — adopting it");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn boot_control(base: &PgConnectOptions) -> Result<PgPool, sqlx::Error> {
@@ -259,23 +296,55 @@ pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// The advisory-lock key [`ensure_template`] holds while it creates and
+/// migrates the template: one name for one control database, contended only
+/// by concurrent boots of the same deployment. Distinct from
+/// [`TEST_TEMPLATE_LOCK_KEY`], which guards a different database.
+const TEMPLATE_LOCK_KEY: i64 = 0x6865_7A74_6D70_0001;
+
 /// Ensure the school-template database exists and carries the current school
 /// schema. `CREATE DATABASE` runs on the control pool outside any
-/// transaction; the loser of a race adopts the winner's database.
+/// transaction; a template another boot already made is adopted.
+///
+/// Boots of one deployment can overlap (a rolling restart, two replicas), and
+/// this pair is a critical section across processes for the same reasons the
+/// test harness's is (see [`ensure_test_template`]): unsynchronized, the
+/// creates collide — the loser's `pg_database_datname_index` violation is
+/// logged as a server-side `ERROR` even though [`ensure_database`] swallows
+/// it — and two migrators interleave their DDL on the same fresh database and
+/// kill each other on a duplicate table.
 async fn ensure_template(
     control: &PgPool,
     base: &PgConnectOptions,
     name: &str,
 ) -> Result<(), AppError> {
-    if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
-        "CREATE DATABASE",
-        name,
-    )))
-    .execute(control)
-    .await
-        && !is_duplicate_database(&err) {
-            return Err(err.into());
-        }
+    // A connection of its own, held for the section: an advisory lock is a
+    // server-wide name, so which connection issues the `CREATE` and the
+    // migrations inside the section does not matter — only that every boot
+    // takes the lock first.
+    let mut session = control.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut *session)
+        .await?;
+    let ensured = ensure_template_locked(control, base, name).await;
+    // Unlocked before anything is returned: the lock is session-scoped and the
+    // connection goes back to the pool, so skipping this on the error path
+    // would wedge every later boot.
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(TEMPLATE_LOCK_KEY)
+        .execute(&mut *session)
+        .await?;
+    ensured
+}
+
+/// The template's create-and-migrate, under [`ensure_template`]'s lock.
+async fn ensure_template_locked(
+    control: &PgPool,
+    base: &PgConnectOptions,
+    name: &str,
+) -> Result<(), AppError> {
+    ensure_database(control, name).await?;
     // One migrator connection, made and closed: the template is never served.
     let pool = pool_options(1)
         .connect_with(base.clone().database(name))
@@ -290,6 +359,17 @@ async fn ensure_template(
 pub(crate) fn is_duplicate_database(err: &sqlx::Error) -> bool {
     err.as_database_error()
         .is_some_and(|db| db.code().as_deref() == Some("42P04"))
+}
+
+/// Is this error "the database is already there"? Two SQLSTATEs say yes:
+/// `42P04`, the duplicate-database check `CREATE DATABASE` runs against the
+/// catalog, and `23505` on `pg_database_datname_index` — how Postgres reports
+/// the *losing* side of two concurrent creates, the name check and the
+/// catalog insert not being one atomic step. Measured on 18.6: four boots
+/// racing on an absent template, three of them got `23505` and died, so a
+/// `42P04`-only guard is too narrow for the very race it exists for.
+pub(crate) fn is_database_exists(err: &sqlx::Error) -> bool {
+    is_duplicate_database(err) || unique_violation(err) == Some("pg_database_datname_index")
 }
 
 /// The violated `UNIQUE` constraint's name, when `err` is a unique violation

@@ -26,8 +26,7 @@ use crate::constant::{MAX_SLUG_LEN, MIN_SLUG_LEN};
 use uuid::Uuid;
 
 use crate::database::{
-    Database, create_database_sql, is_duplicate_database, migrate_school, school_pool,
-    unique_violation,
+    Database, create_database_sql, ensure_database, migrate_school, school_pool, unique_violation,
 };
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
@@ -496,15 +495,7 @@ impl Tenants {
         // `CREATE DATABASE` cannot run inside a transaction; `Pool::execute`
         // sends it as a bare autocommit statement. A name left over by a
         // create that died before its rollback is adopted, not fought.
-        if let Err(err) = sqlx::query(sqlx::AssertSqlSafe(create_database_sql(
-            "CREATE DATABASE",
-            &db_name,
-        )))
-        .execute(&self.control)
-        .await
-            && !is_duplicate_database(&err) {
-                return Err(err.into());
-            }
+        ensure_database(&self.control, &db_name).await?;
         let pool = school_pool(&self.base, &db_name).await?;
         let migrated = migrate_school(&pool).await;
         if migrated.is_err() {
