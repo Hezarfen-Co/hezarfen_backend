@@ -470,6 +470,25 @@ impl Tenants {
                     .bind(id.uuid())
                     .execute(&self.control)
                     .await;
+                // The rows go first — a slug taken by a school that never came
+                // to exist is wedged for good — then the database, which is the
+                // expensive half and whose name nothing will ever reuse (the id
+                // is minted per create, never replayed). Best-effort, but not
+                // silent: a failure here is a half-provisioned database nobody
+                // can see or reach, so it earns the one log line this path has.
+                if let Err(leak) = sqlx::query(sqlx::AssertSqlSafe(
+                    create_database_sql(
+                        "DROP DATABASE IF EXISTS",
+                        &school_db_name(&self.control_db, id.uuid()),
+                    ) + " WITH (FORCE)",
+                ))
+                .execute(&self.control)
+                .await
+                {
+                    tracing::warn!(
+                        "failed to drop the database of a school whose create failed: {leak}"
+                    );
+                }
                 return Err(err);
             }
         };
@@ -650,7 +669,6 @@ impl Tenants {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn a_slug_names_a_school_and_nothing_reserved() {

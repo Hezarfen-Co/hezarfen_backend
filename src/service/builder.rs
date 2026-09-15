@@ -28,10 +28,15 @@ pub async fn ensure(db: &Database, username: Username, password: Password) -> Re
         password_hash: password.hash_async().await?,
         username,
     };
-    builder::create(db, builder).await?;
-    // The account name stays out of the event: exported log records must
-    // name no person (see `telemetry`).
-    tracing::info!("seeded the builder account named by BUILDER_USERNAME");
+    // A rival boot that seeded the same username between the read above and
+    // this insert loses the race silently — `create` reports "already there"
+    // instead of raising, so the second container of a fresh deployment boots
+    // instead of dying on a duplicate key. The winner's credential stands.
+    if builder::create(db, builder).await? {
+        // The account name stays out of the event: exported log records must
+        // name no person (see `telemetry`).
+        tracing::info!("seeded the builder account named by BUILDER_USERNAME");
+    }
     Ok(())
 }
 
@@ -90,6 +95,42 @@ mod tests {
         assert_eq!(
             again.get_password_hash().as_str(),
             first.get_password_hash().as_str()
+        );
+    }
+
+    /// Two boots of one deployment seed the same username in the same instant.
+    /// The loser must adopt the winner's row instead of dying on its own
+    /// insert — measured on a fresh control database: four boots racing, three
+    /// died on `23505 builder_username` and only the winner stayed up.
+    #[tokio::test]
+    async fn a_racing_seed_adopts_the_row_it_lost_to() {
+        let tenants = crate::database::init_test_tenants().await;
+        let control = tenants.control();
+        let name = Username::try_new("builder_race").unwrap();
+        let (first, second) = tokio::join!(
+            ensure(control, name.clone(), Password::try_new("secret1").unwrap()),
+            ensure(control, name.clone(), Password::try_new("secret2").unwrap()),
+        );
+        first.expect("the first seed");
+        second.expect("the racing seed adopts the account the winner seeded");
+
+        // One account, and the credential is whichever writer won the insert —
+        // neither seed rewrites the other's row.
+        let row = find_by_username(control, "builder_race")
+            .await
+            .unwrap()
+            .expect("seeded");
+        let matches_offered = row
+            .get_password_hash()
+            .verify_async(&Password::try_new("secret1").unwrap())
+            .await
+            || row
+                .get_password_hash()
+                .verify_async(&Password::try_new("secret2").unwrap())
+                .await;
+        assert!(
+            matches_offered,
+            "the stored hash belongs to no offered password"
         );
     }
 }

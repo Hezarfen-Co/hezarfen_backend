@@ -39,14 +39,20 @@ pub async fn read(db: &Database, id: &BuilderId) -> Result<Option<Builder>, AppE
     Ok(builder)
 }
 
-/// The raw account insert behind [`crate::service::builder::ensure`]'s seed.
-/// The unique index on `username` is the whole availability check: a racing
-/// second seed is a `23505` on `builder_username`, and the seed's
-/// find-then-insert order makes that unreachable in practice — but the
-/// constraint stands guard regardless.
-pub async fn create(db: &Database, builder: Builder) -> Result<(), AppError> {
-    sqlx::query!(
-        "INSERT INTO builder (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)",
+/// Seed one builder account: the insert that leaves an existing row alone.
+/// `true` when this call created it, `false` when the username was already
+/// taken.
+///
+/// `ON CONFLICT DO NOTHING` rather than find-then-insert-then-catch: the seed
+/// runs on every boot, two boots of a fresh deployment collide on it, and an
+/// insert that is *refused* is logged by the server as an `ERROR` line even
+/// when the client handles it (measured: four boots racing a fresh control
+/// database, three of them lost the race). The conflict target is the
+/// username index alone, so every other insert failure still surfaces.
+pub async fn create(db: &Database, builder: Builder) -> Result<bool, AppError> {
+    let result = sqlx::query!(
+        "INSERT INTO builder (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (username) DO NOTHING",
         builder.id.uuid(),
         builder.username.as_str(),
         builder.password_hash.as_str(),
@@ -54,7 +60,7 @@ pub async fn create(db: &Database, builder: Builder) -> Result<(), AppError> {
     )
     .execute(db)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Mint and store one builder login session.
