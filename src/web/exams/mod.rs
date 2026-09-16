@@ -40,11 +40,13 @@ use super::{
 };
 
 pub(crate) mod attempts;
+pub(crate) mod audience;
 pub(crate) mod images;
 pub(crate) mod questions;
 pub(crate) mod review;
 
 pub(crate) use attempts::*;
+pub(crate) use audience::*;
 pub(crate) use images::*;
 pub(crate) use questions::*;
 pub(crate) use review::*;
@@ -74,6 +76,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         )
         .routes(routes!(list_exams))
         .routes(routes!(get_exam, update_exam, delete_exam))
+        .routes(routes!(add_audience, list_audience, remove_audience))
         .routes(routes!(grade, list_results))
         .routes(routes!(my_result))
         .routes(routes!(remove_result))
@@ -286,17 +289,20 @@ async fn list_exams(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Fetch a single exam by id. Visible to its instance's enrolled students, its
-/// teachers (or its class's homeroom teacher), and managers/admins — except
-/// drafts, which only the instance's managers see (everyone else gets a `404`,
-/// as if the exam doesn't exist yet — because it doesn't, officially).
+/// Fetch a single exam by id. Visible to **any instance the exam is addressed
+/// to** — its owner's enrolled students and teachers, and, for an announced
+/// exam (ortak sınav), each addressed section's alike — plus managers/admins;
+/// drafts only show to the managers of an addressed instance (everyone else
+/// gets a `404`, as if the exam doesn't exist yet — because it doesn't,
+/// officially).
 ///
 /// Gate order is deliberate and must stay as written: a caller with no view of
-/// the instance is refused by the *view* gate (`403`) before the draft gate is
-/// reached, so the `404` rule covers only callers who can see the instance — a
-/// teacher since removed from it, for instance, gets the `403` unless they are
-/// enrolled. Moving the draft check above the view check to "make the 404
-/// universal" would hand every unenrolled caller a probe for which exams exist.
+/// any addressed instance is refused by the *view* gate (`403`) before the
+/// draft gate is reached, so the `404` rule covers only callers who can see an
+/// instance the exam reaches — a teacher since removed from it, for instance,
+/// gets the `403` unless they are enrolled. Moving the draft check above the
+/// view check to "make the 404 universal" would hand every unenrolled caller a
+/// probe for which exams exist.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -306,7 +312,7 @@ async fn list_exams(
     responses(
         (status = 200, description = "The exam", body = ExamResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, and not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled and not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found (or a draft the caller may not see)", body = ErrorResponse),
     ),
 )]
@@ -318,15 +324,16 @@ async fn get_exam(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_view_instance(&st.db, instance.get_id(), &user).await? {
+    let (may_view, may_manage) = audience_rights(&st.db, &exam, &user).await?;
+    if !may_view {
         return Err(AppError::Forbidden(
-            "only this instance's enrolled students, its teachers, its class's homeroom teacher, or a manager/admin can view this exam",
+            "only an addressed instance's enrolled students, its teachers, its class's homeroom teacher, or a manager/admin can view this exam",
         ));
     }
-    // A draft doesn't exist for anyone but its instance's managers — 404, not
-    // 403, so its existence never leaks to the students it's hidden from.
-    if exam.is_draft() && !can_manage_instance(&st.db, instance.get_id(), &user).await? {
+    // A draft doesn't exist for anyone but an addressed instance's managers —
+    // 404, not 403, so its existence never leaks to the students it's hidden
+    // from.
+    if exam.is_draft() && !may_manage {
         return Err(AppError::NotFound);
     }
     Ok(Json(ExamResponse::new(&exam)))
@@ -494,8 +501,10 @@ async fn delete_exam(
 // ---- results ------------------------------------------------------------
 
 /// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
-/// management rights over the exam's instance; the target must be a student
-/// and enrolled. Only students carry marks; students never grade — and nobody
+/// management rights over **an instance the exam is addressed to** (the
+/// announced-to section's teacher grades its own students on an ortak sınav);
+/// the target must be a student enrolled in one of them. Only students carry
+/// marks; students never grade — and nobody
 /// grades themselves. A draft can't be graded (`409`) — a mark would point at
 /// an exam its student can't see.
 #[utoipa::path(
@@ -509,7 +518,7 @@ async fn delete_exam(
         (status = 200, description = "Result recorded", body = ExamResultResponse),
         (status = 400, description = "Invalid mark, unknown user, user not a student, or not enrolled", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin, or attempted to grade yourself", body = ErrorResponse),
+        (status = 403, description = "Not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin, or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
         (status = 409, description = "The exam is a draft, its kind has been removed from the school's settings, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
@@ -527,10 +536,10 @@ async fn grade(
     let exam = service::exam::read(&st.db, &exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_manage_instance(&st.db, instance.get_id(), &teacher).await? {
+    let (_, manages) = audience_rights(&st.db, &exam, &teacher).await?;
+    if !manages {
         return Err(AppError::Forbidden(
-            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can grade this exam",
+            "only a teacher of an instance the exam is addressed to, that instance's class's homeroom teacher, or a manager/admin can grade this exam",
         ));
     }
     let target = UserId::from_key(&req.user_id);
@@ -550,8 +559,9 @@ async fn grade(
 }
 
 /// List an exam's results, paged via `?limit=&offset=` (omit `limit` for all
-/// of them). Requires teacher+ and management rights over the exam's instance
-/// — students read only their own via `GET /exams/{id}/result`. Returns a
+/// of them). Requires teacher+ and management rights over an instance the
+/// exam is addressed to — students read only their own via
+/// `GET /exams/{id}/result`. Returns a
 /// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -563,7 +573,7 @@ async fn grade(
         (status = 200, description = "A page of results (all of them when unpaged)", body = Page<ExamResultResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -578,10 +588,10 @@ async fn list_results(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
+    let (_, manages) = audience_rights(&st.db, &exam, &user).await?;
+    if !manages {
         return Err(AppError::Forbidden(
-            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can list results",
+            "only a teacher of an instance the exam is addressed to, that instance's class's homeroom teacher, or a manager/admin can list results",
         ));
     }
     let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;
@@ -630,7 +640,7 @@ async fn my_result(
 }
 
 /// Remove a student's result from an exam. Requires teacher+ and management
-/// rights over the exam's instance.
+/// rights over an instance the exam is addressed to.
 #[utoipa::path(
     delete,
     path = "/{id}/results/{user}",
@@ -643,7 +653,7 @@ async fn my_result(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
@@ -656,10 +666,10 @@ async fn remove_result(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
+    let (_, manages) = audience_rights(&st.db, &exam, &user).await?;
+    if !manages {
         return Err(AppError::Forbidden(
-            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can remove results",
+            "only a teacher of an instance the exam is addressed to, that instance's class's homeroom teacher, or a manager/admin can remove results",
         ));
     }
     // The archived-term gate and the refunding delete are
@@ -672,7 +682,7 @@ async fn remove_result(
 }
 
 /// Summary statistics for an exam's graded results. Requires teacher+ and
-/// management rights over the exam's instance.
+/// management rights over an instance the exam is addressed to.
 #[utoipa::path(
     get,
     path = "/{id}/statistics",
@@ -682,7 +692,7 @@ async fn remove_result(
     responses(
         (status = 200, description = "The exam's mark statistics", body = ExamStatisticsResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -695,10 +705,10 @@ async fn exam_statistics(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
+    let (_, manages) = audience_rights(&st.db, &exam, &user).await?;
+    if !manages {
         return Err(AppError::Forbidden(
-            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can view statistics",
+            "only a teacher of an instance the exam is addressed to, that instance's class's homeroom teacher, or a manager/admin can view statistics",
         ));
     }
     let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;

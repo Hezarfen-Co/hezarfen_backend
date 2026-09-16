@@ -10,6 +10,7 @@ use crate::constant::CAS_UPDATE_RETRIES;
 use crate::database::Database;
 use crate::db::exam;
 use crate::db::exam_attempt::any_for_exam;
+use crate::db::exam_audience;
 use crate::db::exam_result;
 use crate::domain::class_course::ClassCourseId;
 use crate::domain::course::CourseId;
@@ -19,7 +20,7 @@ use crate::domain::exam::{
 };
 use crate::domain::term::TermId;
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::UserId;
+use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 use crate::service::exam_attempt::require_open;
 
@@ -138,6 +139,174 @@ pub async fn list_for_class_course_courses(
 /// as one user sees it, across the instances those courses are taught in.
 pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec<Exam>, AppError> {
     exam::list_for_courses(db, courses).await
+}
+
+// ---- audience: the ortak sınav (D2) ---------------------------------------
+
+/// The exam, or the `404` a gone id deserves — and the caller's right to act
+/// on the exam's **owner** instance, or the `403` D10 answers
+/// ([`crate::service::class_course::ensure_instance_teacher`]: manager+, an
+/// assigned teacher, or the şube's homeroom teacher).
+///
+/// The audience routes never move the exam, they announce it, so the gate is
+/// the owner's and not the target's: the section that runs the exam decides
+/// who else it is addressed to, and a teacher of the receiving section has no
+/// say in the announcement.
+async fn managed_exam(db: &Database, user: &User, id: &ExamId) -> Result<Exam, AppError> {
+    let exam = exam::read(db, id).await?.ok_or(AppError::NotFound)?;
+    crate::service::class_course::ensure_instance_teacher(db, user, exam.get_class_course())
+        .await?;
+    Ok(exam)
+}
+
+/// Announce `exam` to another instance — the ortak sınav write (D2).
+///
+/// The exam stays owned by the instance it was created on; an audience row is
+/// what makes a second (third, …) şube sit the same sitting and carry the
+/// mark in its own marks and karne ([`crate::db::exam_result`] reads through
+/// `exam_audience`). Three rules keep the announcement from filing academic
+/// work where it cannot be graded:
+///
+/// - the target must teach the **same catalog course** — a mark on an algebra
+///   exam standing in a geometry instance's report is a subject that report
+///   never taught;
+/// - both instances must sit under the **same academic year** — a karne is
+///   computed over one year, so an announcement across years would file the
+///   mark into a year the exam is not taught in (the rule [`create`] already
+///   applies to the dönem);
+/// - the target may not be the owner itself: the owner's audience row always
+///   exists, and the owner cannot be withdrawn (see [`remove_audience`]) —
+///   deleting the exam is what ends it.
+///
+/// The target's year must still be open ([`crate::service::class_course::require_open`]):
+/// announcing into an archived year is a write into a read-only year like
+/// every other one. A repeat announcement is success, not a conflict — the
+/// store treats the existing row as a no-op — and the answer is the audience
+/// the exam holds after the call.
+///
+/// Every refusal is coded: `404` for a gone exam or target instance, `403`
+/// for a caller with no right over the owner, `400` for the three shape
+/// rules, and the archived year's `409`.
+pub async fn add_audience(
+    db: &Database,
+    user: &User,
+    id: &ExamId,
+    target: &ClassCourseId,
+) -> Result<Vec<exam_audience::Audience>, AppError> {
+    let exam = managed_exam(db, user, id).await?;
+    let owner = crate::db::class_course::read(db, exam.get_class_course())
+        .await?
+        // A foreign key names the owner, so only a concurrent detach — which
+        // sweeps the exam in the same transaction — could have taken it;
+        // either way the exam is gone, and 404 is that answer.
+        .ok_or(AppError::NotFound)?;
+    let target_row = crate::db::class_course::read(db, target)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if target_row.get_id() == owner.get_id() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "instance",
+            reason: "this instance owns the exam — an audience is another instance, and \
+                     deleting the exam is what ends the owner's",
+        }));
+    }
+    if target_row.get_course() != owner.get_course() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "instance",
+            reason: "the instance teaches another course than the exam's",
+        }));
+    }
+    let owner_year = crate::service::class_course::year_of(db, owner.get_id()).await?;
+    if owner_year != crate::service::class_course::year_of(db, target).await? {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "instance",
+            reason: "the instance belongs to another academic year than the exam's",
+        }));
+    }
+    crate::service::class_course::require_open(db, target).await?;
+    exam_audience::add(db, id, target).await?;
+    list_audience(db, id).await
+}
+
+/// Withdraw `exam` from one instance's audience. The same **gate** as
+/// [`add_audience`] (management rights over the exam's owner instance), and
+/// none of its shape rules re-run: the row was validated when it was
+/// announced, and taking it back is cleanup — a stale announcement (an
+/// instance whose section moved years, say) can always be withdrawn.
+///
+/// One pair is the exception, and it is the route's whole safety property:
+/// the **owner's** row is not withdrawable. Removing it would leave an exam
+/// belonging to no instance — every audience read is the `exam_audience`
+/// join, so the exam, its marks and its attempts would vanish from every
+/// report while their rows stood — which is why the owner pair is a `400`
+/// here and not a delete.
+///
+/// A pair that holds no audience row is the `404`
+/// [`crate::db::exam_audience::remove`]'s boolean carries — never a silent
+/// success. The exam's own year must still be open, like every other write
+/// against the exam's structure ([`update`] and [`delete`]): withdrawing from
+/// an archived year's ortak sınav is a `409`, not a silent edit of a past
+/// year's record. The answer is the audience the exam holds after the call.
+pub async fn remove_audience(
+    db: &Database,
+    user: &User,
+    id: &ExamId,
+    target: &ClassCourseId,
+) -> Result<Vec<exam_audience::Audience>, AppError> {
+    let exam = managed_exam(db, user, id).await?;
+    if exam.get_class_course() == target {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "instance",
+            reason: "the owner instance is not an audience — an exam cannot lose the \
+                     instance it belongs to; delete the exam instead",
+        }));
+    }
+    require_open(db, &exam).await?;
+    if !exam_audience::remove(db, id, target).await? {
+        return Err(AppError::NotFound);
+    }
+    list_audience(db, id).await
+}
+
+/// The audience of one exam: the instances it is announced to, its owner
+/// included — the read behind `GET /exams/{id}/audience`. Read-only, so the
+/// web layer gates it with the exam's own view rule.
+pub async fn list_audience(
+    db: &Database,
+    id: &ExamId,
+) -> Result<Vec<exam_audience::Audience>, AppError> {
+    exam_audience::list_for_exam(db, id).await
+}
+
+/// Whether `user` is enrolled in any instance `exam` is addressed to — its
+/// owner or an announced sibling (D2).
+///
+/// This is the enrollment predicate every *student* door at an exam asks
+/// (sitting, answering, grading), and announcing an exam is what moves it:
+/// the addressed sections' students sit and are graded at their own instance.
+/// An exam nobody was announced to answers exactly what the owner-only check
+/// these doors used to run answered.
+pub async fn enrolled_anywhere(
+    db: &Database,
+    exam: &Exam,
+    user: &UserId,
+) -> Result<bool, AppError> {
+    exam_audience::enrolled(db, exam.get_id(), user).await
+}
+
+/// A `403` unless [`enrolled_anywhere`] — the refusal the sit paths answer,
+/// kept byte-for-byte from the owner-only check it replaces.
+pub async fn ensure_enrolled_anywhere(
+    db: &Database,
+    exam: &Exam,
+    user: &UserId,
+) -> Result<(), AppError> {
+    if enrolled_anywhere(db, exam, user).await? {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "you are not enrolled in this exam's course",
+    ))
 }
 
 /// A `PATCH /exams/{id}` request after field validation: every value the
@@ -337,4 +506,318 @@ pub async fn delete(db: &Database, target: &Exam) -> Result<DeleteOutcome, AppEr
         image_files: deleted.question_image_files,
         answer_image_files: deleted.answer_image_files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::academic_year::AcademicYearId;
+    use crate::domain::class_course::ClassCourse;
+    use crate::domain::class_group::ClassName;
+    use crate::domain::role::Role;
+    use crate::domain::settings::Settings;
+    use crate::domain::user::Username;
+
+    /// A real account at a role — the announcement gate judges the live row,
+    /// so a raw fixture id would not do.
+    async fn staff(db: &Database, username: &str, role: Role) -> User {
+        let account = crate::db::user::create(db, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap();
+        crate::service::user::set_role(db, account.get_id(), role)
+            .await
+            .unwrap();
+        crate::db::user::read(db, account.get_id())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// An instance of `course` inside a fresh şube of `year` — one side of an
+    /// announcement.
+    async fn instance_in(
+        db: &Database,
+        manager: &UserId,
+        name: &str,
+        course: &CourseId,
+        year: Option<&AcademicYearId>,
+    ) -> ClassCourse {
+        let class = crate::db::class_group::create(
+            db,
+            manager,
+            ClassName::try_new(name).unwrap(),
+            None,
+            year.cloned(),
+            None,
+        )
+        .await
+        .unwrap();
+        crate::service::class_course::attach(db, class.get_id(), course, manager)
+            .await
+            .unwrap()
+    }
+
+    /// A published, unscheduled exam on `instance` — the parent an audience
+    /// row hangs off.
+    async fn exam_on(db: &Database, instance: &ClassCourse) -> Exam {
+        let creator = crate::db::class_member::tests::fixture_user(db, "audience-author").await;
+        let term = crate::db::term::a_test_term(db).await;
+        let allowed = Settings::defaults().get_exam_kinds().to_vec();
+        crate::db::exam::create(
+            db,
+            &creator,
+            instance.get_id(),
+            &term,
+            ExamTitle::try_new("1. Yazılı").unwrap(),
+            ExamDescription::try_new("").unwrap(),
+            ExamKind::try_new("yazili", &allowed).unwrap(),
+            ExamSchedule::try_new(None, None, None, None).unwrap(),
+            ExamAttemptLimit::try_new(1).unwrap(),
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The announcement's shape rules: same catalog course, same academic
+    /// year, another instance — each violation a coded `400`, the pair that
+    /// satisfies all three a row the audience read (and so the marks reports)
+    /// sees, and a repeat a no-op rather than a conflict.
+    #[tokio::test]
+    async fn an_announcement_needs_the_same_course_and_year() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "audience-mudur", Role::Manager).await;
+        let algebra = crate::db::class_member::tests::a_course("algebra", &db).await;
+        let geometry = crate::db::class_member::tests::a_course("geometry", &db).await;
+        let year = crate::db::academic_year::a_test_year(&db).await;
+        let other_year = crate::db::academic_year::a_test_year(&db).await;
+
+        let owner = instance_in(&db, manager.get_id(), "5-A", &algebra, Some(&year)).await;
+        let sibling = instance_in(&db, manager.get_id(), "5-B", &algebra, Some(&year)).await;
+        let wrong_course = instance_in(&db, manager.get_id(), "5-C", &geometry, Some(&year)).await;
+        let wrong_year =
+            instance_in(&db, manager.get_id(), "6-A", &algebra, Some(&other_year)).await;
+        let exam = exam_on(&db, &owner).await;
+
+        let audience = add_audience(&db, &manager, exam.get_id(), sibling.get_id())
+            .await
+            .unwrap();
+        assert_eq!(audience.len(), 2, "owner + announcement");
+        assert_eq!(
+            audience[0].get_instance(),
+            owner.get_id(),
+            "the owner stands first — announcement order is creation order"
+        );
+        assert_eq!(audience[1].get_instance(), sibling.get_id());
+        assert_eq!(audience[1].get_class(), sibling.get_class());
+        assert_eq!(audience[1].get_course(), &algebra);
+        // The sibling's own exam list carries it — the join the marks reports
+        // and the instance page read.
+        assert_eq!(
+            list_for_class_course(&db, sibling.get_id())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the announcement is one exam, addressed here"
+        );
+
+        for (bad, why) in [
+            (&wrong_course, "another course"),
+            (&wrong_year, "another year"),
+        ] {
+            let refused = add_audience(&db, &manager, exam.get_id(), bad.get_id()).await;
+            assert!(
+                matches!(refused, Err(AppError::Validation(_))),
+                "{why} must be a coded 400: {refused:?}"
+            );
+        }
+        let owned = add_audience(&db, &manager, exam.get_id(), owner.get_id()).await;
+        assert!(
+            matches!(owned, Err(AppError::Validation(_))),
+            "the owner is not an audience: {owned:?}"
+        );
+        let ghost = ClassCourseId::generate();
+        assert!(
+            matches!(
+                add_audience(&db, &manager, exam.get_id(), &ghost).await,
+                Err(AppError::NotFound)
+            ),
+            "a minted instance id names nothing"
+        );
+        assert!(matches!(
+            add_audience(&db, &manager, &ExamId::generate(), sibling.get_id()).await,
+            Err(AppError::NotFound)
+        ));
+
+        add_audience(&db, &manager, exam.get_id(), sibling.get_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            exam_audience::list_for_exam(&db, exam.get_id())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a repeat announcement is a no-op, not a second row"
+        );
+    }
+
+    /// The gate is the **owner** instance's: its assigned teacher and a
+    /// manager+ may announce and withdraw; the target instance's own teacher
+    /// may not — running the receiving section is not running the exam — and
+    /// a student may not either.
+    #[tokio::test]
+    async fn an_announcement_is_gated_on_the_owner_instance() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "audience-mudur-2", Role::Manager).await;
+        let owner_teacher = staff(&db, "audience-ogretmen-a", Role::Teacher).await;
+        let target_teacher = staff(&db, "audience-ogretmen-b", Role::Teacher).await;
+        let student = staff(&db, "audience-ogrenci", Role::Student).await;
+        let algebra = crate::db::class_member::tests::a_course("algebra", &db).await;
+        let owner = instance_in(&db, manager.get_id(), "7-A", &algebra, None).await;
+        let target = instance_in(&db, manager.get_id(), "7-B", &algebra, None).await;
+        crate::service::class_course::assign_teacher(
+            &db,
+            owner.get_id(),
+            owner_teacher.get_id(),
+            manager.get_id(),
+        )
+        .await
+        .unwrap();
+        crate::service::class_course::assign_teacher(
+            &db,
+            target.get_id(),
+            target_teacher.get_id(),
+            manager.get_id(),
+        )
+        .await
+        .unwrap();
+        let exam = exam_on(&db, &owner).await;
+
+        assert!(
+            add_audience(&db, &owner_teacher, exam.get_id(), target.get_id())
+                .await
+                .is_ok(),
+            "an assigned teacher of the owner instance announces"
+        );
+        assert!(
+            remove_audience(&db, &owner_teacher, exam.get_id(), target.get_id())
+                .await
+                .is_ok(),
+            "…and withdraws"
+        );
+        for (user, who) in [
+            (&target_teacher, "the target's teacher"),
+            (&student, "a student"),
+        ] {
+            let refused = add_audience(&db, user, exam.get_id(), target.get_id()).await;
+            assert!(
+                matches!(refused, Err(AppError::Forbidden(_))),
+                "{who} must be a 403: {refused:?}"
+            );
+        }
+    }
+
+    /// Withdrawal: the owner's own pair is a coded `400` (an exam cannot lose
+    /// the instance it belongs to), a pair holding no row is a `404`, and the
+    /// row the instance's read joins on is gone afterwards.
+    #[tokio::test]
+    async fn withdrawing_an_audience_leaves_the_owner_alone() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "audience-mudur-3", Role::Manager).await;
+        let algebra = crate::db::class_member::tests::a_course("algebra", &db).await;
+        let owner = instance_in(&db, manager.get_id(), "8-A", &algebra, None).await;
+        let target = instance_in(&db, manager.get_id(), "8-B", &algebra, None).await;
+        let exam = exam_on(&db, &owner).await;
+        add_audience(&db, &manager, exam.get_id(), target.get_id())
+            .await
+            .unwrap();
+
+        let audience = remove_audience(&db, &manager, exam.get_id(), target.get_id())
+            .await
+            .unwrap();
+        assert_eq!(audience.len(), 1);
+        assert_eq!(audience[0].get_instance(), owner.get_id());
+        assert!(
+            list_for_class_course(&db, target.get_id())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the withdrawn instance no longer carries the exam"
+        );
+
+        assert!(
+            matches!(
+                remove_audience(&db, &manager, exam.get_id(), target.get_id()).await,
+                Err(AppError::NotFound)
+            ),
+            "a pair holding no row is a 404, never a silent success"
+        );
+        let owner_pair = remove_audience(&db, &manager, exam.get_id(), owner.get_id()).await;
+        assert!(
+            matches!(owner_pair, Err(AppError::Validation(_))),
+            "the owner pair is refused: {owner_pair:?}"
+        );
+        assert_eq!(
+            exam_audience::list_for_exam(&db, exam.get_id())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the owner's row stands"
+        );
+    }
+
+    /// The archived-year posture of both routes: announcing into an archived
+    /// year and withdrawing from one are the coded `409` every other write
+    /// against the year answers, and neither writes — an announcement row
+    /// predating the archive is no loophole for more of them.
+    #[tokio::test]
+    async fn an_archived_year_refuses_the_announcement_and_the_withdrawal() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "audience-mudur-4", Role::Manager).await;
+        let algebra = crate::db::class_member::tests::a_course("algebra", &db).await;
+        let year = crate::db::academic_year::a_test_year(&db).await;
+        let owner = instance_in(&db, manager.get_id(), "9-A", &algebra, Some(&year)).await;
+        let announced = instance_in(&db, manager.get_id(), "9-B", &algebra, Some(&year)).await;
+        let later = instance_in(&db, manager.get_id(), "9-C", &algebra, Some(&year)).await;
+        let exam = exam_on(&db, &owner).await;
+        add_audience(&db, &manager, exam.get_id(), announced.get_id())
+            .await
+            .unwrap();
+
+        crate::service::academic_year::archive(&db, &year)
+            .await
+            .unwrap();
+
+        for (result, route) in [
+            (
+                add_audience(&db, &manager, exam.get_id(), later.get_id()).await,
+                "the announcement",
+            ),
+            (
+                remove_audience(&db, &manager, exam.get_id(), announced.get_id()).await,
+                "the withdrawal",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(AppError::ConflictCoded { code, .. }) if code == "academic_year_archived"
+                ),
+                "{route} into an archived year must be the coded 409: {result:?}"
+            );
+        }
+        assert_eq!(
+            exam_audience::list_for_exam(&db, exam.get_id())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "neither refusal wrote"
+        );
+    }
 }

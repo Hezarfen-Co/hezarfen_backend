@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (e.app_user)\n                  e.class_course AS \"class_course: ClassCourseId\",\n                  e.app_user AS \"user: UserId\",\n                  e.enrolled_by AS \"enrolled_by: UserId\",\n                  e.source AS \"source: ClassGroupId\",\n                  e.created_at AS \"created_at: Timestamp\"\n           FROM enrollment e\n           JOIN exam_audience a ON a.class_course = e.class_course\n           WHERE a.exam = $1\n           ORDER BY e.app_user, e.created_at, e.class_course",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "enrolled_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "enrolled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "source: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "5df20b5a3c54f189ee0acad7b4967004fdf228e3a2611e575f354f3d89f2a98c"
+}

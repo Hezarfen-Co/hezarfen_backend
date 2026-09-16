@@ -462,9 +462,30 @@ pub(crate) async fn sweep_instance_subtree(
     )
     .fetch_all(&mut *tx)
     .await?;
+    // Both directions of the audience table, and each has to go before the
+    // row it names. The rows *addressed to* this instance (an exam owned by
+    // another instance may be announced here — an ortak sınav) reference the
+    // `class_course` row the caller deletes right after this sweep and would
+    // otherwise refuse it with a `23503`. The rows *of* the exams this sweep
+    // deletes reference *those* exams the same way (`exam_audience.exam` is
+    // `NO ACTION` too), so they block the `DELETE FROM exam` below wherever
+    // they point — an audience of a swept exam in a şube that is *not* being
+    // detached included.
+    //
+    // The instance row is held `FOR UPDATE` by the caller from before this
+    // sweep, and an insert into `exam_audience` takes that row's
+    // `FOR KEY SHARE` through its foreign key, so no audience *addressed to*
+    // this instance can land under the sweep: the `add` blocks behind the
+    // detach and, on the settled state, finds the instance gone (`404`). An
+    // audience of one of the swept *exams* rides that exam's own key-share
+    // lock instead; if it commits between this delete and the exam delete
+    // below, the `exam_audience_exam_fkey` refusal that follows is what the
+    // detach's `cascade` retry re-runs on — the second round sees the
+    // settled row and takes it.
     sqlx::query!(
-        r#"DELETE FROM exam_audience WHERE class_course = $1"#,
-        instance
+        r#"DELETE FROM exam_audience WHERE class_course = $1 OR exam = ANY($2)"#,
+        instance,
+        &exams,
     )
     .execute(&mut *tx)
     .await?;

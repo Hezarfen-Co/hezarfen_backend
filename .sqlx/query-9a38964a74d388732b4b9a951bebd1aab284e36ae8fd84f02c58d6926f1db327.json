@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO exam_audience (exam, class_course) VALUES ($1, $2)\n           ON CONFLICT ON CONSTRAINT exam_audience_pk DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9a38964a74d388732b4b9a951bebd1aab284e36ae8fd84f02c58d6926f1db327"
+}

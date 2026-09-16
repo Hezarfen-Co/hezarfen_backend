@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.class_course AS \"class_course: ClassCourseId\",\n                  c.class AS \"class: ClassGroupId\",\n                  c.course AS \"course: CourseId\"\n           FROM exam_audience a\n           JOIN class_course c ON c.id = a.class_course\n           WHERE a.exam = $1\n           ORDER BY a.class_course",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_audience",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2d5355e3d1705a624bd1cba4d208036072113705cb5dc8e70b1009d332f2cbbb"
+}

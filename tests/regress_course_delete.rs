@@ -24,8 +24,8 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    Res, app_and_db, create_exam, create_exam_with, create_subject, enroll, id_of, login, login_as,
-    me_id, send, taught, unenroll,
+    Res, app_and_db, blob_dir, create_exam, create_exam_with, create_subject, enroll, id_of, login,
+    login_as, me_id, send, taught, unenroll, upload_file_at,
 };
 use hezarfen_backend::db::course;
 use hezarfen_backend::db::exam_attempt::list_for_exam;
@@ -277,6 +277,118 @@ async fn the_sweep_that_takes_an_instances_exams_gives_its_term_the_count_back()
         StatusCode::NO_CONTENT,
         "the released dönem must be deletable: {}",
         gone.body
+    );
+}
+
+/// The third blob collection the instance sweep hands back is the students'
+/// answer images — the exam questions' illustrations and the homework
+/// submissions were already pinned, the started sitting's drawing was not.
+/// The row is written only through the sitting wall (an in-progress attempt
+/// plus a live enrollment), so the fixture has to actually sit the exam: the
+/// upload is the student's own route and its bytes land on disk under the
+/// row's file name.
+///
+/// The detach is the shipped sweep that takes the row, and the route is what
+/// unlinks the bytes — a route that drops that list strands the drawing on
+/// disk with nothing left pointing at it, which is the leak this pins closed.
+#[tokio::test]
+async fn the_detach_unlinks_a_swept_instances_answer_drawing_bytes() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "cizim_ders_sil", "manager").await;
+    let student = login_as(&app, &db, "cizim_ogrenci", "student").await;
+    let student_id = me_id(&app, &student).await;
+
+    let t = taught(&app, &mudur, "Resim").await;
+    enroll(&app, &mudur, &t.instance, &student_id).await;
+    // `open` mode, as next door: an unscheduled exam answers the start with a
+    // 409 before it ever writes, and there would be no sitting to draw under.
+    let res = create_exam_with(
+        &app,
+        &mudur,
+        &t.instance,
+        json!({ "title": "Vize", "kind": "yazili", "mode": "open", "term": t.term.clone() }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create exam: {}", res.body);
+    let exam = id_of(&res.body);
+    let subject = create_subject(&app, &mudur, &t.course, "Natürmort").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions"),
+        Some(&mudur),
+        Some(json!({ "subject_id": subject, "text": "elma çiz", "kind": "text", "points": 5 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let question = id_of(&res.body);
+
+    // The drawing rides a started sitting: the upload 404s without an attempt.
+    let sat = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(sat.status, StatusCode::CREATED, "sit: {}", sat.body);
+    let drawn = upload_file_at(
+        &app,
+        &student,
+        &format!("/exams/{exam}/attempt/answers/{question}/image"),
+        "elma.png",
+        "image/png",
+        b"png-drawing",
+    )
+    .await;
+    assert_eq!(drawn.status, StatusCode::CREATED, "draw: {}", drawn.body);
+
+    // The blob name straight out of the store: the bytes on disk are keyed by
+    // the row's own file name.
+    let file: String = sqlx::query_scalar("SELECT file FROM answer_image WHERE exam = $1")
+        .bind(uuid::Uuid::parse_str(&exam).expect("a uuid exam id"))
+        .fetch_one(&db)
+        .await
+        .expect("the answer-image row");
+    assert!(
+        blob_dir().join(&file).exists(),
+        "the fixture's drawing blob {file} never landed on disk"
+    );
+
+    let detached = detach_instance(&app, &mudur, &t).await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the instance detaches: {}",
+        detached.body
+    );
+
+    // Stored state is the verdict: the drawing's row, its sitting and its exam
+    // are gone, and so are the bytes the row named.
+    let exam_id = uuid::Uuid::parse_str(&exam).expect("a uuid exam id");
+    let drawings: i64 = sqlx::query_scalar("SELECT count(*) FROM answer_image WHERE exam = $1")
+        .bind(exam_id)
+        .fetch_one(&db)
+        .await
+        .expect("the answer-image count");
+    assert_eq!(drawings, 0, "the sweep must take the drawing's row");
+    let sittings: i64 = sqlx::query_scalar("SELECT count(*) FROM exam_attempt WHERE exam = $1")
+        .bind(exam_id)
+        .fetch_one(&db)
+        .await
+        .expect("the attempt count");
+    assert_eq!(sittings, 0, "the swept exam must take its sitting rows");
+    let exams: i64 = sqlx::query_scalar("SELECT count(*) FROM exam WHERE id = $1")
+        .bind(exam_id)
+        .fetch_one(&db)
+        .await
+        .expect("the exam count");
+    assert_eq!(exams, 0, "the sweep must take the exam row itself");
+    assert!(
+        !blob_dir().join(&file).exists(),
+        "the swept drawing's blob {file} lingers on disk with nothing pointing \
+         at it"
     );
 }
 

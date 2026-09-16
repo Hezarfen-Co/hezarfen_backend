@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n               SELECT 1 FROM exam_audience a\n               JOIN enrollment e ON e.class_course = a.class_course\n               WHERE a.exam = $1 AND e.app_user = $2) AS \"enrolled!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "enrolled!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "bbed0d6dd708685f1c3c55c3b1041e3d8038c393bdac87ea4a636239427f19d5"
+}

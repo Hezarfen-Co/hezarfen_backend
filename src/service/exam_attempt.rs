@@ -73,21 +73,14 @@ pub async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppE
     ensure_student(&user)
 }
 
-/// A 403 unless `user` is enrolled in the instance the exam belongs to — the
+/// A 403 unless `user` is enrolled in an instance the exam is addressed to —
+/// its owner, or any sibling it was announced to (an ortak sınav, D2). The
 /// same wall the exam room checks at its door, re-applied to the sitting's
 /// content paths so an unenrollment mid-exam cuts them too. Finishing stays
 /// exempt: like the rejoin lock, submitting what's already saved writes
 /// nothing new.
 pub async fn ensure_enrolled(exam: &Exam, user: &UserId, db: &Database) -> Result<(), AppError> {
-    if crate::db::enrollment::read_for_user(db, exam.get_class_course(), user)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::Forbidden(
-            "you are not enrolled in this exam's course",
-        ));
-    }
-    Ok(())
+    crate::service::exam::ensure_enrolled_anywhere(db, exam, user).await
 }
 
 /// A 409 when the student has walked out of the exam room and the exam's

@@ -36,7 +36,10 @@ weight in the karne average), `counts_toward_karne` flag, teachers, roster,
 exams, lesson sessions and homework. Two sections that attach Matematik get
 **two** instances and share nothing: adding a student to 5-A enrolls them in
 5-A's Matematik only, and an exam written on 5-A's Matematik is invisible to
-5-B. The catalog row is office-owned (creator or manager+; clubs and etüt are
+5-B — unless the exam is **announced** to 5-B as an *ortak sınav*
+(`POST /exams/{id}/audience`): one sitting, one mark, standing in every
+addressed section's exam list, marks report and karne (see "Exam modes…").
+The catalog row is office-owned (creator or manager+; clubs and etüt are
 the exception — see "Courses (catalog)"), while an instance is run by the
 teachers a **manager assigns** to it (`POST /instances/{id}/teachers`) plus the
 section's homeroom teacher: an assigned teacher manages everything inside the
@@ -1259,7 +1262,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/events/{id}/register/{user}`                                   | teacher | Take a user off the signup list — the register rules mirrored: teacher+, students' seats or your own (another *staff* member's seat only if their account no longer exists), and only while the list is open (the event hasn't started or, ends_at-only, passed). A seat held by a `parent` is freeable by any teacher+ as well: no route lets that account free it itself, so a stranded seat needs a door. Attendance already marked stays recorded. |
 | GET    | `/events/{id}/roster`                                            | teacher | The event's expected-attendee roster joined with its attendance marks — the who-came/who-missed report. Resolved live from the audience (today's role holders, current enrollment, the current class roster, the current signup list), so it always reflects the present roster; attendance rows for people no longer in the audience are omitted here (they remain in `GET /events/{id}/attendance`). Requires teacher+. Paged via `?limit=&offset=` (omit `limit` for the whole roster). |
 | GET    | `/exams`                                                         | student | List the exams visible to the caller: every exam for manager+, otherwise the exams of the instances they teach or are enrolled in — minus other people's drafts (a draft shows only to its instance's managers). Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
-| GET    | `/exams/{id}`                                                    | student | Fetch a single exam by id. Visible to its instance's enrolled students, its teachers (or its class's homeroom teacher), and managers/admins — except drafts, which only the instance's managers see (everyone else gets a `404`, as if the exam doesn't exist yet — because it doesn't, officially). |
+| GET    | `/exams/{id}`                                                    | student | Fetch a single exam by id. Visible to **any instance the exam is addressed to** — its owner's enrolled students and teachers, and, for an announced exam (ortak sınav), each addressed section's alike — plus managers/admins; drafts only show to the managers of an addressed instance (everyone else gets a `404`, as if the exam doesn't exist yet — because it doesn't, officially). |
 | PATCH  | `/exams/{id}`                                                    | teacher | Update an exam. Requires teacher+ and management rights over the exam's instance (an assigned teacher, its class's homeroom teacher, or a manager/admin). Omitted fields keep their value; an explicit `null` clears a schedule field; the instance an exam hangs off is not updatable here. The schedule must stay consistent as a whole (see the create endpoint), and `mode` is frozen once anyone has started an attempt — times, duration, `max_attempts`, and `allow_rejoin` stay editable so a running exam can be extended, granted retakes, or have its rejoin door opened live. `draft: false` publishes a draft; `draft: true` re-hides an exam, but only while it has no attempts and no results (`409` otherwise) — students never lose sight of an exam they've already sat or been graded on. |
 | DELETE | `/exams/{id}`                                                    | teacher | Delete an exam. Requires teacher+ and management rights over the exam's instance (an assigned teacher, its class's homeroom teacher, or a manager/admin). Cascades the exam's results, attempts, questions, answers, and question + answer images (blobs included). |
 | GET    | `/exams/{id}/attempt`                                            | student | The caller's own (latest) attempt: status, deadline, remaining time, and mark once graded — everything a student's live exam screen needs, judged by the server clock. `404` until an attempt is started. |
@@ -1273,7 +1276,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/exams/{id}/attempt/ws`                                         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/attempts/{user}/answers`                            | teacher | One student's answer sheet with correctness flags — always the *latest* sitting's answers (a retake starts from a blank sheet). Every row carries the saved answer plus `is_correct` (`null` for text questions — those are the grader's call), and the machine's `auto_score` over the choice questions is attached as a *suggestion*: the final mark stays human, via `POST /exams/{id}/results`. Requires teacher+ and management rights over the exam's instance. |
 | GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image`                | teacher | One student's drawn-answer bytes, for the grader. Requires teacher+ and management rights over the exam's instance — the `attempt_answers` gate. |
-| GET    | `/exams/{id}/live`                                               | teacher | A one-shot live snapshot of the exam: who's in, who's still writing (and on which sitting), who walked out of the room (`left_at`), who never showed at all (`absent`, once the window is over), time each student has left, and marks as they land. Requires teacher+ and management rights over the exam's instance. Poll it to keep a monitor up to date. |
+| GET    | `/exams/{id}/audience`                                           | student | List the instances an exam is announced to, its owner included — the read behind the announce routes' answer, useful on its own to a client that wants to show where else an exam is sat. Visible to the exam's own audience: an addressed instance's enrolled students, its teachers (or its şube's homeroom teacher), and managers/admins — except drafts, which stay a `404` to everyone but an addressed instance's managers. |
+| POST   | `/exams/{id}/audience`                                           | teacher | Announce an exam to another instance — the **ortak sınav** write: one exam addressed to a sibling şube, so it and its marks stand in that section's exam list, marks report and karne. Requires teacher+ and management rights over the exam's **owner** instance (an assigned teacher, its şube's homeroom teacher, or a manager/admin) — the target instance's teachers have no say. The target must teach the exam's own catalog course and sit under the same academic year (`400` otherwise), the owner itself is refused (`400`), and an archived target year is a `409`. Announcing a pair that already stands is a no-op answering `200` with the audience unchanged. |
+| DELETE | `/exams/{id}/audience/{instance}`                                | teacher | Withdraw an exam from one instance's audience. Requires teacher+ and management rights over the exam's **owner** instance, like the announce itself. The owner's own pair is not withdrawable (`400`) — that is the instance the exam belongs to, and deleting the exam is what ends it; an archived year refuses the withdrawal with the same `409` its other writes answer. A pair that holds no audience row is a `404`. |
+| GET    | `/exams/{id}/live`                                               | teacher | A one-shot live snapshot of the exam: who's in, who's still writing (and on which sitting), who walked out of the room (`left_at`), who never showed at all (`absent`, once the window is over), time each student has left, and marks as they land — the roster of every instance the exam is addressed to, so an announced-to section's sitters are here too. Requires teacher+ and management rights over the exam's instance. Poll it to keep a monitor up to date. |
 | GET    | `/exams/{id}/questions`                                          | teacher | The exam's question list, `correct` choice ids included — the answer key, paged via `?limit=&offset=` (omit `limit` for the whole list). Requires teacher+ and management rights over the exam's instance. Students read questions through `GET /exams/{id}/attempt/questions`. Returns a `{items, total, limit, offset}` envelope. |
 | POST   | `/exams/{id}/questions`                                          | teacher | Add a question to an exam. Requires teacher+ and management rights over the exam's instance. `subject_id` must name one of the subjects of that instance's catalog course (`GET /courses/{id}/subjects`) — every question belongs to a subject. `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text` questions carry neither. Locked once attempts exist. |
 | POST   | `/exams/{id}/questions/from-bank/{bid}`                          | teacher | Instantiate a bank template into this exam as a fresh question. Requires teacher+, management rights over the exam's instance, and a template the caller may see (their own, or one published to the school) — anything else is a 404. `subject_id` must name one of the subjects of the instance's catalog course — the template's own subject is origin metadata and does not carry over. The template (and its blobs) stay untouched; a full copy — text, points, spec, illustration, and option pictures — lands under a new question id. Locked once attempts exist. |
@@ -1288,14 +1294,14 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/exams/{id}/questions/{qid}/refresh-from-bank`                  | teacher | Re-copy a bank template's *current* content over the exam question that was instantiated from it — the escape hatch for the divergence a deep copy creates: fixing a typo in the template does not reach the copies, so this is how a copy is brought back in line, explicitly and per question. Requires teacher+, management rights over the exam's instance, and a template the caller may still see. |
 | POST   | `/exams/{id}/questions/{qid}/to-bank`                            | teacher | Save one of this exam's questions into the school-wide bank as a reusable template. Requires teacher+ and management rights over the exam's instance. The caller becomes the template's owner; the question's subject rides along as origin metadata. A full copy — text, points, spec, illustration, and option pictures — lands under a new bank id. Provenance rides both ways: the origin exam is recorded on the template as `source_exam`, and the exam question's `banked_as` is pointed at the new template (a repeat save is allowed and repoints it at the newest one). `from_bank` is left alone — it records the other direction and a save never changes where a question came from. |
 | GET    | `/exams/{id}/result`                                             | student | The current user's own result for an exam. Any authenticated user may read their own mark; `404` while ungraded (or when the exam doesn't exist). |
-| GET    | `/exams/{id}/results`                                            | teacher | List an exam's results, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+ and management rights over the exam's instance — students read only their own via `GET /exams/{id}/result`. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/exams/{id}/results`                                            | teacher | Record (or overwrite) a student's mark for an exam. Requires teacher+ and management rights over the exam's instance; the target must be a student and enrolled. Only students carry marks; students never grade — and nobody grades themselves. A draft can't be graded (`409`) — a mark would point at an exam its student can't see. |
-| DELETE | `/exams/{id}/results/{user}`                                     | teacher | Remove a student's result from an exam. Requires teacher+ and management rights over the exam's instance. |
+| GET    | `/exams/{id}/results`                                            | teacher | List an exam's results, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+ and management rights over an instance the exam is addressed to — students read only their own via `GET /exams/{id}/result`. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/exams/{id}/results`                                            | teacher | Record (or overwrite) a student's mark for an exam. Requires teacher+ and management rights over **an instance the exam is addressed to** (the announced-to section's teacher grades its own students on an ortak sınav); the target must be a student enrolled in one of them. Only students carry marks; students never grade — and nobody grades themselves. A draft can't be graded (`409`) — a mark would point at an exam its student can't see. |
+| DELETE | `/exams/{id}/results/{user}`                                     | teacher | Remove a student's result from an exam. Requires teacher+ and management rights over an instance the exam is addressed to. |
 | GET    | `/exams/{id}/review/attempts`                                    | student | The caller's own sitting numbers at an exam — every seq that carries answers or a mark, ascending. Own-scoped review view; opens once the teacher enables review and has marked the caller, and closes again (409) while the caller can still sit the exam. |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers`                      | student | One of the caller's own sittings, judged — the `seq`th attempt's answers, drawing refs, correctness flags, and auto-score suggestion. Own-scoped review view; 409 while the caller can still sit the exam, so a retake can't read its own correctness off an earlier seq. |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image`          | student | The caller's own drawn-answer bytes for one of their sittings — the seq-scoped, own-scoped mirror of the grader's drawing read. Same 409 while a sitting is still available. |
 | GET    | `/exams/{id}/review/questions`                                   | student | The exam's full question list, `correct` choice ids included — the answer key the caller reviews their own sheet against. Same review gate as the other self-review reads; revealing `correct` is the point (the gate already proves the caller was marked and can no longer sit the exam). Paged via `?limit=&offset=`. |
-| GET    | `/exams/{id}/statistics`                                         | teacher | Summary statistics for an exam's graded results. Requires teacher+ and management rights over the exam's instance. |
+| GET    | `/exams/{id}/statistics`                                         | teacher | Summary statistics for an exam's graded results. Requires teacher+ and management rights over an instance the exam is addressed to. |
 | GET    | `/exams/{id}/students/{user}/attempts`                           | teacher | The sitting numbers a student has left at an exam — every seq that carries answers or a mark, ascending. Requires teacher+ and management rights over the exam's instance. Drives the FE's attempt-by-attempt picker. |
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers`             | teacher | One prior sitting's judged answer sheet — the `seq`th attempt's answers, drawing refs, correctness flags, and auto-score suggestion. Requires teacher+ and management rights over the exam's instance. Serves an empty sheet for a seq the student never wrote in. |
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | A prior sitting's drawn-answer bytes. Requires teacher+ and management rights over the exam's instance — the seq-scoped mirror of the grader's latest-sitting drawing read. |
@@ -2950,10 +2956,47 @@ records one through `POST /exams/{id}/results`. Poll `GET /exams/{id}/live` to
 keep a monitor current — attendance, ticking clocks, submissions, and marks all
 ride in each snapshot.
 
+### Ortak sınav: one exam, several sections
+
+An exam belongs to the instance it was created on (`exam.class_course`), and
+that owner's audience row is written with it — every exam read goes through
+`exam_audience`, so the owner is always in the set. A **sibling instance** can
+be added to that set (`POST /exams/{id}/audience` with
+`{"instance": "<class_course id>"}`): the ortak sınav — one exam, one mark
+per student, standing in every addressed section's exam list, marks report
+and karne, so a single mark stands on each of their lines. An announcement is
+also what **admits a section**: an addressed instance's students read the exam
+(`GET /exams/{id}`), start and answer it (`POST /exams/{id}/attempt`, the
+answer routes, the exam room), and are graded on it exactly like the owner's —
+the sitting, answering and grading gates ask "enrolled in any instance the
+exam is addressed to", not only the owner's roster — and `GET
+`/exams/{id}/live` monitors every addressed section's sitters, not only the
+owner's, and the teacher side of the exam — grading, the results and
+statistics reads, the monitor — opens to a teacher of **any** addressed
+instance, so the section that sits the exam also runs it there (authoring,
+`PATCH`/`DELETE` and the question/image routes, stays the owner's). Two rules
+make the announcement legal: the target must teach the **same catalog course**
+and sit under the **same academic year** as the owner (an exam's mark has to
+land in a report that teaches the subject, in the year it is sat), and the owner itself
+cannot be announced to — its row is always there, and deleting the exam is
+what ends it. The target's year must still be open, so announcing into an
+archived year is the usual `409`. The gate is the **owner** instance's
+(`manager`+, its assigned teachers, its şube's homeroom teacher): the section
+that runs the exam decides who else sits it; a teacher of the receiving
+section may grade there, not re-announce. `GET /exams/{id}/audience` lists the
+set (owner first, then announcement order), visible exactly as the exam is;
+`DELETE /exams/{id}/audience/{instance}` withdraws one — a repeat announce is
+a no-op `200`, a pair that was never announced a `404`, and the owner's own
+pair a `400`.
+
 Deleting an exam (or its course) cascades attempts, questions, answers, and
 question + answer images (blobs included) along with results; unenrolling mid-exam
 hides the student from the monitor roster but keeps the attempt and mark
-rows, mirroring the marks report.
+rows, mirroring the marks report. Detaching the instance that carries an exam
+sweeps it the same way, and the sweep takes every audience row that names the
+detaching instance — the ones addressed **to** it (an exam a sibling owns) and
+the rows of the exams it **owns** (announcements out to siblings) — so an
+ortak sınav never blocks a detach on a foreign key.
 
 > **Schema changes are migrations, not boot batches.** The sqlx migrator
 > applies `migrations/control` to the control database at boot and

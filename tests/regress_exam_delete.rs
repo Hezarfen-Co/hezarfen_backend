@@ -19,7 +19,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_exam_with, enroll, id_of, login_as, me_id, send, taught, taught_under,
+    add_member, app_and_db, attach_instance, create_class, create_course, create_exam,
+    create_exam_with, create_term, enroll, ensure_year, id_of, items, login_as, me_id, send,
+    taught, taught_under, total,
 };
 use hezarfen_backend::db::exam_attempt::list_for_exam;
 use hezarfen_backend::domain::exam::ExamId;
@@ -139,10 +141,10 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
 }
 
 /// An archived academic year freezes the exams hanging off its şubeler'
-/// instances: all nineteen write routes under `/exams/{id}` answer
+/// instances: every write route under `/exams/{id}` (the lists below) answers
 /// `409 academic_year_archived` — authoring, grading, the images on both sides,
-/// and the sitting itself — while every read stays open. Past years are a
-/// read-only archive, not a hidden one.
+/// the ortak-sınav audience pair, and the sitting itself — while every read
+/// stays open. Past years are a read-only archive, not a hidden one.
 ///
 /// The sitting is deliberately *live* when the archive lands: a student mid-exam
 /// is the case where a freeze can do real damage, and every one of their write
@@ -182,6 +184,24 @@ async fn an_archived_years_exams_take_no_writes_but_still_read() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let exam = id_of(&res.body);
+
+    let sibling_class =
+        create_class(&app, &manager, "Tarih 2", json!({ "year": t.year.clone() })).await;
+    let sibling = attach_instance(&app, &manager, &sibling_class, &t.course).await;
+    let announced = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/audience"),
+        Some(&manager),
+        Some(json!({ "instance": sibling })),
+    )
+    .await;
+    assert_eq!(
+        announced.status,
+        StatusCode::OK,
+        "the announcement predating the archive: {}",
+        announced.body
+    );
 
     // One choice question — it supplies the qid every question route needs and
     // the choice id the option-picture routes need.
@@ -226,9 +246,11 @@ async fn an_archived_years_exams_take_no_writes_but_still_read() {
         "the fixture's year is archived"
     );
 
-    // The thirteen JSON write routes: exam, results, and the question authoring
-    // set. `from-bank` takes an id that need not exist — the freeze is judged
-    // before the bank lookup, and a 404 here would be the bug.
+    // The JSON write routes: exam, results, the question authoring set, and
+    // the ortak-sınav audience pair (its announcement is re-sent — a no-op
+    // against an open year, which the archive must still refuse). `from-bank`
+    // takes an id that need not exist — the freeze is judged before the bank
+    // lookup, and a 404 here would be the bug.
     let staff_writes: Vec<(&str, String, Option<serde_json::Value>)> = vec![
         (
             "PATCH",
@@ -236,6 +258,12 @@ async fn an_archived_years_exams_take_no_writes_but_still_read() {
             Some(json!({ "title": "Final" })),
         ),
         ("DELETE", format!("/exams/{exam}"), None),
+        (
+            "POST",
+            format!("/exams/{exam}/audience"),
+            Some(json!({ "instance": sibling })),
+        ),
+        ("DELETE", format!("/exams/{exam}/audience/{sibling}"), None),
         (
             "POST",
             format!("/exams/{exam}/results"),
@@ -398,4 +426,591 @@ async fn an_archived_years_exams_take_no_writes_but_still_read() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// One instance's line out of a `?term=` karne report.
+fn karne_line<'a>(body: &'a serde_json::Value, instance: &str) -> &'a serde_json::Value {
+    body["instances"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a karne report with an instances array: {body}"))
+        .iter()
+        .find(|line| line["class_course"] == instance)
+        .unwrap_or_else(|| panic!("a karne line for {instance}: {body}"))
+}
+
+/// The ortak sınav round trip over HTTP: 5-A and 5-B teach the same course in
+/// the same year (two instances), an exam written on 5-A is announced to 5-B,
+/// and the **same mark** then stands in 5-B's karne — the per-instance read
+/// joins `exam_audience`, so the announcement is what attributes it there.
+/// 5-B's own exam list carries it while the announcement stands; withdrawal
+/// takes both back out. The student is enrolled by hand on 5-A's instance too
+/// (an operator may place anyone), which is what makes one mark readable from
+/// both sides without a second grade.
+#[tokio::test]
+async fn an_ortak_sinav_lands_in_the_targets_karne_until_withdrawn() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_ortak", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen_ortak", "teacher").await;
+    let student = login_as(&app, &db, "ogrenci_ortak_b", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    let year = ensure_year(&app, &mudur).await;
+    let term = create_term(&app, &mudur, &year, "1. Dönem").await;
+    let course = create_course(&app, &teacher, "Matematik").await;
+    let a_class = create_class(
+        &app,
+        &mudur,
+        "5-A",
+        json!({ "year": year, "teacher_id": teacher_id }),
+    )
+    .await;
+    let b_class = create_class(&app, &mudur, "5-B", json!({ "year": year })).await;
+    let a_inst = attach_instance(&app, &mudur, &a_class, &course).await;
+    let b_inst = attach_instance(&app, &mudur, &b_class, &course).await;
+
+    // 5-B's roster carries the student; the hand enrollment on 5-A's instance
+    // is the operator's row the grader's enrollment gate reads.
+    add_member(&app, &mudur, &b_class, &student_id).await;
+    enroll(&app, &mudur, &a_inst, &student_id).await;
+
+    let exam = create_exam(&app, &teacher, &a_inst, &term, "Ortak Yazılı", "yazili").await;
+    let graded = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&mudur),
+        Some(json!({ "user_id": student_id, "mark": 85 })),
+    )
+    .await;
+    assert_eq!(graded.status, StatusCode::OK, "grade: {}", graded.body);
+
+    // A karne line exists per instance the student's şubeler carry — 5-B's is
+    // the only one here — and before the announcement the mark is not
+    // attributed to it: nothing addresses the exam to 5-B's instance.
+    let before = send(
+        &app,
+        "GET",
+        &format!("/marks/karne?term={term}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK, "karne: {}", before.body);
+    assert_eq!(
+        karne_line(&before.body, &b_inst)["average"],
+        serde_json::Value::Null,
+        "5-B's line carries nothing before the announcement: {}",
+        before.body
+    );
+
+    // Announce. The answer is the audience, owner first.
+    let announced = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/audience"),
+        Some(&mudur),
+        Some(json!({ "instance": b_inst })),
+    )
+    .await;
+    assert_eq!(
+        announced.status,
+        StatusCode::OK,
+        "announce: {}",
+        announced.body
+    );
+    assert_eq!(
+        announced.body.as_array().map(Vec::len),
+        Some(2),
+        "{}",
+        announced.body
+    );
+    assert_eq!(announced.body[0]["instance"], json!(a_inst));
+    assert_eq!(announced.body[1]["instance"], json!(b_inst));
+    assert_eq!(announced.body[1]["class"], json!(b_class));
+    assert_eq!(announced.body[1]["course"], json!(course));
+
+    // 5-B's own list carries the exam now, and the mark is attributed to its
+    // line — the whole point of the announcement.
+    let listed = send(
+        &app,
+        "GET",
+        &format!("/instances/{b_inst}/exams"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(
+        total(&listed.body),
+        1,
+        "5-B carries the exam: {}",
+        listed.body
+    );
+    assert_eq!(id_of(&items(&listed.body)[0]), exam);
+
+    let during = send(
+        &app,
+        "GET",
+        &format!("/marks/karne?term={term}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(during.status, StatusCode::OK, "karne: {}", during.body);
+    assert_eq!(
+        karne_line(&during.body, &b_inst)["average"],
+        json!(85.0),
+        "the announcement puts the mark on 5-B's line: {}",
+        during.body
+    );
+
+    // Withdrawal: the audience is back to the owner, 5-B drops the exam, and
+    // the mark leaves its line — the announcement was the only attribution.
+    let withdrawn = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}/audience/{b_inst}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        withdrawn.status,
+        StatusCode::OK,
+        "withdraw: {}",
+        withdrawn.body
+    );
+    assert_eq!(
+        withdrawn.body.as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        withdrawn.body
+    );
+    assert_eq!(withdrawn.body[0]["instance"], json!(a_inst));
+
+    let relay = send(
+        &app,
+        "GET",
+        &format!("/instances/{b_inst}/exams"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(total(&relay.body), 0, "5-B dropped it: {}", relay.body);
+    let after = send(
+        &app,
+        "GET",
+        &format!("/marks/karne?term={term}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        karne_line(&after.body, &b_inst)["average"],
+        serde_json::Value::Null,
+        "the withdrawal takes the mark off 5-B's line: {}",
+        after.body
+    );
+}
+
+/// Detaching an instance an exam is announced *to* (one it does not own) is
+/// not a foreign-key failure: the audience row naming it is swept with the
+/// instance, and the exam — owned by a sibling — stands with its owner's row.
+#[tokio::test]
+async fn detaching_an_audience_instance_sweeps_its_row() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_ortak_detach_a", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen_ortak_detach_a", "teacher").await;
+
+    let year = ensure_year(&app, &mudur).await;
+    let term = create_term(&app, &mudur, &year, "1. Dönem").await;
+    let course = create_course(&app, &teacher, "Fizik").await;
+    let a_class = create_class(&app, &mudur, "6-A", json!({ "year": year })).await;
+    let b_class = create_class(&app, &mudur, "6-B", json!({ "year": year })).await;
+    let a_inst = attach_instance(&app, &mudur, &a_class, &course).await;
+    let b_inst = attach_instance(&app, &mudur, &b_class, &course).await;
+    let exam = create_exam(&app, &mudur, &a_inst, &term, "Ortak Vize", "yazili").await;
+    let announced = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/audience"),
+        Some(&mudur),
+        Some(json!({ "instance": b_inst })),
+    )
+    .await;
+    assert_eq!(announced.status, StatusCode::OK, "{}", announced.body);
+
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{b_class}/instances/{b_inst}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "detaching an announced-to instance must not 500: {}",
+        detached.body
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM exam_audience WHERE class_course = $1")
+            .bind(sqlx::types::Uuid::parse_str(&b_inst).unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "the row naming the detached instance is gone");
+    // The exam is a sibling's: it stands, addressed to its owner alone.
+    let read = send(&app, "GET", &format!("/exams/{exam}"), Some(&mudur), None).await;
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "the exam stands: {}",
+        read.body
+    );
+    let audience = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/audience"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        audience.body.as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        audience.body
+    );
+    assert_eq!(audience.body[0]["instance"], json!(a_inst));
+}
+
+/// Detaching the instance that **owns** an exam which is announced to a
+/// sibling: the audience rows of the exams being swept go with them, wherever
+/// they point. Without that sweep the `exam` delete trips
+/// `exam_audience_exam_fkey` (`NO ACTION`) and the detach is a `500` — the
+/// probe is mutation-tested, dropping `exam = ANY(...)` from the sweep's
+/// delete turns this red.
+#[tokio::test]
+async fn detaching_the_owner_instance_sweeps_its_exams_audiences() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_ortak_detach_b", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen_ortak_detach_b", "teacher").await;
+
+    let year = ensure_year(&app, &mudur).await;
+    let term = create_term(&app, &mudur, &year, "1. Dönem").await;
+    let course = create_course(&app, &teacher, "Kimya").await;
+    let a_class = create_class(&app, &mudur, "7-A", json!({ "year": year })).await;
+    let b_class = create_class(&app, &mudur, "7-B", json!({ "year": year })).await;
+    let a_inst = attach_instance(&app, &mudur, &a_class, &course).await;
+    let b_inst = attach_instance(&app, &mudur, &b_class, &course).await;
+    let exam = create_exam(&app, &mudur, &a_inst, &term, "Ortak Final", "yazili").await;
+    let announced = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/audience"),
+        Some(&mudur),
+        Some(json!({ "instance": b_inst })),
+    )
+    .await;
+    assert_eq!(announced.status, StatusCode::OK, "{}", announced.body);
+
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{a_class}/instances/{a_inst}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "detaching the owner must not 500: {}",
+        detached.body
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM exam_audience WHERE exam = $1")
+        .bind(sqlx::types::Uuid::parse_str(&exam).unwrap())
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "the swept exam left no audience behind");
+    // The sibling no longer carries it.
+    let listed = send(
+        &app,
+        "GET",
+        &format!("/instances/{b_inst}/exams"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(total(&listed.body), 0, "{}", listed.body);
+    // And 7-B itself is untouched.
+    let read = send(
+        &app,
+        "GET",
+        &format!("/instances/{b_inst}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "7-B's instance stands: {}",
+        read.body
+    );
+}
+
+/// The cutover: a student enrolled **only** in an instance the exam is
+/// announced to can see the exam, sit it, and be graded on it — the
+/// announcement is what admits them (`exam_audience`), not a roster row on the
+/// owner's instance. Both read and write doors were owner-only before this;
+/// an unrelated student stays refused on every one of them.
+#[tokio::test]
+async fn an_announced_student_can_see_sit_and_be_graded() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_ortak_sit", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen_ortak_sit", "teacher").await;
+    let b_teacher = login_as(&app, &db, "ogretmen_ortak_sit_b", "teacher").await;
+    let x_teacher = login_as(&app, &db, "ogretmen_ortak_sit_x", "teacher").await;
+    let b_student = login_as(&app, &db, "ogrenci_ortak_sit_b", "student").await;
+    let outsider = login_as(&app, &db, "ogrenci_ortak_sit_x", "student").await;
+    let b_student_id = me_id(&app, &b_student).await;
+    let outsider_id = me_id(&app, &outsider).await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let b_teacher_id = me_id(&app, &b_teacher).await;
+
+    let year = ensure_year(&app, &mudur).await;
+    let term = create_term(&app, &mudur, &year, "1. Dönem").await;
+    let course = create_course(&app, &teacher, "Biyoloji").await;
+    let a_class = create_class(
+        &app,
+        &mudur,
+        "10-A",
+        json!({ "year": year, "teacher_id": teacher_id }),
+    )
+    .await;
+    let b_class = create_class(&app, &mudur, "10-B", json!({ "year": year })).await;
+    let a_inst = attach_instance(&app, &mudur, &a_class, &course).await;
+    let b_inst = attach_instance(&app, &mudur, &b_class, &course).await;
+    // Only 10-B's roster carries the student; nobody is enrolled on 10-A's
+    // instance, where the exam is written.
+    add_member(&app, &mudur, &b_class, &b_student_id).await;
+
+    let created = create_exam_with(
+        &app,
+        &teacher,
+        &a_inst,
+        json!({ "title": "Ortak Sınav", "kind": "yazili", "mode": "open", "term": term }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let exam = id_of(&created.body);
+
+    // Before the announcement the 10-B student is nobody to this exam.
+    let pre_read = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}"),
+        Some(&b_student),
+        None,
+    )
+    .await;
+    assert_eq!(pre_read.status, StatusCode::FORBIDDEN, "{}", pre_read.body);
+    let pre_sit = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&b_student),
+        None,
+    )
+    .await;
+    assert_eq!(pre_sit.status, StatusCode::FORBIDDEN, "{}", pre_sit.body);
+
+    let announced = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/audience"),
+        Some(&mudur),
+        Some(json!({ "instance": b_inst })),
+    )
+    .await;
+    assert_eq!(announced.status, StatusCode::OK, "{}", announced.body);
+
+    // The announced section's own teacher now runs the exam's teacher side:
+    // grading its students, reading the results and statistics, and watching
+    // the monitor.
+    let assigned = send(
+        &app,
+        "POST",
+        &format!("/instances/{b_inst}/teachers"),
+        Some(&mudur),
+        Some(json!({ "user_id": b_teacher_id })),
+    )
+    .await;
+    assert_eq!(
+        assigned.status,
+        StatusCode::OK,
+        "assign 10-B's teacher: {}",
+        assigned.body
+    );
+
+    // (a) The read door opens for a student of an addressed instance.
+    let read = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}"),
+        Some(&b_student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "the announcement admits them: {}",
+        read.body
+    );
+
+    // (b) The sitting door opens too.
+    let sat = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&b_student),
+        None,
+    )
+    .await;
+    assert_eq!(sat.status, StatusCode::CREATED, "sitting: {}", sat.body);
+
+    // …and the teacher's monitor sees them: the roster is the exam's whole
+    // audience, so an announced-to section's sitter is not a blind spot.
+    let live = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/live"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(live.status, StatusCode::OK, "monitor: {}", live.body);
+    let names: Vec<&str> = live.body["students"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a live snapshot with students: {}", live.body))
+        .iter()
+        .filter_map(|row| row["user"]["id"].as_str())
+        .collect();
+    assert!(
+        names.contains(&b_student_id.as_str()),
+        "the monitor lists the announced-to section's sitter ({}): {}",
+        b_student_id,
+        live.body
+    );
+
+    // (c) And the mark can be recorded — by the **announced section's own
+    // teacher** — standing on their own instance's line.
+    let graded = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&b_teacher),
+        Some(json!({ "user_id": b_student_id, "mark": 90 })),
+    )
+    .await;
+    assert_eq!(graded.status, StatusCode::OK, "grading: {}", graded.body);
+    let karne = send(
+        &app,
+        "GET",
+        &format!("/marks/karne?term={term}"),
+        Some(&b_student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        karne_line(&karne.body, &b_inst)["average"],
+        json!(90.0),
+        "the mark stands on 10-B's line: {}",
+        karne.body
+    );
+
+    // The results readers and the monitor, from that teacher's cookie too.
+    for (uri, what) in [
+        (format!("/exams/{exam}/results"), "results"),
+        (format!("/exams/{exam}/statistics"), "statistics"),
+        (format!("/exams/{exam}/live"), "the monitor"),
+        (format!("/exams/{exam}/audience"), "the audience"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&b_teacher), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "10-B's teacher reads {what}: {}",
+            res.body
+        );
+    }
+
+    // An unrelated teacher manages no addressed instance: refused at every
+    // teacher-side door, grading included.
+    for (method, uri, body, what) in [
+        (
+            "POST",
+            format!("/exams/{exam}/results"),
+            Some(json!({ "user_id": b_student_id, "mark": 60 })),
+            "grading",
+        ),
+        ("GET", format!("/exams/{exam}/results"), None, "results"),
+        (
+            "GET",
+            format!("/exams/{exam}/statistics"),
+            None,
+            "statistics",
+        ),
+        ("GET", format!("/exams/{exam}/live"), None, "the monitor"),
+    ] {
+        let res = send(&app, method, &uri, Some(&x_teacher), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "an unrelated teacher on {what}: {}",
+            res.body
+        );
+    }
+
+    // An unrelated student is refused at every door.
+    let f_read = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(f_read.status, StatusCode::FORBIDDEN, "{}", f_read.body);
+    let f_sit = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(f_sit.status, StatusCode::FORBIDDEN, "{}", f_sit.body);
+    let f_grade = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&mudur),
+        Some(json!({ "user_id": outsider_id, "mark": 50 })),
+    )
+    .await;
+    assert_eq!(
+        f_grade.status,
+        StatusCode::BAD_REQUEST,
+        "grading a student outside every addressed instance: {}",
+        f_grade.body
+    );
 }

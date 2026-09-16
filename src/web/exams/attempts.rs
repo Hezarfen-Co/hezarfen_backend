@@ -321,15 +321,15 @@ pub(crate) struct ExamLiveResponse {
 
 /// Build the monitor snapshot: roster ⋈ attempts ⋈ marks at one instant.
 /// Students unenrolled mid-exam drop off the roster view (their attempt and
-/// mark rows survive, exactly like the marks report).
+/// mark rows survive, exactly like the marks report). The roster is the
+/// exam's whole audience (D2), so an announced-to section's sitters appear
+/// here exactly like the owner's — deduped by student, one row per person.
 pub(crate) async fn live_snapshot(
     exam: &Exam,
     db: &Database,
 ) -> Result<ExamLiveResponse, AppError> {
     let now = Timestamp::now();
-    let (roster, _) =
-        crate::service::enrollment::list_for_class_course(db, exam.get_class_course(), None, 0)
-            .await?;
+    let roster = crate::db::enrollment::list_for_exam_audience(db, exam.get_id()).await?;
     // Per student: their latest sitting (the one the monitor shows) plus how
     // many they've used.
     let mut attempts: HashMap<String, ExamAttempt> = HashMap::new();
@@ -439,8 +439,10 @@ pub(crate) async fn live_snapshot(
 /// A one-shot live snapshot of the exam: who's in, who's still writing (and
 /// on which sitting), who walked out of the room (`left_at`), who never
 /// showed at all (`absent`, once the window is over), time each student has
-/// left, and marks as they land. Requires teacher+ and management rights
-/// over the exam's instance. Poll it to keep a monitor up to date.
+/// left, and marks as they land — the roster of every instance the exam is
+/// addressed to, so an announced-to section's sitters are here too. Requires
+/// teacher+ and management rights over the exam's instance. Poll it to keep a
+/// monitor up to date.
 #[utoipa::path(
     get,
     path = "/{id}/live",
@@ -450,7 +452,7 @@ pub(crate) async fn live_snapshot(
     responses(
         (status = 200, description = "Live snapshot", body = ExamLiveResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not a teacher of any instance the exam is addressed to, nor its şube's homeroom teacher, nor a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -462,10 +464,10 @@ pub(crate) async fn exam_live(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let instance = exam_attempt::class_course_of(&exam, &st.db).await?;
-    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
+    let (_, manages) = audience_rights(&st.db, &exam, &user).await?;
+    if !manages {
         return Err(AppError::Forbidden(
-            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can monitor this exam",
+            "only a teacher of an instance the exam is addressed to, that instance's class's homeroom teacher, or a manager/admin can monitor this exam",
         ));
     }
     Ok(Json(live_snapshot(&exam, &st.db).await?))

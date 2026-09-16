@@ -16,6 +16,7 @@ use crate::domain::class_course::ClassCourseId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
+use crate::domain::exam::ExamId;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -221,6 +222,38 @@ pub async fn read_for_user(
     .fetch_optional(db)
     .await?;
     Ok(row)
+}
+
+/// The roster an exam is sat by: every enrollment of every instance the exam
+/// is addressed to (`exam_audience`, D2), deduped by student — the live
+/// monitor's roster read, and the one that makes an announced-to section's
+/// sitters visible to it. For an exam nobody was announced to this is the
+/// owner instance's roster, row for row.
+///
+/// `DISTINCT ON (app_user)` because a student enrolled in two addressed
+/// instances sits once: the roster is a set of people, and the monitor joins
+/// it with one attempt/mark map per person.
+pub async fn list_for_exam_audience(
+    db: &Database,
+    exam: &ExamId,
+) -> Result<Vec<Enrollment>, AppError> {
+    let rows = sqlx::query_as!(
+        Enrollment,
+        r#"SELECT DISTINCT ON (e.app_user)
+                  e.class_course AS "class_course: ClassCourseId",
+                  e.app_user AS "user: UserId",
+                  e.enrolled_by AS "enrolled_by: UserId",
+                  e.source AS "source: ClassGroupId",
+                  e.created_at AS "created_at: Timestamp"
+           FROM enrollment e
+           JOIN exam_audience a ON a.class_course = e.class_course
+           WHERE a.exam = $1
+           ORDER BY e.app_user, e.created_at, e.class_course"#,
+        exam.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// Whether `user` is one of `course`'s students right now — the point probe

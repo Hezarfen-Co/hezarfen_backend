@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT exam AS \"exam: ExamId\" FROM exam_audience\n           WHERE class_course = $1 ORDER BY exam",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_audience",
+            "name": "exam"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "05651fea73df39aad458cf27fe791dc62dbd5a9933e4e3cd3b66fb9e15c545bf"
+}
