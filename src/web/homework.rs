@@ -1,8 +1,8 @@
-//! Homework entity endpoints: the cross-course "my homework" list, lookup,
+//! Homework entity endpoints: the cross-instance "my homework" list, lookup,
 //! edit, and delete of one homework by id, the student's submission with its
 //! files, the teacher's grading and roster, and the observer report. Creation
-//! and the per-course listing live under `/courses/{id}/homework` (see
-//! [`super::courses`]); everything shares the visibility rule
+//! and the per-instance listing live under `/instances/{id}/homework` (see
+//! [`super::instances`]); everything shares the visibility rule
 //! ([`Homework::student_sees`](crate::domain::homework::Homework::student_sees))
 //! The freeze and the audience interlock are conditions of the writes
 //! themselves ([`crate::db::homework_submission`]), serialized on the
@@ -21,7 +21,7 @@ use utoipa_axum::routes;
 
 use crate::constant::{MAX_HOMEWORK_ASSIGNED, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
-use crate::domain::course::{Course, CourseId};
+use crate::domain::class_course::{ClassCourse, ClassCourseId};
 
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
@@ -37,7 +37,7 @@ use crate::service;
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
-use super::courses::{can_manage_course, can_view_course, visible_courses};
+use super::instances::{can_manage_instance, can_view_instance, visible_instances};
 use super::notes::content_disposition;
 use super::{
     CurrentUser, HomeworkResponse, Page, PageParams, RequireTeacher, UploadFileForm, blob_path,
@@ -73,14 +73,14 @@ pub fn routes() -> OpenApiRouter<AppState> {
 }
 
 /// Validate a request's `assigned` list into a stored student subset. `None`,
-/// an explicit `null`, and an empty list all mean "the whole enrolled course"
+/// an explicit `null`, and an empty list all mean "the whole enrolled roster"
 /// (stored as `None`); a non-empty list must name at most
-/// [`MAX_HOMEWORK_ASSIGNED`] students, each currently enrolled in `course`.
+/// [`MAX_HOMEWORK_ASSIGNED`] students, each currently enrolled in `instance`.
 /// Deduped so a repeated id can't inflate the cap or double a roster row.
-/// Shared by the create ([`super::courses`]) and PATCH handlers.
+/// Shared by the create ([`super::instances`]) and PATCH handlers.
 pub(crate) async fn resolve_assigned(
     assigned: Option<Vec<String>>,
-    course: &CourseId,
+    instance: &ClassCourseId,
     db: &Database,
 ) -> Result<Option<Vec<UserId>>, AppError> {
     let Some(mut keys) = assigned.filter(|keys| !keys.is_empty()) else {
@@ -97,13 +97,13 @@ pub(crate) async fn resolve_assigned(
     let mut users = Vec::with_capacity(keys.len());
     for key in keys {
         let user = UserId::from_key(&key);
-        if service::enrollment::read_for_user(db, course, &user)
+        if service::enrollment::read_for_user(db, instance, &user)
             .await?
             .is_none()
         {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "assigned",
-                reason: "every assigned student must be enrolled in the course",
+                reason: "every assigned student must be enrolled in the instance",
             }));
         }
         users.push(user);
@@ -122,22 +122,25 @@ pub(crate) fn description_or_none(text: &str) -> Result<Option<HomeworkDescripti
     }
 }
 
-/// The homework plus its course, or a 404 — every entity handler here gates on
-/// the parent course, so they always travel together.
-async fn homework_with_course(id: &str, db: &Database) -> Result<(Homework, Course), AppError> {
+/// The homework plus its instance, or a 404 — every entity handler here gates
+/// on the parent instance, so they always travel together.
+async fn homework_with_instance(
+    id: &str,
+    db: &Database,
+) -> Result<(Homework, ClassCourse), AppError> {
     let homework = service::homework::read(db, &HomeworkId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = crate::service::course::read(db, homework.get_course())
+    let instance = crate::service::class_course::read(db, homework.get_class_course())
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok((homework, course))
+    Ok((homework, instance))
 }
 
-/// List the homework across the caller's courses — their "my homework" view —
+/// List the homework across the caller's instances — their "my homework" view —
 /// paged via `?limit=&offset=` (omit `limit` for all of it). Manager+ see every
-/// course's homework; a teacher sees the homework of courses they run; a
-/// student sees only the homework they are assigned (whole-course ones plus any
+/// instance's homework; a teacher sees the homework of instances they run; a
+/// student sees only the homework they are assigned (whole-roster ones plus any
 /// subset that names them, each with its `assigned` narrowed to themselves).
 /// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
@@ -158,31 +161,29 @@ async fn list_homework(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<HomeworkResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    // The courses this caller manages — empty for a manager+, who manages all
+    // The instances this caller manages — empty for a manager+, who manages all
     // of them, and who is told apart by this flag.
     let manages_all = user.get_role().at_least(Role::Manager);
-    let mut managed: Vec<String> = Vec::new();
+    let mut managed: Vec<ClassCourseId> = Vec::new();
     let homework = if manages_all {
         service::homework::list_all(&st.db).await?
     } else {
-        let courses = visible_courses(&user, &st.db).await?;
-        let ids: Vec<_> = courses
+        let instances = visible_instances(&user, &st.db).await?;
+        let ids: Vec<ClassCourseId> = instances
             .iter()
-            .map(|course| course.get_id().clone())
+            .map(|(instance, _)| instance.get_id().clone())
             .collect();
         // A student sees only the homework they are assigned; a teacher who
-        // manages a course sees all of its homework (the manager+ path above
+        // manages an instance sees all of its homework (the manager+ path above
         // already saw everything).
-        managed = courses
+        managed = instances
             .iter()
-            .filter(|course| can_manage_course(course, &user))
-            .map(|course| course.get_id().key().to_string())
+            .filter(|(_, manages)| *manages)
+            .map(|(instance, _)| instance.get_id().clone())
             .collect();
-        let mut homework = service::homework::list_for_courses(&st.db, &ids).await?;
-        homework.retain(|hw| {
-            managed.iter().any(|key| key == &hw.get_course().key())
-                || hw.student_sees(user.get_id())
-        });
+        let mut homework = service::homework::list_for_class_courses(&st.db, &ids).await?;
+        homework
+            .retain(|hw| managed.contains(hw.get_class_course()) || hw.student_sees(user.get_id()));
         homework
     };
     let total = homework.len() as i64;
@@ -193,7 +194,7 @@ async fn list_homework(
     let items = paginate(&homework, limit, offset)
         .iter()
         .map(|hw| {
-            if manages_all || managed.iter().any(|key| key == &hw.get_course().key()) {
+            if manages_all || managed.contains(hw.get_class_course()) {
                 HomeworkResponse::new(hw)
             } else {
                 HomeworkResponse::for_viewer(hw, user.get_id())
@@ -203,13 +204,13 @@ async fn list_homework(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Fetch a single homework by id. Visible to whoever can view its course (its
-/// enrolled users, creator, assigned teachers, and managers/admins). A student
-/// the homework is *not* assigned to gets a 404 — the same no-leak an unseen
-/// exam draft gets, so a subset assignment never reveals itself to the students
-/// left out of it. To a caller without course-management rights the `assigned`
-/// subset comes back narrowed to their own id: being named is theirs to know,
-/// the rest of the roster is not.
+/// Fetch a single homework by id. Visible to whoever can view its instance (its
+/// enrolled students, its teachers, its şube's homeroom teacher, and
+/// managers/admins). A student the homework is *not* assigned to gets a 404 —
+/// the same no-leak an unseen exam draft gets, so a subset assignment never
+/// reveals itself to the students left out of it. To a caller without
+/// instance-management rights the `assigned` subset comes back narrowed to their
+/// own id: being named is theirs to know, the rest of the roster is not.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -219,7 +220,7 @@ async fn list_homework(
     responses(
         (status = 200, description = "The homework", body = HomeworkResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the homework's course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the homework's instance, not one of its teachers, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found (or a subset assignment the caller is not part of)", body = ErrorResponse),
     ),
 )]
@@ -228,15 +229,15 @@ async fn get_homework(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<HomeworkResponse>, AppError> {
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_view_course(&course, &user, &st.db).await? {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_view_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this homework",
+            "only the instance's enrolled students, its teachers, its şube's homeroom teacher, or a manager/admin can view this homework",
         ));
     }
     // A student the homework is not assigned to must not even learn it exists —
     // 404, not 403, exactly like an exam draft hidden from non-managers.
-    let manages = can_manage_course(&course, &user);
+    let manages = can_manage_instance(&st.db, instance.get_id(), &user).await?;
     if !manages && !homework.student_sees(user.get_id()) {
         return Err(AppError::NotFound);
     }
@@ -275,10 +276,10 @@ struct UpdateHomework {
 }
 
 /// Edit a homework's title, description, due date, subject, or assigned subset.
-/// Requires teacher+ and management rights over its course. Omitted fields keep
-/// their value; a newly set `due_at` is re-checked against now and a new
-/// `subject_id` re-checked against the course. Narrowing `assigned` is refused
-/// (409) while it would orphan an existing submission or result.
+/// Requires teacher+ and management rights over its instance. Omitted fields
+/// keep their value; a newly set `due_at` is re-checked against now and a new
+/// `subject_id` re-checked against the instance's course. Narrowing `assigned`
+/// is refused (409) while it would orphan an existing submission or result.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -290,9 +291,9 @@ struct UpdateHomework {
         (status = 200, description = "Updated homework", body = HomeworkResponse),
         (status = 400, description = "Invalid title, description, due date, subject (unknown or from another course), or assigned list", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry; or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry; or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -302,13 +303,13 @@ async fn update_homework(
     Path(id): Path<String>,
     Json(req): Json<UpdateHomework>,
 ) -> Result<Json<HomeworkResponse>, AppError> {
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this homework",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can edit this homework",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
 
     // The orphan guard and the write are one unit in
     // [`service::homework::update`]: the guard reads the live submissions and
@@ -333,9 +334,9 @@ async fn update_homework(
     // A kept (absent) due date may already be past; a newly set one may not be.
     check_not_past("due_at", due_at)?;
     let subject = match &req.subject_id {
-        Some(subject_id) => {
-            Some(crate::service::subject::in_course(&st.db, subject_id, course.get_id()).await?)
-        }
+        Some(subject_id) => Some(
+            crate::service::subject::in_course(&st.db, subject_id, instance.get_course()).await?,
+        ),
         None => None,
     };
     // The orphan guard runs on exactly the requests that re-scope the audience.
@@ -343,7 +344,7 @@ async fn update_homework(
     // no narrowing can happen behind the guard's back — which the old "carry the
     // snapshot back" branch could do, re-narrowing over a concurrent widening.
     let assigned = match req.assigned {
-        Some(assigned) => Some(resolve_assigned(assigned, course.get_id(), &st.db).await?),
+        Some(assigned) => Some(resolve_assigned(assigned, instance.get_id(), &st.db).await?),
         None => None,
     };
 
@@ -362,7 +363,7 @@ async fn update_homework(
 
 /// Delete a homework and everything under it — submissions, their files, and
 /// results — then unlink the file blobs from disk. Requires teacher+ and
-/// management rights over its course. The cascade is one transaction whose
+/// management rights over its instance. The cascade is one transaction whose
 /// homework-row lock keeps a submission from landing under the homework
 /// mid-delete; the blob names are collected inside that transaction, before
 /// the rows are wiped, and removed after, so a crash in between strands at
@@ -376,9 +377,9 @@ async fn update_homework(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_homework(
@@ -386,13 +387,13 @@ async fn delete_homework(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this homework",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can delete this homework",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // The blob-key collection and the cascade are
     // [`service::homework::delete`]'s; unlinking the blobs stays here because
     // only the web layer knows `files_path`.
@@ -515,7 +516,7 @@ struct SubmitHomework {
 }
 
 /// Submit (or re-submit) the caller's own work for a homework: optional text,
-/// files added separately. Requires the student role, enrollment in the course,
+/// files added separately. Requires the student role, enrollment in the instance,
 /// and that the homework is assigned to the caller (a subset it doesn't name
 /// 404s, never leaking the assignment). Text replaces the previous text; the
 /// first-submit stamp is pinned once and `updated_at` moves to now. `201` on the
@@ -533,9 +534,9 @@ struct SubmitHomework {
         (status = 201, description = "Submission created", body = SubmissionResponse),
         (status = 400, description = "Text exceeds its length limit", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the homework's instance", body = ErrorResponse),
         (status = 404, description = "No such homework (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -550,7 +551,7 @@ async fn submit(
         Some(text) if !text.is_empty() => Some(SubmissionText::try_new(text)?),
         _ => None,
     };
-    // The gate, the term wall, the graded check, and the upsert are one
+    // The gate, the year wall, the graded check, and the upsert are one
     // unit in [`service::homework_submission::submit`] — the audience
     // interlock, not the freeze (that is the stamp on the row).
     let landed = service::homework_submission::submit(&st.db, &user, &id, text).await?;
@@ -585,7 +586,7 @@ async fn submit(
     responses(
         (status = 200, description = "The caller's submission", body = SubmissionResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the homework's instance", body = ErrorResponse),
         (status = 404, description = "No such homework, a subset assignment the caller is not part of, or nothing submitted yet", body = ErrorResponse),
     ),
 )]
@@ -623,9 +624,9 @@ async fn get_submission(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the homework's instance", body = ErrorResponse),
         (status = 404, description = "No such homework, a subset assignment the caller is not part of, or nothing submitted yet", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_submission(
@@ -633,7 +634,7 @@ async fn delete_submission(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    // Gate, term wall, graded check, and the cascade are
+    // Gate, year wall, graded check, and the cascade are
     // [`service::homework_submission::delete`]'s; the file rows it returns
     // carry the blob names to unlink now that the rows are gone.
     let files = service::homework_submission::delete(&st.db, &user, &id).await?;
@@ -695,9 +696,9 @@ async fn serve_download(st: &AppState, file: &HomeworkFile) -> Result<Response, 
         (status = 201, description = "File stored", body = HomeworkFileResponse),
         (status = 400, description = "Missing file field, empty file, or an invalid filename or content type", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the homework's instance", body = ErrorResponse),
         (status = 404, description = "No such homework (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded, or the submission already holds the maximum of 10 files, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded, or the submission already holds the maximum of 10 files, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -711,7 +712,7 @@ async fn upload_submission_file(
     // 25 MiB; the gate that *licenses the write* is the one under the lease
     // below, because this snapshot goes stale while the body streams.
     let preflight = service::homework::gate_own_submission(&id, &user, &st.db).await?;
-    service::homework::require_open_term(&preflight, &st.db).await?;
+    service::homework::require_open_instance(&preflight, &st.db).await?;
     let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
     // Consume the body before taking the lock — a slow upload must not stall the
     // homework subsystem (mirrors the exam/note image uploads).
@@ -732,8 +733,8 @@ async fn upload_submission_file(
     // and a PATCH narrowing the audience — each contends on the homework
     // row's lock inside its own transaction.
     let homework = service::homework::gate_own_submission(&id, &user, &st.db).await?;
-    // Re-walled too: the term can be archived while the body streams.
-    service::homework::require_open_term(&homework, &st.db).await?;
+    // Re-walled too: the year can be archived while the body streams.
+    service::homework::require_open_instance(&homework, &st.db).await?;
     let submission = service::homework_file::ensure_can_attach(&st.db, &user, &homework).await?;
 
     // Blob first, row second — a stored row always points at a real blob. The
@@ -769,7 +770,7 @@ async fn upload_submission_file(
 
 /// Download a submission file's bytes. Two callers, one handler: a student reads
 /// their own file (behind the submission gate), or a teacher who manages the
-/// homework's course reads any file under it. A parent never reaches here —
+/// homework's instance reads any file under it. A parent never reaches here —
 /// observers get the report, never the bytes. The file is scoped to the homework
 /// in the path, so a managed homework's id can't be used to pull a file from
 /// another one.
@@ -785,7 +786,7 @@ async fn upload_submission_file(
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "A student not enrolled, or a teacher without management rights over the course", body = ErrorResponse),
+        (status = 403, description = "A student not enrolled, or a teacher without management rights over the instance", body = ErrorResponse),
         (status = 404, description = "No such homework or file (or a subset assignment the caller is not part of)", body = ErrorResponse),
     ),
 )]
@@ -807,10 +808,10 @@ async fn download_submission_file(
             .ok_or(AppError::NotFound)?
     } else {
         // Teacher+: any file under a homework they manage.
-        let (homework, course) = homework_with_course(&id, &st.db).await?;
-        if !can_manage_course(&course, &user) {
+        let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+        if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
             return Err(AppError::Forbidden(
-                "only the course creator, an assigned teacher, or a manager/admin can read submission files",
+                "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can read submission files",
             ));
         }
         service::homework_file::read_in_homework(&st.db, &file_id, homework.get_id())
@@ -835,9 +836,9 @@ async fn download_submission_file(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the homework's instance", body = ErrorResponse),
         (status = 404, description = "No such homework or file (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_submission_file(
@@ -846,7 +847,7 @@ async fn delete_submission_file(
     Path((id, fid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let homework = service::homework::gate_own_submission(&id, &user, &st.db).await?;
-    service::homework::require_open_term(&homework, &st.db).await?;
+    service::homework::require_open_instance(&homework, &st.db).await?;
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before deleting files",
     );
@@ -899,8 +900,8 @@ struct GradeHomework {
 
 /// Record (or overwrite) a student's grade for a homework: a status
 /// (`done`/`incomplete`/`missing`) plus an optional 0–100 mark. Requires
-/// teacher+ and management rights over the homework's course; the target must
-/// be a live student, enrolled in the course, and in the homework's audience.
+/// teacher+ and management rights over the homework's instance; the target must
+/// be a live student, enrolled in the instance, and in the homework's audience.
 /// Nobody grades themselves. Grading before the due date, or before any
 /// submission exists (`missing` for work never handed in), is allowed. A stored
 /// grade freezes the student's submission until it is removed.
@@ -915,9 +916,9 @@ struct GradeHomework {
         (status = 200, description = "Grade recorded", body = HomeworkResultResponse),
         (status = 400, description = "Invalid status or mark, unknown user, user not a student, not enrolled, or not in the homework's audience", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin, or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Homework not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -932,13 +933,13 @@ async fn grade_homework(
     // orders it against every student-side write — and keeps a homework
     // delete from letting the upsert resurrect a result row under a vanished
     // homework (the vanished row answers 404).
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &teacher) {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &teacher).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can grade this homework",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can grade this homework",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
 
     let status = HomeworkStatus::try_new(&req.status)?;
     let mark = req.mark.map(Mark::try_new).transpose()?;
@@ -954,7 +955,7 @@ async fn grade_homework(
 
 /// Remove a student's grade from a homework — un-grading, which unfreezes the
 /// student's submission and files for further edits. Requires teacher+ and
-/// management rights over the homework's course.
+/// management rights over the homework's instance.
 #[utoipa::path(
     delete,
     path = "/{id}/results/{user}",
@@ -967,9 +968,9 @@ async fn grade_homework(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such homework, or no grade for this user", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_homework_result(
@@ -980,13 +981,13 @@ async fn remove_homework_result(
     // Removing the grade is what unfreezes the submission; the un-grade's
     // transaction takes the homework row's lock, so it cannot straddle a
     // student-side write either.
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can remove grades",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can remove grades",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     let removed =
         service::homework_result::ungrade(&st.db, homework.get_id(), &UserId::from_key(&target))
             .await?;
@@ -1053,19 +1054,20 @@ struct HomeworkRosterEntry {
     /// Computed: nothing submitted and the due date has passed. Independent of
     /// the teacher-set `missing` status, which is a deliberate verdict.
     missing: bool,
-    /// Computed: the student is no longer enrolled in the course. Their stale
+    /// Computed: the student is no longer enrolled in the instance. Their stale
     /// rows stay readable here, but they can't submit and can't be graded.
     unenrolled: bool,
 }
 
 /// The teacher's roster for a homework, paged via `?limit=&offset=` (omit
 /// `limit` for all of it): one row per student in the audience — the assigned
-/// subset, or every currently enrolled student for a whole-course homework —
+/// subset, or every student currently enrolled in the instance when the
+/// homework carries none —
 /// plus any student outside it who still owns a submission or grade (an
 /// unenrollment or an audience change leaves work behind; it stays visible
 /// here, flagged). Each row carries the submission with its files and computed
 /// late flag, the grade, a computed `missing`, and a computed `unenrolled`.
-/// Requires teacher+ and management rights over the homework's course. Returns
+/// Requires teacher+ and management rights over the homework's instance. Returns
 /// a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -1077,7 +1079,7 @@ struct HomeworkRosterEntry {
         (status = 200, description = "A page of roster rows (all of them when unpaged)", body = Page<HomeworkRosterEntry>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Homework not found", body = ErrorResponse),
     ),
 )]
@@ -1088,23 +1090,23 @@ async fn list_homework_submissions(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<HomeworkRosterEntry>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (homework, course) = homework_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (homework, instance) = homework_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can list submissions",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can list submissions",
         ));
     }
     let submissions =
         service::homework_submission::list_for_homework(&st.db, homework.get_id()).await?;
     let results = service::homework_result::list_for_homework(&st.db, homework.get_id()).await?;
     let enrolled: Vec<String> =
-        service::enrollment::list_for_course(&st.db, course.get_id(), None, 0)
+        service::enrollment::list_for_class_course(&st.db, instance.get_id(), None, 0)
             .await?
             .0
             .iter()
             .map(|enrollment| enrollment.get_user().key().to_string())
             .collect();
-    // The audience: the assigned subset as stored, or — whole-course — whoever
+    // The audience: the assigned subset as stored, or — no subset — whoever
     // is enrolled right now. Anyone outside it who still owns a submission or
     // grade is appended rather than dropped: their stale rows are exactly what
     // a narrowing 409 names as blockers, so the teacher must be able to see
@@ -1167,8 +1169,8 @@ async fn list_homework_submissions(
 /// student did with it and how it was graded, if it was.
 #[derive(Serialize, ToSchema)]
 struct HomeworkReportEntry {
-    /// The course the homework belongs to.
-    course: String,
+    /// The class×course instance the homework belongs to.
+    class_course: String,
     /// The homework id.
     homework: String,
     title: String,
@@ -1187,14 +1189,14 @@ struct HomeworkReportEntry {
     result: Option<HomeworkResultResponse>,
 }
 
-/// A student's homework report across their enrolled courses, paged via
-/// `?limit=&offset=` (omit `limit` for all of it): one row per homework in
+/// A student's homework report across the instances their şube carries, paged
+/// via `?limit=&offset=` (omit `limit` for all of it): one row per homework in
 /// their audience — submitted/late/missing state plus the grade once one
 /// exists. Statuses and marks, never the submitted files (observers get the
 /// report, not the bytes). Requires teacher+, or a parent linked to the target
-/// student. Managers, admins, and parents see every course; a teacher sees only
-/// the target's courses they manage. Returns a `{items, total, limit, offset}`
-/// envelope.
+/// student. Managers, admins, and parents see every instance; a teacher sees
+/// only the target's instances they manage. Returns a `{items, total, limit,
+/// offset}` envelope.
 #[utoipa::path(
     get,
     path = "/report/{user}",
@@ -1218,32 +1220,46 @@ async fn homework_report(
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
-    // User must exist — a missing user is a 404, not an empty report.
-    crate::service::user::read(&st.db, &target)
+    // User must exist — a missing user is a 404, not an empty report. The row
+    // itself is what `visible_instances` takes.
+    let target_user = crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
-    // Only an exactly-teacher caller is narrowed to their managed courses;
+    // Only an exactly-teacher caller is narrowed to the instances they manage;
     // manager+ and a linked parent read the full report (the marks idiom).
-    let (mut courses, _) = crate::service::course::list_enrolled(&st.db, &target, None, 0).await?;
+    let mut instances: Vec<ClassCourse> = visible_instances(&target_user, &st.db)
+        .await?
+        .into_iter()
+        .map(|(instance, _)| instance)
+        .collect();
     if caller.get_role() == Role::Teacher {
-        courses.retain(|course| can_manage_course(course, &caller));
+        let mut managed = Vec::with_capacity(instances.len());
+        for instance in instances {
+            // The narrowing asks about the *caller's* rights, not the target's:
+            // `visible_instances` answers for the user it was handed.
+            if can_manage_instance(&st.db, instance.get_id(), &caller).await? {
+                managed.push(instance);
+            }
+        }
+        instances = managed;
     }
     let mut rows = Vec::new();
-    for course in &courses {
+    for instance in &instances {
         rows.extend(
-            service::homework::list_for_user_in_course(&st.db, course.get_id(), &target).await?,
+            service::homework::list_for_user_in_class_course(&st.db, instance.get_id(), &target)
+                .await?,
         );
     }
     let total = rows.len() as i64;
     // Join submissions and grades onto the page alone.
     let mut items = Vec::new();
-    // Paged in the web layer: the rows are gathered course by course.
+    // Paged in the web layer: the rows are gathered instance by instance.
     for homework in paginate(&rows, limit, offset) {
         let submission =
             service::homework_submission::read_for(&st.db, homework.get_id(), &target).await?;
         let result = service::homework_result::read_for(&st.db, homework.get_id(), &target).await?;
         items.push(HomeworkReportEntry {
-            course: homework.get_course().key().to_string(),
+            class_course: homework.get_class_course().key().to_string(),
             homework: homework.get_id().key().to_string(),
             title: homework.get_title().as_str().to_string(),
             subject: homework.get_subject().key().to_string(),

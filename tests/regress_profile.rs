@@ -13,8 +13,8 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_exam_with, create_homework, create_subject, enroll, id_of,
-    items, login, login_as, me_id, send, set_role, ABSENT_ID,
+    app_and_db, create_exam_with, create_homework, create_subject, enroll, id_of, items, login,
+    login_as, me_id, send, set_role, taught_under, ABSENT_ID,
 };
 use hezarfen_backend::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN};
 use hezarfen_backend::database::Database;
@@ -653,15 +653,18 @@ async fn a_demoted_teacher_lists_enrolled_courses_not_created_ones() {
     let staff = login_as(&app, &db, "coach", "teacher").await;
     let ex_id = me_id(&app, &ex).await;
 
-    create_course(&app, &ex, "Owned").await;
-    let joined = create_course(&app, &staff, "Joined").await;
+    // "Owned": the ex-teacher runs the instance — the assignment the teacher
+    // course block reads — so the catalog course is theirs while they teach.
+    let owned = taught_under(&app, &admin, &ex, "Owned").await;
+    assign_teacher(&app, &admin, &owned.instance, &ex_id).await;
+    let joined = taught_under(&app, &admin, &staff, "Joined").await;
 
     let as_teacher = send(&app, "GET", "/users/me/profile", Some(&ex), None).await;
     assert_eq!(as_teacher.body["courses"][0]["title"], "Owned");
     assert_eq!(as_teacher.body["stats"]["courses"], 1);
 
     set_role(&db, "exteach", "student").await;
-    enroll(&app, &staff, &joined, &ex_id).await;
+    enroll(&app, &staff, &joined.instance, &ex_id).await;
 
     let after = profile(&app, &admin, &ex_id).await;
     assert_eq!(after.status, StatusCode::OK, "{}", after.body);
@@ -764,9 +767,13 @@ async fn school() -> School {
     let peer_id = me_id(&app, &peer).await;
     let stranger = login(&app, "nosy").await;
 
-    let secret = create_course(&app, &teacher, "Secret Club").await;
-    let shared = create_course(&app, &teacher, "Shared Math").await;
-    enroll(&app, &teacher, &shared, &peer_id).await;
+    let secret = taught_under(&app, &manager, &teacher, "Secret Club").await;
+    let shared = taught_under(&app, &manager, &teacher, "Shared Math").await;
+    // The teacher runs both instances — the assignment the profile's teacher
+    // course block reads.
+    assign_teacher(&app, &manager, &secret.instance, &teacher_id).await;
+    assign_teacher(&app, &manager, &shared.instance, &teacher_id).await;
+    enroll(&app, &teacher, &shared.instance, &peer_id).await;
 
     School {
         app,
@@ -775,8 +782,22 @@ async fn school() -> School {
         peer,
         stranger,
         manager,
-        secret,
+        secret: secret.course,
     }
+}
+
+/// Assign `user` as a teacher on `instance` as `manager` (asserts 200). Instance
+/// staffing is the office's call, so a plain teacher cannot place one.
+async fn assign_teacher(app: &Router, manager: &str, instance: &str, user: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/instances/{instance}/teachers"),
+        Some(manager),
+        Some(json!({ "user_id": user })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "assign teacher: {}", res.body);
 }
 
 /// The titles a profile's course block hands `cookie`.
@@ -1110,25 +1131,28 @@ struct Classroom {
     teacher: String,
     student: String,
     student_id: String,
-    course: String,
+    instance: String,
+    term: String,
     subject: String,
 }
 
 async fn classroom() -> Classroom {
     let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
     let teacher = login_as(&app, &db, "teach", "teacher").await;
     let student = login(&app, "stu").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let subject = create_subject(&app, &teacher, &course, "Fractions").await;
+    let t = taught_under(&app, &manager, &teacher, "Algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let subject = create_subject(&app, &teacher, &t.course, "Fractions").await;
     Classroom {
         app,
         db,
         teacher,
         student,
         student_id,
-        course,
+        instance: t.instance,
+        term: t.term,
         subject,
     }
 }
@@ -1137,7 +1161,7 @@ async fn classroom() -> Classroom {
 /// scheduling grace — the only way to hand something in late in one test.
 async fn homework(c: &Classroom, title: &str, in_ms: i64) -> String {
     let due = Timestamp::now().as_millis() + in_ms;
-    create_homework(&c.app, &c.teacher, &c.course, &c.subject, title, due).await
+    create_homework(&c.app, &c.teacher, &c.instance, &c.subject, title, due).await
 }
 
 /// Move `homework`'s deadline to `in_ms` from now, as the teacher who set it.
@@ -1437,8 +1461,9 @@ async fn a_resumed_exam_attempt_counts_once() {
     let res = create_exam_with(
         &c.app,
         &c.teacher,
-        &c.course,
-        json!({ "title": "Midterm", "kind": "quiz", "mode": "sync",
+        &c.instance,
+        json!({ "title": "Midterm", "kind": "yazili", "term": c.term.clone(),
+                "mode": "sync",
                 "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;

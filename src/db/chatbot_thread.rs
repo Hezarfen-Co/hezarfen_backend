@@ -205,14 +205,13 @@ mod tests {
     /// The owner's counter and the threads it counts, both re-read out of the
     /// store — never off a return value.
     async fn stored(db: &Database) -> (i64, usize) {
-        let counter =
-            sqlx::query("SELECT chatbot_thread_count FROM app_user WHERE id = $1")
-                .bind(UserId::from_key(U).uuid())
-                .fetch_one(db)
-                .await
-                .unwrap()
-                .try_get::<i64, _>(0)
-                .unwrap();
+        let counter = sqlx::query("SELECT chatbot_thread_count FROM app_user WHERE id = $1")
+            .bind(UserId::from_key(U).uuid())
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
+            .unwrap();
         let rows = sqlx::query("SELECT count(*) FROM chatbot_thread")
             .fetch_one(db)
             .await

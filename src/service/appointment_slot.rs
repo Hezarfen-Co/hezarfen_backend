@@ -75,9 +75,7 @@ pub async fn create(
             series: None,
             created_at: Timestamp::now(),
         }],
-        AppError::ConflictOwned(
-            "this time overlaps a slot you have already published".into(),
-        ),
+        AppError::ConflictOwned("this time overlaps a slot you have already published".into()),
     )
     .await?
     .into_iter()
@@ -151,9 +149,7 @@ pub async fn publish_weekly(
         db,
         teacher,
         rows,
-        AppError::ConflictOwned(
-            "a repeated slot overlaps one you have already published".into(),
-        ),
+        AppError::ConflictOwned("a repeated slot overlaps one you have already published".into()),
     )
     .await?;
     if created.len() != windows.len() {

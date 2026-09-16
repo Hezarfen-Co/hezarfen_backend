@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::web::tenant_state::State;
 use axum::Json;
 use axum::extract::{Path, Query};
@@ -11,26 +9,16 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::course_session::SessionTopic;
-use crate::domain::enrollment::Enrollment;
-use crate::domain::exam::{
-    ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle,
-};
-use crate::domain::homework::HomeworkTitle;
 use crate::domain::role::Role;
 use crate::domain::subject::{SubjectDescription, SubjectName};
-use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::error::{AppError, ErrorResponse};
 use crate::service;
 use crate::state::AppState;
 
-use super::homework::{description_or_none, resolve_assigned};
 use super::{
-    CourseResponse, CurrentUser, ExamResponse, HomeworkResponse, Page, PageParams, PersonRef,
-    RequireManager, RequireTeacher, SessionResponse, SubjectResponse, check_not_past,
-    check_time_range, course_people, paginate, person_map, remove_blob, set_or_clear,
-    undo_if_demoted,
+    CourseResponse, CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SubjectResponse,
+    course_people, paginate, person_map, remove_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -38,31 +26,19 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(create_course, list_courses))
         .routes(routes!(my_courses))
         .routes(routes!(get_course, update_course, delete_course))
-        .routes(routes!(assign_teacher))
-        .routes(routes!(unassign_teacher))
-        .routes(routes!(enroll, list_roster))
-        .routes(routes!(unenroll))
+        .routes(routes!(join_member, list_members))
+        .routes(routes!(leave_member))
 }
 
-// The four route pairs below are mounted under `/courses` but *belong* to
-// another module, so each is split out to carry that module's gate as well as
-// the course one — see `crate::web::module_gate`. They are merged back in
-// `build_router`, so the URL space is unchanged.
-
-pub fn exam_routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(create_exam_in_course, list_course_exams))
-}
-
-pub fn session_routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(create_session_in_course, list_course_sessions))
-}
+// The route pair below is mounted under `/courses` but *belongs* to another
+// module, so it is split out to carry that module's gate as well as the course
+// one — see `crate::web::module_gate`. It is merged back in `build_router`, so
+// the URL space is unchanged. The exam, session and homework pairs that used to
+// sit here moved to `/instances/{id}/...` (see [`super::instances`]), because
+// they hang off the instance, not off the catalog row.
 
 pub fn subject_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(create_subject_in_course, list_course_subjects))
-}
-
-pub fn homework_routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(create_homework_in_course, list_course_homework))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -72,15 +48,50 @@ struct CreateCourse {
     #[schema(max_length = 2000)]
     description: Option<String>,
     /// `course` (a regular class — the default), `study` (a supervised study
-    /// session — etüt), or `club` (a student club — kulüp). Behaviorally
-    /// identical; a label for the UI.
+    /// session — etüt), or `club` (a student club — kulüp). Only a `course` is
+    /// taught through şube instances (and carries exams, sessions and
+    /// homework); a `study`/`club` is joined school-wide.
     #[schema(example = "course")]
     kind: Option<String>,
-    /// The academic term this course belongs to (`GET /terms`). Optional.
-    term_id: Option<String>,
-    /// Seat cap enforced when enrolling, at least 1. Omit for unlimited.
-    #[schema(example = 12)]
-    capacity: Option<i64>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct JoinMember {
+    /// The user to add to the club/etüt.
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
+    user_id: String,
+}
+
+/// Public shape of one individual membership in a club or etüt — the
+/// school-scoped tier, distinct from a class instance's roster.
+#[derive(Serialize, ToSchema)]
+struct MembershipResponse {
+    #[schema(
+        example = "019732e3-7b00-7000-8000-00000000dead_019732e3-7b00-7000-8000-00000000dead"
+    )]
+    id: String,
+    /// The course joined (`GET /courses/{id}`).
+    course: String,
+    user: PersonRef,
+    /// Who placed the membership.
+    added_by: PersonRef,
+    /// When, UTC unix-milliseconds.
+    created_at: i64,
+}
+
+impl MembershipResponse {
+    fn new(
+        membership: &crate::domain::course_membership::CourseMembership,
+        people: &std::collections::HashMap<String, PersonRef>,
+    ) -> Self {
+        Self {
+            id: membership.get_id().key(),
+            course: membership.get_course().key().to_string(),
+            user: PersonRef::resolve(people, membership.get_user()),
+            added_by: PersonRef::resolve(people, membership.get_added_by()),
+            created_at: membership.get_created_at().as_millis(),
+        }
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -92,141 +103,45 @@ struct UpdateCourse {
     /// `course`, `study` (etüt), or `club` (kulüp). Omit to keep the current
     /// kind.
     kind: Option<String>,
-    /// Omit to keep the current term, send `null` to unlink, or send a term
-    /// id to (re)assign.
-    #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<String>)]
-    term_id: Option<Option<String>>,
-    /// Omit to keep the current cap, send `null` to lift it, or send a value
-    /// (at least 1) to (re)cap. Lowering below the current roster keeps the
-    /// roster — only new enrolls are refused.
-    #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<i64>, example = 12)]
-    capacity: Option<Option<i64>>,
 }
 
-#[derive(Deserialize, ToSchema)]
-struct EnrollUser {
-    /// The user to enroll.
-    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
-    user_id: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-struct AssignTeacher {
-    /// The staff member to put in charge of the course. Must hold the
-    /// `teacher` role or higher.
-    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
-    user_id: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-struct CreateExamInCourse {
-    #[schema(max_length = 200, example = "Midterm")]
-    title: String,
-    #[schema(max_length = 2000)]
-    description: Option<String>,
-    /// The assessment form — one of the school's exam kinds (`GET /settings`;
-    /// defaults: `homework`, `quiz`, `midterm`, `final`, `project`, `oral`).
-    /// The kind's settings-configured weight decides how heavily the exam
-    /// counts into the course average.
-    #[schema(max_length = 50, example = "midterm")]
-    kind: String,
-    /// `sync` (one fixed window for everyone), `async` (each student starts
-    /// inside the window and gets `duration_ms`), or `open` (no window — sit
-    /// anytime). Omit for an offline-graded exam that cannot be sat.
-    #[schema(example = "sync")]
-    mode: Option<String>,
-    /// Window open, UTC unix-milliseconds. Required for `sync`/`async`,
-    /// forbidden for `open`; must not be in the past.
-    #[schema(example = 1_900_000_000_000_i64)]
-    starts_at: Option<i64>,
-    /// Window close, UTC unix-milliseconds. Required for `sync`/`async`,
-    /// forbidden for `open`; must not be in the past.
-    ends_at: Option<i64>,
-    /// Per-attempt time budget, milliseconds — required for `async`, optional
-    /// for `open` (omit for unlimited time), forbidden for `sync`.
-    #[schema(minimum = 60_000, maximum = 86_400_000, example = 5_400_000_i64)]
-    duration_ms: Option<i64>,
-    /// How many attempts each student gets, `1`–`100`, or `0` for unlimited.
-    /// Defaults to `1` — the classic single sitting.
-    #[schema(minimum = 0, maximum = 100, example = 1)]
-    max_attempts: Option<i64>,
-    /// Whether a student who left the exam room may come back in and keep
-    /// answering. Defaults to `true`; editable live while the exam runs.
-    allow_rejoin: Option<bool>,
-    /// Whether students may review their graded attempt once results are out.
-    /// Defaults to `false`; editable live.
-    allow_review: Option<bool>,
-    /// Save as a work-in-progress draft: visible only to the course's
-    /// managers, not sittable, not gradable, until published via
-    /// `PATCH /exams/{id}` with `draft: false`. Defaults to `false`.
-    draft: Option<bool>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct EnrollmentResponse {
-    id: String,
-    course: String,
-    /// The enrolled student.
-    user: PersonRef,
-    /// Who enrolled them.
-    enrolled_by: PersonRef,
-    /// The class (`GET /classes/{id}`) this row was pumped by, or `null` when a
-    /// human placed it directly. A row with a class on it is *swept* when that
-    /// class drops the student or detaches the course; a `null` one is nobody's
-    /// to take back. Without it no client could tell which of its roster rows a
-    /// class change is about to remove.
-    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
-    source: Option<String>,
-}
-
-impl EnrollmentResponse {
-    fn new(enrollment: &Enrollment, people: &HashMap<String, PersonRef>) -> Self {
-        Self {
-            id: enrollment.get_id().key().to_string(),
-            course: enrollment.get_course().key().to_string(),
-            user: PersonRef::resolve(people, enrollment.get_user()),
-            enrolled_by: PersonRef::resolve(people, enrollment.get_enrolled_by()),
-            source: enrollment.get_source().map(|class| class.key().to_string()),
-        }
-    }
-}
-
-/// Who may write inside a specific course (edit it, enroll, add exams,
-/// sessions, subjects, grade): its creator, a teacher a manager assigned to
-/// it, or anyone `manager` and above — and in every case only while the
-/// caller is *still* `teacher` or above.
+/// Who may write the **catalog** row (edit it, delete it, write its
+/// subjects): its creator, or anyone `manager` and above — and in every case
+/// only while the caller is *still* `teacher` or above.
 ///
 /// The `teacher` floor is enforced here rather than left to the callers: half
 /// of them extract `CurrentUser`, not `RequireTeacher`, so a creator demoted
-/// to `student` or `parent` used to keep course-management rights forever (the
-/// `creator` column is a historical fact and is never swept, unlike the
-/// assignment list).
+/// to `student` or `parent` would otherwise keep catalog rights forever (the
+/// `creator` column is a historical fact and is never swept).
 ///
-/// Deleting the course and changing its teacher list sit *above* this bar —
-/// see [`owns_course`].
+/// The teacher *assignment* list is gone from this row (D6): who teaches is
+/// per instance now, and being assigned to one grants rights inside it — via
+/// [`super::instances::can_manage_instance`] — never over the catalog.
 pub(crate) fn can_manage_course(course: &Course, user: &User) -> bool {
-    user.get_role().at_least(Role::Teacher)
-        && (course.is_creator(user.get_id())
-            || course.is_assigned(user.get_id())
-            || user.get_role().at_least(Role::Manager))
-}
-
-/// Who may destroy a course: its creator, or anyone `manager` and above. An
-/// assigned teacher runs the course but does not own it — they cannot delete
-/// it out from under the person who made it.
-///
-/// Carries the same live-`teacher` floor as [`can_manage_course`], and for the
-/// same reason: a demoted creator owns nothing.
-fn owns_course(course: &Course, user: &User) -> bool {
     user.get_role().at_least(Role::Teacher)
         && (course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager))
 }
 
-/// Who may read inside a specific course (its details, exams, sessions):
-/// anyone who can manage it, plus its enrolled users. Other teachers and
-/// unenrolled students see nothing.
+/// Who may destroy a catalog row: its creator, or anyone `manager` and above.
+/// Carries the same live-`teacher` floor as [`can_manage_course`], and for the
+/// same reason: a demoted creator owns nothing.
+fn owns_course(course: &Course, user: &User) -> bool {
+    can_manage_course(course, user)
+}
+
+/// Who may read a catalog course (its details, its curriculum subjects):
+/// anyone who can manage it, a teacher assigned to one of its **instances**,
+/// and anyone the course reaches — a student enrolled in any of its instances,
+/// or a member of the course itself. Other teachers and unenrolled students see
+/// nothing.
+///
+/// The assigned-teacher arm is what keeps the catalog honest about the
+/// instance layer: those teachers author homework and exam questions *inside*
+/// the instance (D10 lets them), and every one of those routes needs a
+/// `subject_id` belonging to this very course — so a `403` here would hand them
+/// a picker they cannot fill. At HEAD the assignment list lived on the catalog
+/// row and the arm came for free; after D6 it is read through the instances
+/// they teach ([`crate::service::course::list_for_teacher`]).
 pub(crate) async fn can_view_course(
     course: &Course,
     user: &User,
@@ -235,18 +150,22 @@ pub(crate) async fn can_view_course(
     if can_manage_course(course, user) {
         return Ok(true);
     }
-    Ok(
-        service::enrollment::read_for_user(db, course.get_id(), user.get_id())
+    if user.get_role().at_least(Role::Teacher)
+        && crate::service::course::list_for_teacher(db, user.get_id())
             .await?
-            .is_some(),
-    )
+            .iter()
+            .any(|taught| taught.get_id() == course.get_id())
+    {
+        return Ok(true);
+    }
+    crate::db::enrollment::user_is_in_course(db, course.get_id(), user.get_id()).await
 }
 
 /// The catalog as one user sees it: every course for manager+, otherwise the
-/// courses they created or were assigned to plus the ones they're enrolled in,
-/// newest first.
+/// courses they are assigned to teach somewhere plus the ones they're enrolled
+/// in, newest first.
 ///
-/// The created/assigned half carries the same live-`teacher` floor as
+/// The taught half carries the same live-`teacher` floor as
 /// [`can_manage_course`], and for the same reason: `creator` is a historical
 /// column no demotion sweeps, so without it a demoted creator kept seeing the
 /// course — and, through the `/exams` and `/homework` catalogs that build on
@@ -279,22 +198,12 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
 
 // ---- courses ------------------------------------------------------------
 
-/// A seat cap, when given, must be positive — `null`/omitted means unlimited.
-fn check_capacity(capacity: Option<i64>) -> Result<(), AppError> {
-    if capacity.is_some_and(|capacity| capacity < 1) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "capacity",
-            reason: "capacity must be at least 1",
-        }));
-    }
-    Ok(())
-}
-
-/// Create a course owned by the current user. Requires the `teacher` role or
-/// higher. `kind` picks the flavor — `course` (a regular class, the default),
-/// `study` (a supervised study session — etüt), or `club` (a student club —
-/// kulüp); all behave identically. `capacity` caps the roster at enroll time
-/// (omit for unlimited).
+/// Create a catalog course owned by the current user. Requires the `teacher`
+/// role or higher. `kind` picks the flavor — `course` (a regular class, the
+/// default), `study` (a supervised study session — etüt), or `club` (a
+/// student club — kulüp). A catalog row teaches nobody by itself: a şube
+/// attaches it into an instance (`POST /classes/{id}/instances`), and a
+/// `study`/`club` is joined school-wide (`POST /courses/{id}/members`).
 #[utoipa::path(
     post,
     path = "/",
@@ -303,10 +212,9 @@ fn check_capacity(capacity: Option<i64>) -> Result<(), AppError> {
     request_body = CreateCourse,
     responses(
         (status = 201, description = "Course created", body = CourseResponse),
-        (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
+        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
-        (status = 409, description = "The named term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -321,21 +229,7 @@ async fn create_course(
         Some(ref kind) => CourseKind::try_new(kind)?,
         None => CourseKind::course(),
     };
-    // Pre-flight only: the create itself claims a reference on the term before
-    // it writes the link, and a term deleted in between fails that claim with
-    // this very error — so an unknown id reads the same whichever side wins.
-    let term = service::term::resolve(&st.db, req.term_id.as_deref()).await?;
-    check_capacity(req.capacity)?;
-    let course = service::course::create(
-        &st.db,
-        user.get_id(),
-        title,
-        description,
-        kind,
-        term,
-        req.capacity,
-    )
-    .await?;
+    let course = service::course::create(&st.db, user.get_id(), title, description, kind).await?;
     // The creator is the caller — already loaded, no extra lookup.
     let people = PersonRef::map_of(&[&user]);
     Ok((
@@ -344,9 +238,9 @@ async fn create_course(
     ))
 }
 
-/// List the courses visible to the caller: every course for manager+,
-/// otherwise the courses they created plus the ones they're enrolled in. Paged
-/// via `?limit=&offset=` (omit `limit` for the full list); returns a
+/// List the catalog courses visible to the caller: every course for manager+,
+/// otherwise the courses they teach somewhere plus the ones they're enrolled
+/// in. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -379,9 +273,13 @@ async fn list_courses(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// The courses the current user is enrolled in, paged via `?limit=&offset=`
-/// (omit `limit` for all of them); returns a `{items, total, limit, offset}`
-/// envelope.
+/// The catalog courses the current user is reached by, paged via
+/// `?limit=&offset=` (omit `limit` for all of them); returns a
+/// `{items, total, limit, offset}` envelope.
+///
+/// Both membership tiers are here: a student's enrollments in the instances
+/// their şubeler teach, and an individual club/etüt membership. The
+/// *instances* themselves are `GET /instances/me`.
 #[utoipa::path(
     get,
     path = "/me",
@@ -389,7 +287,7 @@ async fn list_courses(
     security(("session_cookie" = [])),
     params(PageParams),
     responses(
-        (status = 200, description = "A page of the caller's enrolled courses (all of them when unpaged)", body = Page<CourseResponse>),
+        (status = 200, description = "A page of the caller's courses (all of them when unpaged)", body = Page<CourseResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
@@ -400,20 +298,42 @@ async fn my_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (courses, total) =
-        service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
-    let people = person_map(courses.iter().flat_map(course_people), &st.db).await?;
-    let items = courses
+    // Two sources, one list: the courses reached through the instances the
+    // caller is enrolled in, and the ones they joined individually. Either
+    // read is unpaged — the union is a Rust list, so it is paged here (the
+    // `visible_courses` shape).
+    let mut courses = service::course::list_enrolled(&st.db, user.get_id(), None, 0)
+        .await?
+        .0;
+    let (joined, _) =
+        crate::db::course_membership::list_for_user(&st.db, user.get_id(), None, 0).await?;
+    let known: Vec<CourseId> = courses
+        .iter()
+        .map(|course| course.get_id().clone())
+        .collect();
+    let mut missing: Vec<CourseId> = joined
+        .iter()
+        .map(|membership| membership.get_course().clone())
+        .filter(|id| !known.contains(id))
+        .collect();
+    missing.sort_by_key(|id| std::cmp::Reverse(id.key()));
+    missing.dedup();
+    courses.extend(service::course::list_by_ids(&st.db, &missing).await?);
+    courses.sort_by_key(|course| std::cmp::Reverse(course.get_id().key()));
+    let total = courses.len() as i64;
+    let window = paginate(&courses, limit, offset);
+    let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
+    let items = window
         .iter()
         .map(|course| CourseResponse::new(course, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Fetch a single course by id. Visible to its enrolled users, and to its
-/// creator, its assigned teachers and managers/admins while those accounts are
-/// still `teacher`+ — a demoted creator sees it only if they are enrolled, like
-/// any other student (see [`can_manage_course`]).
+/// Fetch a single catalog course by id. Visible to the people it reaches —
+/// students enrolled in any of its instances, members of the course itself —
+/// and to its creator and managers/admins while those accounts are still
+/// `teacher`+.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -423,7 +343,7 @@ async fn my_courses(
     responses(
         (status = 200, description = "The course", body = CourseResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, and not a still-`teacher`+ course creator, assigned teacher, or manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by this course, and not a still-`teacher`+ course creator or manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -437,16 +357,15 @@ async fn get_course(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
+            "only a student enrolled in one of this course's instances, a member of it, its creator, or a manager/admin can view this course",
         ));
     }
     let people = person_map(course_people(&course), &st.db).await?;
     Ok(Json(CourseResponse::new(&course, &people)))
 }
 
-/// Update a course. Requires teacher+ and course management rights — its
-/// creator, a teacher assigned to it, or a manager/admin. Omitted fields keep
-/// their value.
+/// Update a catalog course. Requires teacher+ and catalog rights — its
+/// creator, or a manager/admin. Omitted fields keep their value.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -456,11 +375,10 @@ async fn get_course(
     request_body = UpdateCourse,
     responses(
         (status = 200, description = "Updated course", body = CourseResponse),
-        (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
+        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term this update moves the course off changed since the caller read it (nothing was written, re-read and retry), or this course's term (or the named one) is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -475,10 +393,9 @@ async fn update_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this course",
+            "only the course creator or a manager/admin can edit this course",
         ));
     }
-    service::course::require_open(&st.db, &course).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -490,34 +407,24 @@ async fn update_course(
         .map(CourseDescription::try_new)
         .transpose()?;
     let kind = req.kind.as_deref().map(CourseKind::try_new).transpose()?;
-    // Both columns are nullable, so both stay clearable: omitted is `None`
-    // (keep), an explicit `null` is `Some(None)` (write `NONE`).
-    let term = match req.term_id {
-        // Explicit `null` clears the link; a value must name a real term.
-        Some(ref update) => Some(service::term::resolve(&st.db, update.as_deref()).await?),
-        None => None,
-    };
-    // Explicit `null` lifts the cap; a value must be positive.
-    check_capacity(req.capacity.flatten())?;
-    let capacity = req.capacity;
 
-    let updated =
-        service::course::update(&st.db, course, title, description, kind, term, capacity).await?;
+    let updated = service::course::update(&st.db, course, title, description, kind).await?;
     let people = person_map(course_people(&updated), &st.db).await?;
     Ok(Json(CourseResponse::new(&updated, &people)))
 }
 
-/// Delete a course. Requires teacher+; only its creator or a manager/admin may
-/// delete it — an assigned teacher runs the course but does not own it.
-/// Refused with a 409 while anyone is still enrolled — empty the roster first,
-/// so a course that carries students is never dropped by accident. Once empty,
-/// it cascades the course's exams (with their results, questions, answers, and
-/// question images), its homework (with submissions, submission files, and
-/// grades), its sessions and roll call, and its subjects. It also detaches the
-/// course from every class that carried it and strikes its id out of every
-/// class blueprint that named it — a template holding a course nothing can
-/// resolve is a stocking run that skips it and a `PATCH` that refuses the very
-/// list the template already holds.
+/// Delete a catalog course. Requires teacher+; only its creator or a
+/// manager/admin may delete it. Refused with a 409 while the course is still
+/// taught anywhere — detach it from every şube (`DELETE
+/// /classes/{id}/instances/{instance}`) and remove its individual members
+/// first, so a course that carries teaching is never dropped by accident.
+/// Once free, it cascades the instances' exams (with their results, questions,
+/// answers, and question images), homework (with submissions, submission
+/// files, and grades), sessions and roll call, its individual memberships, its
+/// subjects, and the teacher links. It also strikes its id out of every class
+/// blueprint that named it — a template holding a course nothing can resolve
+/// is a stocking run that skips it and a `PATCH` that refuses the very list
+/// the template already holds.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -529,7 +436,7 @@ async fn update_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Students are still enrolled in this course, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "A class still teaches this course, or students still hold an individual membership in it", body = ErrorResponse),
     ),
 )]
 async fn delete_course(
@@ -545,13 +452,14 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
-    // The workflow — archived-term gate, blob-key collection, cascade — is
+    // The workflow — blob-key collection and the guarded cascade — is
     // [`service::course::delete`]'s.
     // Blob unlinking stays here because only the web layer knows `files_path`.
     let outcome = service::course::delete(&st.db, &course).await?;
     if !outcome.deleted {
         return Err(AppError::Conflict(
-            "students are still enrolled in this course — remove them first",
+            "a class still teaches this course, or students still hold an individual \
+             membership in it — detach the classes and remove the members first",
         ));
     }
     for file in outcome
@@ -566,192 +474,109 @@ async fn delete_course(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- assigned teachers ----------------------------------------------------
+// ---- club/etüt membership ---------------------------------------------------
 
-/// Assign a teacher to a course (idempotent). Manager+ only — staffing is the
-/// office's call, so a course's own creator cannot hand management rights to
-/// their peers. The assignee must already hold the `teacher` role or higher;
-/// assigning gives them full management of the course (exams, sessions,
-/// subjects, roster, grading) but not the power to delete it or change this
-/// list. The course's assigned teachers are returned on every course response.
+/// Add a user to a club or etüt — the **school-scoped** membership tier.
+/// Requires teacher+ and catalog rights (its creator, or a manager/admin).
+/// Only students can be added, and only to a `study` (etüt) or `club`
+/// (kulüp): a regular ders (`kind` `course`) has no school-wide roster — its
+/// students come from the şubeler that teach it, and that join is
+/// `POST /instances/{id}/enrollments` (400 here). Idempotent: a pair that
+/// already holds a membership is returned as-is.
 #[utoipa::path(
     post,
-    path = "/{id}/teachers",
+    path = "/{id}/members",
     tag = "courses",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Course id")),
-    request_body = AssignTeacher,
+    request_body = JoinMember,
     responses(
-        (status = 200, description = "Assigned (or already assigned)", body = CourseResponse),
-        (status = 400, description = "Unknown user, or user is not a teacher or higher", body = ErrorResponse),
+        (status = 200, description = "Member added (or already a member)", body = MembershipResponse),
+        (status = 400, description = "Unknown user, user is not a student, or the course is a class-delivered ders", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "That user was demoted below teacher while the request ran — the assignment was undone; or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
-async fn assign_teacher(
-    State(st): State<AppState>,
-    RequireManager(_manager): RequireManager,
-    Path(id): Path<String>,
-    Json(req): Json<AssignTeacher>,
-) -> Result<Json<CourseResponse>, AppError> {
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let target = UserId::from_key(&req.user_id);
-    let updated = service::course::assign_teacher(&st.db, &course, &target).await?;
-    // The row is written; a demotion that raced the bar above swept the list
-    // before this assignment was in it, and nothing re-sweeps (see
-    // [`super::undo_if_demoted`]).
-    undo_if_demoted(&target, &st.db).await?;
-    let people = person_map(course_people(&updated), &st.db).await?;
-    Ok(Json(CourseResponse::new(&updated, &people)))
-}
-
-/// Unassign a teacher from a course. Manager+ only. The course itself, its
-/// exams, sessions, and roster are untouched — the teacher just loses their
-/// management rights over it. A user who was never assigned is a 404.
-#[utoipa::path(
-    delete,
-    path = "/{id}/teachers/{user}",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(
-        ("id" = String, Path, description = "Course id"),
-        ("user" = String, Path, description = "User id"),
-    ),
-    responses(
-        (status = 204, description = "Unassigned"),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 404, description = "Course not found, or that user was not assigned to it", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
-    ),
-)]
-async fn unassign_teacher(
-    State(st): State<AppState>,
-    RequireManager(_manager): RequireManager,
-    Path((id, target)): Path<(String, String)>,
-) -> Result<StatusCode, AppError> {
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let removed =
-        service::course::unassign_teacher(&st.db, &course, &UserId::from_key(&target)).await?;
-    if removed.is_none() {
-        return Err(AppError::NotFound);
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ---- enrollments ----------------------------------------------------------
-
-/// Enroll a user into a course (idempotent upsert). Requires teacher+ and
-/// course management rights. Only students can be enrolled — enrollment is
-/// student membership, and it gates sitting exams, being graded, and the class
-/// roster, all student-only. A course with a `capacity` refuses new members
-/// once the roster is full (someone already enrolled is returned as-is).
-/// Enrolling a student a class pumped in takes the row *off* that class —
-/// `source` comes back `null` — so a later class sweep can no longer undo a
-/// placement made by hand, the mirror of a manual unenroll winning permanently.
-#[utoipa::path(
-    post,
-    path = "/{id}/enrollments",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
-    request_body = EnrollUser,
-    responses(
-        (status = 200, description = "Enrolled (or already enrolled)", body = EnrollmentResponse),
-        (status = 400, description = "Unknown user, or user is not a student", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "The course is full, or this course's term is archived — past years are read-only", body = ErrorResponse),
-        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-    ),
-)]
-async fn enroll(
+async fn join_member(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
-    Json(req): Json<EnrollUser>,
-) -> Result<Json<EnrollmentResponse>, AppError> {
+    Json(req): Json<JoinMember>,
+) -> Result<Json<MembershipResponse>, AppError> {
     let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can enroll users",
+            "only the course creator or a manager/admin can add members to this course",
         ));
     }
-    service::course::require_open(&st.db, &course).await?;
-
     let target = UserId::from_key(&req.user_id);
-    let enrollment =
-        service::enrollment::enroll(&st.db, course.get_id(), &target, user.get_id()).await?;
+    let membership =
+        service::enrollment::join_activity(&st.db, course.get_id(), &target, user.get_id()).await?;
     let people = person_map([target, *user.get_id()], &st.db).await?;
-    Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
+    Ok(Json(MembershipResponse::new(&membership, &people)))
 }
 
-/// List a course's roster, paged via `?limit=&offset=` (omit `limit` for the
-/// whole roster). Requires teacher+ and course management rights — students see
-/// their own courses via `GET /courses/me`. Returns a
-/// `{items, total, limit, offset}` envelope.
+/// List a club/etüt's members, newest first, paged via `?limit=&offset=`
+/// (omit `limit` for the whole list). Requires teacher+ and catalog rights.
+/// Returns a `{items, total, limit, offset}` envelope. An instance's roster
+/// is `GET /instances/{id}/enrollments`.
 #[utoipa::path(
     get,
-    path = "/{id}/enrollments",
+    path = "/{id}/members",
     tag = "courses",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Course id"), PageParams),
     responses(
-        (status = 200, description = "A page of enrollments (the whole roster when unpaged)", body = Page<EnrollmentResponse>),
+        (status = 200, description = "A page of members (the whole list when unpaged)", body = Page<MembershipResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
-async fn list_roster(
+async fn list_members(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
     Query(page): Query<PageParams>,
-) -> Result<Json<Page<EnrollmentResponse>>, AppError> {
+) -> Result<Json<Page<MembershipResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    // Course must exist — a missing course is a 404, not an empty roster.
     let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can list the roster",
+            "only the course creator or a manager/admin can list this course's members",
         ));
     }
     let (rows, total) =
-        service::enrollment::list_for_course(&st.db, course.get_id(), limit, offset).await?;
+        crate::db::course_membership::list_for_course(&st.db, course.get_id(), limit, offset)
+            .await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
-            .flat_map(|e| [*e.get_user(), *e.get_enrolled_by()]),
+            .flat_map(|row| [*row.get_user(), *row.get_added_by()]),
         &st.db,
     )
     .await?;
     let items = rows
         .iter()
-        .map(|e| EnrollmentResponse::new(e, &people))
+        .map(|row| MembershipResponse::new(row, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Unenroll a user from a course. Requires teacher+ and course management
-/// rights. Existing exam results are kept (they disappear from the user's marks
-/// report until re-enrolled).
+/// Remove a user from a club or etüt. Requires teacher+ and catalog rights.
+/// Existing exam results and badges are untouched — the membership is a door,
+/// not a record of what happened inside. A pair holding no membership is a
+/// 404.
 #[utoipa::path(
     delete,
-    path = "/{id}/enrollments/{user}",
+    path = "/{id}/members/{user}",
     tag = "courses",
     security(("session_cookie" = [])),
     params(
@@ -759,14 +584,13 @@ async fn list_roster(
         ("user" = String, Path, description = "User id"),
     ),
     responses(
-        (status = 204, description = "Unenrolled"),
+        (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Course not found, or that user held no membership", body = ErrorResponse),
     ),
 )]
-async fn unenroll(
+async fn leave_member(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
@@ -776,140 +600,12 @@ async fn unenroll(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can unenroll users",
+            "only the course creator or a manager/admin can remove members from this course",
         ));
     }
-    service::course::require_open(&st.db, &course).await?;
-    service::enrollment::unenroll(&st.db, course.get_id(), &UserId::from_key(&target)).await?;
+    service::enrollment::leave_activity(&st.db, course.get_id(), &UserId::from_key(&target))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ---- exams in a course ----------------------------------------------------
-
-/// Create an exam inside a course. Requires teacher+ and course management
-/// rights; the exam's marks count into the course average with its kind's
-/// weight (`GET /settings`). Omit `mode` for an offline-graded exam nobody
-/// can sit; `sync`/`async` take a window (async also `duration_ms`), `open`
-/// is sittable anytime with an optional per-attempt `duration_ms`.
-/// `max_attempts` (default 1, `0` = unlimited) meters retakes and
-/// `allow_rejoin` (default `true`) is the exam-room door — both stay editable
-/// while the exam runs. Send `draft: true` to keep the exam private while
-/// it's still being written: only the course's managers see it, and sitting
-/// and grading are blocked until it's published (`PATCH` `draft: false`).
-#[utoipa::path(
-    post,
-    path = "/{id}/exams",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
-    request_body = CreateExamInCourse,
-    responses(
-        (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, duration exceeding the window, or times in the past)", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
-        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-    ),
-)]
-async fn create_exam_in_course(
-    State(st): State<AppState>,
-    RequireTeacher(user): RequireTeacher,
-    Path(id): Path<String>,
-    Json(req): Json<CreateExamInCourse>,
-) -> Result<(StatusCode, Json<ExamResponse>), AppError> {
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_manage_course(&course, &user) {
-        return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add exams to this course",
-        ));
-    }
-    service::course::require_open(&st.db, &course).await?;
-
-    let title = ExamTitle::try_new(&req.title)?;
-    let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
-    let school = service::settings::load(&st.db).await?;
-    let kind = ExamKind::try_new(&req.kind, school.get_exam_kinds())?;
-    let starts_at = req.starts_at.map(Timestamp::from_millis);
-    let ends_at = req.ends_at.map(Timestamp::from_millis);
-    check_not_past("starts_at", starts_at)?;
-    check_not_past("ends_at", ends_at)?;
-    let schedule = ExamSchedule::try_new(
-        req.mode.as_deref().map(ExamMode::try_new).transpose()?,
-        starts_at,
-        ends_at,
-        req.duration_ms.map(ExamDuration::try_new).transpose()?,
-    )?;
-    let max_attempts = match req.max_attempts {
-        Some(limit) => ExamAttemptLimit::try_new(limit)?,
-        None => ExamAttemptLimit::single(),
-    };
-    let exam = crate::service::exam::create(
-        &st.db,
-        user.get_id(),
-        course.get_id(),
-        title,
-        description,
-        kind,
-        schedule,
-        max_attempts,
-        req.allow_rejoin.unwrap_or(true),
-        req.allow_review.unwrap_or(false),
-        req.draft.unwrap_or(false),
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(ExamResponse::new(&exam))))
-}
-
-/// List a course's exams, paged via `?limit=&offset=` (omit `limit` for all of
-/// them). Visible to the course's enrolled users, its creator, and
-/// managers/admins — but drafts appear only to the course's managers.
-/// Returns a `{items, total, limit, offset}` envelope.
-#[utoipa::path(
-    get,
-    path = "/{id}/exams",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id"), PageParams),
-    responses(
-        (status = 200, description = "A page of the course's exams (all of them when unpaged)", body = Page<ExamResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-    ),
-)]
-async fn list_course_exams(
-    State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
-    Path(id): Path<String>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Page<ExamResponse>>, AppError> {
-    let (limit, offset) = page.resolve()?;
-    // Course must exist — a missing course is a 404, not an empty exam list.
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_view_course(&course, &user, &st.db).await? {
-        return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
-        ));
-    }
-    let mut exams = crate::service::exam::list_for_course(&st.db, course.get_id()).await?;
-    // Drafts are the managers' workbench — enrolled students don't see them.
-    if !can_manage_course(&course, &user) {
-        exams.retain(|exam| !exam.is_draft());
-    }
-    let total = exams.len() as i64;
-    // Paged in the web layer: the draft filter above is per-row Rust.
-    let items = paginate(&exams, limit, offset)
-        .iter()
-        .map(ExamResponse::new)
-        .collect();
-    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 // ---- subjects in a course ---------------------------------------------------
@@ -924,9 +620,10 @@ struct CreateSubject {
     description: Option<String>,
 }
 
-/// Create a subject inside a course. Requires teacher+ and course management
-/// rights. Subjects are the course's curriculum topics — every exam question
-/// must be tagged with one of its course's subjects.
+/// Create a subject inside a course. Requires teacher+ and catalog rights
+/// (its creator, or a manager/admin). Subjects are the curriculum topics of the
+/// *catalog* row — every exam of every instance teaching it tags its questions
+/// with one of them.
 #[utoipa::path(
     post,
     path = "/{id}/subjects",
@@ -938,9 +635,8 @@ struct CreateSubject {
         (status = 201, description = "Subject created", body = SubjectResponse),
         (status = 400, description = "Invalid name or description", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -955,10 +651,9 @@ async fn create_subject_in_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add subjects to this course",
+            "only the course creator or a manager/admin can add subjects to this course",
         ));
     }
-    service::course::require_open(&st.db, &course).await?;
 
     let name = SubjectName::try_new(&req.name)?;
     let description = SubjectDescription::try_new(&req.description.unwrap_or_default())?;
@@ -967,8 +662,9 @@ async fn create_subject_in_course(
 }
 
 /// List a course's subjects in creation order, paged via `?limit=&offset=`
-/// (omit `limit` for all of them). Visible to the course's enrolled users, its
-/// creator, and managers/admins. Returns a `{items, total, limit, offset}`
+/// (omit `limit` for all of them). Visible to its creator, to managers/admins,
+/// and to anyone the course reaches (a student enrolled in one of its
+/// instances, or a member of it). Returns a `{items, total, limit, offset}`
 /// envelope.
 #[utoipa::path(
     get,
@@ -980,7 +676,7 @@ async fn create_subject_in_course(
         (status = 200, description = "A page of the course's subjects (all of them when unpaged)", body = Page<SubjectResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -997,285 +693,12 @@ async fn list_course_subjects(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
+            "only a user this course reaches, its creator, or a manager/admin can view this course",
         ));
     }
     let (subjects, total) =
         service::subject::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     let items = subjects.iter().map(SubjectResponse::new).collect();
-    Ok(Json(Page::new(items, total, limit, offset)))
-}
-
-// ---- homework in a course --------------------------------------------------
-// A teacher assigns homework per course, tagged with one of the course's
-// subjects and due at a future time. `assigned` optionally narrows it to a
-// subset of the enrolled students; omit it for the whole course.
-
-#[derive(Deserialize, ToSchema)]
-struct CreateHomework {
-    #[schema(max_length = 200, example = "Read chapter 3 and answer Q1-Q5")]
-    title: String,
-    #[schema(max_length = 2000)]
-    description: Option<String>,
-    /// The course subject this homework belongs to
-    /// (`GET /courses/{id}/subjects`). Required — every homework is tagged with
-    /// one of its course's subjects.
-    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
-    subject_id: String,
-    /// When the homework is due, UTC unix-milliseconds. Required; must not be
-    /// in the past. Late submissions are still accepted, just flagged late.
-    #[schema(example = 1_900_000_000_000_i64)]
-    due_at: i64,
-    /// The students this homework is for: a list of enrolled student ids. Omit,
-    /// send `null`, or send `[]` to assign the whole enrolled course (whoever is
-    /// enrolled when they submit); a subset caps at 200 named students.
-    #[schema(max_items = 200)]
-    assigned: Option<Vec<String>>,
-}
-
-/// Assign a homework inside a course. Requires teacher+ and course management
-/// rights. The homework is tagged with one of the course's subjects and given a
-/// future `due_at`; `assigned` optionally narrows it to a subset of the enrolled
-/// students (omit or empty = the whole course).
-#[utoipa::path(
-    post,
-    path = "/{id}/homework",
-    tag = "homework",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
-    request_body = CreateHomework,
-    responses(
-        (status = 201, description = "Homework created", body = HomeworkResponse),
-        (status = 400, description = "Invalid fields, a due date in the past, an unknown subject (or one from another course), or an assigned student not enrolled / over the cap", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
-        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-    ),
-)]
-async fn create_homework_in_course(
-    State(st): State<AppState>,
-    RequireTeacher(user): RequireTeacher,
-    Path(id): Path<String>,
-    Json(req): Json<CreateHomework>,
-) -> Result<(StatusCode, Json<HomeworkResponse>), AppError> {
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_manage_course(&course, &user) {
-        return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add homework to this course",
-        ));
-    }
-    service::course::require_open(&st.db, &course).await?;
-
-    let title = HomeworkTitle::try_new(&req.title)?;
-    let description = match req.description.as_deref() {
-        Some(text) => description_or_none(text)?,
-        None => None,
-    };
-    let due_at = Timestamp::from_millis(req.due_at);
-    check_not_past("due_at", Some(due_at))?;
-    // No lease: the create takes the subject's reference counter in the same
-    // breath as the row, and the subject delete is refused while that counter
-    // is non-zero — so the check below is only a pre-flight for the message.
-    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
-    let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
-    let homework = service::homework::create(
-        &st.db,
-        course.get_id(),
-        &subject,
-        title,
-        description,
-        due_at,
-        assigned,
-        user.get_id(),
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(HomeworkResponse::new(&homework))))
-}
-
-/// List a course's homework, newest first, paged via `?limit=&offset=` (omit
-/// `limit` for all of it). Visible to the course's enrolled users, its creator,
-/// its assigned teachers, and managers/admins — but a student sees only the
-/// homework they are assigned (whole-course ones plus subsets that name them,
-/// each with its `assigned` narrowed to themselves).
-/// Returns a `{items, total, limit, offset}` envelope.
-#[utoipa::path(
-    get,
-    path = "/{id}/homework",
-    tag = "homework",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id"), PageParams),
-    responses(
-        (status = 200, description = "A page of the course's homework (all of it when unpaged)", body = Page<HomeworkResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-    ),
-)]
-async fn list_course_homework(
-    State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
-    Path(id): Path<String>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Page<HomeworkResponse>>, AppError> {
-    let (limit, offset) = page.resolve()?;
-    // Course must exist — a missing course is a 404, not an empty homework list.
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_view_course(&course, &user, &st.db).await? {
-        return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
-        ));
-    }
-    let mut homework = service::homework::list_for_course(&st.db, course.get_id()).await?;
-    // A student sees only the homework they are assigned; managers see all.
-    let manages = can_manage_course(&course, &user);
-    if !manages {
-        homework.retain(|hw| hw.student_sees(user.get_id()));
-    }
-    let total = homework.len() as i64;
-    // Paged in the web layer: the audience filter above is per-row Rust. A
-    // subset roster goes out whole only to a manager of the course; a student
-    // sees themselves in it and no one else.
-    let items = paginate(&homework, limit, offset)
-        .iter()
-        .map(|hw| {
-            if manages {
-                HomeworkResponse::new(hw)
-            } else {
-                HomeworkResponse::for_viewer(hw, user.get_id())
-            }
-        })
-        .collect();
-    Ok(Json(Page::new(items, total, limit, offset)))
-}
-
-// ---- sessions in a course --------------------------------------------------
-
-#[derive(Deserialize, ToSchema)]
-struct CreateSessionInCourse {
-    /// What the lesson covers. Optional.
-    #[schema(max_length = 200, example = "Limits and continuity")]
-    topic: Option<String>,
-    /// Who teaches the session. Defaults to the caller; must hold the
-    /// `teacher` role or higher.
-    teacher_id: Option<String>,
-    /// Lesson start, UTC unix-milliseconds. Must not be in the past.
-    #[schema(example = 1_900_000_000_000_i64)]
-    starts_at: i64,
-    /// Lesson end, UTC unix-milliseconds. Optional (open-ended); must not be
-    /// in the past.
-    ends_at: Option<i64>,
-}
-
-/// Create a lesson session inside a course. Requires teacher+ and course
-/// management rights. The session's teacher defaults to the caller.
-#[utoipa::path(
-    post,
-    path = "/{id}/sessions",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
-    request_body = CreateSessionInCourse,
-    responses(
-        (status = 201, description = "Session created", body = SessionResponse),
-        (status = 400, description = "Invalid fields, time range, times in the past, or teacher", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
-        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-    ),
-)]
-async fn create_session_in_course(
-    State(st): State<AppState>,
-    RequireTeacher(user): RequireTeacher,
-    Path(id): Path<String>,
-    Json(req): Json<CreateSessionInCourse>,
-) -> Result<(StatusCode, Json<SessionResponse>), AppError> {
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_manage_course(&course, &user) {
-        return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add sessions to this course",
-        ));
-    }
-    service::course::require_open(&st.db, &course).await?;
-
-    let topic = SessionTopic::try_new(&req.topic.unwrap_or_default())?;
-    let teacher =
-        service::course_session::resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db)
-            .await?;
-    let starts_at = Timestamp::from_millis(req.starts_at);
-    let ends_at = req.ends_at.map(Timestamp::from_millis);
-    check_not_past("starts_at", Some(starts_at))?;
-    check_not_past("ends_at", ends_at)?;
-    check_time_range(Some(starts_at), ends_at)?;
-
-    let session = service::course_session::create(
-        &st.db,
-        course.get_id(),
-        teacher.get_id(),
-        topic,
-        starts_at,
-        ends_at,
-    )
-    .await?;
-    let people = PersonRef::map_of(&[&teacher]);
-    Ok((
-        StatusCode::CREATED,
-        Json(SessionResponse::new(&session, &people)),
-    ))
-}
-
-/// List a course's lesson sessions, most recent first, paged via
-/// `?limit=&offset=` (omit `limit` for all of them). Visible to the course's
-/// enrolled users, its creator, and managers/admins. Returns a
-/// `{items, total, limit, offset}` envelope.
-#[utoipa::path(
-    get,
-    path = "/{id}/sessions",
-    tag = "courses",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id"), PageParams),
-    responses(
-        (status = 200, description = "A page of the course's sessions (all of them when unpaged)", body = Page<SessionResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
-        (status = 404, description = "Course not found", body = ErrorResponse),
-    ),
-)]
-async fn list_course_sessions(
-    State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
-    Path(id): Path<String>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Page<SessionResponse>>, AppError> {
-    let (limit, offset) = page.resolve()?;
-    // Course must exist — a missing course is a 404, not an empty list.
-    let course = service::course::read(&st.db, &CourseId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_view_course(&course, &user, &st.db).await? {
-        return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
-        ));
-    }
-    let (rows, total) =
-        service::course_session::list_for_course(&st.db, course.get_id(), limit, offset).await?;
-    // Join teachers onto the page alone — the lookup shrinks with the window.
-    let people = person_map(rows.iter().map(|s| *s.get_teacher()), &st.db).await?;
-    let items = rows
-        .iter()
-        .map(|s| SessionResponse::new(s, &people))
-        .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1296,7 +719,7 @@ mod tests {
             .0
     }
 
-    /// A course `creator` made, with nobody assigned.
+    /// A catalog course `creator` made.
     async fn course(creator: &User, db: &Database) -> Course {
         service::course::create(
             db,
@@ -1304,8 +727,6 @@ mod tests {
             CourseTitle::try_new("Matematik").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::try_new("course").unwrap(),
-            None,
-            None,
         )
         .await
         .unwrap()
@@ -1337,78 +758,8 @@ mod tests {
         }
     }
 
-    /// The same floor on the assignment list — the demotion sweep clears it,
-    /// but the grant must not depend on that sweep having run.
-    #[tokio::test]
-    async fn demoted_assigned_teacher_loses_management() {
-        let (db, _leases) = init_test_db().await;
-        let creator = user("creator", Role::Teacher, &db).await;
-        let assigned = user("assigned", Role::Teacher, &db).await;
-        let course =
-            service::course::assign_teacher(&db, &course(&creator, &db).await, assigned.get_id())
-                .await
-                .unwrap();
-        // Still teacher+: untouched by the floor.
-        assert!(can_manage_course(&course, &assigned));
-        // ...but never an owner, assigned or not.
-        assert!(!owns_course(&course, &assigned));
-
-        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student)
-            .await
-            .unwrap()
-            .0;
-        assert!(!can_manage_course(&course, &demoted));
-    }
-
-    /// A manager may schedule a lesson on a teacher's behalf, and the session
-    /// belongs to the teacher they named — not to the caller. Everything hung
-    /// off that column (who may take the roll call, and who the roll call
-    /// credits) follows it, so a handler that stored the caller instead would
-    /// hand the office staff somebody else's lesson.
-    #[tokio::test]
-    async fn a_manager_scheduling_a_lesson_names_the_teacher_not_themselves() {
-        let (db, _leases) = init_test_db().await;
-        let manager = user("manager", Role::Manager, &db).await;
-        let teacher = user("teacher", Role::Teacher, &db).await;
-        let course = course(&manager, &db).await;
-        let st = AppState {
-            db: db.clone(),
-            tenants: crate::database::init_test_tenants().await,
-            files_path: std::env::temp_dir(),
-            cookie_secure: false,
-            rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
-            chatbot_limit: Default::default(),
-            exam_presence: Default::default(),
-            board_hub: Default::default(),
-            ai: None,
-            metrics: crate::telemetry::Metrics::noop(),
-        };
-
-        let (status, Json(session)) = create_session_in_course(
-            State(st),
-            RequireTeacher(manager.clone()),
-            Path(course.get_id().key().to_string()),
-            Json(CreateSessionInCourse {
-                topic: None,
-                teacher_id: Some(teacher.get_id().key().to_string()),
-                starts_at: Timestamp::now().as_millis() + 60_000,
-                ends_at: None,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(status, StatusCode::CREATED);
-        // Read back off the stored row, which is what `SessionResponse` names.
-        assert_eq!(session.teacher.id, teacher.get_id().key());
-        assert_ne!(
-            session.teacher.id,
-            manager.get_id().key(),
-            "the caller took the lesson instead of the teacher they named"
-        );
-    }
-
     /// No course is left orphaned by the floor: manager+ reaches a course whose
-    /// creator was demoted and which has no assigned teachers.
+    /// creator was demoted.
     #[tokio::test]
     async fn manager_still_manages_a_demoted_creators_course() {
         let (db, _leases) = init_test_db().await;
@@ -1423,5 +774,19 @@ mod tests {
             assert!(can_manage_course(&course, &boss), "{role:?} locked out");
             assert!(owns_course(&course, &boss), "{role:?} cannot delete");
         }
+    }
+
+    /// The assignment list is off the catalog (D6): a teacher assigned to an
+    /// instance runs that instance, but holds no rights over the catalog row
+    /// itself — the gate that grants them the instance is
+    /// [`super::instances::can_manage_instance`].
+    #[tokio::test]
+    async fn an_instance_teacher_holds_no_catalog_rights() {
+        let (db, _leases) = init_test_db().await;
+        let creator = user("owner", Role::Manager, &db).await;
+        let assigned = user("assigned", Role::Teacher, &db).await;
+        let course = course(&creator, &db).await;
+        assert!(!can_manage_course(&course, &assigned));
+        assert!(!owns_course(&course, &assigned));
     }
 }

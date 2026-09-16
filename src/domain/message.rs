@@ -2,8 +2,8 @@ use sqlx::Type;
 use uuid::Uuid;
 
 use crate::constant::{
-    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN,
-    RECIPIENT_FOLDERS, SENDER_FOLDERS,
+    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN, RECIPIENT_FOLDERS,
+    SENDER_FOLDERS,
 };
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;

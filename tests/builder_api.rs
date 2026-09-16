@@ -2185,8 +2185,8 @@ async fn probe_registry_reads_per_request() {
     );
 }
 
-/// P8: the four foreign route pairs mounted under `/courses` carry both gates,
-/// and a disabled nest still `404`s an unmatched path inside it.
+/// P8: the foreign route pairs nested under another module's nest carry both
+/// gates, and a disabled nest still `404`s an unmatched path inside it.
 #[tokio::test]
 async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
     let (app, db, _tenants) = deployment().await;
@@ -2205,11 +2205,11 @@ async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
         .await;
         assert_eq!(off.status, StatusCode::OK, "{module}: {:?}", off.body);
     }
-    let child = send(&app, "GET", "/courses/x/exams", Some(&cookie), None).await;
+    let child = send(&app, "GET", "/instances/x/exams", Some(&cookie), None).await;
     assert_eq!(
         child.status,
         StatusCode::FORBIDDEN,
-        "/courses/x/exams with exams off -> {} {:?}",
+        "/instances/x/exams with exams off -> {} {:?}",
         child.status,
         child.body
     );

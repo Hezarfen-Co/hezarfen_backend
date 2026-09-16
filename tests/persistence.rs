@@ -9,7 +9,7 @@ mod common;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::{create_course, create_subject, enroll, me_id, send, set_role};
+use common::{create_subject, enroll, login_as, me_id, send, set_role, taught_under};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
@@ -38,8 +38,8 @@ async fn reboot(db: &Database, tenants: &Tenants) -> Router {
 }
 
 /// School policy and terms survive a second boot — the settings singleton
-/// (nested band objects included) and the course→term link both come back,
-/// untouched by the re-applied idempotent migration.
+/// (nested band objects included) and a dönem under its academic year both come
+/// back, untouched by the re-applied idempotent migration.
 #[tokio::test]
 async fn settings_and_terms_survive_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
@@ -69,23 +69,17 @@ async fn settings_and_terms_survive_remigration() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
-    let res = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&cookie),
-        Some(json!({ "name": "2026 Fall", "starts_at": 1, "ends_at": 2 })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED);
-    let term = res.body["id"].as_str().unwrap().to_string();
+    // A dönem is a slice of an academic year now, so the calendar is minted in
+    // two steps — the year, then the term inside it.
+    let year = common::create_year(&app, &cookie, "2026-2027").await;
+    let term = common::create_term(&app, &cookie, &year, "2026 Fall").await;
 
     let res = send(
         &app,
         "POST",
         "/courses",
         Some(&cookie),
-        Some(json!({ "title": "History", "term_id": term })),
+        Some(json!({ "title": "History" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -111,11 +105,12 @@ async fn settings_and_terms_survive_remigration() {
     let res = send(&app, "GET", &format!("/terms/{term}"), Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["name"], "2026 Fall");
+    assert_eq!(res.body["year"], year, "the dönem keeps its academic year");
 
     let res = send(&app, "GET", "/courses", Some(&cookie), None).await;
     let courses = common::items(&res.body);
     assert_eq!(courses.len(), 1);
-    assert_eq!(courses[0]["term"].as_str(), Some(term.as_str()));
+    assert_eq!(courses[0]["title"], "History");
 }
 
 /// A weekly appointment series and a booking that carries a full proposal
@@ -310,15 +305,21 @@ async fn attempt_history_survives_remigration() {
     .unwrap();
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "biology").await;
-    let subject = create_subject(&app, &teacher, &course, "cells").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    // The academic anchor is the instance — one catalog course as one şube
+    // teaches it. A manager mints the şube and names the teacher its homeroom
+    // teacher, so the teacher keeps rights over the instance; the catalog course
+    // it forms stays the teacher's own.
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/exams"),
+        &format!("/instances/{}/exams", t.instance),
         Some(&teacher),
-        Some(json!({ "title": "quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 })),
+        Some(json!({ "title": "quiz", "kind": "yazili", "mode": "open",
+                     "max_attempts": 2, "term": t.term })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

@@ -105,12 +105,19 @@ pub async fn list_all(
 /// it holds, so an edit racing a pump is only ever the retro-pump this
 /// feature is built on. Rows a racing edit leaves behind stay reachable,
 /// because [`delete`] sweeps the whole tag rather than a list.
+///
+/// Answers `(the stored template, what the pump did, the blob keys the
+/// removals swept)`: detaching an instance takes its exams'/homework's images
+/// and files with it ([`class_blueprint::drop_links`]), and those rows are
+/// gone by the time this returns, so the keys have to reach the caller's route
+/// to be unlinked. They ride out as a third element rather than inside
+/// [`Pumped`] — the pump never touched a blob, and said so.
 pub async fn set_courses(
     db: &Database,
     blueprint: ClassBlueprint,
     courses: Vec<CourseId>,
     by: &UserId,
-) -> Result<(ClassBlueprint, Pumped), AppError> {
+) -> Result<(ClassBlueprint, Pumped, Vec<String>), AppError> {
     let wanted = ClassBlueprint::course_list(courses)?;
     let Some(mut saved) = class_blueprint::set_courses_if_unchanged(
         db,
@@ -131,9 +138,9 @@ pub async fn set_courses(
         };
     };
     let doomed = class_blueprint::sourced_links(db, saved.get_id(), &saved.courses).await?;
-    class_blueprint::drop_links(db, saved.get_id(), doomed).await?;
+    let blob_keys = class_blueprint::drop_links(db, saved.get_id(), doomed).await?;
     let pumped = pump(db, &mut saved, by).await?;
-    Ok((saved, pumped))
+    Ok((saved, pumped, blob_keys))
 }
 
 /// Delete the blueprint, taking every attachment it made with it. Courses a
@@ -177,7 +184,16 @@ pub async fn set_courses(
 /// Content-equal is intent-equal — the end state is the one the caller
 /// asked for — and telling the two apart needs a revision column on the
 /// row, which nothing else here would use.
-pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppError> {
+///
+/// Answers the blob keys the tag sweep's detaches removed
+/// ([`class_blueprint::drop_links`]): each detached instance took its exams'
+/// and homework's images and files with it, and the rows are gone by the time
+/// this returns, so those names have to reach the route to be unlinked. The
+/// keys are the sweep's, not the caller's — a hand-attached course carries no
+/// tag and is not swept, so nothing of its is in the list. A failure between
+/// the sweep and the commit drops them, the same accepted window the rest of
+/// this doc covers.
+pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<Vec<String>, AppError> {
     // The claim, the sweep and the delete are one transaction — the shape
     // Postgres demands and the doc above argues for. The old order (delete
     // the row on the pool, then sweep) cannot work against an enforcing
@@ -204,10 +220,8 @@ pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppE
     // holds the claim: it touches no `class_blueprint` rows, so it cannot
     // deadlock against the lock it runs under.
     let doomed = class_blueprint::sourced_links(db, &blueprint.id, &[]).await?;
-    class_blueprint::drop_links(db, &blueprint.id, doomed).await?;
-    if !class_blueprint::delete_if_unchanged_in(&mut tx, &blueprint.id, &blueprint.courses)
-        .await?
-    {
+    let blob_keys = class_blueprint::drop_links(db, &blueprint.id, doomed).await?;
+    if !class_blueprint::delete_if_unchanged_in(&mut tx, &blueprint.id, &blueprint.courses).await? {
         // The row was locked, matched at the claim, and vanished anyway:
         // nothing does that but a bug.
         return Err(AppError::Internal(
@@ -215,7 +229,7 @@ pub async fn delete(db: &Database, blueprint: ClassBlueprint) -> Result<(), AppE
         ));
     }
     tx.commit().await?;
-    Ok(())
+    Ok(blob_keys)
 }
 
 /// Attach every course in this blueprint to `class`, skipping — never
@@ -443,7 +457,7 @@ mod tests {
 
         // The course is deleted out from under the pump: the pivot claim
         // matches nothing.
-        let course = a_course("algebra", None, &db).await;
+        let course = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
@@ -484,7 +498,7 @@ mod tests {
         // The class is deleted out from under the pump: the counter claim
         // matches nothing and the read that follows finds no row.
         let (db, _leases) = crate::database::init_test_db().await;
-        let course = a_course("algebra", None, &db).await;
+        let course = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
@@ -514,18 +528,16 @@ mod tests {
         // The class stands at its own ceiling: the same claim matches nothing,
         // but the row is there — and that is the one a manager can act on.
         let (db, _leases) = crate::database::init_test_db().await;
-        let course = a_course("algebra", None, &db).await;
+        let course = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
         let blueprint = a_blueprint(vec![course], &db).await;
-        sqlx::query(
-            sqlx::AssertSqlSafe(format!(
-                "UPDATE class_group SET class_course_count = {} WHERE id = $1",
-                MAX_CLASS_COURSES
-            )),
-        )
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE class_group SET class_course_count = {} WHERE id = $1",
+            MAX_CLASS_COURSES
+        )))
         .bind(class.get_id().uuid())
         .execute(&db)
         .await
@@ -549,8 +561,8 @@ mod tests {
     async fn a_delete_of_a_list_that_moved_is_a_409_that_writes_nothing() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
-        let algebra = a_course("algebra", None, &db).await;
-        let physics = a_course("physics", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
+        let physics = a_course("physics", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
@@ -561,7 +573,7 @@ mod tests {
         // The edit this caller did not see: it adds a course and pumps it into
         // the section. (The pump is applied by hand because the helper class
         // carries no grade for `set_courses`'s own loop to find.)
-        let (edited, _) = set_courses(
+        let (edited, _, _) = set_courses(
             &db,
             read(&db, stale.get_id()).await.unwrap().unwrap(),
             vec![algebra, physics],
@@ -603,7 +615,7 @@ mod tests {
     async fn a_delete_waits_for_an_attach_in_flight() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
-        let algebra = a_course("algebra", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
@@ -692,8 +704,8 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
         let courses = vec![
-            a_course("algebra", None, &db).await,
-            a_course("physics", None, &db).await,
+            a_course("algebra", &db).await,
+            a_course("physics", &db).await,
         ];
         let blueprint = a_blueprint(courses, &db).await;
         let mut classes = Vec::new();
@@ -737,16 +749,16 @@ mod tests {
         // The pump is answered in bounded time even though the delete is
         // sweeping two sections' link rows — and answered with one of the two
         // honest outcomes, never a 500.
-        let pumped =
-            tokio::time::timeout(std::time::Duration::from_secs(10), pumping)
-                .await
-                .expect("a pump must not wait behind a delete's unbounded sweep")
-                .unwrap();
+        let pumped = tokio::time::timeout(std::time::Duration::from_secs(10), pumping)
+            .await
+            .expect("a pump must not wait behind a delete's unbounded sweep")
+            .unwrap();
         let skipped = pumped.unwrap();
         assert!(
-            skipped.iter().all(|s| {
-                s.reason == "blueprint_deleted" || s.reason == "course_deleted"
-            }) || skipped.is_empty(),
+            skipped
+                .iter()
+                .all(|s| { s.reason == "blueprint_deleted" || s.reason == "course_deleted" })
+                || skipped.is_empty(),
             "neither a clean attach nor a clean skip: {skipped:?}"
         );
 
@@ -776,7 +788,7 @@ mod tests {
     async fn a_pump_whose_blueprint_died_attaches_nothing() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
-        let algebra = a_course("algebra", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
@@ -815,8 +827,8 @@ mod tests {
     async fn a_dead_course_is_pruned_and_skipped_once_for_the_whole_grade() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
-        let astronomy = a_course("astronomy", None, &db).await;
-        let algebra = a_course("algebra", None, &db).await;
+        let astronomy = a_course("astronomy", &db).await;
+        let algebra = a_course("algebra", &db).await;
         let a = a_section("9-A", &db).await;
         let b = a_section("9-B", &db).await;
         let mut blueprint = a_blueprint(vec![astronomy.clone(), algebra.clone()], &db).await;
@@ -876,7 +888,7 @@ mod tests {
     async fn a_deleted_blueprint_stops_the_grade_loop_after_one_skip() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = fixture_user(&db, "manager").await;
-        let algebra = a_course("algebra", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
         a_section("9-A", &db).await;
         a_section("9-B", &db).await;
         let mut stale = a_blueprint(vec![algebra], &db).await;

@@ -6,7 +6,7 @@
 
 use crate::database::Database;
 use crate::db::course_session;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -47,32 +47,31 @@ pub async fn resolve_session_teacher(
     Ok(user)
 }
 
-/// Schedule a lesson on `course`. The write bumps the course row in the same
-/// transaction (`cap::touch_and_create`), so a lesson can never outlive its
-/// course — a create racing the course delete refuses instead of orphaning.
+/// Schedule a lesson on `class_course` — one dated occurrence of the instance,
+/// which is what a roll call hangs off.
 pub async fn create(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     teacher: &UserId,
     topic: SessionTopic,
     starts_at: Timestamp,
     ends_at: Option<Timestamp>,
 ) -> Result<CourseSession, AppError> {
-    course_session::create(db, course, teacher, topic, starts_at, ends_at).await
+    course_session::create(db, class_course, teacher, topic, starts_at, ends_at).await
 }
 
 pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSession>, AppError> {
     course_session::read(db, id).await
 }
 
-/// A course's sessions, most recent lesson first — the timetable read.
-pub async fn list_for_course(
+/// An instance's sessions, most recent lesson first — the timetable read.
+pub async fn list_for_class_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<CourseSession>, i64), AppError> {
-    course_session::list_for_course(db, course, limit, offset).await
+    course_session::list_for_class_course(db, class_course, limit, offset).await
 }
 
 /// Only what the request carried is written: an omitted field (`None`) is

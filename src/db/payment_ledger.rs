@@ -302,4 +302,3 @@ pub(crate) async fn applied_to(
     let total = PaymentLedger::fold_balance(folds.into_iter().map(|fold| (fold.kind, fold.total)));
     Ok(total * -target_kind.sign())
 }
-

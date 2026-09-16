@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n               DELETE FROM exam WHERE class_course = $1\n               RETURNING term),\n           terms AS (\n               SELECT term, count(*) AS n FROM gone GROUP BY term)\n           UPDATE term t SET exam_count = GREATEST(t.exam_count - c.n, 0)\n           FROM terms c WHERE t.id = c.term",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8d76160e8b143ddee72c34878fbe9bf3140bea9c12f8c3ba324fc16c81167905"
+}

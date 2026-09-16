@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n                 UPDATE course\n                    SET course_membership_count = course_membership_count + 1\n                  WHERE id = $1\n                  RETURNING 1)\n               INSERT INTO course_membership (course, app_user, added_by, created_at)\n               SELECT $1, $2, $3, $4 WHERE EXISTS (SELECT 1 FROM seat)\n               RETURNING course AS \"course: CourseId\", app_user AS \"user: UserId\",\n                         added_by AS \"added_by: UserId\",\n                         created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "added_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "added_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2461d810d04aca273a98714d99f0f1d815e12943439002b4615f379f8586768d"
+}

@@ -71,8 +71,8 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::service::exam_attempt::{
-    check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student, finish, read,
-    save_answer_in, set_left, writable_attempt,
+    check_rejoin, ensure_enrolled, ensure_sittable, ensure_student, finish, read, save_answer_in,
+    set_left, writable_attempt,
 };
 use crate::state::AppState;
 use crate::tenant::Slug;
@@ -120,8 +120,8 @@ enum ClientMessage {
 /// unknown or draft exam (404), unscheduled with no mode (409), not a student
 /// (403), not enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt`
 /// first), submitted or expired (409), left the room while rejoin is closed
-/// (409), the course's term archived (409 `term_archived` — a past year's room
-/// is read-only, and the room's whole purpose is writing).
+/// (409), its instance's academic year archived (409 `academic_year_archived` —
+/// a past year's room is read-only, and the room's whole purpose is writing).
 ///
 /// The rejoin gate here is a read-only fast-fail for a proper 409; the
 /// authoritative clear of `left_at` happens inside the room task, paired
@@ -144,7 +144,7 @@ pub async fn attempt_ws(
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
-    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
+    crate::service::exam_attempt::require_open(&st.db, &exam).await?;
 
     let user_id = *user.get_id();
     Ok(ws.on_upgrade(move |socket| room(socket, st, slug, exam, attempt, user_id)))
@@ -424,14 +424,13 @@ async fn handle_message(
             // retake it never hosted.
             let finished = match crate::service::exam::read(db, exam_id).await {
                 Ok(Some(exam)) => {
-                    // Its own archived-term gate: `finish` is the one
+                    // Its own archived-year gate: `finish` is the one
                     // sitting-side write that does not go through
                     // `save_answer_in`, and the refusal leaves the room by the
                     // same error frame as every other conflict.
                     async {
                         let attempt = writable_room_attempt(&exam, attempt_id, user, db).await?;
-                        crate::service::course::require_open(db, &course_of(&exam, db).await?)
-                            .await?;
+                        crate::service::exam_attempt::require_open(db, &exam).await?;
                         finish(db, attempt).await
                     }
                     .await

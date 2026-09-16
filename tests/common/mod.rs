@@ -466,7 +466,12 @@ pub async fn me_id(app: &Router, cookie: &str) -> String {
     id_of(&res.body)
 }
 
-/// Create a course as `cookie` (asserts 201); returns its id.
+/// Create a **catalog** course as `cookie` (asserts 201); returns its id.
+///
+/// The catalog is the title and the subjects hung off it. What one şube teaches
+/// is an *instance* (`POST /classes/{class}/instances`), and enrollment, exams,
+/// sessions and homework key on that instance, never on this row —
+/// [`taught`] is the fixture that mints the whole stack.
 pub async fn create_course(app: &Router, cookie: &str, title: &str) -> String {
     let res = send(
         app,
@@ -495,49 +500,244 @@ pub async fn create_subject(app: &Router, cookie: &str, course: &str, name: &str
     id_of(&res.body)
 }
 
-/// Create an exam inside `course` as `cookie` (asserts 201); returns its id.
-/// The exam's weight in the course average comes from its kind (settings).
+// ---- the academic fixture ---------------------------------------------------
+//
+// The K12 remodel made the class×course **instance** the academic anchor: a
+// şube (class) teaches a catalog course, and that pair is one `class_course` row
+// every exam, session, homework, roster and karne keys on. A suite that needs a
+// roster to exist therefore mints three rows, not one — and the şube is school
+// structure, so whoever creates it holds manager+ (the course itself stays the
+// teacher's: the catalog is teacher-owned).
+
+/// The bounds every fixture calendar uses: one year-wide span, fixed so two
+/// tests cannot race a clock.
+pub const FIXTURE_YEAR_STARTS_AT: i64 = 1_750_000_000_000;
+pub const FIXTURE_YEAR_ENDS_AT: i64 = 1_800_000_000_000;
+
+/// Create an academic year as `staff` (asserts 201); returns its id. `staff`
+/// must hold manager+.
+pub async fn create_year(app: &Router, staff: &str, name: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/academic-years",
+        Some(staff),
+        Some(json!({
+            "name": name,
+            "starts_at": FIXTURE_YEAR_STARTS_AT,
+            "ends_at": FIXTURE_YEAR_ENDS_AT,
+        })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create academic year {name}: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// The school's newest academic year, minted when it has none yet — a fixture
+/// needs a calendar without the test having to name one.
+pub async fn ensure_year(app: &Router, staff: &str) -> String {
+    let res = send(app, "GET", "/academic-years?limit=1", Some(staff), None).await;
+    assert_eq!(res.status, StatusCode::OK, "list academic years");
+    match items(&res.body).first() {
+        Some(year) => id_of(year),
+        None => create_year(app, staff, "2026-2027").await,
+    }
+}
+
+/// Create a dönem inside `year` as `staff` (asserts 201); returns its id.
+/// Dönem names repeat freely, so a fixture may mint one per call.
+pub async fn create_term(app: &Router, staff: &str, year: &str, name: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/terms",
+        Some(staff),
+        Some(json!({
+            "name": name,
+            "year": year,
+            "starts_at": FIXTURE_YEAR_STARTS_AT,
+            "ends_at": FIXTURE_YEAR_ENDS_AT,
+        })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create term {name}: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// Create a class (şube) as `staff` (asserts 201); returns its id. `body`
+/// carries everything but the name: `year`, `teacher_id`, `grade`.
+pub async fn create_class(app: &Router, staff: &str, name: &str, body: Value) -> String {
+    let mut body = body;
+    body["name"] = json!(name);
+    let res = send(app, "POST", "/classes", Some(staff), Some(body)).await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create class {name}: {}",
+        res.body
+    );
+    res.body["class"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("class envelope with a class id: {}", res.body))
+        .to_string()
+}
+
+/// Put `user_id` in `class` as `staff` (asserts 201). The pump enrolls them into
+/// every instance the şube already carries, so a pumped roster row names the
+/// şube as its `source` — [`enroll`] is the hand-placed row that does not.
+pub async fn add_member(app: &Router, staff: &str, class: &str, user_id: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(staff),
+        Some(json!({ "user_id": user_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "add member {user_id}: {}",
+        res.body
+    );
+}
+
+/// Attach `course` to `class` as `staff` (asserts 201); returns the **instance
+/// id** — the anchor every exam, session, homework and enrollment keys on.
+/// `staff` needs catalog rights on the course (its creator, or manager+).
+pub async fn attach_instance(app: &Router, staff: &str, class: &str, course: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        &format!("/classes/{class}/instances"),
+        Some(staff),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "attach course {course} to class {class}: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// A catalog course as one şube teaches it: the stack a suite needs before
+/// anyone can be enrolled, examined or marked.
+pub struct Taught {
+    /// The academic year the şube sits in — what a karne counts into.
+    pub year: String,
+    /// The dönem exams written against this fixture are filed under.
+    pub term: String,
+    /// The catalog course: `GET|PATCH /courses/{id}`, `/courses/{id}/subjects`.
+    pub course: String,
+    /// The şube itself: `GET|POST|DELETE /classes/{id}/members`, `/instances`.
+    pub class: String,
+    /// The `class_course` anchor: `/instances/{id}/…` — enrollments, exams,
+    /// sessions, homework, roll call, marks.
+    pub instance: String,
+}
+
+/// [`taught_under`] with the caller as the şube's homeroom teacher too — for a
+/// suite whose actor is one manager/admin account.
+pub async fn taught(app: &Router, staff: &str, title: &str) -> Taught {
+    taught_under(app, staff, staff, title).await
+}
+
+/// Mint a whole academic stack for `title`: a year (reused when the school has
+/// one), a dönem, the catalog course — created by `homeroom`, so a
+/// creator-gated catalog route stays theirs — a şube naming `homeroom` as its
+/// sınıf öğretmeni, and the instance the pair forms.
+///
+/// `staff` must hold manager+ (a şube is school structure) and `homeroom`
+/// teacher+; passing the same cookie twice is the one-account fixture. Naming
+/// the homeroom teacher is what lets a plain `teacher` cookie act on the
+/// instance, because `ensure_instance_teacher` passes for the şube's own
+/// öğretmen as well as for manager+.
+pub async fn taught_under(app: &Router, staff: &str, homeroom: &str, title: &str) -> Taught {
+    let year = ensure_year(app, staff).await;
+    let term = create_term(app, staff, &year, "1. Dönem").await;
+    let course = create_course(app, homeroom, title).await;
+    let homeroom_id = me_id(app, homeroom).await;
+    let class = create_class(
+        app,
+        staff,
+        &format!("{title} şubesi"),
+        json!({ "year": year, "teacher_id": homeroom_id }),
+    )
+    .await;
+    let instance = attach_instance(app, staff, &class, &course).await;
+    Taught {
+        year,
+        term,
+        course,
+        class,
+        instance,
+    }
+}
+
+/// Create an exam inside `instance` as `cookie` (asserts 201); returns its id.
+/// `term` is the dönem the marks count into (`GET /terms`); the exam's weight in
+/// the instance's average comes from its kind (settings).
 pub async fn create_exam(
     app: &Router,
     cookie: &str,
-    course: &str,
+    instance: &str,
+    term: &str,
     title: &str,
     kind: &str,
 ) -> String {
     let res = send(
         app,
         "POST",
-        &format!("/courses/{course}/exams"),
+        &format!("/instances/{instance}/exams"),
         Some(cookie),
-        Some(json!({ "title": title, "kind": kind })),
+        Some(json!({ "title": title, "kind": kind, "term": term })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create exam {title}");
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create exam {title}: {}",
+        res.body
+    );
     id_of(&res.body)
 }
 
-/// Create an exam inside `course` from a full JSON body (no assertion) —
-/// for exercising the scheduling fields and their validation.
-pub async fn create_exam_with(app: &Router, cookie: &str, course: &str, body: Value) -> Res {
+/// Create an exam inside `instance` from a full JSON body (no assertion) — for
+/// exercising the scheduling fields and their validation. The body must carry
+/// its own `term`.
+pub async fn create_exam_with(app: &Router, cookie: &str, instance: &str, body: Value) -> Res {
     send(
         app,
         "POST",
-        &format!("/courses/{course}/exams"),
+        &format!("/instances/{instance}/exams"),
         Some(cookie),
         Some(body),
     )
     .await
 }
 
-/// Create a homework inside `course` as `cookie` (asserts 201); returns its
+/// Create a homework inside `instance` as `cookie` (asserts 201); returns its
 /// id. Tagged with `subject` (required — every homework carries one of its
 /// course's subjects) and due at `due_at` (unix-millis; must not lie past the
-/// 60s grace). Whole-course audience; use [`create_homework_with`] for an
+/// 60s grace). Whole-instance audience; use [`create_homework_with`] for an
 /// `assigned` subset.
 pub async fn create_homework(
     app: &Router,
     cookie: &str,
-    course: &str,
+    instance: &str,
     subject: &str,
     title: &str,
     due_at: i64,
@@ -545,69 +745,85 @@ pub async fn create_homework(
     let res = send(
         app,
         "POST",
-        &format!("/courses/{course}/homework"),
+        &format!("/instances/{instance}/homework"),
         Some(cookie),
         Some(json!({ "title": title, "subject_id": subject, "due_at": due_at })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create homework {title}");
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create homework {title}: {}",
+        res.body
+    );
     id_of(&res.body)
 }
 
-/// Create a homework inside `course` from a full JSON body (no assertion) —
+/// Create a homework inside `instance` from a full JSON body (no assertion) —
 /// for exercising the `assigned` subset and the validation rejects.
-pub async fn create_homework_with(app: &Router, cookie: &str, course: &str, body: Value) -> Res {
+pub async fn create_homework_with(app: &Router, cookie: &str, instance: &str, body: Value) -> Res {
     send(
         app,
         "POST",
-        &format!("/courses/{course}/homework"),
+        &format!("/instances/{instance}/homework"),
         Some(cookie),
         Some(body),
     )
     .await
 }
 
-/// Create a lesson session inside `course` as `cookie` (asserts 201); returns
+/// Create a lesson session inside `instance` as `cookie` (asserts 201); returns
 /// its id. The session's teacher defaults to the caller.
-pub async fn create_session(app: &Router, cookie: &str, course: &str, starts_at: i64) -> String {
+pub async fn create_session(app: &Router, cookie: &str, instance: &str, starts_at: i64) -> String {
     let res = send(
         app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{instance}/sessions"),
         Some(cookie),
         Some(json!({ "starts_at": starts_at })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create session");
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create session: {}",
+        res.body
+    );
     id_of(&res.body)
 }
 
-/// Drop `user_id` from `course`'s roster as `cookie` (asserts 204). Deleting a
-/// course is refused while anyone is still enrolled, so cascade tests empty the
-/// roster first.
-pub async fn unenroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
+/// Drop `user_id` from `instance`'s roster as `cookie` (asserts 204). Deleting a
+/// catalog course is refused while instances still teach it, so cascade tests
+/// detach instances and empty rosters first.
+pub async fn unenroll(app: &Router, cookie: &str, instance: &str, user_id: &str) {
     let res = send(
         app,
         "DELETE",
-        &format!("/courses/{course}/enrollments/{user_id}"),
+        &format!("/instances/{instance}/enrollments/{user_id}"),
         Some(cookie),
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT, "unenroll {user_id}");
+    assert_eq!(
+        res.status,
+        StatusCode::NO_CONTENT,
+        "unenroll {user_id}: {}",
+        res.body
+    );
 }
 
-/// Enroll `user_id` into `course` as `cookie` (asserts 200).
-pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
+/// Enroll `user_id` into `instance` as `cookie` (asserts 200) — the roster row a
+/// human placed, carrying no şube, so no şube sweep may take it back.
+pub async fn enroll(app: &Router, cookie: &str, instance: &str, user_id: &str) {
     let res = send(
         app,
         "POST",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{instance}/enrollments"),
         Some(cookie),
         Some(json!({ "user_id": user_id })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "enroll {user_id}");
+    assert_eq!(res.status, StatusCode::OK, "enroll {user_id}: {}", res.body);
 }
 
 // ---- multi-school deployments ---------------------------------------------

@@ -4,7 +4,6 @@
 //! the row mint, and the field-scoped writers live in [`crate::db::user`].
 
 use crate::database::Database;
-use crate::tenant::{Slug, Tenants};
 use crate::db::user;
 use crate::domain::board::Board;
 use crate::domain::note_file::FileContentType;
@@ -14,6 +13,7 @@ use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Pho
 use crate::domain::role::Role;
 use crate::domain::user::{Password, User, UserId, Username};
 use crate::error::AppError;
+use crate::tenant::{Slug, Tenants};
 
 /// Idempotent startup seed: guarantee an admin account with this username.
 /// Missing → created directly with [`Role::Admin`]. Already an admin →
@@ -173,6 +173,9 @@ pub async fn set_profile(
     birth_date: Option<Option<BirthDate>>,
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
+    // The branş, clearable like `bio`; membership in the school's
+    // `Settings::get_branches()` list is the caller's check, not this one's.
+    branch: Option<Option<String>>,
 ) -> Result<User, AppError> {
     user::set_profile(
         db,
@@ -184,6 +187,7 @@ pub async fn set_profile(
         birth_date,
         display_name,
         bio,
+        branch,
     )
     .await
 }

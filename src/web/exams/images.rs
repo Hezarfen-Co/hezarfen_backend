@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::service::exam_attempt::{
-    check_rejoin, course_of, ensure_enrolled, ensure_student, ensure_student_now,
+    check_rejoin, class_course_of, ensure_enrolled, ensure_student, ensure_student_now,
     read_latest_for_user, writable_attempt,
 };
 use crate::service::exam_question::{choice_slot, ensure_questions_editable, question_of_exam};
@@ -87,7 +87,7 @@ pub(crate) async fn images_by_question(
 // own visibility (author side and sitting side alike).
 
 /// The exam, provided the caller may author its questions — the shared front
-/// half of every image write. The archived-term refusal lives here rather than
+/// half of every image write. The archived-year refusal lives here rather than
 /// in each caller: all four question-image writes (upload/delete of a question
 /// illustration and of a choice picture) come through this one door, and none
 /// of the reads do.
@@ -99,17 +99,17 @@ pub(crate) async fn image_managed_exam(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, user) {
+    let instance = class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can manage question images",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can manage question images",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     Ok(exam)
 }
 
-/// A 403/404 unless the caller may see the exam's question content: course
+/// A 403/404 unless the caller may see the exam's question content: instance
 /// managers always, students through the same wall as
 /// `GET /exams/{id}/attempt/questions` — enrollment plus a started attempt,
 /// so there is no early peek at the pictures either.
@@ -118,8 +118,8 @@ pub(crate) async fn ensure_question_content_visible(
     exam: &Exam,
     user: &User,
 ) -> Result<(), AppError> {
-    let course = course_of(exam, &st.db).await?;
-    if can_manage_course(&course, user) {
+    let instance = class_course_of(exam, &st.db).await?;
+    if can_manage_instance(&st.db, instance.get_id(), user).await? {
         return Ok(());
     }
     ensure_enrolled(exam, user.get_id(), &st.db).await?;
@@ -170,7 +170,7 @@ pub(crate) async fn serve_image(
 /// the image under a `file` field; the declared content type must be
 /// `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only —
 /// no SVG), the bytes at most the school's `max_file_bytes` (settings).
-/// Requires teacher+ and management rights over the exam's course; frozen
+/// Requires teacher+ and management rights over the exam's instance; frozen
 /// once attempts exist, like every other question edit.
 #[utoipa::path(
     post,
@@ -186,9 +186,9 @@ pub(crate) async fn serve_image(
         (status = 201, description = "Image stored", body = ImageMetaResponse),
         (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -211,7 +211,7 @@ pub(crate) async fn upload_question_image(
     Ok((StatusCode::CREATED, Json(ImageMetaResponse::new(&stored))))
 }
 
-/// The question's illustration bytes. Course managers read anytime; students
+/// The question's illustration bytes. Instance managers read anytime; students
 /// through the same wall as the sitting view — enrollment plus a started
 /// attempt (404 before that, like the question list itself).
 #[utoipa::path(
@@ -226,7 +226,7 @@ pub(crate) async fn upload_question_image(
     responses(
         (status = 200, description = "The image bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image — or no attempt yet", body = ErrorResponse),
     ),
 )]
@@ -247,7 +247,7 @@ pub(crate) async fn get_question_image(
 }
 
 /// Remove a question's illustration. Requires teacher+ and management rights
-/// over the exam's course; frozen once attempts exist.
+/// over the exam's instance; frozen once attempts exist.
 #[utoipa::path(
     delete,
     path = "/{id}/questions/{qid}/image",
@@ -260,9 +260,9 @@ pub(crate) async fn get_question_image(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_question_image(
@@ -303,9 +303,9 @@ pub(crate) async fn delete_question_image(
         (status = 201, description = "Image stored", body = ImageMetaResponse),
         (status = 400, description = "Missing file field, empty file, a content type outside the image allowlist, a text question, or an unknown choice id", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -338,7 +338,7 @@ pub(crate) async fn upload_choice_image(
     responses(
         (status = 200, description = "The image bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image — or no attempt yet", body = ErrorResponse),
     ),
 )]
@@ -360,7 +360,7 @@ pub(crate) async fn get_choice_image(
 }
 
 /// Remove one option's picture. Requires teacher+ and management rights over
-/// the exam's course; frozen once attempts exist.
+/// the exam's instance; frozen once attempts exist.
 #[utoipa::path(
     delete,
     path = "/{id}/questions/{qid}/choices/{choice_id}/image",
@@ -374,9 +374,9 @@ pub(crate) async fn get_choice_image(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_choice_image(
@@ -454,9 +454,9 @@ pub(crate) async fn store_answer_image(
         (status = 201, description = "Drawing stored", body = ImageMetaResponse),
         (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -470,9 +470,9 @@ pub(crate) async fn upload_answer_image(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
-    // Before the body is read: an archived term refuses the upload without
+    // Before the body is read: an archived year refuses the upload without
     // making the client push its bytes first.
-    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
+    crate::service::exam_attempt::require_open(&st.db, &exam).await?;
     // The body is consumed before the gates — a client's slow upload must
     // not delay its own refusal (mirrors the question-image upload). No
     // process lease wraps the gate and the write: the drawing upsert is one
@@ -536,9 +536,9 @@ pub(crate) async fn upload_answer_image(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, attempt, or drawing", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_answer_image(
@@ -550,7 +550,7 @@ pub(crate) async fn delete_answer_image(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
-    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
+    crate::service::exam_attempt::require_open(&st.db, &exam).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     ensure_student_now(attempt.get_user(), &st.db).await?;
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
@@ -592,7 +592,7 @@ pub(crate) async fn delete_answer_image(
     responses(
         (status = 200, description = "The drawing bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or drawing — or no attempt yet", body = ErrorResponse),
     ),
 )]
@@ -618,7 +618,7 @@ pub(crate) async fn get_answer_image(
 }
 
 /// One student's drawn-answer bytes, for the grader. Requires teacher+ and
-/// management rights over the exam's course — the `attempt_answers` gate.
+/// management rights over the exam's instance — the `attempt_answers` gate.
 #[utoipa::path(
     get,
     path = "/{id}/attempts/{user}/answers/{qid}/image",
@@ -632,7 +632,7 @@ pub(crate) async fn get_answer_image(
     responses(
         (status = 200, description = "The student's drawing bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or drawing", body = ErrorResponse),
     ),
 )]
@@ -644,10 +644,10 @@ pub(crate) async fn get_student_answer_image(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can read answer sheets",
         ));
     }
     let target = UserId::from_key(&target);

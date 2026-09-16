@@ -21,7 +21,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 #[derive(Serialize, Deserialize, ToSchema)]
 struct ExamKindDto {
     /// The `kind` value exams carry, 1–50 characters.
-    #[schema(example = "midterm", max_length = 50)]
+    #[schema(example = "yazili", max_length = 50)]
     name: String,
     /// The kind's weight in the course average, `1`–`100`. Editing it
     /// re-weights every exam of this kind at once.
@@ -68,9 +68,9 @@ struct SettingsResponse {
     /// Accepted `kind` values for new exams, each with its weight in the
     /// course average.
     #[schema(example = json!([
-        {"name": "midterm", "weight": 2},
-        {"name": "final", "weight": 3},
-        {"name": "oral", "weight": 1},
+        {"name": "yazili", "weight": 3},
+        {"name": "sozlu", "weight": 1},
+        {"name": "uygulama", "weight": 1},
     ]))]
     exam_kinds: Vec<ExamKindDto>,
     /// Accepted `status` values for attendance marking. Always contains the
@@ -107,6 +107,25 @@ struct SettingsResponse {
     /// cancelling close. `null` = no cutoff.
     #[schema(example = 120)]
     meal_cancel_cutoff_minutes: Option<i64>,
+    /// The branş (teaching subject) vocabulary a profile's `branch` may name.
+    /// Empty = the school keeps no list, and no profile may carry one.
+    #[schema(max_items = 20, example = json!(["Matematik", "Fizik"]))]
+    branches: Vec<String>,
+    /// What an absence may be excused as (raporlu/izinli/…). Empty = the
+    /// school names no kinds.
+    #[schema(max_items = 20, example = json!(["raporlu", "izinli"]))]
+    excuse_kinds: Vec<String>,
+    /// Per-dönem excused-absence day limit; `null` = no limit configured.
+    #[schema(example = 10)]
+    max_excused_absent_days: Option<i64>,
+    /// Per-dönem unexcused-absence day limit; `null` = no limit configured.
+    #[schema(example = 20)]
+    max_unexcused_absent_days: Option<i64>,
+    /// The school's IANA timezone; `null` = the deployment default
+    /// (`Europe/Istanbul`), which is what an unset setting reads as. It is the
+    /// zone the devamsızlık days are bucketed in.
+    #[schema(example = "Europe/Istanbul")]
+    timezone: Option<String>,
 }
 
 impl SettingsResponse {
@@ -143,6 +162,11 @@ impl SettingsResponse {
                 .collect(),
             dietary_tags: settings.get_dietary_tags(),
             meal_cancel_cutoff_minutes: settings.get_meal_cancel_cutoff_minutes(),
+            branches: settings.get_branches(),
+            excuse_kinds: settings.get_excuse_kinds(),
+            max_excused_absent_days: settings.get_max_excused_absent_days(),
+            max_unexcused_absent_days: settings.get_max_unexcused_absent_days(),
+            timezone: settings.timezone.clone(),
         }
     }
 }
@@ -202,6 +226,33 @@ struct UpdateSettings {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 120, minimum = 0, maximum = 10_080)]
     meal_cancel_cutoff_minutes: Option<Option<i64>>,
+    /// Replaces the whole branş list when present: at most 20 entries, each
+    /// 1–50 characters, unique. `[]` means the school keeps no list — and a
+    /// profile's `branch` may then only be cleared, never set.
+    #[schema(max_items = 20, example = json!(["Matematik", "Fizik"]))]
+    branches: Option<Vec<String>>,
+    /// Replaces the whole excuse-kind list when present: at most 20 entries,
+    /// each 1–50 characters, unique. `[]` clears it.
+    #[schema(max_items = 20, example = json!(["raporlu", "izinli"]))]
+    excuse_kinds: Option<Vec<String>>,
+    /// Per-dönem excused-absence day limit, `0`–`365`. Omit to keep the
+    /// current value; send `null` for no limit at all.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<i64>, example = 10, minimum = 0, maximum = 365)]
+    max_excused_absent_days: Option<Option<i64>>,
+    /// Per-dönem unexcused-absence day limit, `0`–`365`. Omit to keep the
+    /// current value; send `null` for no limit at all.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<i64>, example = 20, minimum = 0, maximum = 365)]
+    max_unexcused_absent_days: Option<Option<i64>>,
+    /// The school's IANA timezone — one of the deployment's allow-list
+    /// (`Europe/Istanbul`, `UTC`), by name. It is the zone the devamsızlık
+    /// days are bucketed in and the one a menu's serving minute is *not*
+    /// (that clock is UTC on purpose). Omit to keep the current value; send
+    /// `null` to fall back to the deployment default.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<String>, example = "Europe/Istanbul")]
+    timezone: Option<Option<String>>,
 }
 
 /// The school's current policy. Any authenticated user — clients need it to
@@ -301,6 +352,11 @@ async fn update_settings(
         }),
         dietary_tags: req.dietary_tags.clone(),
         meal_cancel_cutoff_minutes: req.meal_cancel_cutoff_minutes,
+        branches: req.branches.clone(),
+        excuse_kinds: req.excuse_kinds.clone(),
+        max_excused_absent_days: req.max_excused_absent_days,
+        max_unexcused_absent_days: req.max_unexcused_absent_days,
+        timezone: req.timezone.clone(),
     };
     Ok(Json(SettingsResponse::new(
         &service::settings::apply(&st.db, &patch).await?,

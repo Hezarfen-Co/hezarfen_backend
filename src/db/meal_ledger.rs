@@ -8,8 +8,8 @@ use crate::db::page::PagedList;
 use crate::domain::meal_ledger::{
     LedgerAmount, LedgerMethod, LedgerNote, MealLedger, MealLedgerId, MealLedgerKind,
 };
-use crate::domain::timestamp::Timestamp;
 use crate::domain::menu::MenuId;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 

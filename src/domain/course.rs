@@ -1,6 +1,5 @@
 use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
 use crate::domain::monotonic_id::next_uuid;
-use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_course_kind, validate_optional, validate_required};
@@ -66,7 +65,8 @@ impl CourseDescription {
 
 /// A validated course kind: `course` (a regular class — ders), `study` (a
 /// supervised study session — etüt), or `club` (a student club — kulüp).
-/// Purely a label; all kinds behave identically.
+/// Only `course` is class-delivered (a şube attaches it as an instance);
+/// `study`/`club` are school-scoped and joined individually.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct CourseKind(String);
@@ -85,32 +85,36 @@ impl CourseKind {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether a şube attaches this kind as an instance. Only a regular ders
+    /// (`course`) is class-delivered; clubs and etüt are school-scoped and
+    /// joined individually ([`crate::domain::course_membership`]).
+    pub fn is_class_delivered(&self) -> bool {
+        self.0 == "course"
+    }
 }
 
-/// A course: the unit exams and enrollments hang off. Marks are computed per
-/// course, each exam weighted by its kind's settings weight. May belong to an
-/// academic term. Comes in three behaviorally identical kinds: `course`,
-/// `study` (etüt), and `club` (kulüp). An optional `capacity` caps the roster
-/// at enroll time (`NULL` = unlimited).
+/// A course: a school-level catalog entry. It is a *template* — the academic
+/// work (roster, exams, timetable) lives on the instances a class attaches
+/// ([`crate::domain::class_course::ClassCourse`]), so this row carries only
+/// what every instance shares: title, description, kind.
 ///
-/// `creator` owns the course for good — only they (or a manager+) may delete
-/// it. `teachers` are the staff a manager assigned to run it: full management
-/// rights inside the course, no power to delete it or change the assignment
-/// list. The assignment itself is `course_teacher` rows; the struct carries
-/// the resolved list, joined on by the db layer.
+/// `creator` is who minted it; the catalog is Manager+-owned, so there is no
+/// per-teacher ownership. The two counters are the delete guard: a course may
+/// only be dropped when no class attaches it and no one holds an individual
+/// membership.
 ///
 /// Fields are crate-visible: [`crate::db::course`] mints the rows on create
 /// and reads the id when updating and cascading a delete.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Course {
     pub(crate) id: CourseId,
     pub(crate) creator: UserId,
-    pub(crate) teachers: Vec<UserId>,
     pub(crate) title: CourseTitle,
     pub(crate) description: CourseDescription,
     pub(crate) kind: CourseKind,
-    pub(crate) term: Option<TermId>,
-    pub(crate) capacity: Option<i64>,
+    pub(crate) class_course_count: i64,
+    pub(crate) course_membership_count: i64,
 }
 
 impl Course {
@@ -134,29 +138,18 @@ impl Course {
         &self.kind
     }
 
-    pub fn get_term(&self) -> Option<&TermId> {
-        self.term.as_ref()
+    /// How many class instances attach this catalog course.
+    pub fn get_class_course_count(&self) -> i64 {
+        self.class_course_count
     }
 
-    /// The seat cap enforced at enroll time; `None` = unlimited.
-    pub fn get_capacity(&self) -> Option<i64> {
-        self.capacity
+    /// How many users hold an individual (club/etüt) membership.
+    pub fn get_course_membership_count(&self) -> i64 {
+        self.course_membership_count
     }
 
     pub fn is_creator(&self, user: &UserId) -> bool {
         &self.creator == user
-    }
-
-    /// The staff assigned to run this course. Assignment order is not kept:
-    /// the links are `course_teacher` rows now, and a set has no order.
-    pub fn get_teachers(&self) -> &[UserId] {
-        &self.teachers
-    }
-
-    /// Whether `user` was assigned to teach this course. Says nothing about
-    /// the creator — they own it whether or not they also appear here.
-    pub fn is_assigned(&self, user: &UserId) -> bool {
-        self.teachers.contains(user)
     }
 }
 
@@ -183,5 +176,8 @@ mod tests {
         assert!(CourseKind::try_new("club").is_ok());
         assert!(CourseKind::try_new("etut").is_err());
         assert_eq!(CourseKind::course().as_str(), "course");
+        assert!(CourseKind::course().is_class_delivered());
+        assert!(!CourseKind::try_new("club").unwrap().is_class_delivered());
+        assert!(!CourseKind::try_new("study").unwrap().is_class_delivered());
     }
 }

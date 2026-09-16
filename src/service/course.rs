@@ -1,39 +1,27 @@
-//! Course workflows: the archived-term gate every course-scoped write pays,
-//! the staffing changes a manager makes, and the delete that collects the
-//! image/homework/note-file blob keys before the guarded cascade sweeps
-//! those rows. The queries live in
+//! Course workflows: the catalog's CRUD — the template a şube attaches, with
+//! no term, capacity or teacher list of its own any more (D1/D5/D6: staffing
+//! and roster live on the instances, [`crate::service::class_course`]) — and
+//! the delete that collects the image/homework/note-file blob keys before the
+//! guarded cascade sweeps those rows. The queries live in
 //! [`crate::db::course`].
 
 use crate::database::Database;
 use crate::db::course;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::role::Role;
-use crate::domain::term::TermId;
 use crate::domain::user::UserId;
-use crate::error::{AppError, ValidationError};
-use crate::service::term;
+use crate::error::AppError;
 
-/// Refuse the write when this course's term is archived — a pre-flight guard,
-/// accepted race (see README concurrency model): a term archived after this
-/// read still lets the write through.
-pub async fn require_open(db: &Database, course: &Course) -> Result<(), AppError> {
-    let Some(term) = course.get_term().cloned() else {
-        return Ok(());
-    };
-    let db = db.clone();
-    term::require_open(&db, &term).await
-}
-
+/// Mint a catalog course. The catalog is not bound to a dönem (D1): exams are,
+/// through their instance, and no capacity is stored — the roster counter
+/// lives on the instance and gates nothing.
 pub async fn create(
     db: &Database,
     creator: &UserId,
     title: CourseTitle,
     description: CourseDescription,
     kind: CourseKind,
-    term: Option<TermId>,
-    capacity: Option<i64>,
 ) -> Result<Course, AppError> {
-    course::create(db, creator, title, description, kind, term, capacity).await
+    course::create(db, creator, title, description, kind).await
 }
 
 pub async fn read(db: &Database, id: &CourseId) -> Result<Option<Course>, AppError> {
@@ -69,63 +57,16 @@ pub async fn update(
     title: Option<CourseTitle>,
     description: Option<CourseDescription>,
     kind: Option<CourseKind>,
-    term: Option<Option<TermId>>,
-    capacity: Option<Option<i64>>,
 ) -> Result<Course, AppError> {
-    course::update(db, course, title, description, kind, term, capacity).await
-}
-
-/// Assign `target` to run `course`, or return the course untouched if they
-/// already run it — assignment is idempotent, like enrollment.
-///
-/// The assignee must already hold the `teacher` role or higher: assignment
-/// hands out course-management rights, which every gate behind it re-checks
-/// against the `teacher` bar — assigning anyone below it would write a row
-/// that can never be used.
-pub async fn assign_teacher(
-    db: &Database,
-    course: &Course,
-    target: &UserId,
-) -> Result<Course, AppError> {
-    require_open(db, course).await?;
-    let Some(target_user) = crate::db::user::read(db, target).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-    if !target_user.get_role().at_least(Role::Teacher) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "assigned teacher must hold the teacher role or higher",
-        }));
-    }
-    course::assign_teacher(db, course.clone(), target).await
-}
-
-/// Drop `target` from this course's assigned teachers. `None` when they
-/// weren't assigned, so the web layer can answer 404 instead of pretending
-/// it removed someone.
-pub async fn unassign_teacher(
-    db: &Database,
-    course: &Course,
-    target: &UserId,
-) -> Result<Option<Course>, AppError> {
-    require_open(db, course).await?;
-    course::unassign_teacher(db, course.clone(), target).await
-}
-
-/// Strip `user` from every course they were assigned to — the sweep for a
-/// user demoted below `teacher`, who may no longer run anything.
-pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), AppError> {
-    course::unassign_everywhere(db, user).await
+    course::update(db, course, title, description, kind).await
 }
 
 /// What [`delete`] did: whether the course went, and the blob keys of the
 /// rows its cascade removed — exactly whose files the web layer may unlink.
 #[derive(Debug)]
 pub struct DeleteOutcome {
-    /// `false` = refused, nothing was written: someone is still enrolled.
+    /// `false` = refused, nothing was written: a şube still teaches this
+    /// course, or a student still holds an individual membership in it.
     pub deleted: bool,
     pub image_files: Vec<String>,
     pub answer_image_files: Vec<String>,
@@ -134,7 +75,9 @@ pub struct DeleteOutcome {
 }
 
 /// Delete the course: collect the image/homework/note-file blob keys, then
-/// run the cascading delete.
+/// run the cascading delete — which takes every instance the catalog is taught
+/// in (with everything under them), every individual membership and every
+/// teacher link, all in one guarded transaction.
 ///
 /// The old writer leases on the exam-attempt and homework state are gone
 /// with the store that needed them: this cascade is one guarded
@@ -149,7 +92,6 @@ pub struct DeleteOutcome {
 /// web layer's job — a crash in between strands at worst an unreachable
 /// blob.
 pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, AppError> {
-    require_open(db, course).await?;
     let image_files = crate::db::question_image::file_keys_for_course(db, course.get_id()).await?;
     let answer_image_files =
         crate::db::answer_image::file_keys_for_course(db, course.get_id()).await?;

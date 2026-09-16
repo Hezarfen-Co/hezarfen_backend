@@ -1,0 +1,98 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: CourseId\", creator AS \"creator: UserId\",\n                  title AS \"title: CourseTitle\",\n                  description AS \"description: CourseDescription\",\n                  kind AS \"kind: CourseKind\", class_course_count, course_membership_count\n           FROM course ORDER BY id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: CourseTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description: CourseDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: CourseKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "class_course_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "class_course_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "course_membership_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "course_membership_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8fcc7fe1692f122310769d3575feabbf9648a92d9c0ad9ecb62a69779c21ef43"
+}

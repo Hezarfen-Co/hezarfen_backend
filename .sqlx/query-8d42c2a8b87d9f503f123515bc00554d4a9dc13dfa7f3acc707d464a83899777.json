@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM class_member\n                   WHERE class = $1 AND app_user = $2 AND left_at IS NULL\n                   RETURNING 1 AS \"one\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8d42c2a8b87d9f503f123515bc00554d4a9dc13dfa7f3acc707d464a83899777"
+}

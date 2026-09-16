@@ -40,7 +40,10 @@ impl QuestionImageId {
     /// The wire form, `None` spelled with the `"q"` sentinel — the same
     /// spelling the stored key uses.
     pub fn key(&self) -> String {
-        crate::domain::key::slot(&self.question.key(), self.slot.as_ref().map(|id| id.as_str()))
+        crate::domain::key::slot(
+            &self.question.key(),
+            self.slot.as_ref().map(|id| id.as_str()),
+        )
     }
 
     pub fn question(&self) -> &ExamQuestionId {

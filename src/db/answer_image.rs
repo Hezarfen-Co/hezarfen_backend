@@ -179,7 +179,9 @@ pub async fn file_keys_for_course(
 ) -> Result<Vec<String>, AppError> {
     let rows = sqlx::query!(
         r#"SELECT ai.file FROM answer_image ai
-           JOIN exam e ON e.id = ai.exam WHERE e.course = $1"#,
+           JOIN exam e ON e.id = ai.exam
+           JOIN class_course cc ON cc.id = e.class_course
+           WHERE cc.course = $1"#,
         course.uuid(),
     )
     .fetch_all(db)
@@ -346,9 +348,12 @@ mod tests {
         let exam_b = exam_row(&db).await;
         let user = a_student(&db).await;
         let question = a_question(&db, &exam_a).await;
-        upsert(&db, AnswerImage::new(&exam_a, &question, &user, 1, png(), 1))
-            .await
-            .unwrap();
+        upsert(
+            &db,
+            AnswerImage::new(&exam_a, &question, &user, 1, png(), 1),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             list_for_exam_user(&db, &exam_a, &user, 1)
                 .await

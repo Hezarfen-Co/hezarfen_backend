@@ -330,11 +330,8 @@ mod tests {
         use crate::db::fee_plan;
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
-        let manager =
-            crate::db::class_member::tests::fixture_user(db, "ledger-manager")
-                .await;
-        let student =
-            crate::db::class_member::tests::fixture_user(db, "ledger-student").await;
+        let manager = crate::db::class_member::tests::fixture_user(db, "ledger-manager").await;
+        let student = crate::db::class_member::tests::fixture_user(db, "ledger-student").await;
         let plan = fee_plan::create(
             db,
             FeePlanName::try_new("Yearly").unwrap(),
@@ -538,11 +535,8 @@ mod tests {
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
         let (db, _leases) = crate::database::init_test_db().await;
-        let manager =
-            crate::db::class_member::tests::fixture_user(&db, "ledger-manager")
-                .await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "ledger-student").await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "ledger-manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "ledger-student").await;
         let plan = fee_plan::create(
             &db,
             FeePlanName::try_new("Yearly").unwrap(),

@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT course AS \"course: CourseId\", app_user AS \"user: UserId\",\n               added_by AS \"added_by: UserId\", created_at AS \"created_at: Timestamp\"\n           FROM course_membership WHERE course = $1 AND app_user = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "added_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "added_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "70d3d8c7cb74016eb71516a9db2fd7dd62bf80c388814ee0f5cdd771f22a5120"
+}

@@ -1,0 +1,196 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM exam WHERE id = $1\n                   RETURNING id AS \"id: ExamId\", creator AS \"creator: UserId\",\n                             class_course AS \"class_course: ClassCourseId\",\n                             term AS \"term: TermId\", title AS \"title: ExamTitle\",\n                             description AS \"description: ExamDescription\",\n                             kind AS \"kind: ExamKind\", mode AS \"mode: ExamMode\",\n                             starts_at AS \"starts_at: Timestamp\",\n                             ends_at AS \"ends_at: Timestamp\",\n                             duration_ms AS \"duration_ms: ExamDuration\",\n                             max_attempts AS \"max_attempts: ExamAttemptLimit\",\n                             allow_rejoin, allow_review, draft",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "term: TermId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "term"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "title: ExamTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "description: ExamDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "kind: ExamKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "mode: ExamMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "duration_ms: ExamDuration",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "duration_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "max_attempts: ExamAttemptLimit",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "max_attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "allow_rejoin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "allow_rejoin"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "allow_review",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "allow_review"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "draft",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "draft"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "da8172853a9900e6572ec43020f316f9d034f53ba696a5c9ad300663e8e5db2c"
+}

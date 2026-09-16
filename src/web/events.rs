@@ -157,7 +157,10 @@ impl AudienceDto {
         match audience.kind {
             EventAudienceKind::School => AudienceDto::School,
             EventAudienceKind::Role => AudienceDto::Role {
-                role: audience.role.map(|role| role.as_str().to_string()).unwrap_or_default(),
+                role: audience
+                    .role
+                    .map(|role| role.as_str().to_string())
+                    .unwrap_or_default(),
             },
             EventAudienceKind::Course => AudienceDto::Course {
                 course: audience
@@ -579,8 +582,7 @@ async fn mark(
 
     // Only expected attendees can be marked. The marker needn't be in the
     // audience — a teacher takes roll of a student-targeted event.
-    if !service::event::includes(&st.db, &event, &target_user).await?
-    {
+    if !service::event::includes(&st.db, &event, &target_user).await? {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user is not in this event's audience",
@@ -834,10 +836,7 @@ async fn register(
     // existing seat, whose registered_by is the *original* placer — someone
     // the {target, caller} pair may not contain.
     let people = person_map(
-        [
-            *registration.get_user(),
-            *registration.get_registered_by(),
-        ],
+        [*registration.get_user(), *registration.get_registered_by()],
         &st.db,
     )
     .await?;

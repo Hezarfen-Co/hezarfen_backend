@@ -1,24 +1,24 @@
 use super::*;
 
 use crate::domain::exam_attempt::AttemptStatus;
-use crate::service::exam_attempt::{course_of, list_for_user, list_unfinished_for_user};
+use crate::service::exam_attempt::{class_course_of, list_for_user, list_unfinished_for_user};
 use crate::service::exam_question;
 
 // ---- per-attempt history ----------------------------------------------------
 // The grading views above show the latest sitting; these expose every prior
 // sitting a re-taking student left behind. Same wall as grading: teacher+ who
-// manages the exam's course. A student never reaches another student's sheet,
-// and a student's own prior attempts are staff-visible by design.
+// manages the exam's instance. A student never reaches another student's
+// sheet, and a student's own prior attempts are staff-visible by design.
 
 /// The exam plus the manage-rights check the grading and history reads share.
 pub(crate) async fn gradable_exam(st: &AppState, user: &User, id: &str) -> Result<Exam, AppError> {
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, user) {
+    let instance = class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can read answer sheets",
         ));
     }
     Ok(exam)
@@ -26,7 +26,7 @@ pub(crate) async fn gradable_exam(st: &AppState, user: &User, id: &str) -> Resul
 
 /// The sitting numbers a student has left at an exam — every seq that carries
 /// answers or a mark, ascending. Requires teacher+ and management rights over
-/// the exam's course. Drives the FE's attempt-by-attempt picker.
+/// the exam's instance. Drives the FE's attempt-by-attempt picker.
 #[utoipa::path(
     get,
     path = "/{id}/students/{user}/attempts",
@@ -39,7 +39,7 @@ pub(crate) async fn gradable_exam(st: &AppState, user: &User, id: &str) -> Resul
     responses(
         (status = 200, description = "The student's sitting numbers, ascending", body = [i64]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -64,7 +64,7 @@ pub(crate) async fn student_attempts(
 
 /// One prior sitting's judged answer sheet — the `seq`th attempt's answers,
 /// drawing refs, correctness flags, and auto-score suggestion. Requires
-/// teacher+ and management rights over the exam's course. Serves an empty
+/// teacher+ and management rights over the exam's instance. Serves an empty
 /// sheet for a seq the student never wrote in.
 #[utoipa::path(
     get,
@@ -79,7 +79,7 @@ pub(crate) async fn student_attempts(
     responses(
         (status = 200, description = "That sitting's answers, judged", body = AttemptAnswersResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -96,7 +96,7 @@ pub(crate) async fn student_attempt_answers(
 }
 
 /// A prior sitting's drawn-answer bytes. Requires teacher+ and management
-/// rights over the exam's course — the seq-scoped mirror of the grader's
+/// rights over the exam's instance — the seq-scoped mirror of the grader's
 /// latest-sitting drawing read.
 #[utoipa::path(
     get,
@@ -112,7 +112,7 @@ pub(crate) async fn student_attempt_answers(
     responses(
         (status = 200, description = "The student's drawing bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or drawing", body = ErrorResponse),
     ),
 )]
@@ -132,7 +132,7 @@ pub(crate) async fn student_attempt_answer_image(
 
 /// A student's full mark history at an exam — every sitting's mark, oldest
 /// first (the grade-of-record is the latest). Requires teacher+ and management
-/// rights over the exam's course.
+/// rights over the exam's instance.
 #[utoipa::path(
     get,
     path = "/{id}/students/{user}/marks",
@@ -145,7 +145,7 @@ pub(crate) async fn student_attempt_answer_image(
     responses(
         (status = 200, description = "The student's per-sitting marks, oldest first", body = [ExamResultResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -187,7 +187,7 @@ pub(crate) async fn student_marks_history(
 /// The mark check runs *before* the `allow_review` one, and must stay there: a
 /// caller with no mark is an outsider to this exam, and answering them 403-if-
 /// off / 404-otherwise made the status code an oracle for a flag they cannot
-/// read anywhere else (`GET /exams/{id}` refuses them at `can_view_course`
+/// read anywhere else (`GET /exams/{id}` refuses them at `can_view_instance`
 /// before it serves `allow_review` at all). With the mark first, an outsider's
 /// answer is 404 whatever the flag says; only a caller who was marked — who
 /// therefore sat the exam, enrolled or since dropped — ever sees the 403.
@@ -232,7 +232,7 @@ pub(crate) async fn reviewable_exam(
     // under (`ensure_sittable` + the window + `exam_attempt::start`'s limit
     // check), minus the caller's role and enrollment: those bar the sitting
     // without making the key any safer to hand out, and a student dropped from
-    // the course after being marked should still read their own review back.
+    // the instance after being marked should still read their own review back.
     if exam.get_mode().is_some()
         && exam.get_ends_at().is_none_or(|ends| now < ends)
         && exam.get_max_attempts().allows_another(attempts.len())

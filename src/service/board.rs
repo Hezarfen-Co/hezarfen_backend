@@ -220,7 +220,6 @@ pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
 
 #[cfg(test)]
 mod tests {
-    
 
     /// The security boundary of the gates this module owns, in one test: an
     /// outsider is told the board does not exist, an insider without rights is

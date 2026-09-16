@@ -26,20 +26,24 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
         crate::domain::event::EventAudienceKind::Role => {
             Ok(Some(user.get_role()) == event.get_audience_role())
         }
-        crate::domain::event::EventAudienceKind::Course => {
-            match event.get_audience_course() {
-                Some(course) => Ok(crate::db::enrollment::read_for_user(db, course, user.get_id())
-                    .await?
-                    .is_some()),
-                None => Ok(false),
+        crate::domain::event::EventAudienceKind::Course => match event.get_audience_course() {
+            Some(course) => {
+                Ok(crate::db::enrollment::user_is_in_course(db, course, user.get_id()).await?)
             }
-        }
-        // The (class, user) pair is the membership row's own primary key, so
-        // the point check is one existence probe — no scan, no index needed.
+            None => Ok(false),
+        },
+        // The (class, user) pair is the membership row's own key, so the point
+        // check is one existence probe — and `left_at IS NULL` makes it the
+        // *live* stint's, the row the partial unique index
+        // `class_member_live_pair` carries: a student who left the şube is
+        // history, not audience, and a stale probe would let them be marked
+        // present at (and counted by) an event their section no longer
+        // attends.
         crate::domain::event::EventAudienceKind::Class => match event.get_audience_class() {
             Some(class) => {
                 let row = sqlx::query!(
-                    "SELECT EXISTS(SELECT 1 FROM class_member WHERE class = $1 AND app_user = $2)
+                    "SELECT EXISTS(SELECT 1 FROM class_member
+                                    WHERE class = $1 AND app_user = $2 AND left_at IS NULL)
                      AS \"present!\"",
                     class.uuid(),
                     user.get_id().uuid()
@@ -50,11 +54,11 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
             }
             None => Ok(false),
         },
-        crate::domain::event::EventAudienceKind::Registration => {
-            Ok(crate::db::registration::read_for_user(db, event.get_id(), user.get_id())
+        crate::domain::event::EventAudienceKind::Registration => Ok(
+            crate::db::registration::read_for_user(db, event.get_id(), user.get_id())
                 .await?
-                .is_some())
-        }
+                .is_some(),
+        ),
     }
 }
 
@@ -63,29 +67,24 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
 /// are kept; the caller degrades their display like any stale reference.
 pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppError> {
     match event.get_audience_kind() {
-        crate::domain::event::EventAudienceKind::School => Ok(crate::db::user::list_all(db, None, 0)
-            .await?
-            .0
-            .iter()
-            .map(|user| *user.get_id())
-            .collect()),
-        crate::domain::event::EventAudienceKind::Role => {
-            match event.get_audience_role() {
-                Some(role) => Ok(crate::db::user::list_by_role(db, role)
-                    .await?
-                    .iter()
-                    .map(|user| *user.get_id())
-                    .collect()),
-                None => Ok(Vec::new()),
-            }
-        }
-        crate::domain::event::EventAudienceKind::Course => match event.get_audience_course() {
-            Some(course) => Ok(crate::db::enrollment::list_for_course(db, course, None, 0)
+        crate::domain::event::EventAudienceKind::School => {
+            Ok(crate::db::user::list_all(db, None, 0)
                 .await?
                 .0
                 .iter()
-                .map(|enrollment| *enrollment.get_user())
+                .map(|user| *user.get_id())
+                .collect())
+        }
+        crate::domain::event::EventAudienceKind::Role => match event.get_audience_role() {
+            Some(role) => Ok(crate::db::user::list_by_role(db, role)
+                .await?
+                .iter()
+                .map(|user| *user.get_id())
                 .collect()),
+            None => Ok(Vec::new()),
+        },
+        crate::domain::event::EventAudienceKind::Course => match event.get_audience_course() {
+            Some(course) => Ok(crate::db::enrollment::list_users_for_course(db, course).await?),
             None => Ok(Vec::new()),
         },
         crate::domain::event::EventAudienceKind::Class => match event.get_audience_class() {
@@ -225,11 +224,15 @@ pub async fn update(
         )
         .set(
             "audience_course",
-            audience.as_ref().map(|a| Param::OptUuid(a.course.as_ref().map(|c| c.uuid()))),
+            audience
+                .as_ref()
+                .map(|a| Param::OptUuid(a.course.as_ref().map(|c| c.uuid()))),
         )
         .set(
             "audience_class",
-            audience.as_ref().map(|a| Param::OptUuid(a.class.as_ref().map(|c| c.uuid()))),
+            audience
+                .as_ref()
+                .map(|a| Param::OptUuid(a.class.as_ref().map(|c| c.uuid()))),
         )
         .set(
             "audience_capacity",

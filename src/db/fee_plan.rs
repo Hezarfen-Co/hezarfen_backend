@@ -177,8 +177,7 @@ mod tests {
     #[tokio::test]
     async fn installments_survive_a_round_trip_through_the_schema() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let manager =
-            crate::db::class_member::tests::fixture_user(&db, "fee-manager").await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "fee-manager").await;
         let installments = vec![
             Installment::new(
                 LedgerAmount::try_new(150_000).unwrap(),

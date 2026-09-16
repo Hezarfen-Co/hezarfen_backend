@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT payload AS \"payload: Json<serde_json::Value>\"\n           FROM karne_snapshot WHERE term = $1 AND app_user = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "payload: Json<serde_json::Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "karne_snapshot",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d06525ead7b0e7e9a589950826700212d313d65c3feab3aaa029723ee2bee7cf"
+}

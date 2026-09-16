@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO class_course_teacher (class_course, teacher)\n           SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM class_course WHERE id = $1)\n           ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6efeb49c4351e1dfb26a97ab0e2f2e2dfd7b11cd99856f35a41e06d55004bede"
+}

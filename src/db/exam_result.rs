@@ -6,11 +6,12 @@
 
 use crate::constant::HIGH_MARK_MIN;
 use crate::database::{Database, tx_with_retry};
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_result::{
     ExamResult, Mark, draft_error, latest_per_pair, retired_kind_error,
 };
+use crate::domain::term::TermId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -202,11 +203,11 @@ pub async fn grade(
     .await
 }
 
-/// The user's graded results restricted to one course's exams — the raw
-/// rows behind the per-course block of the marks report.
+/// The user's graded results restricted to one instance's exams — the raw
+/// rows behind the per-instance block of the marks report.
 pub async fn list_for_user_in_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<ExamResult>, AppError> {
     let rows = sqlx::query_as!(
@@ -214,10 +215,33 @@ pub async fn list_for_user_in_course(
         r#"SELECT r.exam AS "exam: ExamId", r.app_user AS "user: UserId", r.seq,
                   r.mark AS "mark: Mark", r.graded_by AS "graded_by: UserId"
            FROM exam_result r JOIN exam e ON e.id = r.exam
-           WHERE r.app_user = $1 AND e.course = $2
+           WHERE r.app_user = $1 AND e.class_course = $2
            ORDER BY r.exam DESC, r.seq DESC"#,
         user.uuid(),
-        course.uuid(),
+        class_course.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(latest_per_pair(rows))
+}
+
+/// The user's graded results inside one dönem — every instance's exams whose
+/// `term` is `term`, which is exactly the karne's input slice (D8: a karne is
+/// per dönem, and an exam belongs to the dönem it was sat in).
+pub async fn list_for_user_in_term(
+    db: &Database,
+    user: &UserId,
+    term: &TermId,
+) -> Result<Vec<ExamResult>, AppError> {
+    let rows = sqlx::query_as!(
+        ExamResult,
+        r#"SELECT r.exam AS "exam: ExamId", r.app_user AS "user: UserId", r.seq,
+                  r.mark AS "mark: Mark", r.graded_by AS "graded_by: UserId"
+           FROM exam_result r JOIN exam e ON e.id = r.exam
+           WHERE r.app_user = $1 AND e.term = $2
+           ORDER BY r.exam DESC, r.seq DESC"#,
+        user.uuid(),
+        term.uuid(),
     )
     .fetch_all(db)
     .await?;
@@ -505,8 +529,7 @@ mod tests {
             .unwrap()
             .map(|row| row.try_get::<i64, _>(0).unwrap())
             .unwrap_or(0);
-        let exam_count =
-            sqlx::query("SELECT COALESCE(sum(result_count), 0)::bigint FROM exam")
+        let exam_count = sqlx::query("SELECT COALESCE(sum(result_count), 0)::bigint FROM exam")
             .fetch_one(db)
             .await
             .unwrap()
@@ -517,8 +540,9 @@ mod tests {
 
     async fn an_exam(db: &Database, exam: &ExamId, kind: &str) {
         // The exam has to be real: a mark is refused on one that isn't. Its
-        // creator and course are real parents now, so the fixture grows them
-        // too (the teacher idempotently — [`the_two_people`] re-runs it).
+        // creator is a real row (idempotently — [`the_two_people`] re-runs it)
+        // and so are its parents: the instance it is taught in and the dönem it
+        // is graded in, both through the shared fixtures.
         let teacher = UserId::from_key(TEACHER);
         sqlx::query(
             "INSERT INTO app_user (id, username, created_at, role) \
@@ -528,23 +552,17 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
-        let course = CourseId::generate();
+        let (instance, _course) = crate::db::course::a_test_instance(db).await;
+        let term = crate::db::term::a_test_term(db).await;
         sqlx::query(
-            "INSERT INTO course (id, creator, title, description) \
-             VALUES ($1, $2, 'c', '')",
-        )
-        .bind(course.uuid())
-        .bind(teacher.uuid())
-        .execute(db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO exam (id, creator, course, title, description, kind) \
-             VALUES ($1, $2, $3, 't', '', $4)",
+            "INSERT INTO exam (id, creator, class_course, term, title, description, kind, \
+                               max_attempts, allow_rejoin, allow_review, draft) \
+             VALUES ($1, $2, $3, $4, 't', '', $5, 1, true, false, false)",
         )
         .bind(exam.uuid())
         .bind(teacher.uuid())
-        .bind(course.uuid())
+        .bind(instance.uuid())
+        .bind(term.uuid())
         .bind(kind)
         .execute(db)
         .await

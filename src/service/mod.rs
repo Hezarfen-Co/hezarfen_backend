@@ -1,5 +1,6 @@
 //! Business rules, workflow locks, multi-call orchestration; calls db::*; no
 //! SurrealQL text.
+pub mod academic_year;
 pub mod answer_image;
 pub mod appointment;
 pub mod appointment_slot;
@@ -34,6 +35,7 @@ pub mod homework;
 pub mod homework_file;
 pub mod homework_result;
 pub mod homework_submission;
+pub mod karne;
 pub mod meal_attendance;
 pub mod meal_booking;
 pub mod meal_ledger;

@@ -199,7 +199,10 @@ pub async fn file_keys_for_course(
         r#"SELECT file FROM homework_file
            WHERE submission IN (
                SELECT id FROM homework_submission
-               WHERE homework IN (SELECT id FROM homework WHERE course = $1)
+               WHERE homework IN (
+                   SELECT h.id FROM homework h
+                   JOIN class_course cc ON cc.id = h.class_course
+                   WHERE cc.course = $1)
            )"#,
         course.uuid()
     )
@@ -284,7 +287,7 @@ mod tests {
         use crate::domain::homework::HomeworkTitle;
         use crate::domain::subject::{SubjectDescription, SubjectName};
 
-        let course = crate::db::course::a_test_course(db).await;
+        let (instance, course) = crate::db::course::a_test_instance(db).await;
         let subject = crate::db::subject::create(
             db,
             &course,
@@ -295,7 +298,7 @@ mod tests {
         .unwrap();
         hw::create(
             db,
-            &course,
+            &instance,
             subject.get_id(),
             HomeworkTitle::try_new("essay").unwrap(),
             None,
@@ -310,24 +313,28 @@ mod tests {
     /// A real `app_user` row: submitters are foreign keys too.
     async fn a_student(db: &Database) -> UserId {
         let user = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, created_at, role) VALUES ($1, $2, 0, 'student')")
-            .bind(user.uuid())
-            .bind(format!("s-{}", &user.key()[30..]))
-            .execute(db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) VALUES ($1, $2, 0, 'student')",
+        )
+        .bind(user.uuid())
+        .bind(format!("s-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
         user
     }
 
     /// A real `app_user` row: creators and submitters are foreign keys now.
     async fn a_teacher(db: &Database) -> UserId {
         let user = UserId::generate();
-        sqlx::query("INSERT INTO app_user (id, username, created_at, role) VALUES ($1, $2, 0, 'teacher')")
-            .bind(user.uuid())
-            .bind(format!("t-{}", &user.key()[30..]))
-            .execute(db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) VALUES ($1, $2, 0, 'teacher')",
+        )
+        .bind(user.uuid())
+        .bind(format!("t-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
         user
     }
 

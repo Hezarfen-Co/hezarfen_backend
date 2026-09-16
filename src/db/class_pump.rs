@@ -2,37 +2,41 @@
 //! `enrollment` row that link implies reconciled with it, in one transaction.
 //!
 //! A class section (şube) has two link tables — `class_member` (a student in
-//! it) and `class_course` (a course attached to it) — and the *product* of the
-//! two is the roster it owes: every member is enrolled in every attached
-//! course, in real `enrollment` rows tagged [`source`](crate::domain::enrollment)
-//! with the class that wrote them. Adding a member and attaching a course are
-//! therefore the same operation seen along its two axes, and so are removing
+//! it) and `class_course` (a course attached to it, as that class×course
+//! *instance*) — and the *product* of the two is the roster it owes: every
+//! live member is enrolled in every instance the class carries, in real
+//! `enrollment` rows tagged [`source`](crate::domain::enrollment) with the
+//! class that wrote them. Adding a member and attaching a course are
+//! therefore the same operation seen along its two axes, and so are ending
 //! one and detaching the other.
 //!
 //! What is *not* one primitive is attach and detach. They share no statement:
 //! one gates on "this pair already holds a row" and claims a counter upwards,
-//! the other gates on nothing, releases, and has to decide per enrollment row
-//! whether a *rival* class still claims it.
+//! the other takes the instance and everything the class taught under it, and
+//! the member exits release the enrollment rows the ended stint owned — one
+//! row per *instance*, so a section's exit never touches the seat the student
+//! holds in another section.
 //!
 //! Every invariant is one Postgres statement or one row lock, in the shapes
 //! [`crate::db::cap`] documents: the class counter is claimed by a conditional
 //! `UPDATE` fused with the link's `INSERT` (one CTE — a refused insert takes
-//! its own seat bump back), a duplicate is the link table's natural composite
-//! primary key answering as `23505`, a gone parent is a real `FOREIGN KEY`
-//! answering as `23503`, and the row locks (`FOR KEY SHARE` / `FOR NO KEY
-//! UPDATE`) put each transaction on the very record a racing writer must
-//! touch. A refusal is an early `Err` (or an `Ok` verdict) from the
+//! its own bump back), a duplicate live stint is the partial unique index
+//! `class_member_live_pair` answering as `23505` (and enrollment's natural
+//! `(class_course, app_user)` key doing the same job through `ON CONFLICT`),
+//! a gone parent is a real `FOREIGN KEY` answering as `23503`, and the row
+//! locks (`FOR KEY SHARE` / `FOR NO KEY UPDATE` / `FOR UPDATE`) put each
+//! transaction on the very record a racing writer must touch. A refusal is an
+//! early `Err` (or an `Ok` verdict) from the
 //! [`crate::database::tx_with_retry`] closure — a decision, never a retry.
 
 use sqlx::postgres::PgConnection;
 
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::{Database, foreign_key_violation, tx_with_retry, unique_violation};
-use crate::db::cap;
 use crate::domain::class_blueprint::ClassBlueprintId;
-use crate::domain::class_course::ClassCourse;
+use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati};
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::class_member::ClassMember;
+use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -72,13 +76,12 @@ pub(crate) enum Attached<T> {
     /// be. Only a class predating the ceilings can be here, and only its own
     /// axis can make room — which is why it is not [`Attached::ClassFull`].
     ClassOverloaded,
-    /// One of the courses had no free seat, named by its key. Nothing was
-    /// written — not one of the earlier seats in the same run, which is the
-    /// whole point of doing this in a transaction.
-    Full(String),
-    /// One of the courses the class carries no longer exists, named by its id:
-    /// a stale `class_course` link. Nothing was written, and no capacity anyone
-    /// can raise will change that answer.
+    /// One of the class's instances no longer exists, named by its id: a
+    /// `class_course` row a concurrent detach took while this pump was walking
+    /// its pairs. Nothing was written — not one of the earlier rows in the
+    /// same run, which is the whole point of doing this in a transaction. No
+    /// capacity anyone can raise will change that answer; the attach must be
+    /// retried against the class as it now stands.
     CourseGone(String),
     /// The blueprint this attach was sourced from is gone — a delete landed
     /// between the pump reading the template and this transaction running.
@@ -105,8 +108,9 @@ impl<T> Attached<T> {
     /// *course* delete ([`Attached::PivotGone`] → `course_deleted`) — and
     /// telling a manager the class vanished when the course did sends them to
     /// look at a section that is standing right there. `linked_course_missing`
-    /// is a third: *another* course already attached to this class no longer
-    /// exists, and it must be detached before this attach can be retried.
+    /// is a third: one of the class's *instances* vanished while the pump was
+    /// walking its pairs (a concurrent detach), so the attach must be retried
+    /// against the class as it now stands.
     /// `blueprint_deleted` is a pump losing the template itself mid-run — the
     /// only refusal that says nothing about the (class, course) pair it names.
     ///
@@ -124,7 +128,6 @@ impl<T> Attached<T> {
             Attached::PivotGone => Some("course_deleted"),
             Attached::ClassFull => Some(axis.at_ceiling_code()),
             Attached::ClassOverloaded => Some(axis.other().over_ceiling_code()),
-            Attached::Full(_) => Some("course_full"),
             Attached::CourseGone(_) => Some("linked_course_missing"),
             Attached::SourceGone => Some("blueprint_deleted"),
         }
@@ -228,11 +231,14 @@ fn refusal_of<T>(early: Early) -> Attached<T> {
 /// The gates that run before any counter moves, in the order their answers
 /// outrank each other:
 ///
-/// 1. **Duplicate** — "you are already in" outranks "there is no room": a
-///    caller whose row a rival placed a moment ago must not be told a course
-///    is full about seats they already hold. (The link table's own primary key
-///    re-answers this below as `23505` for a rival landing inside the window —
-///    same verdict, no second seat.)
+/// 1. **Duplicate** — "you are already in" outranks every other answer: a
+///    caller whose row a rival placed a moment ago must be told they are in,
+///    not refused for a class ceiling they are not near. The member axis reads
+///    a **live** stint (a left one claims nothing, so rejoining is not a
+///    duplicate); the course axis reads the (class, course) pair. (The link
+///    tables re-answer this below — `23505` on the live-stint partial index,
+///    `ON CONFLICT DO NOTHING` on the enrollment pair — for a rival landing
+///    inside the window: same verdict, no second count.)
 /// 2. **Source** — the blueprint that asked for this attach is still there. A
 ///    `FOR KEY SHARE` row lock on the blueprint row: it serializes the attach
 ///    against the blueprint's own delete — the closure the old process-wide
@@ -265,7 +271,8 @@ async fn early_verdicts(
 ) -> Result<(Option<Early>, Option<uuid::Uuid>), AppError> {
     let held = match pivot {
         Pivot::User(user) => sqlx::query_scalar!(
-            r#"SELECT 1 AS "one" FROM class_member WHERE class = $1 AND app_user = $2"#,
+            r#"SELECT 1 AS "one" FROM class_member
+               WHERE class = $1 AND app_user = $2 AND left_at IS NULL"#,
             class as _,
             user as _
         )
@@ -350,13 +357,12 @@ async fn early_verdicts(
     Ok((over.then_some(Early::Overloaded), source_id))
 }
 
-/// Write the member link and enroll the student into every course the class is
-/// already attached to, or write nothing at all.
+/// Write the member stint and enroll the student into every instance the
+/// class already carries, or write nothing at all.
 ///
-/// A student already enrolled in one of those courses keeps the row they
-/// have — no seat is charged, and the existing row's `source` is left exactly
+/// A student already enrolled in one of those instances keeps the row they
+/// have — no count charged, and the existing row's `source` is left exactly
 /// as it was, so a hand-placed student is never quietly adopted by a class.
-/// A course with no free seat refuses the *whole* join rather than half of it.
 ///
 /// The class counter is claimed by the conditional half of the CTE below
 /// rather than a bare increment, so a class deleted out from under this run
@@ -366,18 +372,45 @@ async fn early_verdicts(
 /// this transaction — finite: [`Attached::ClassFull`] once the class is at its
 /// ceiling. Claim and insert are one statement, so a refused insert takes its
 /// own seat bump back.
+///
+/// The stint is live (`left_at` NULL) by construction, which is the row the
+/// partial unique index `class_member_live_pair` guards: a rival landing in
+/// the window is answered as [`Attached::Duplicate`] rather than a second
+/// live stint for the same pair. A student who left earlier keeps their
+/// history row — it claims nothing.
 pub(crate) async fn add_member(
     db: &Database,
     class: &ClassGroupId,
     user: &UserId,
     by: &UserId,
 ) -> Result<Attached<ClassMember>, AppError> {
-    let added_at = Timestamp::now();
+    add_member_sourced(db, class, user, by, None).await
+}
+
+/// [`add_member`] carrying the stint's *provenance*: the şube the student was
+/// copied from, written into `source_class_group` in the same statement as
+/// the row. `None` is the hand add — a student someone put here, who came
+/// from nowhere (the pump is the only writer of this column, and a rollover
+/// is the only caller that has a source to name).
+///
+/// Everything else — the claim, the cap, the duplicate verdict, the pair loop
+/// — is identical, and deliberately so: the tag rides the member axis's own
+/// single statement rather than a follow-up write, so a crash cannot leave a
+/// copied stint that lost its provenance.
+pub(crate) async fn add_member_sourced(
+    db: &Database,
+    class: &ClassGroupId,
+    user: &UserId,
+    by: &UserId,
+    source: Option<&ClassGroupId>,
+) -> Result<Attached<ClassMember>, AppError> {
+    let joined_at = Timestamp::now();
     let class = class.clone();
+    let source = source.cloned();
     let (user, by) = (*user, *by);
+    let id = ClassMemberId::generate();
     let outcome = tx_with_retry(db, false, async move |tx| {
-        let (early, _) =
-            early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?;
+        let (early, _) = early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?;
         if let Some(early) = early {
             return Ok(refusal_of(early));
         }
@@ -389,23 +422,27 @@ pub(crate) async fn add_member(
                    UPDATE class_group SET class_member_count = class_member_count + 1
                     WHERE id = $1 AND class_member_count < $2
                     RETURNING 1)
-               INSERT INTO class_member (class, app_user, added_by, added_at)
-               SELECT $1, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM seat)
+               INSERT INTO class_member (id, class, app_user, added_by, joined_at, left_at,
+                                         source_class_group)
+               SELECT $3, $1, $4, $5, $6, NULL, $7 WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING 1 AS "one""#,
             class as _,
             Axis::Member.cap(),
+            id.uuid(),
             user as _,
             by as _,
-            added_at as _
+            joined_at as _,
+            source.as_ref().map(ClassGroupId::uuid),
         )
         .fetch_optional(&mut *tx)
         .await
         {
             Ok(result) => result,
             // A rival landed in the window between the gate and the insert:
-            // the link table's own primary key answers, same verdict as the
-            // gate, no second seat.
-            Err(e) if unique_violation(&e) == Some("class_member_class_user") => {
+            // the live-stint partial index answers, same verdict as the gate,
+            // no second seat. (A left row is not in that index, so a rejoin
+            // after a leave is never a duplicate.)
+            Err(e) if unique_violation(&e) == Some("class_member_live_pair") => {
                 return Ok(Attached::Duplicate);
             }
             // The student row vanished mid-run despite the locked pivot claim.
@@ -428,36 +465,59 @@ pub(crate) async fn add_member(
                 Attached::Gone
             });
         }
-        let courses: Vec<uuid::Uuid> = sqlx::query_scalar!(
-            r#"SELECT course AS "course: uuid::Uuid" FROM class_course WHERE class = $1"#,
+        // The pairs are the class's *instances*, one per attached course: the
+        // member axis now enrolls into the class×course instance, not into a
+        // school-wide course row.
+        let instances: Vec<uuid::Uuid> = sqlx::query_scalar!(
+            r#"SELECT id AS "id: uuid::Uuid" FROM class_course WHERE class = $1"#,
             class as _
         )
         .fetch_all(&mut *tx)
         .await?;
-        let pairs = courses.into_iter().map(|course| (course, user.uuid()));
+        let pairs = instances
+            .into_iter()
+            .map(|instance| (instance, user.uuid()));
         enroll_pairs(tx, &class, pairs, &by).await?;
         Ok(Attached::Made(ClassMember {
+            id: id.clone(),
             class: class.clone(),
             user,
             added_by: by,
+            joined_at,
+            left_at: None,
+            source_class_group: source.clone(),
         }))
     })
     .await;
     map_sweep_abort(outcome)
 }
 
-/// Write the course link and enroll the class's whole roster into it, or
+/// Write the instance and enroll the class's whole live roster into it, or
 /// write nothing at all.
 ///
-/// Students already in the course keep the rows they have — no seat charged,
-/// `source` untouched — and a roster that does not fit refuses the whole
-/// attach rather than filling the course to its cap and stopping.
+/// Students already enrolled in it keep the rows they have — no count charged,
+/// `source` untouched. There is no roster-size gate any more (D5: the
+/// counter is a count, not a capacity), so the only refusals left are the
+/// class's own ceilings and a vanished pivot.
 ///
 /// `source` is the blueprint whose behalf this attach runs on, and supplying
 /// it adds one more claim: that it is still there when the transaction runs
 /// ([`Attached::SourceGone`]) — the `FOR KEY SHARE` lock that serializes this
 /// transaction against the blueprint's own delete. A hand attach owns itself
 /// and passes `None`.
+///
+/// The instance's own id is minted here (v7, so a class's instances list in
+/// creation order) and its policy columns take the schema defaults: one weekly
+/// hour, counted toward the karne, an empty roster. A PATCH on `/instances`
+/// changes them afterwards.
+///
+/// Two counters ride the write, both in this one transaction: the class's
+/// `class_course_count` (claimed by the conditional CTE, so a full or gone
+/// class writes nothing) and the *catalog's* `class_course_count` — how many
+/// şubeler teach this course, which is what [`crate::db::course::delete`]'s
+/// guard reads. This is the only insert path into `class_course`; every layer
+/// above it (hand attach, blueprint pump, rollover copy) reaches the counter
+/// through here.
 pub(crate) async fn attach_course(
     db: &Database,
     class: &ClassGroupId,
@@ -470,6 +530,7 @@ pub(crate) async fn attach_course(
     let course = course.clone();
     let by = *by;
     let source = source.cloned();
+    let id = ClassCourseId::generate();
     let outcome = tx_with_retry(db, false, async move |tx| {
         let (early, source_id) = early_verdicts(
             tx,
@@ -487,11 +548,12 @@ pub(crate) async fn attach_course(
                    UPDATE class_group SET class_course_count = class_course_count + 1
                     WHERE id = $1 AND class_course_count < $2
                     RETURNING 1)
-               INSERT INTO class_course (class, course, attached_by, attached_at, source)
-               SELECT $1, $3, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
+               INSERT INTO class_course (id, class, course, attached_by, attached_at, source)
+               SELECT $3, $1, $4, $5, $6, $7 WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING 1 AS "one""#,
             class as _,
             Axis::Course.cap(),
+            id.uuid(),
             course as _,
             by as _,
             attached_at as _,
@@ -521,19 +583,51 @@ pub(crate) async fn attach_course(
                 Attached::Gone
             });
         }
+        // The catalog's own counter: how many şubeler teach this course. It is
+        // what [`crate::db::course::delete`]'s guard reads — a course a class
+        // still teaches may not go — and this insert is the only place it can
+        // be claimed. It is a *count*, not a capacity (D5: nothing is refused
+        // for being near it), so it is a plain increment in the same
+        // transaction as the row: the link and its count commit together, and
+        // the early refusals above (a full or gone class, a lost insert) have
+        // already returned, so no give-back path exists to get wrong.
+        sqlx::query!(
+            r#"UPDATE course SET class_course_count = class_course_count + 1 WHERE id = $1"#,
+            course as _
+        )
+        .execute(&mut *tx)
+        .await?;
+        // The roster is the class's *live* stints: a student who left holds no
+        // seat and is enrolled in nothing the class attaches afterwards.
         let members: Vec<uuid::Uuid> = sqlx::query_scalar!(
-            r#"SELECT app_user AS "app_user: uuid::Uuid" FROM class_member WHERE class = $1"#,
+            r#"SELECT app_user AS "app_user: uuid::Uuid" FROM class_member
+               WHERE class = $1 AND left_at IS NULL"#,
             class as _
         )
         .fetch_all(&mut *tx)
         .await?;
-        let pairs = members.into_iter().map(|user| (course.uuid(), user));
+        let pairs = members.into_iter().map(|user| (id.uuid(), user));
         enroll_pairs(tx, &class, pairs, &by).await?;
+        // The counter the pair loop just moved, read back inside the
+        // transaction so the returned row reports the roster it now has
+        // rather than the empty one it was inserted with.
+        let enrollment_count = sqlx::query_scalar!(
+            r#"SELECT enrollment_count AS "count: i64" FROM class_course WHERE id = $1"#,
+            id.uuid()
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         Ok(Attached::Made(ClassCourse {
+            id: id.clone(),
             class: class.clone(),
             course: course.clone(),
             attached_by: by,
             source: source.clone(),
+            ders_saati: DersSaati::try_new(crate::constant::MIN_DERS_SAATI)
+                .expect("the schema default is a valid weekly-hours count"),
+            counts_toward_karne: true,
+            enrollment_count,
+            attached_at,
         }))
     })
     .await;
@@ -543,11 +637,10 @@ pub(crate) async fn attach_course(
 /// Abort markers the pair loop raises where the old transaction `THROW` did,
 /// in the [`crate::db::field_update`] style: a refusal found *after* earlier
 /// pairs wrote must take the whole run down with it — returning it as `Ok`
-/// would COMMIT the partial enrollment. The marker carries the course's key
+/// would COMMIT the partial enrollment. The marker carries the instance's id
 /// and is mapped back to [`Attached`] right after [`tx_with_retry`] returns
 /// ([`map_sweep_abort`]); it never reaches the wire.
 const COURSE_GONE_MARK: &str = "class_pump_course_gone:";
-const COURSE_FULL_MARK: &str = "class_pump_course_full:";
 
 /// The pair loop's abort markers back into their [`Attached`] refusals —
 /// every other outcome passes through untouched.
@@ -556,28 +649,24 @@ fn map_sweep_abort<T>(outcome: Result<Attached<T>, AppError>) -> Result<Attached
         Err(AppError::Internal(m)) if m.starts_with(COURSE_GONE_MARK) => Ok(Attached::CourseGone(
             m[COURSE_GONE_MARK.len()..].to_string(),
         )),
-        Err(AppError::Internal(m)) if m.starts_with(COURSE_FULL_MARK) => {
-            Ok(Attached::Full(m[COURSE_FULL_MARK.len()..].to_string()))
-        }
         other => other,
     }
 }
 
-/// Enroll every `(course, user)` pair that has no row yet, each against its
-/// own course's capacity, skipping — never charging — the pairs that do.
+/// Enroll every `(instance, user)` pair that has no row yet, and charge the
+/// instance's roster counter only for the rows actually written.
 ///
-/// Per pair, in the order the refusals outrank each other: the pair's own row
-/// answers "already enrolled" (skip, no seat); the course row answers "gone"
-/// *before* the seat claim, so a stale link is never mis-reported as a
-/// capacity problem; the seat claim is a conditional `UPDATE` on the course
-/// row (live cap — `capacity` as it stands at write time, `NULL` reading as
-/// unlimited); and the insert rides the seat it claimed. A rival that lands
-/// between the gate and the insert answers `23505`, and the bump is given
-/// back before the skip — the outcome a re-sent transaction used to reach by
-/// seeing the rival's row at its gate.
+/// Per pair, in the order the answers outrank each other: the pair's own row
+/// answers "already enrolled" (skip, no count moved); the counter claim is a
+/// plain increment on the instance row, so it doubles as the existence check —
+/// a claim matching nothing is an instance a concurrent detach took, which is
+/// the abort marker rather than a refusal of this pair alone; and then the
+/// row is inserted with `ON CONFLICT DO NOTHING`, so a rival landing between
+/// the gate and the insert leaves *their* row standing and this run gives its
+/// own claim back before the skip.
 ///
 /// Every abort stops the loop inside the caller's transaction: not one of the
-/// earlier seats in the same run survives, which is the whole point of doing
+/// earlier rows in the same run survives, which is the whole point of doing
 /// this in a transaction.
 async fn enroll_pairs(
     tx: &mut PgConnection,
@@ -586,10 +675,10 @@ async fn enroll_pairs(
     by: &UserId,
 ) -> Result<(), AppError> {
     let now = Timestamp::now();
-    for (course, user) in pairs {
+    for (instance, user) in pairs {
         let held = sqlx::query_scalar!(
-            r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
-            course,
+            r#"SELECT 1 AS "one" FROM enrollment WHERE class_course = $1 AND app_user = $2"#,
+            instance,
             user
         )
         .fetch_optional(&mut *tx)
@@ -598,32 +687,27 @@ async fn enroll_pairs(
         if held {
             continue;
         }
-        let alive = sqlx::query_scalar!(r#"SELECT 1 AS "one" FROM course WHERE id = $1"#, course)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-        if !alive {
-            return Err(AppError::Internal(format!("{COURSE_GONE_MARK}{course}")));
-        }
-        let seat = sqlx::query_scalar!(
-            r#"UPDATE course SET enrollment_count = enrollment_count + 1
-               WHERE id = $1 AND enrollment_count < COALESCE(capacity, $2)
+        // The claim doubles as the existence check: there is no capacity to
+        // refuse on, so an increment that matches no row means the instance is
+        // gone — a stale link, never a full roster.
+        let claimed = sqlx::query_scalar!(
+            r#"UPDATE class_course SET enrollment_count = enrollment_count + 1
+               WHERE id = $1
                RETURNING 1 AS "one""#,
-            course,
-            cap::UNLIMITED,
+            instance,
         )
         .fetch_optional(&mut *tx)
         .await?
         .is_some();
-        if !seat {
-            return Err(AppError::Internal(format!("{COURSE_FULL_MARK}{course}")));
+        if !claimed {
+            return Err(AppError::Internal(format!("{COURSE_GONE_MARK}{instance}")));
         }
         let wrote = sqlx::query_scalar!(
-            r#"INSERT INTO enrollment (course, app_user, enrolled_by, source, created_at)
+            r#"INSERT INTO enrollment (class_course, app_user, enrolled_by, source, created_at)
                VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (course, app_user) DO NOTHING
+               ON CONFLICT (class_course, app_user) DO NOTHING
                RETURNING 1 AS "one""#,
-            course,
+            instance,
             user,
             by as _,
             class as _,
@@ -634,23 +718,15 @@ async fn enroll_pairs(
         match wrote {
             Ok(Some(_)) => {}
             // A rival placed the pair in the window: their row stands, no
-            // second seat, and the claim this run took is given back — the
-            // skip wins over the capacity answer, exactly as a re-sent
-            // transaction found the row at its gate.
+            // second count, and the claim this run took is given back — the
+            // skip wins, exactly as a re-sent transaction found the row at its
+            // gate.
             Ok(None) => {
                 sqlx::query!(
-                    r#"UPDATE course SET enrollment_count = enrollment_count - 1
-                       WHERE id = $1"#,
-                    course
-                )
-                .execute(&mut *tx)
-                .await?;
-            }
-            Err(e) if unique_violation(&e) == Some("enrollment_course_user") => {
-                sqlx::query!(
-                    r#"UPDATE course SET enrollment_count = enrollment_count - 1
-                       WHERE id = $1"#,
-                    course
+                    r#"UPDATE class_course
+                          SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+                        WHERE id = $1"#,
+                    instance
                 )
                 .execute(&mut *tx)
                 .await?;
@@ -672,54 +748,106 @@ async fn enroll_pairs(
 // were left pointing at a class no sweep could ever reach again.
 
 /// Take a student out of a class and sweep the enrollments the class pumped
-/// for them. Answers how many link rows went (0 or 1), so the caller can turn
+/// for them. Answers how many stints went (0 or 1), so the caller can turn
 /// zero into a 404.
 ///
-/// The sweep is *repair-first*: an enrollment this class wrote is only deleted
-/// once no other class still claims it. Two classes attached to the same
-/// course share a student — the second attach skipped the row the first had
-/// already written, so the row carries only the first class's name — and
-/// deleting it on the first class's way out would unenroll a student the
-/// second class is still responsible for. So the row is re-tagged to that
-/// rival instead, and only a row nobody is left to claim is deleted and its
-/// seat given back. The heir is the lowest class id among the claimants: a
-/// deterministic pick (uuid order is mint order), so a repeat of the same
-/// sweep lands on the same class.
-///
-/// That pick is then **claimed** — a `FOR NO KEY UPDATE` read of the heir's
-/// class row, no counter moved — before the row is handed over. Both reads
-/// behind it are pure, and this sweep is long — one pass per enrollment row
-/// the link implies — so `DELETE /classes/{heir}/members/{user}` and
-/// `DELETE /classes/{heir}/courses/{course}` could both commit inside it and
-/// leave the row tagged with a class holding neither link: a `class_group`
-/// whose own 0/0 delete guard then passes, stranding an enrollment nothing can
-/// ever sweep. Every one of those writers moves a counter on the heir's own
-/// row, so the row lock here puts this transaction on the record they write
-/// and the two settle in either order. A claim that matches nothing is an
-/// heir whose class row is gone — a stale link outliving its class — and it
-/// takes the release arm rather than tagging the row with an id no route can
-/// reach.
-///
-/// Sweeps tolerate rows that are already gone. A course delete wipes a
-/// course's enrollments wholesale while the `class_member` rows survive it, so
-/// "this class has a member" and "that member has a live pumped row" are
-/// independent facts and the loop simply finds nothing to sweep.
+/// This is the hard form — the row is deleted — and it is kept only for the
+/// transfer rollback path, where the stint being undone must leave no trace.
+/// The route uses [`leave_member`], which stamps `left_at` and keeps the
+/// history.
 pub(crate) async fn remove_member(
     db: &Database,
     class: &ClassGroupId,
     user: &UserId,
 ) -> Result<i64, AppError> {
+    drop_member(db, class, user, false).await
+}
+
+/// The same exit, soft: `left_at` is stamped and the row stays as history.
+/// The roster read and the cap both filter on `left_at IS NULL`, so the
+/// student holds no seat from this moment — and a rejoin later inserts a
+/// fresh live row beside this one (the partial unique index only guards the
+/// live stint), which is how "left in October, came back in January" is
+/// represented.
+///
+/// Both exits take the user row `FOR NO KEY UPDATE` first — the same lock the
+/// pump's pivot claim and a role-change sweep take — so a demotion cannot
+/// interleave with this write in either direction.
+pub(crate) async fn leave_member(
+    db: &Database,
+    class: &ClassGroupId,
+    user: &UserId,
+) -> Result<i64, AppError> {
+    drop_member(db, class, user, true).await
+}
+
+/// The one body both exits run: find the live stint, end it, give the class
+/// its seat back, and release the enrollments the class pumped for the
+/// student.
+///
+/// The sweep's rule, and it is the whole rule: **every row the ended stint
+/// owned goes, and each instance gets its roster count back**. An enrollment
+/// is keyed `(class_course, app_user)` — one row per *instance* — so a student
+/// in two şubeler that teach the same course holds two rows, one on each
+/// section's instance, and the seat they keep is the other section's own row,
+/// written when they joined it. Handing this row over to a rival class (the
+/// pre-remodel rule, when one school-wide course carried one roster) would
+/// leave the leaving section's roster, exams and roll-call still listing a
+/// student who left it, with its `enrollment_count` inflated on top — a
+/// "repair" that repairs nothing, because there was never a shortage of rows
+/// to repair.
+///
+/// Only the rows *this class* wrote are in the list ([`drop_member`] reads
+/// `source = <class>`), so a hand-placed enrollment — the operator's own, or
+/// one a section handed over before this rule — is never touched.
+///
+/// Sweeps tolerate rows that are already gone: an instance detach wipes its
+/// own enrollments wholesale while the `class_member` rows survive it, so
+/// "this class has a member" and "that member has a live pumped row" are
+/// independent facts and the loop simply finds nothing to sweep (and, because
+/// [`release`] only gives a count back for a row it actually deleted, takes
+/// nothing back twice).
+async fn drop_member(
+    db: &Database,
+    class: &ClassGroupId,
+    user: &UserId,
+    soft: bool,
+) -> Result<i64, AppError> {
     let class = class.clone();
     let user = *user;
+    let now = Timestamp::now();
     tx_with_retry(db, true, async move |tx| {
-        let gone = sqlx::query_scalar!(
-            r#"DELETE FROM class_member WHERE class = $1 AND app_user = $2
-               RETURNING 1 AS "one""#,
-            class as _,
+        // The role-claim handshake: the same `FOR NO KEY UPDATE` the pump's
+        // pivot takes, so a demotion's sweep and this exit serialize on the
+        // user row rather than interleaving.
+        sqlx::query!(
+            r#"SELECT role FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
             user as _
         )
         .fetch_optional(&mut *tx)
         .await?;
+        let gone = if soft {
+            sqlx::query_scalar!(
+                r#"UPDATE class_member SET left_at = $3
+                   WHERE class = $1 AND app_user = $2 AND left_at IS NULL
+                   RETURNING 1 AS "one""#,
+                class as _,
+                user as _,
+                now as _
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_scalar!(
+                r#"DELETE FROM class_member
+                   WHERE class = $1 AND app_user = $2 AND left_at IS NULL
+                   RETURNING 1 AS "one""#,
+                class as _,
+                user as _
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+        };
         let Some(_) = gone else {
             return Ok(0);
         };
@@ -731,8 +859,11 @@ pub(crate) async fn remove_member(
         )
         .execute(&mut *tx)
         .await?;
+        // Only the rows *this class* wrote: a hand-placed enrollment is the
+        // operator's and is never taken back by a class sweep.
         let rows = sqlx::query!(
-            r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
+            r#"SELECT class_course AS "class_course: uuid::Uuid",
+                      app_user AS "app_user: uuid::Uuid"
                FROM enrollment WHERE app_user = $1 AND source = $2"#,
             user as _,
             class as _
@@ -740,36 +871,70 @@ pub(crate) async fn remove_member(
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
-        .map(|row| (row.course, row.app_user))
+        .map(|row| (row.class_course, row.app_user))
         .collect::<Vec<_>>();
-        sweep_enrollments(tx, &class, rows).await?;
+        // Every row this class's tag owns goes, and each instance gets its
+        // roster count back — see the doc above: the student's seat in a
+        // second şube teaching the same course is that şube's *own* row, so
+        // there is no heir to hand this one over to.
+        for (instance, member) in rows {
+            release(tx, instance, member).await?;
+        }
         Ok(1)
     })
     .await
 }
 
-/// Detach `course` from `class` and sweep the enrollments the class pumped
-/// into it. `source`, when given, re-asserts the provenance tag on the link's
-/// own delete — a blueprint sweep may only take back rows its own tag owns.
-/// Answers how many link rows went, so a caller whose link was a single pair
-/// can turn zero into a 404. The sweep underneath is the shared one: a student
-/// a second class still claims is re-tagged rather than unenrolled.
+/// Detach one instance from its class and sweep what hangs off it. `source`,
+/// when given, re-asserts the provenance tag on the link's own delete — a
+/// blueprint sweep may only take back rows its own tag owns. Answers the blob
+/// keys of the image and homework-file rows the sweep removed, or `None` when
+/// the pair held no instance at all (nothing written), so a caller whose link
+/// was a single pair can turn `None` into a 404 while a detach that removed an
+/// instance carrying no uploads still reads as one that went.
+///
+/// The instance is the anchor now, so detaching it takes everything the class
+/// taught under it: its exams (with their results and questions), its sessions
+/// with their roll call, its homework with its submissions, its roster and its
+/// teacher links. That is the same cascade a course delete runs
+/// ([`crate::db::course::sweep_instance_subtree`]), scoped to one instance —
+/// and it has to be, because every one of those rows names the instance as its
+/// parent key (`ON DELETE NO ACTION`), so deleting the instance while they
+/// stand is refused by the store itself.
+///
+/// The sweep runs behind a `FOR UPDATE` claim on the instance row: a rival
+/// detach waits here and finds nothing left to sweep, so exactly one
+/// transaction unlinks the pair and gives the class its counter back — and
+/// with it the catalog's `class_course_count`, the count
+/// [`crate::db::course::delete`]'s guard reads (`course::delete` needs no
+/// release of its own: it deletes the course row the counter lives on).
+/// This is the only delete path for an instance that does *not* remove the
+/// course: the hand detach and the blueprint sweep both come through it.
+///
+/// The image and homework-file *blobs* the cascade removes come back as keys
+/// and are unlinked by the caller, after the commit — the same shape
+/// [`crate::service::course::delete`] has. The rows are gone the moment this
+/// returns, so a caller that drops the list strands the bytes on disk with
+/// nothing left pointing at them.
 pub(crate) async fn detach_course(
     db: &Database,
     class: &ClassGroupId,
     course: &CourseId,
     source: Option<&ClassBlueprintId>,
-) -> Result<i64, AppError> {
+) -> Result<Option<Vec<String>>, AppError> {
     let class = class.clone();
     let course = course.clone();
     let source = source.cloned();
     tx_with_retry(db, true, async move |tx| {
-        let gone = match &source {
+        // The claim and the resolution in one read: the row this returns is
+        // the very row the lock holds against a rival detach.
+        let target = match &source {
             Some(source) => {
                 sqlx::query_scalar!(
-                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2
+                    r#"SELECT id AS "id: uuid::Uuid" FROM class_course
+                       WHERE class = $1 AND course = $2
                          AND source = (SELECT id FROM class_blueprint WHERE grade = $3)
-                       RETURNING 1 AS "one""#,
+                       FOR UPDATE"#,
                     class as _,
                     course as _,
                     source as _
@@ -779,8 +944,8 @@ pub(crate) async fn detach_course(
             }
             None => {
                 sqlx::query_scalar!(
-                    r#"DELETE FROM class_course WHERE class = $1 AND course = $2
-                       RETURNING 1 AS "one""#,
+                    r#"SELECT id AS "id: uuid::Uuid" FROM class_course
+                       WHERE class = $1 AND course = $2 FOR UPDATE"#,
                     class as _,
                     course as _
                 )
@@ -788,9 +953,13 @@ pub(crate) async fn detach_course(
                 .await?
             }
         };
-        let Some(_) = gone else {
-            return Ok(0);
+        let Some(instance) = target else {
+            return Ok(None);
         };
+        let blobs = crate::db::course::sweep_instance_subtree(&mut *tx, instance).await?;
+        sqlx::query!(r#"DELETE FROM class_course WHERE id = $1"#, instance)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query!(
             r#"UPDATE class_group
                SET class_course_count = GREATEST(class_course_count - 1, 0)
@@ -799,92 +968,41 @@ pub(crate) async fn detach_course(
         )
         .execute(&mut *tx)
         .await?;
-        let rows = sqlx::query!(
-            r#"SELECT course AS "course: uuid::Uuid", app_user AS "app_user: uuid::Uuid"
-               FROM enrollment WHERE course = $1 AND source = $2"#,
-            course as _,
-            class as _
+        // …and the catalog's own counter: the course is taught in one fewer
+        // şube from this commit. Same transaction as the delete, so the link
+        // and its count move together — `course::delete`'s guard reads this,
+        // and a course whose last instance was just detached is deletable the
+        // moment this lands. `GREATEST` for the same reason the class counter
+        // uses it: a drift can only ever be repaired downward, never refused.
+        sqlx::query!(
+            r#"UPDATE course SET class_course_count = GREATEST(class_course_count - 1, 0)
+                WHERE id = $1"#,
+            course as _
         )
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|row| (row.course, row.app_user))
-        .collect::<Vec<_>>();
-        sweep_enrollments(tx, &class, rows).await?;
-        Ok(1)
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(blobs))
     })
     .await
 }
 
-/// The repair-first tail both detaches share: for every enrollment row the
-/// deleted link owned, hand it to a rival class that still claims it, or
-/// delete it and give the course its seat back.
+/// The row goes, and the instance's roster count with it. It is the *only*
+/// fate for an enrollment a section's exit owns: the roster is per instance
+/// (D4), so a student who is also in another şube teaching the same course
+/// keeps their seat there through that section's own row — see
+/// [`drop_member`].
 ///
-/// The heir is the lowest class id among the rivals that carry both this
-/// course *and* the student — the same deterministic pick on every repeat. Its
-/// class row is read `FOR NO KEY UPDATE` (a claim that moves no counter: the
-/// class_member row already covers the student, and the enrollment is counted
-/// on the course) so a concurrent member/course write on the heir serializes
-/// behind this transaction; a claim matching nothing is a gone heir, and the
-/// row takes the release arm.
-async fn sweep_enrollments(
-    tx: &mut PgConnection,
-    class: &ClassGroupId,
-    rows: Vec<(uuid::Uuid, uuid::Uuid)>,
-) -> Result<(), AppError> {
-    for (course, user) in rows {
-        let heir = sqlx::query_scalar!(
-            r#"SELECT cm.class AS "class: uuid::Uuid"
-               FROM class_member cm
-               JOIN class_course cc ON cc.class = cm.class AND cc.course = $1
-               WHERE cm.app_user = $2 AND cm.class <> $3
-               ORDER BY cm.class
-               LIMIT 1"#,
-            course,
-            user,
-            class as _
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(heir) = heir else {
-            release(tx, course, user).await?;
-            continue;
-        };
-        let claimed = sqlx::query_scalar!(
-            r#"SELECT class_member_count AS "heir_count: i64" FROM class_group
-               WHERE id = $1 FOR NO KEY UPDATE"#,
-            heir
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        if claimed.is_none() {
-            release(tx, course, user).await?;
-            continue;
-        }
-        sqlx::query!(
-            r#"UPDATE enrollment SET source = $1 WHERE course = $2 AND app_user = $3"#,
-            heir,
-            course,
-            user
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Nobody is left to claim the row: it goes, and its seat with it. The seat
-/// is only given back when the delete actually took the row — a course
-/// delete's wholesale sweep may have taken both while this transaction read
-/// them, and both halves vanish together there.
+/// The count is only given back when the delete actually took the row — an
+/// instance detach's wholesale sweep may have taken both while this
+/// transaction read them, and both halves vanish together there.
 async fn release(
     tx: &mut PgConnection,
-    course: uuid::Uuid,
+    instance: uuid::Uuid,
     user: uuid::Uuid,
 ) -> Result<(), AppError> {
     let deleted = sqlx::query!(
-        r#"DELETE FROM enrollment WHERE course = $1 AND app_user = $2"#,
-        course,
+        r#"DELETE FROM enrollment WHERE class_course = $1 AND app_user = $2"#,
+        instance,
         user
     )
     .execute(&mut *tx)
@@ -892,22 +1010,24 @@ async fn release(
     .rows_affected();
     if deleted > 0 {
         sqlx::query!(
-            r#"UPDATE course SET enrollment_count = GREATEST(enrollment_count - 1, 0)
-               WHERE id = $1"#,
-            course
+            r#"UPDATE class_course
+                  SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+                WHERE id = $1"#,
+            instance
         )
         .execute(&mut *tx)
         .await?;
     }
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
-    
+
     use crate::db::class_member::tests::{a_class, counter, fixture_user, rows};
     use crate::domain::class_group::ClassGroupId;
     use crate::error::AppError;
-    use crate::service::{class_course, class_member};
+    use crate::service::class_member;
 
     /// The class counter is claimed conditionally, so a class that is not there
     /// stops the cascade before anything is written — rather than leaving a
@@ -971,100 +1091,4 @@ mod tests {
             "a second removal is a 404, not a silent no-op: {again:?}"
         );
     }
-
-    /// The heir a sweep hands a shared enrollment to must still hold *both*
-    /// links when the transaction commits — not merely when it read them.
-    ///
-    /// Two classes carry one course and one student, so the row names the first
-    /// and the second is its heir. While that first class's detach sweeps — a
-    /// pass per enrollment row, up to a full roster long — the heir drops the
-    /// student and detaches the course, both committed. Its two reads see an
-    /// heir that is already gone, and its write set (its own class, its own
-    /// link, the enrollment) touches nothing the heir's two deletes wrote: with
-    /// no read-set conflict detection, both sides commit and the row is left
-    /// tagged with a class holding neither link, which then passes its own 0/0
-    /// delete guard. The claim on the heir's counter is what puts the two
-    /// transactions on one record.
-    ///
-    /// Real server, and `#[ignore]`d for it, exactly like
-    /// [`crate::domain::class_course`]'s course-delete twin: the subject *is*
-    /// the store's conflict detection, which `init_mem`'s embedded engine does
-    /// not have — it commits both sides and answers `Ok` to each, so this passes
-    /// there on broken code.
-    ///
-    /// The window the old engine needed a schema event to open is the row
-    /// lock now: the owner's sweep claims the heir's class row before it
-    /// chooses the heir, so the heir's own member/course writes either land
-    /// wholly before the sweep reads them or wait behind it — and the
-    /// invariant below must hold in both orders. A barrier start lets every
-    /// interleaving happen instead of pinning one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_detached_row_is_never_handed_to_a_class_that_let_it_go() {
-        use crate::db::class_member::tests::{a_course, fixture_user, source_of};
-
-        let (db, _leases) = crate::database::init_test_db().await;
-        let manager = fixture_user(&db, "manager").await;
-        let student = fixture_user(&db, "student").await;
-        let (mut raced, mut stranded) = (0, 0);
-        for round in 0..4 {
-            let algebra = a_course(&format!("algebra{round}"), None, &db).await;
-            let owner = a_class(&format!("9-{round}-owner"), &db).await;
-            let heir = a_class(&format!("9-{round}-heir"), &db).await;
-            for class in [&owner, &heir] {
-                class_member::add(&db, class, &student, &manager)
-                    .await
-                    .unwrap();
-                class_course::attach(&db, class, &algebra, &manager)
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                source_of(&algebra, &student, &db).await,
-                Some(Some(owner.clone())),
-                "round {round}: the row must start out owned by the first class"
-            );
-
-            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-            let detaching = {
-                let (db, owner, algebra, gate) =
-                    (db.clone(), owner.clone(), algebra.clone(), gate.clone());
-                tokio::spawn(async move {
-                    gate.wait().await;
-                    class_course::detach(&db, &owner, &algebra).await
-                })
-            };
-            // The heir lets the row go, twice over, while the sweep is racing
-            // it for the same enrollment row.
-            let heir_moves = {
-                let (db, heir, algebra, gate) =
-                    (db.clone(), heir.clone(), algebra.clone(), gate);
-                tokio::spawn(async move {
-                    gate.wait().await;
-                    class_member::remove(&db, &heir, &student).await?;
-                    class_course::detach(&db, &heir, &algebra).await
-                })
-            };
-            let swept = detaching.await.unwrap();
-            heir_moves.await.unwrap().unwrap();
-            assert!(
-                !matches!(swept, Err(AppError::Db(_))),
-                "round {round}: a raced detach must be answered, not 500: {swept:?}"
-            );
-
-            // Stored state is the whole verdict; a return value is not evidence.
-            if swept.is_ok() {
-                raced += 1;
-            }
-            if source_of(&algebra, &student, &db).await == Some(Some(heir.clone())) {
-                stranded += 1;
-            }
-        }
-        eprintln!("a detach raced by its heir: {raced}/4 rounds swept");
-        assert!(raced > 0, "no round ever committed its sweep");
-        assert_eq!(
-            stranded, 0,
-            "an enrollment was left tagged with a class holding neither link"
-        );
-    }
-
 }

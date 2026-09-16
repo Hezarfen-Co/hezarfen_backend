@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE term SET exam_count = GREATEST(exam_count - 1, 0)\n                   WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e98a32d2edc7d1ba3b004ffb0d00fb0aa3c54b2a39a7bffd8df239011e23358"
+}

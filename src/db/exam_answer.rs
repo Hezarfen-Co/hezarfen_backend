@@ -312,13 +312,18 @@ mod tests {
         let kinds = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
+        // The instance and the dönem are foreign keys now: real rows the
+        // fixture mints.
+        let (instance, _course) = crate::db::course::a_test_instance(&db).await;
+        let term = crate::db::term::a_test_term(&db).await;
         let exam = crate::db::exam::create(
             &db,
             &student(),
-            &crate::db::course::a_test_course(&db).await,
+            &instance,
+            &term,
             ExamTitle::try_new("quiz").unwrap(),
             ExamDescription::try_new("").unwrap(),
-            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamKind::try_new("yazili", &kinds).unwrap(),
             ExamSchedule::try_new(None, None, None, None).unwrap(),
             ExamAttemptLimit::try_new(1).unwrap(),
             true,
@@ -396,7 +401,11 @@ mod tests {
         assert_eq!(stored(&db).await, Some(7), "the touch moved a real count");
 
         // The gate that makes the touch worth having: no exam, no answer.
-        let orphan = choice_question(&ExamId::from_key("019732e3-7b00-7000-8000-00000000e0a0"), 10, 0);
+        let orphan = choice_question(
+            &ExamId::from_key("019732e3-7b00-7000-8000-00000000e0a0"),
+            10,
+            0,
+        );
         let pick = choice_id(&orphan, 0).as_str().to_string();
         let refused = save(&db, &orphan, &student(), 1, Some(pick), None).await;
         assert!(

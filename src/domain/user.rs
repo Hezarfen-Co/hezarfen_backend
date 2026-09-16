@@ -233,6 +233,10 @@ pub struct User {
     // type and size live on the row.
     pub(crate) display_name: Option<DisplayName>,
     pub(crate) bio: Option<Bio>,
+    /// The staff member's branş (subject area), free text validated against
+    /// the school's own `Settings::get_branches()` list at the web layer —
+    /// optional like every other profile field, and clearable.
+    pub(crate) branch: Option<String>,
     pub(crate) avatar_file: Option<String>,
     pub(crate) avatar_content_type: Option<FileContentType>,
     pub(crate) avatar_size: Option<i64>,
@@ -262,6 +266,7 @@ impl User {
             palette_color: None,
             display_name: None,
             bio: None,
+            branch: None,
             avatar_file: None,
             avatar_content_type: None,
             avatar_size: None,
@@ -321,6 +326,12 @@ impl User {
 
     pub fn get_bio(&self) -> Option<&Bio> {
         self.bio.as_ref()
+    }
+
+    /// The staff member's branş, as stored (free text; membership in the
+    /// school's list is the write path's check, not this read's).
+    pub fn get_branch(&self) -> Option<&str> {
+        self.branch.as_deref()
     }
 
     pub fn get_avatar_file(&self) -> Option<&str> {

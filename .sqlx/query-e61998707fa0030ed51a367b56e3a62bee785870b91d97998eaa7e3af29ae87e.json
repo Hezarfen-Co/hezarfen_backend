@@ -1,0 +1,128 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE academic_year\n              SET name = COALESCE($2, name),\n                  starts_at = COALESCE($3, starts_at),\n                  ends_at = COALESCE($4, ends_at),\n                  grade_promotions = COALESCE($5, grade_promotions)\n            WHERE id = $1\n              AND COALESCE($4, ends_at) > COALESCE($3, starts_at)\n            RETURNING id AS \"id: AcademicYearId\", name AS \"name: AcademicYearName\",\n                      starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at: Timestamp\",\n                      archived_at AS \"archived_at: Timestamp\", creator AS \"creator: UserId\",\n                      grade_promotions AS \"grade_promotions: Json<Vec<GradePromotion>>\",\n                      class_count, term_count",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AcademicYearId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name: AcademicYearName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "archived_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "archived_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "grade_promotions: Json<Vec<GradePromotion>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "grade_promotions"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "class_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "class_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "term_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "term_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e61998707fa0030ed51a367b56e3a62bee785870b91d97998eaa7e3af29ae87e"
+}

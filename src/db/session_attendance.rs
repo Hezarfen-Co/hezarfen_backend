@@ -7,7 +7,7 @@
 use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
 use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::timestamp::Timestamp;
@@ -20,7 +20,7 @@ use crate::error::AppError;
 ///
 /// The "session still exists" gate is a row lock: the transaction takes the
 /// session row `FOR NO KEY UPDATE` before anything else, so a session (or
-/// course) delete cascading beneath this mark simply waits, and a delete
+/// instance) delete cascading beneath this mark simply waits, and a delete
 /// that got there first leaves this gate matching nothing — `404`, the
 /// mirror of [`crate::db::course_session::delete`]. The caller's
 /// pre-flight read sits several round trips in front of this write, which
@@ -130,17 +130,18 @@ pub async fn mark(
         .unwrap_or(false);
         let row = sqlx::query_as!(
             SessionAttendance,
-            r#"INSERT INTO session_attendance (session, app_user, course, status, marked_by, marked_at)
+            r#"INSERT INTO session_attendance (session, app_user, class_course, status, marked_by, marked_at)
                VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (session, app_user) DO UPDATE
                  SET status = EXCLUDED.status, marked_by = EXCLUDED.marked_by,
                      marked_at = EXCLUDED.marked_at
                RETURNING session AS "session: CourseSessionId", app_user AS "user: UserId",
-                         course AS "course: CourseId", status AS "status: AttendanceStatus",
+                         class_course AS "class_course: ClassCourseId",
+                         status AS "status: AttendanceStatus",
                          marked_by AS "marked_by: UserId""#,
             session.id.uuid(),
             user.uuid(),
-            session.course.uuid(),
+            session.class_course.uuid(),
             status.as_str(),
             marked_by.uuid(),
             now.as_millis(),
@@ -213,7 +214,8 @@ pub async fn list_for_user(
     let rows = sqlx::query_as!(
         SessionAttendance,
         r#"SELECT session AS "session: CourseSessionId", app_user AS "user: UserId",
-                  course AS "course: CourseId", status AS "status: AttendanceStatus",
+                  class_course AS "class_course: ClassCourseId",
+                  status AS "status: AttendanceStatus",
                   marked_by AS "marked_by: UserId"
            FROM session_attendance WHERE app_user = $1
            ORDER BY session DESC, app_user DESC"#,
@@ -251,7 +253,8 @@ pub async fn remove(
         let Some(gone) = sqlx::query_as!(
             SessionAttendance,
             r#"SELECT session AS "session: CourseSessionId", app_user AS "user: UserId",
-               course AS "course: CourseId", status AS "status: AttendanceStatus",
+               class_course AS "class_course: ClassCourseId",
+               status AS "status: AttendanceStatus",
                marked_by AS "marked_by: UserId"
                FROM session_attendance
                WHERE session = $1 AND app_user = $2
@@ -336,7 +339,7 @@ mod tests {
     async fn a_session_at(teacher: &UserId, starts_at: i64, db: &Database) -> CourseSession {
         crate::db::course_session::create(
             db,
-            &crate::db::course::a_test_course(db).await,
+            &crate::db::course::a_test_instance(db).await.0,
             teacher,
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(starts_at),
@@ -656,8 +659,9 @@ mod tests {
 
         let teacher = a_teacher("t", &db).await;
         let (mut swept, mut orphans) = (0, 0);
-        for (round, already_counted) in
-            [false, true, false, true, false, true, false, true].into_iter().enumerate()
+        for (round, already_counted) in [false, true, false, true, false, true, false, true]
+            .into_iter()
+            .enumerate()
         {
             let session = if already_counted {
                 // Counted by somebody else's mark, so this one credits nothing.

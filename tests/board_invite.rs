@@ -13,7 +13,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{ABSENT_ID, Res, app_and_db, create_course, enroll, login, login_as, me_id, send};
+use common::{ABSENT_ID, Res, app_and_db, enroll, login, login_as, me_id, send, taught_under};
 use hezarfen_backend::constant::MAX_BOARD_PARTICIPANTS;
 use hezarfen_backend::domain::board::BoardId;
 use hezarfen_backend::domain::user::UserId;
@@ -187,8 +187,19 @@ async fn a_club_invite_adds_its_members_without_removing_a_hand_invited_one() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let club = res.body["id"].as_str().unwrap().to_string();
-    enroll(&app, &teacher, &club, &ali_id).await;
-    enroll(&app, &teacher, &club, &ayse_id).await;
+    // A club is school-scoped (`kind` `club`), so its roster is the course
+    // membership tier — `POST /courses/{id}/members` — not a şube instance.
+    for user in [&ali_id, &ayse_id] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/courses/{club}/members"),
+            Some(&teacher),
+            Some(json!({ "user_id": user })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
 
     // Hakan is not in the club — he was invited by hand, and the club invite
     // must leave him alone.
@@ -276,9 +287,11 @@ async fn a_deleted_user_in_a_source_is_dropped() {
     let ghost = login(&app, "ghost").await;
     let (ali_id, ghost_id) = (me_id(&app, &ali).await, me_id(&app, &ghost).await);
 
-    let course = create_course(&app, &teacher, "Fizik").await;
-    enroll(&app, &teacher, &course, &ali_id).await;
-    enroll(&app, &teacher, &course, &ghost_id).await;
+    let mudur = login_as(&app, &db, "manager_g", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "Fizik").await;
+    enroll(&app, &teacher, &t.instance, &ali_id).await;
+    enroll(&app, &teacher, &t.instance, &ghost_id).await;
+    let course = t.course.clone();
 
     // The row goes without the cascade a real DELETE runs, which is exactly the
     // state a stale enrollment leaves behind. Real FKs refuse that state, so
@@ -407,8 +420,10 @@ async fn a_teacher_who_does_not_run_the_course_cannot_invite_its_roster() {
     let ali = login(&app, "ali").await;
     let ali_id = me_id(&app, &ali).await;
 
-    let course = create_course(&app, &owner, "Kimya").await;
-    enroll(&app, &owner, &course, &ali_id).await;
+    let mudur = login_as(&app, &db, "manager_h", "manager").await;
+    let t = taught_under(&app, &mudur, &owner, "Kimya").await;
+    enroll(&app, &owner, &t.instance, &ali_id).await;
+    let course = t.course.clone();
 
     let their_board = a_board(&app, &outsider).await;
     let res = invite(

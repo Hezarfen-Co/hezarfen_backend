@@ -16,13 +16,13 @@ use sqlx::types::Json;
 
 use crate::constant::{
     DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_DIETARY_TAGS,
-    DEFAULT_EXAM_KINDS, DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_CHATBOT_THREADS,
-    DEFAULT_MAX_FILE_BYTES, DEFAULT_MEAL_SLOTS, MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT,
-    MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN,
-    MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES,
-    MAX_MEAL_SERVING_MINUTE, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
-    MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN,
-    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
+    DEFAULT_EXAM_KINDS, DEFAULT_GRADE_BANDS, DEFAULT_MAX_CHATBOT_MESSAGE_LEN,
+    DEFAULT_MAX_CHATBOT_THREADS, DEFAULT_MAX_FILE_BYTES, DEFAULT_MEAL_SLOTS, DEFAULT_TIMEZONE,
+    MAX_ABSENCE_DAYS, MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS,
+    MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_CHATBOT_THREADS,
+    MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES, MAX_MEAL_SERVING_MINUTE,
+    MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
+    MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, TIMEZONES,
 };
 use crate::domain::text_fold;
 use crate::error::ValidationError;
@@ -215,6 +215,21 @@ pub struct Settings {
     /// for both deadlines; `None` = no cutoff at all, which is also what an
     /// unset column reads as.
     pub(crate) meal_cancel_cutoff_minutes: Option<i64>,
+    /// Öğretmen branş lists (D6): the school's subject specialisations a
+    /// teacher profile may name. `None`-while-unset; an empty list is legal
+    /// (a school that never configured branş).
+    pub(crate) branches: Option<Json<Vec<String>>>,
+    /// What an absence may be excused as (raporlu/izinli/…): the vocabulary
+    /// pointed at by an excused roll-call row. `None`-while-unset, like
+    /// `branches`.
+    pub(crate) excuse_kinds: Option<Json<Vec<String>>>,
+    /// Devamsızlık policy (D7): the per-dönem excused/unexcused day limits a
+    /// student may exceed. `None` = no limit configured.
+    pub(crate) max_excused_absent_days: Option<i64>,
+    pub(crate) max_unexcused_absent_days: Option<i64>,
+    /// The school's IANA timezone, used to bucket attendance days. `None`
+    /// reads as [`crate::constant::DEFAULT_TIMEZONE`].
+    pub(crate) timezone: Option<String>,
 }
 
 /// Everything [`Settings::try_new`] validates, in one struct — the knobs
@@ -233,6 +248,13 @@ pub struct SettingsParams {
     pub dietary_tags: Vec<String>,
     /// `None` = no booking/cancel cutoff.
     pub meal_cancel_cutoff_minutes: Option<i64>,
+    pub branches: Vec<String>,
+    pub excuse_kinds: Vec<String>,
+    /// `None` = no limit configured.
+    pub max_excused_absent_days: Option<i64>,
+    pub max_unexcused_absent_days: Option<i64>,
+    /// `None` = the deployment default timezone.
+    pub timezone: Option<String>,
 }
 
 impl Settings {
@@ -253,7 +275,14 @@ impl Settings {
                 statuses.sort();
                 statuses
             },
-            grade_bands: Json(Vec::new()),
+            grade_bands: Json(
+                DEFAULT_GRADE_BANDS
+                    .map(|(min, label)| GradeBand {
+                        min,
+                        label: label.to_string(),
+                    })
+                    .to_vec(),
+            ),
             max_file_bytes: None,
             chatbot_history_turns: None,
             max_chatbot_threads: None,
@@ -261,6 +290,11 @@ impl Settings {
             meal_slots: None,
             dietary_tags: None,
             meal_cancel_cutoff_minutes: None,
+            branches: None,
+            excuse_kinds: None,
+            max_excused_absent_days: None,
+            max_unexcused_absent_days: None,
+            timezone: None,
         }
     }
 
@@ -278,6 +312,11 @@ impl Settings {
             meal_slots: self.get_meal_slots(),
             dietary_tags: self.get_dietary_tags(),
             meal_cancel_cutoff_minutes: self.meal_cancel_cutoff_minutes,
+            branches: self.get_branches(),
+            excuse_kinds: self.get_excuse_kinds(),
+            max_excused_absent_days: self.max_excused_absent_days,
+            max_unexcused_absent_days: self.max_unexcused_absent_days,
+            timezone: self.timezone.clone(),
         }
     }
 
@@ -301,6 +340,11 @@ impl Settings {
             meal_slots,
             dietary_tags,
             meal_cancel_cutoff_minutes,
+            branches,
+            excuse_kinds,
+            max_excused_absent_days,
+            max_unexcused_absent_days,
+            timezone,
         } = params;
         in_range(
             "max_file_bytes",
@@ -395,6 +439,41 @@ impl Settings {
             )?;
         }
 
+        // Branş and excuse-kind lists follow the same rules as the kinds and
+        // statuses above, but empty is legal on both — a school that never
+        // configured either is not forced to invent one.
+        let branches = if branches.is_empty() {
+            branches
+        } else {
+            validate_list("branches", branches)?
+        };
+        let excuse_kinds = if excuse_kinds.is_empty() {
+            excuse_kinds
+        } else {
+            validate_list("excuse_kinds", excuse_kinds)?
+        };
+        for (field, value) in [
+            ("max_excused_absent_days", max_excused_absent_days),
+            ("max_unexcused_absent_days", max_unexcused_absent_days),
+        ] {
+            if let Some(days) = value {
+                in_range(
+                    field,
+                    days,
+                    0..=MAX_ABSENCE_DAYS,
+                    "must be between 0 and 365 days",
+                )?;
+            }
+        }
+        if let Some(tz) = timezone.as_deref()
+            && !TIMEZONES.contains(&tz)
+        {
+            return Err(ValidationError::Invalid {
+                field: "timezone",
+                reason: "is not a supported timezone (see GET /limits)",
+            });
+        }
+
         Ok(Self {
             exam_kinds: Json(exam_kinds),
             attendance_statuses,
@@ -406,6 +485,11 @@ impl Settings {
             meal_slots: Some(Json(meal_slots)),
             dietary_tags: Some(dietary_tags),
             meal_cancel_cutoff_minutes,
+            branches: Some(Json(branches)),
+            excuse_kinds: Some(Json(excuse_kinds)),
+            max_excused_absent_days,
+            max_unexcused_absent_days,
+            timezone,
         })
     }
 
@@ -494,6 +578,39 @@ impl Settings {
     /// no cutoff, the default while the school never set one.
     pub fn get_meal_cancel_cutoff_minutes(&self) -> Option<i64> {
         self.meal_cancel_cutoff_minutes
+    }
+
+    /// The branş (subject specialisation) vocabulary a teacher profile may
+    /// name; empty while the school never configured one.
+    pub fn get_branches(&self) -> Vec<String> {
+        self.branches
+            .as_ref()
+            .map(|list| list.0.clone())
+            .unwrap_or_default()
+    }
+
+    /// The excuse-kind vocabulary an excused absence may name; empty while the
+    /// school never configured one.
+    pub fn get_excuse_kinds(&self) -> Vec<String> {
+        self.excuse_kinds
+            .as_ref()
+            .map(|list| list.0.clone())
+            .unwrap_or_default()
+    }
+
+    /// The per-dönem excused-absence day limit; `None` = no limit configured.
+    pub fn get_max_excused_absent_days(&self) -> Option<i64> {
+        self.max_excused_absent_days
+    }
+
+    /// The per-dönem unexcused-absence day limit; `None` = no limit configured.
+    pub fn get_max_unexcused_absent_days(&self) -> Option<i64> {
+        self.max_unexcused_absent_days
+    }
+
+    /// The school's IANA timezone; the deployment default while unset.
+    pub fn get_timezone(&self) -> &str {
+        self.timezone.as_deref().unwrap_or(DEFAULT_TIMEZONE)
     }
 
     /// The label of the band `mark` falls into: the band with the greatest
@@ -600,7 +717,10 @@ mod tests {
         let defaults = Settings::defaults();
         let rebuilt = Settings::try_new(defaults.params()).unwrap();
         assert_eq!(rebuilt.get_exam_kinds(), defaults.get_exam_kinds());
-        assert!(defaults.get_grade_bands().is_empty());
+        // The Türkiye 5-point scale ships by default, so a mark always labels.
+        assert_eq!(defaults.get_grade_bands().len(), DEFAULT_GRADE_BANDS.len());
+        assert_eq!(defaults.grade_label(90.0), Some("5"));
+        assert_eq!(defaults.grade_label(0.0), Some("1"));
     }
 
     #[tokio::test]
@@ -846,7 +966,12 @@ mod tests {
         assert_eq!(s.grade_label(84.9), Some("CC"));
         assert_eq!(s.grade_label(85.0), Some("AA"));
         assert_eq!(s.grade_label(100.0), Some("AA"));
-        // No bands configured → no label, never a panic.
-        assert_eq!(Settings::defaults().grade_label(90.0), None);
+        // With no bands configured there is no label, never a panic.
+        let bare = Settings::try_new(SettingsParams {
+            grade_bands: vec![],
+            ..params()
+        })
+        .unwrap();
+        assert_eq!(bare.grade_label(90.0), None);
     }
 }

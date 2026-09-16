@@ -12,7 +12,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{create_course, create_exam, enroll, login_as, me_id, send};
+use common::{create_exam, enroll, login_as, me_id, send, taught};
 use serde_json::{Value, json};
 
 /// The two kinds these tests move in and out of the school's list.
@@ -47,7 +47,8 @@ fn listed_kinds(body: &Value) -> Vec<String> {
 struct School {
     app: axum::Router,
     boss: String,
-    course: String,
+    instance: String,
+    term: String,
     exam: String,
     student: String,
 }
@@ -66,13 +67,17 @@ async fn school_with_kinds(names: &[&str]) -> School {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "seed exam kinds");
-    let course = create_course(&app, &boss, "Maths").await;
-    enroll(&app, &boss, &course, &student).await;
-    let exam = create_exam(&app, &boss, &course, "Midterm", names[0]).await;
+    // The instance is the anchor: exams, marks and rosters hang off it, not the
+    // catalog course. A manager mints the şube (school structure) and is its
+    // homeroom teacher too, so the same cookie keeps rights over the instance.
+    let t = taught(&app, &boss, "Maths").await;
+    enroll(&app, &boss, &t.instance, &student).await;
+    let exam = create_exam(&app, &boss, &t.instance, &t.term, "Midterm", names[0]).await;
     School {
         app,
         boss,
-        course,
+        instance: t.instance,
+        term: t.term,
         exam,
         student,
     }
@@ -245,7 +250,15 @@ async fn a_graded_exams_kind_is_frozen() {
 #[tokio::test]
 async fn deleting_one_exam_frees_only_its_own_marks() {
     let school = school_with_kinds(&["lab", "quiz"]).await;
-    let second = create_exam(&school.app, &school.boss, &school.course, "Final", "lab").await;
+    let second = create_exam(
+        &school.app,
+        &school.boss,
+        &school.instance,
+        &school.term,
+        "Final",
+        "lab",
+    )
+    .await;
     assert_eq!(school.grade(80).await.status, StatusCode::OK);
     assert_eq!(school.grade_exam(&second, 70).await.status, StatusCode::OK);
 
@@ -278,30 +291,6 @@ async fn deleting_one_exam_frees_only_its_own_marks() {
     .await;
     assert_eq!(last.status, StatusCode::NO_CONTENT);
     assert_eq!(school.set_kinds(&["quiz"]).await.status, StatusCode::OK);
-}
-
-/// A course delete cascades its exams' marks, so it owes their kinds the same
-/// references back — otherwise the kind is held down by marks that no longer
-/// exist, forever.
-#[tokio::test]
-async fn deleting_a_course_frees_the_kinds_its_marks_held() {
-    let school = school_with_kinds(&["lab", "quiz"]).await;
-    assert_eq!(school.grade(80).await.status, StatusCode::OK);
-    // A course with a roster refuses the delete; the mark stays either way.
-    common::unenroll(&school.app, &school.boss, &school.course, &school.student).await;
-
-    let gone = send(
-        &school.app,
-        "DELETE",
-        &format!("/courses/{}", school.course),
-        Some(&school.boss),
-        None,
-    )
-    .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT, "{}", gone.body);
-
-    assert_eq!(school.set_kinds(&["quiz"]).await.status, StatusCode::OK);
-    assert_eq!(listed_kinds(&school.settings().await), ["quiz"]);
 }
 
 /// The same pair for meal slots, whose reference is a published menu.
@@ -366,4 +355,3 @@ async fn a_published_menu_pins_its_meal_slot() {
         "slot is no longer served"
     );
 }
-

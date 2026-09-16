@@ -40,7 +40,10 @@ mod tests {
     #[test]
     fn a_slot_key_never_collides_with_the_illustration() {
         assert_eq!(slot(QUESTION, None), format!("{QUESTION}_q"));
-        assert_eq!(slot(QUESTION, Some(STUDENT)), format!("{QUESTION}_{STUDENT}"));
+        assert_eq!(
+            slot(QUESTION, Some(STUDENT)),
+            format!("{QUESTION}_{STUDENT}")
+        );
         // A choice id is a UUID, so it can never be the literal "q".
         assert_ne!(slot(QUESTION, Some(STUDENT)), slot(QUESTION, None));
     }
@@ -49,7 +52,10 @@ mod tests {
     fn the_first_sitting_stays_bare_and_later_ones_are_numbered() {
         // Byte-for-byte the shape the four sitting-keyed tables wrote before
         // this helper existed; a pre-history row is keyed by the bare pair.
-        assert_eq!(sitting(QUESTION, STUDENT, 1), format!("{QUESTION}_{STUDENT}"));
+        assert_eq!(
+            sitting(QUESTION, STUDENT, 1),
+            format!("{QUESTION}_{STUDENT}")
+        );
         assert_eq!(
             sitting(QUESTION, STUDENT, 2),
             format!("{QUESTION}_{STUDENT}_2")

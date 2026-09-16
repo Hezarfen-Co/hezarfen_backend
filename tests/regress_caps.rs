@@ -11,14 +11,14 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{app_and_db, create_course, create_exam, enroll, id_of, login, login_as, me_id, send};
+use common::{app_and_db, create_exam, enroll, id_of, login, login_as, me_id, send, taught_under};
 use hezarfen_backend::domain::board::BoardId;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 
-/// The default kinds, minus one — the body a manager sends to drop `midterm`.
-fn kinds_without_midterm() -> serde_json::Value {
-    json!({"exam_kinds": [{"name": "final", "weight": 3}, {"name": "oral", "weight": 1}]})
+/// The default kinds, minus one — the body a manager sends to drop `yazili`.
+fn kinds_without_yazili() -> serde_json::Value {
+    json!({"exam_kinds": [{"name": "sozlu", "weight": 1}, {"name": "uygulama", "weight": 1}]})
 }
 
 /// Grading is gated twice: by the school's list and by the kind's reference
@@ -34,9 +34,9 @@ async fn a_kind_off_the_schools_list_cannot_be_graded_even_with_a_live_counter()
     let manager = login_as(&app, &db, "mudur", "manager").await;
     let student = login(&app, "ogrenci").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Matematik").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Vize", "midterm").await;
+    let t = taught_under(&app, &manager, &teacher, "Matematik").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "Vize", "yazili").await;
 
     // The kind leaves the list — legal, nothing is graded under it yet.
     let res = send(
@@ -44,7 +44,7 @@ async fn a_kind_off_the_schools_list_cannot_be_graded_even_with_a_live_counter()
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(kinds_without_midterm()),
+        Some(kinds_without_yazili()),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -52,7 +52,7 @@ async fn a_kind_off_the_schools_list_cannot_be_graded_even_with_a_live_counter()
     // The corrupt half a lost settings race used to leave: the name is off the
     // list, but its counter says "in service".
     sqlx::query(
-        "INSERT INTO kind_ref (name, count, retired) VALUES ('midterm', 0, false)
+        "INSERT INTO kind_ref (name, count, retired) VALUES ('yazili', 0, false)
          ON CONFLICT (name) DO UPDATE SET retired = false",
     )
     .execute(&db)
@@ -98,9 +98,9 @@ async fn re_adding_the_kind_lets_the_grade_land() {
     let manager = login_as(&app, &db, "mudur", "manager").await;
     let student = login(&app, "ogrenci").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Matematik").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Vize", "midterm").await;
+    let t = taught_under(&app, &manager, &teacher, "Matematik").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "Vize", "yazili").await;
     let grade = json!({ "user_id": student_id, "mark": 80 });
 
     send(
@@ -108,7 +108,7 @@ async fn re_adding_the_kind_lets_the_grade_land() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(kinds_without_midterm()),
+        Some(kinds_without_yazili()),
     )
     .await;
     let res = send(
@@ -127,9 +127,9 @@ async fn re_adding_the_kind_lets_the_grade_land() {
         "/settings",
         Some(&manager),
         Some(json!({"exam_kinds": [
-            {"name": "midterm", "weight": 2},
-            {"name": "final", "weight": 3},
-            {"name": "oral", "weight": 1},
+            {"name": "yazili", "weight": 2},
+            {"name": "sozlu", "weight": 1},
+            {"name": "uygulama", "weight": 1},
         ]})),
     )
     .await;

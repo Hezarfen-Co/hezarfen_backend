@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM academic_year\n           WHERE id = $1 AND class_count = 0 AND term_count = 0",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ccb478d5d6140d28698b183ad905af36a014f483dc548b0068be808eb7b38df0"
+}

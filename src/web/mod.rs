@@ -3,6 +3,7 @@
 //! validated domain newtypes before doing anything. Role-gated endpoints take a
 //! `RequireTeacher` / `RequireAdmin` extractor instead of `CurrentUser`.
 
+pub mod academic_years;
 pub mod ai;
 pub mod appointments;
 pub mod attendance;
@@ -20,6 +21,7 @@ pub mod events;
 pub mod exam_ws;
 pub mod exams;
 pub mod homework;
+pub mod instances;
 pub mod limits;
 pub mod marks;
 pub mod meals;
@@ -106,7 +108,7 @@ pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<()
         return Ok(());
     }
     crate::service::class_group::unassign_everywhere(db, target).await?;
-    crate::service::course::unassign_everywhere(db, target).await?;
+    crate::db::class_course_teacher::unassign_everywhere(db, target).await?;
     Err(AppError::Conflict(
         "that user was demoted below teacher while this request ran — the assignment was undone; re-read their role and retry",
     ))
@@ -382,12 +384,22 @@ mod tests {
 
         let (db, _leases) = crate::database::init_test_db().await;
         let office = crate::db::class_member::tests::fixture_user(&db, "office").await;
+        // Staffing an instance is the office's call: `assign_teacher` is
+        // manager+, and the fixture mints a plain student.
+        sqlx::query("UPDATE app_user SET role = 'manager' WHERE id = $1")
+            .bind(office.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
         let teacher = crate::service::user::create(&db, Username::try_new("ada").unwrap(), None)
             .await
             .unwrap();
         crate::service::user::set_role(&db, teacher.get_id(), Role::Teacher)
             .await
             .unwrap();
+        // The two assignments the undo owes: the şube's homeroom teacher, and
+        // a teacher assigned to one of its instances (the catalog's own
+        // assignment list is gone with D6 — who teaches is per instance).
         let assigned = async |db: &Database| {
             let class = crate::service::class_group::create(
                 db,
@@ -399,29 +411,33 @@ mod tests {
             )
             .await
             .unwrap();
-            let course = crate::service::course::assign_teacher(
+            let course = crate::service::course::create(
                 db,
-                &crate::service::course::create(
-                    db,
-                    &office,
-                    CourseTitle::try_new("algebra").unwrap(),
-                    CourseDescription::try_new("").unwrap(),
-                    CourseKind::course(),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap(),
-                teacher.get_id(),
+                &office,
+                CourseTitle::try_new("algebra").unwrap(),
+                CourseDescription::try_new("").unwrap(),
+                CourseKind::course(),
             )
             .await
             .unwrap();
-            (class, course)
+            let instance =
+                crate::service::class_course::attach(db, class.get_id(), course.get_id(), &office)
+                    .await
+                    .unwrap();
+            crate::service::class_course::assign_teacher(
+                db,
+                instance.get_id(),
+                teacher.get_id(),
+                &office,
+            )
+            .await
+            .unwrap();
+            (class, instance)
         };
-        /// `(the class's stored teacher, the course's stored teacher list)`.
+        /// `(the class's stored homeroom teacher, the instance's teacher list)`.
         async fn stored(
             class: &crate::domain::class_group::ClassGroupId,
-            course: &crate::domain::course::CourseId,
+            instance: &crate::domain::class_course::ClassCourseId,
             db: &Database,
         ) -> (Option<UserId>, Vec<UserId>) {
             (
@@ -431,26 +447,20 @@ mod tests {
                     .unwrap()
                     .get_teacher()
                     .cloned(),
-                crate::service::course::read(db, course)
+                crate::db::class_course_teacher::list_for_instance(db, instance)
                     .await
-                    .unwrap()
-                    .unwrap()
-                    .get_teachers()
-                    .to_vec(),
+                    .unwrap(),
             )
         }
 
         // Still staff: one read, and not a single write.
-        let (class, course) = assigned(&db).await;
+        let (class, instance) = assigned(&db).await;
         undo_if_demoted(teacher.get_id(), &db)
             .await
             .expect("an account that is still teacher+ keeps what it was given");
         assert_eq!(
-            stored(class.get_id(), course.get_id(), &db).await,
-            (
-                Some(*teacher.get_id()),
-                vec![*teacher.get_id()]
-            ),
+            stored(class.get_id(), instance.get_id(), &db).await,
+            (Some(*teacher.get_id()), vec![*teacher.get_id()]),
             "nothing may be undone while the bar still holds"
         );
 
@@ -466,7 +476,7 @@ mod tests {
             "a demotion mid-request must be a 409 naming it: {refused:?}"
         );
         assert_eq!(
-            stored(class.get_id(), course.get_id(), &db).await,
+            stored(class.get_id(), instance.get_id(), &db).await,
             (None, Vec::new()),
             "…with both assignments taken back, not just the caller's own"
         );
@@ -479,7 +489,7 @@ mod tests {
         );
         assert!(undo_if_demoted(teacher.get_id(), &db).await.is_err());
         assert_eq!(
-            stored(class.get_id(), course.get_id(), &db).await,
+            stored(class.get_id(), instance.get_id(), &db).await,
             (None, Vec::new())
         );
     }

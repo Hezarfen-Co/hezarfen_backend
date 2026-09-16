@@ -9,9 +9,7 @@
 //! ([`ChatbotMessage::projected`]) — the durable repair for a dead process
 //! happens once, at mint, in `database.rs`'s school migration sweep.
 
-use crate::constant::{
-    CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, STALE_ERROR_CODE,
-};
+use crate::constant::{CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, STALE_ERROR_CODE};
 use crate::domain::chatbot_thread::ChatbotThreadId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;

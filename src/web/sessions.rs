@@ -11,7 +11,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::course::Course;
+use crate::domain::class_course::ClassCourse;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 
 use crate::domain::role::Role;
@@ -22,7 +22,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::service;
 use crate::state::AppState;
 
-use super::courses::{can_manage_course, can_view_course};
+use super::instances::{can_manage_instance, can_view_instance};
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SessionResponse, check_not_past,
     check_time_range, person_map, set_or_clear,
@@ -66,7 +66,7 @@ struct MarkRollCall {
 struct SessionAttendanceResponse {
     id: String,
     session: String,
-    course: String,
+    class_course: String,
     /// Whose attendance this row records.
     user: PersonRef,
     status: String,
@@ -77,9 +77,10 @@ struct SessionAttendanceResponse {
 impl SessionAttendanceResponse {
     fn new(attendance: &SessionAttendance, people: &HashMap<String, PersonRef>) -> Self {
         Self {
-            id: SessionAttendanceId::composite(attendance.get_session(), attendance.get_user()).key(),
+            id: SessionAttendanceId::composite(attendance.get_session(), attendance.get_user())
+                .key(),
             session: attendance.get_session().key().to_string(),
-            course: attendance.get_course().key().to_string(),
+            class_course: attendance.get_class_course().key().to_string(),
             user: PersonRef::resolve(people, attendance.get_user()),
             status: attendance.get_status().as_str().to_string(),
             marked_by: PersonRef::resolve(people, attendance.get_marked_by()),
@@ -87,39 +88,48 @@ impl SessionAttendanceResponse {
     }
 }
 
-/// Load a session and its course together; a session whose course is gone
+/// Load a session and its instance together; a session whose instance is gone
 /// cannot happen given the delete cascade, so both misses are plain 404s.
-async fn session_with_course(id: &str, db: &Database) -> Result<(CourseSession, Course), AppError> {
+async fn session_with_instance(
+    id: &str,
+    db: &Database,
+) -> Result<(CourseSession, ClassCourse), AppError> {
     let session = service::course_session::read(db, &CourseSessionId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = crate::service::course::read(db, session.get_course())
+    let instance = crate::service::class_course::read(db, session.get_class_course())
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok((session, course))
+    Ok((session, instance))
 }
 
 /// Whether `user` is the session's own teacher *and* still `teacher`+ today.
 ///
-/// The `teacher` column is a historical fact like a course's `creator` (a
+/// The `teacher` column is a historical fact like an instance's assignment (a
 /// demotion never rewrites past sessions), so teaching a session grants nothing
-/// once the account falls below `teacher` — see [`can_manage_course`], which
+/// once the account falls below `teacher` — see [`can_manage_instance`], which
 /// carries the same floor.
 fn is_live_session_teacher(session: &CourseSession, user: &User) -> bool {
     user.get_role().at_least(Role::Teacher) && session.is_teacher(user.get_id())
 }
 
 /// Who may take (or amend) a session's roll call: the session's own teacher,
-/// or anyone with course-management rights (creator / manager+) — in both
-/// cases only while still `teacher`+.
-fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool {
-    is_live_session_teacher(session, user) || can_manage_course(course, user)
+/// or anyone who manages its instance (manager+, one of its teachers, or its
+/// şube's homeroom teacher) — in both cases only while still `teacher`+.
+async fn can_roll_call(
+    session: &CourseSession,
+    instance: &ClassCourse,
+    user: &User,
+    db: &Database,
+) -> Result<bool, AppError> {
+    Ok(is_live_session_teacher(session, user)
+        || can_manage_instance(db, instance.get_id(), user).await?)
 }
 
 // ---- sessions -------------------------------------------------------------
 
-/// Fetch a single session by id. Visible to its course's enrolled users, the
-/// session's teacher, the course's own teachers, and managers/admins.
+/// Fetch a single session by id. Visible to the instance's enrolled students, the
+/// session's own teacher, the instance's teachers, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -129,7 +139,7 @@ fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool 
     responses(
         (status = 200, description = "The session", body = SessionResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the session teacher, and without course rights", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the session's teacher, and without instance rights", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -138,18 +148,19 @@ async fn get_session(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<SessionResponse>, AppError> {
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !is_live_session_teacher(&session, &user) && !can_view_course(&course, &user, &st.db).await?
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !is_live_session_teacher(&session, &user)
+        && !can_view_instance(&st.db, instance.get_id(), &user).await?
     {
         return Err(AppError::Forbidden(
-            "only enrolled users, the session teacher, the course's teachers, or a manager/admin can view this session",
+            "only the instance's enrolled students, the session's teacher, its teachers, or a manager/admin can view this session",
         ));
     }
     let people = person_map([*session.get_teacher()], &st.db).await?;
     Ok(Json(SessionResponse::new(&session, &people)))
 }
 
-/// Update a session. Requires teacher+ with course-management rights. Omitted
+/// Update a session. Requires teacher+ with instance-management rights. Omitted
 /// fields keep their value; an explicit `null` clears `ends_at`.
 #[utoipa::path(
     patch,
@@ -162,10 +173,10 @@ async fn get_session(
         (status = 200, description = "Updated session", body = SessionResponse),
         (status = 400, description = "Invalid fields, time range, newly set times in the past, or teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn update_session(
@@ -184,13 +195,13 @@ async fn update_session(
     if let Some(ends_at) = ends_at {
         check_not_past("ends_at", ends_at)?;
     }
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this session",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can edit this session",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
 
     let topic = req
         .topic
@@ -221,7 +232,7 @@ async fn update_session(
 }
 
 /// Delete a session and its roll-call rows. Requires teacher+ with
-/// course-management rights.
+/// instance-management rights.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -231,9 +242,9 @@ async fn update_session(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_session(
@@ -241,13 +252,13 @@ async fn delete_session(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this session",
+            "only the instance's teachers, its şube's homeroom teacher, or a manager/admin can delete this session",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     service::course_session::delete(&st.db, session).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -255,10 +266,10 @@ async fn delete_session(
 // ---- roll call --------------------------------------------------------------
 
 /// Record a user's roll-call state for a session. The session's teacher or a
-/// course manager marks **enrolled students** (only students attend classes);
-/// marking the **session's teacher** requires manager+ (staff presence is
-/// management's call, so a teacher can't mark themselves present). Students
-/// never self-mark a lesson.
+/// manager of its instance marks **enrolled students** (only students attend
+/// classes); marking the **session's teacher** requires manager+ (staff
+/// presence is management's call, so a teacher can't mark themselves present).
+/// Students never self-mark a lesson.
 #[utoipa::path(
     post,
     path = "/{id}/attendance",
@@ -270,10 +281,10 @@ async fn delete_session(
         (status = 200, description = "Roll-call state recorded", body = SessionAttendanceResponse),
         (status = 400, description = "Invalid status, unknown user, target not a student, or not on the roster", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the session teacher or a course manager; or marking the teacher without manager+", body = ErrorResponse),
+        (status = 403, description = "Not the session's teacher or a manager of its instance; or marking the teacher without manager+", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn mark_roll_call(
@@ -282,13 +293,13 @@ async fn mark_roll_call(
     Path(id): Path<String>,
     Json(req): Json<MarkRollCall>,
 ) -> Result<Json<SessionAttendanceResponse>, AppError> {
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !can_roll_call(&session, &course, &user) {
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !can_roll_call(&session, &instance, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only the session's teacher or a course manager can take roll call",
+            "only the session's teacher or a manager of its instance can take roll call",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
 
     let school = service::settings::load(&st.db).await?;
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
@@ -302,7 +313,8 @@ async fn mark_roll_call(
 
 /// List a session's roll call, paged via `?limit=&offset=` (omit `limit` for
 /// the whole roster). Same rights as taking it: the session's teacher or a
-/// course manager — students see their own tallies via `GET /attendance/me`.
+/// manager of its instance — students see their own tallies via
+/// `GET /attendance/me`.
 /// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -314,7 +326,7 @@ async fn mark_roll_call(
         (status = 200, description = "A page of the roll-call roster (all of it when unpaged)", body = Page<SessionAttendanceResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the session teacher or a course manager", body = ErrorResponse),
+        (status = 403, description = "Not the session's teacher or a manager of its instance", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
     ),
 )]
@@ -325,10 +337,10 @@ async fn list_roll_call(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<SessionAttendanceResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !can_roll_call(&session, &course, &user) {
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !can_roll_call(&session, &instance, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only the session's teacher or a course manager can list the roll call",
+            "only the session's teacher or a manager of its instance can list the roll call",
         ));
     }
     let (rows, total) =
@@ -349,8 +361,8 @@ async fn list_roll_call(
 }
 
 /// Remove a user's roll-call row from a session. Same rights as marking:
-/// session teacher or course manager for students, manager+ for a staff row
-/// (any target holding teacher or higher).
+/// the session's teacher or a manager of its instance for students, manager+
+/// for a staff row (any target holding teacher or higher).
 #[utoipa::path(
     delete,
     path = "/{id}/attendance/{user}",
@@ -363,9 +375,9 @@ async fn list_roll_call(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the session teacher or a course manager; or removing a staff row without manager+", body = ErrorResponse),
+        (status = 403, description = "Not the session's teacher or a manager of its instance; or removing a staff row without manager+", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_roll_call(
@@ -373,13 +385,13 @@ async fn remove_roll_call(
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let (session, course) = session_with_course(&id, &st.db).await?;
-    if !can_roll_call(&session, &course, &user) {
+    let (session, instance) = session_with_instance(&id, &st.db).await?;
+    if !can_roll_call(&session, &instance, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only the session's teacher or a course manager can take roll call",
+            "only the session's teacher or a manager of its instance can take roll call",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     let target = UserId::from_key(&target);
     service::session_attendance::remove(&st.db, &session, &user, &target).await?;
     Ok(StatusCode::NO_CONTENT)

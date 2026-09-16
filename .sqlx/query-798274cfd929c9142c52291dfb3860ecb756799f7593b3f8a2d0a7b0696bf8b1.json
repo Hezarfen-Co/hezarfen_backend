@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT class_member_count, class_course_count, year AS \"year: uuid::Uuid\"\n                 FROM class_group WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_member_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "class_member_count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class_course_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "class_course_count"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "year: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "year"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "798274cfd929c9142c52291dfb3860ecb756799f7593b3f8a2d0a7b0696bf8b1"
+}

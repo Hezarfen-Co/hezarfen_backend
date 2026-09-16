@@ -9,12 +9,14 @@
 use crate::database::{Database, tx_with_retry};
 use crate::db::cap::Claimed;
 use crate::db::page::PagedList;
-use crate::domain::appointment::{Appointment, AppointmentId, AppointmentReason, AppointmentStatus};
+use crate::domain::appointment::{
+    Appointment, AppointmentId, AppointmentReason, AppointmentStatus,
+};
 use crate::domain::appointment_slot::AppointmentSlotId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-use sqlx::{query, query_as, PgConnection, Postgres};
+use sqlx::{PgConnection, Postgres, query, query_as};
 
 /// Is `[starts_at, ends_at)` already taken for either party? Both sides are
 /// checked: a teacher can't be in two meetings at once, and neither can a
@@ -80,7 +82,10 @@ where
         }))
 }
 
-pub(crate) async fn read_on<'e, E>(executor: E, id: &AppointmentId) -> Result<Option<Appointment>, AppError>
+pub(crate) async fn read_on<'e, E>(
+    executor: E,
+    id: &AppointmentId,
+) -> Result<Option<Appointment>, AppError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
@@ -103,10 +108,7 @@ where
     Ok(appointment)
 }
 
-pub async fn read(
-    db: &Database,
-    id: &AppointmentId,
-) -> Result<Option<Appointment>, AppError> {
+pub async fn read(db: &Database, id: &AppointmentId) -> Result<Option<Appointment>, AppError> {
     read_on(db, id).await
 }
 

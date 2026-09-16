@@ -588,11 +588,10 @@ mod tests {
             "the attempt this call read is gone, so it releases nothing"
         );
         // Stored state, not the returned value: the mem engine forges wins.
-        let stored =
-            read(&db, &MealBookingId::composite(&menu, live.get_student()))
-                .await
-                .unwrap()
-                .unwrap();
+        let stored = read(&db, &MealBookingId::composite(&menu, live.get_student()))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.get_status(), MealBookingStatus::Booked);
         assert_eq!(stored.get_attempt(), live.get_attempt());
         assert_eq!(seats(&menu, &db).await, 1, "and gives no seat back");

@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n             DELETE FROM course_membership\n              WHERE course = $1 AND app_user = $2\n              RETURNING course, app_user, added_by, created_at),\n           counted AS (\n             UPDATE course\n                SET course_membership_count = GREATEST(\n                    course_membership_count - (SELECT count(*) FROM gone), 0)\n              WHERE id = $1\n              RETURNING 1)\n           SELECT course AS \"course: CourseId\", app_user AS \"user: UserId\",\n               added_by AS \"added_by: UserId\", created_at AS \"created_at: Timestamp\"\n           FROM gone",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "added_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "added_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_membership",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "719a5da335489982564b3334fd52f86ae36ff88ab1ee7ada8129de8baadea9cf"
+}

@@ -207,10 +207,7 @@ async fn approve_inner(
             }
             _ => {}
         }
-        let slot_id = expected
-            .get_slot()
-            .ok_or(AppError::NotFound)?
-            .clone();
+        let slot_id = expected.get_slot().ok_or(AppError::NotFound)?.clone();
         let slot = appointment_slot::read_on(&mut *tx, &slot_id)
             .await?
             .ok_or(AppError::NotFound)?;
@@ -456,7 +453,13 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            book(&db, started.get_id(), &a_person(&db, "s1", "student").await, reason()).await,
+            book(
+                &db,
+                started.get_id(),
+                &a_person(&db, "s1", "student").await,
+                reason()
+            )
+            .await,
             Err(AppError::Conflict("the slot has already started"))
         ));
 
@@ -464,9 +467,14 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            book(&db, upcoming.get_id(), &a_person(&db, "s1", "student").await, reason())
-                .await
-                .is_ok()
+            book(
+                &db,
+                upcoming.get_id(),
+                &a_person(&db, "s1", "student").await,
+                reason()
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -710,12 +718,23 @@ mod tests {
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
-            .await
-            .unwrap();
+        book(
+            &db,
+            slot.get_id(),
+            &a_person(&db, "s1", "student").await,
+            reason(),
+        )
+        .await
+        .unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
 
-        let refused = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await;
+        let refused = book(
+            &db,
+            slot.get_id(),
+            &a_person(&db, "s2", "student").await,
+            reason(),
+        )
+        .await;
         assert!(
             matches!(refused, Err(AppError::Conflict(_))),
             "the slot is taken"
@@ -785,11 +804,22 @@ mod tests {
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        let first = book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
-            .await
-            .unwrap();
+        let first = book(
+            &db,
+            slot.get_id(),
+            &a_person(&db, "s1", "student").await,
+            reason(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await,
+            book(
+                &db,
+                slot.get_id(),
+                &a_person(&db, "s2", "student").await,
+                reason()
+            )
+            .await,
             Err(AppError::Conflict(_))
         ));
         // The live booking also blocks the slot delete.
@@ -800,9 +830,14 @@ mod tests {
 
         reject(&db, first.get_id(), &teacher, None).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
-        let second = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason())
-            .await
-            .unwrap();
+        let second = book(
+            &db,
+            slot.get_id(),
+            &a_person(&db, "s2", "student").await,
+            reason(),
+        )
+        .await
+        .unwrap();
         assert_eq!(second.get_status(), AppointmentStatus::Pending);
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
     }

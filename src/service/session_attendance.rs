@@ -4,8 +4,8 @@
 //! only by manager+), only students attend lessons, and a non-teacher target
 //! must be enrolled in the course. The queries and the badge-counter
 //! transactions live in [`crate::db::session_attendance`]; who may take a
-//! roll call at all (the session's teacher or a course manager) is the web
-//! layer's authorization, judged against the session and course it loaded.
+//! roll call at all (the session's teacher or a manager) is the web layer's
+//! authorization, judged against the session and the instance it belongs to.
 
 use crate::database::Database;
 use crate::db::session_attendance;
@@ -67,7 +67,7 @@ pub async fn mark(
                 reason: "only students can be marked present in a lesson",
             }));
         }
-        if crate::db::enrollment::read_for_user(db, session.get_course(), target)
+        if crate::db::enrollment::read_for_user(db, session.get_class_course(), target)
             .await?
             .is_none()
         {

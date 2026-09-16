@@ -97,7 +97,6 @@ impl Solution {
     pub fn get_offered_at(&self) -> Timestamp {
         self.offered_at
     }
-
 }
 
 #[cfg(test)]

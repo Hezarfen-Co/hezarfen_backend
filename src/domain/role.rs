@@ -174,7 +174,14 @@ mod tests {
         // never drifts from `as_str` — the CHECK constraint and the filters
         // spell these same words.
         let mut buf = sqlx::postgres::PgArgumentBuffer::default();
-        for role in [Role::Ai, Role::Parent, Role::Student, Role::Teacher, Role::Manager, Role::Admin] {
+        for role in [
+            Role::Ai,
+            Role::Parent,
+            Role::Student,
+            Role::Teacher,
+            Role::Manager,
+            Role::Admin,
+        ] {
             buf.clear();
             let _ = sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&role, &mut buf).unwrap();
             assert_eq!(std::str::from_utf8(&buf).unwrap(), role.as_str());

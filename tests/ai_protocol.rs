@@ -1365,8 +1365,12 @@ async fn armed_with_file(bridge: &AiBridge) -> (axum::Router, String, String, Ve
     let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
     let student = common::me_id(&app, &student_cookie).await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
-    let course = common::create_course(&app, &teacher, "Physics").await;
-    common::enroll(&app, &teacher, &course, &student).await;
+    let mudur = common::login_as(&app, &db, "mudur", "manager").await;
+    // The roster hangs off the şube's instance, so a manager mints the stack
+    // with the teacher as its homeroom teacher.
+    let t = common::taught_under(&app, &mudur, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &t.instance, &student).await;
+    let course = t.course.clone();
 
     let res = common::send(
         &app,

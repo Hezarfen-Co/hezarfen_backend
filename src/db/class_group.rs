@@ -1,50 +1,75 @@
-//! The `class_group` table: the row, its term reference claimed through the
-//! [`crate::db::cap`] shapes in the same statement as the link, and the 0/0
-//! delete guard. The archived-term guard and the route-facing wrappers live in
-//! [`crate::service::class_group`].
+//! The `class_group` table: the row, its academic-year reference claimed
+//! through the [`crate::db::cap`] shapes in the same statement as the link,
+//! and the 0/0 delete guard. The archived-year guard and the route-facing
+//! wrappers live in [`crate::service::class_group`].
 
-use crate::constant::{CLASS_GROUP_TABLE, TERM_CLASS_COUNT_FIELD};
+use crate::constant::{ACADEMIC_YEAR_CLASS_COUNT_FIELD, CLASS_GROUP_TABLE};
 use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::{FieldUpdate, Refcount};
 use crate::db::page::PagedList;
+use crate::domain::academic_year::AcademicYearId;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
-use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
-/// Create the class, claiming a reference on the term it links (if any) in
-/// the *same statement* as the row, exactly as
-/// [`crate::db::course::create`] does: the claim is a
-/// conditional write on the term row, so it fails when the term is already
-/// gone, it makes the term undeletable the instant this link exists, and — the
-/// claim and the insert being one CTE — no crash and no refused claim can
-/// leave either half without the other.
+/// The refusal a şube write naming a year that is not there gets — the mirror
+/// of [`crate::domain::term::gone_error`], one layer up the calendar.
+fn year_gone() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "year",
+        reason: "academic year does not exist",
+    })
+}
+
+/// What a PATCH's `year` field owes the refcounts: the year to claim and the
+/// one to give back. Covers all three moves — set (none→some), move
+/// (some→other) and clear (some→none) — and moves nothing for a PATCH that
+/// omitted the field or re-stated the link it already had. The same shape
+/// [`crate::domain::term::ref_move`] gives the term link.
+fn year_ref_move(
+    current: Option<&AcademicYearId>,
+    patch: &Option<Option<AcademicYearId>>,
+) -> (Option<AcademicYearId>, Option<AcademicYearId>) {
+    match patch {
+        None => (None, None),
+        Some(next) if next.as_ref() == current => (None, None),
+        Some(next) => (*next, current.copied()),
+    }
+}
+
+/// Create the class, claiming a reference on the academic year it links (if
+/// any) in the *same statement* as the row, exactly as
+/// [`crate::db::course::create`] did for the term: the claim is a conditional
+/// write on the year row, so it fails when the year is already gone, it makes
+/// the year undeletable the instant this link exists, and — the claim and the
+/// insert being one CTE — no crash and no refused claim can leave either half
+/// without the other.
 pub async fn create(
     db: &Database,
     creator: &UserId,
     name: ClassName,
     grade: Option<ClassGrade>,
-    term: Option<TermId>,
+    year: Option<AcademicYearId>,
     teacher: Option<UserId>,
 ) -> Result<ClassGroup, AppError> {
     let id = ClassGroupId::generate();
-    match &term {
-        Some(term) => {
+    match &year {
+        Some(year) => {
             // The claim and the insert are one statement: atomic without an
             // explicit transaction, exactly like every other
             // single-statement guard.
             let written = sqlx::query_as!(
                 ClassGroup,
                 r#"WITH seat AS (
-                       UPDATE term SET class_count = class_count + 1
+                       UPDATE academic_year SET class_count = class_count + 1
                         WHERE id = $1
                         RETURNING 1)
-                   INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                   INSERT INTO class_group (id, creator, name, grade, year, teacher)
                    SELECT $2, $3, $4, $5, $1, $6 WHERE EXISTS (SELECT 1 FROM seat)
                    RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
                      name AS "name: ClassName", grade AS "grade: ClassGrade",
-                     term AS "term: TermId", teacher AS "teacher: UserId""#,
-                term.uuid(),
+                     year AS "year: AcademicYearId", teacher AS "teacher: UserId""#,
+                year.uuid(),
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
@@ -56,12 +81,12 @@ pub async fn create(
             match written {
                 Ok(Some(created)) => Ok(created),
                 // Uncapped, so a zero-row claim can only mean the conditional
-                // write matched no term row at all — the claim doubles as the
+                // write matched no year row at all — the claim doubles as the
                 // existence check.
-                Ok(None) => Err(term::gone_error()),
-                // The term row is locked by the claim's own UPDATE, so this
+                Ok(None) => Err(year_gone()),
+                // The year row is locked by the claim's own UPDATE, so this
                 // is unreachable; a defensible answer beats a 500.
-                Err(e) if crate::database::foreign_key_violation(&e) => Err(term::gone_error()),
+                Err(e) if crate::database::foreign_key_violation(&e) => Err(year_gone()),
                 // Unreachable: the id was minted one line above.
                 Err(e) if crate::database::unique_violation(&e).is_some() => {
                     Err(AppError::Internal("failed to create class".into()))
@@ -72,16 +97,16 @@ pub async fn create(
         None => {
             let created = sqlx::query_as!(
                 ClassGroup,
-                r#"INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                r#"INSERT INTO class_group (id, creator, name, grade, year, teacher)
                    VALUES ($1, $2, $3, $4, $5, $6)
                    RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
                      name AS "name: ClassName", grade AS "grade: ClassGrade",
-                     term AS "term: TermId", teacher AS "teacher: UserId""#,
+                     year AS "year: AcademicYearId", teacher AS "teacher: UserId""#,
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
                 grade.as_ref().map(ClassGrade::as_str),
-                term.as_ref().map(TermId::uuid),
+                year.as_ref().map(AcademicYearId::uuid),
                 teacher.as_ref().map(UserId::uuid)
             )
             .fetch_optional(db)
@@ -97,7 +122,7 @@ pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
                   name AS "name: ClassName", grade AS "grade: ClassGrade",
-                  term AS "term: TermId", teacher AS "teacher: UserId"
+                  year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = $1"#,
         id.uuid()
     )
@@ -137,45 +162,45 @@ pub async fn list_all(
 
 /// Write only the fields the PATCH carried — `None` means the request
 /// omitted it, so the column is left alone rather than re-stated from the
-/// snapshot this struct was read into. `grade`, `term` and `teacher` are
+/// snapshot this struct was read into. `grade`, `year` and `teacher` are
 /// nullable, so they take the outer/inner `Option<Option<_>>`: `None` =
 /// omitted (keep), `Some(None)` = clear.
 ///
-/// A term move claims the new term and releases the old one inside the very
+/// A year move claims the new year and releases the old one inside the very
 /// transaction that moves the link, exactly as in
-/// [`crate::db::course::update`]: both counters and the link
-/// commit together, so no crash can strand a count on a term nothing links.
+/// [`crate::db::course::update`] did for the term: both counters and the link
+/// commit together, so no crash can strand a count on a year nothing links.
 pub async fn update(
     db: &Database,
     class: ClassGroup,
     name: Option<ClassName>,
     grade: Option<Option<ClassGrade>>,
-    term: Option<Option<TermId>>,
+    year: Option<Option<AcademicYearId>>,
     teacher: Option<Option<UserId>>,
 ) -> Result<ClassGroup, AppError> {
-    let (claim, release) = term::ref_move(class.term.as_ref(), &term);
-    let expected = class.term.as_ref().map(TermId::uuid);
+    let (claim, release) = year_ref_move(class.year.as_ref(), &year);
+    let expected = class.year.as_ref().map(AcademicYearId::uuid);
     FieldUpdate::new(CLASS_GROUP_TABLE, class.id.uuid())
         .set("name", name.map(|name| name.as_str().to_string()))
         .set(
             "grade",
             grade.map(|grade| grade.map(|grade| grade.as_str().to_string())),
         )
-        .set("term", term.map(|term| term.map(|term| term.uuid())))
+        .set("year", year.map(|year| year.map(|year| year.uuid())))
         // Not refcounted: a homeroom assignment is a label, so it rides the
-        // plain `set` path and never arms the term CAS.
+        // plain `set` path and never arms the year CAS.
         .set(
             "teacher",
             teacher.map(|teacher| teacher.map(|teacher| teacher.uuid())),
         )
         .refcount(Refcount {
-            counter_table: "term",
-            counter_field: TERM_CLASS_COUNT_FIELD,
-            link: "term",
+            counter_table: "academic_year",
+            counter_field: ACADEMIC_YEAR_CLASS_COUNT_FIELD,
+            link: "year",
             expected,
-            claim: claim.map(|term| term.uuid()),
-            release: release.map(|term| term.uuid()),
-            refused: term::gone_error(),
+            claim: claim.map(|year| year.uuid()),
+            release: release.map(|year| year.uuid()),
+            refused: year_gone(),
         })
         .run::<ClassGroup>(db)
         .await
@@ -194,7 +219,7 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
                   name AS "name: ClassName", grade AS "grade: ClassGrade",
-                  term AS "term: TermId", teacher AS "teacher: UserId"
+                  year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = ANY($1)"#,
         &ids
     )
@@ -214,9 +239,58 @@ pub async fn list_for_grade(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
                   name AS "name: ClassName", grade AS "grade: ClassGrade",
-                  term AS "term: TermId", teacher AS "teacher: UserId"
+                  year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE grade = $1"#,
         grade.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
+}
+
+/// Every class of one academic year, newest first — the rollover's input list
+/// ([`crate::service::academic_year::rollover`]). Unpaged for the same reason
+/// [`list_for_grade`] is: the caller reconciles all of them.
+pub async fn list_for_year(
+    db: &Database,
+    year: &AcademicYearId,
+) -> Result<Vec<ClassGroup>, AppError> {
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  year AS "year: AcademicYearId", teacher AS "teacher: UserId"
+           FROM class_group WHERE year = $1 ORDER BY id"#,
+        year.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
+}
+
+/// Every class `user` is the homeroom teacher (sınıf öğretmeni) of, newest
+/// first — the same order [`list_all`] gives, since this is a narrowing of
+/// that list and not a second one.
+///
+/// It is the read behind "which şubeler do I run": the homeroom teacher of a
+/// section may act on every instance of it (D10, the third arm of
+/// [`crate::service::class_course::ensure_instance_teacher`]) without being a
+/// member of it or assigned to the instance — and without a read like this the
+/// section would be invisible to them, so their own instances' exams,
+/// sessions and homework could not be listed at all.
+///
+/// Unpaged like [`list_for_grade`] and [`list_for_year`]: the caller resolves
+/// a *visible set*, and a page would silently hide the sections past the
+/// window. A user who homerooms nothing — including one every sweep has
+/// cleared (`unassign_everywhere`) — simply gets an empty list.
+pub async fn list_for_teacher(db: &Database, user: &UserId) -> Result<Vec<ClassGroup>, AppError> {
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  year AS "year: AcademicYearId", teacher AS "teacher: UserId"
+           FROM class_group WHERE teacher = $1 ORDER BY id DESC"#,
+        user.uuid()
     )
     .fetch_all(db)
     .await?;
@@ -237,20 +311,49 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
     Ok(())
 }
 
-/// Delete the class and give its term reference back. Nothing else cascades:
-/// a class that still holds students or courses is refused outright, because
-/// dropping it silently would leave the enrollments it pumped behind with
-/// nothing left to sweep them. An event aimed at the class keeps standing
-/// with `audience_class` cleared — the course twin's documented outcome
+/// Delete the class and give its academic-year reference back. A class that
+/// still holds students or courses is refused outright, because dropping it
+/// silently would leave the enrollments it pumped behind with nothing left to
+/// sweep them. What the guard cannot see is the *history* standing beside the
+/// live rows, and that is what this delete sweeps first: every `class_member`
+/// stint of the class (a soft-left student holds no seat, so the 0/0 guard
+/// passes while their row still stands, and `class_member.class` would refuse
+/// the delete as a `23503`), plus the provenance tags naming it from rows that
+/// outlive it — a rollover copy's `source_class_group` and a handed-over
+/// enrollment's `source`, both hard foreign keys into this table. Dropping a
+/// şube takes its own history with it; a row that merely *remembers* the şube
+/// keeps standing, untagged. An event aimed at the class keeps standing with
+/// `audience_class` cleared — the course twin's documented outcome
 /// (`db::course::delete`): the roster resolves live, so it simply reads empty.
 ///
-/// `false` = refused, nothing was written. Both counts are read off the
-/// class's own row, so the check and the delete are one conditional write on
-/// one record — a member or attach racing this either claims first (and the
-/// delete is refused) or finds the row gone (and is refused itself). The
-/// `Err(NotFound)` keeps the answer a concurrent *delete* used to get.
+/// `false` = refused, nothing was written — not even the sweeps below. The
+/// guard locks the class row (`FOR UPDATE`) and reads its own two counters, so
+/// a member or an attach racing this either claims first (and the delete is
+/// refused, untouched) or finds the row gone (and is refused itself).
+/// `Err(NotFound)` keeps the answer a concurrent *delete* used to get — and
+/// unlike the old one-statement guard, this one tells the two apart without a
+/// second read. The row lock is what makes the sweeps safe to run before the
+/// final delete: no counter can move under this transaction, so the verdict
+/// this read settled is still the verdict when the children are gone.
 pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> {
     tx_with_retry(db, false, async move |tx| {
+        // The guard and the lock, in one read — the shape
+        // [`crate::db::course::delete`] uses. A refused delete must leave the
+        // class's history exactly as it found it, so nothing may be swept
+        // until this verdict is in.
+        let guard = sqlx::query!(
+            r#"SELECT class_member_count, class_course_count, year AS "year: uuid::Uuid"
+                 FROM class_group WHERE id = $1 FOR UPDATE"#,
+            class.id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(guard) = guard else {
+            return Err(AppError::NotFound);
+        };
+        if guard.class_member_count != 0 || guard.class_course_count != 0 {
+            return Ok(false);
+        }
         // Events aimed at this class keep standing, audience cleared — the
         // hard FK on `event.audience_class` would otherwise refuse the delete
         // outright, and a dangling audience resolves to an empty roster.
@@ -260,37 +363,45 @@ pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> 
         )
         .execute(&mut *tx)
         .await?;
-        let gone = sqlx::query!(
-            r#"DELETE FROM class_group
-               WHERE id = $1
-                 AND class_member_count = 0 AND class_course_count = 0
-               RETURNING term AS "term: uuid::Uuid""#,
+        // The roster history goes with the şube. The 0/0 guard counts *live*
+        // stints, so a class whose last student soft-left passes it with the
+        // history row still standing — and `class_member.class` is a hard
+        // foreign key, which would answer the delete below as a `23503`.
+        sqlx::query!(
+            r#"DELETE FROM class_member WHERE class = $1"#,
             class.id.uuid()
         )
-        .fetch_optional(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        let Some(row) = gone else {
-            // Still linked or already gone: the guard cannot tell those
-            // apart, and only the refusal path pays for the extra read that
-            // can.
-            let standing = sqlx::query_scalar!(
-                r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
-                class.id.uuid()
-            )
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-            return if standing {
-                Ok(false)
-            } else {
-                Err(AppError::NotFound)
-            };
-        };
-        if let Some(term) = row.term {
+        // …and the same key from the *other* side: a stint another şube holds
+        // remembers where it came from (a rollover copy's `source_class_group`)
+        // and an enrollment a class wrote remembers which class pumped it
+        // (its `source`). Both are hard keys into this row, so both would
+        // refuse the delete. The rows outlive the şube and stay; only the tag
+        // goes.
+        sqlx::query!(
+            r#"UPDATE class_member SET source_class_group = NULL WHERE source_class_group = $1"#,
+            class.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"UPDATE enrollment SET source = NULL WHERE source = $1"#,
+            class.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Last, and FK-silent: every child row whose key names this class is
+        // either taken or untagged by now.
+        sqlx::query!(r#"DELETE FROM class_group WHERE id = $1"#, class.id.uuid())
+            .execute(&mut *tx)
+            .await?;
+        if let Some(year) = guard.year {
             sqlx::query!(
-                r#"UPDATE term SET class_count = GREATEST(class_count - 1, 0)
-                   WHERE id = $1"#,
-                term
+                r#"UPDATE academic_year
+                      SET class_count = GREATEST(class_count - 1, 0)
+                    WHERE id = $1"#,
+                year
             )
             .execute(&mut *tx)
             .await?;
@@ -305,7 +416,7 @@ mod tests {
     use super::*;
     use sqlx::Row as _;
 
-    use crate::domain::term::{Term, TermName};
+    use crate::domain::academic_year::{AcademicYear, AcademicYearName};
 
     /// A real `app_user` row: creator, teacher, and attached-by are foreign
     /// keys now, so every fixture participant is a row, not a fabricated id.
@@ -321,32 +432,47 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
-        let id: uuid::Uuid =
-            sqlx::query("SELECT id FROM app_user WHERE username = $1")
-                .bind(username)
-                .fetch_one(db)
-                .await
-                .unwrap()
-                .try_get(0)
-                .unwrap();
+        let id: uuid::Uuid = sqlx::query("SELECT id FROM app_user WHERE username = $1")
+            .bind(username)
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
         UserId::from_key(&id.to_string())
     }
 
-    async fn class_on(term: Option<TermId>, db: &Database) -> ClassGroup {
+    /// A real academic year: the şube's year link is a foreign key now, and
+    /// the class-count claim it carries is what these tests are about.
+    async fn a_year(name: &str, db: &Database) -> AcademicYear {
+        let at = crate::domain::timestamp::Timestamp::from_millis;
+        crate::db::academic_year::create(
+            db,
+            &a_named_user(db, "manager").await,
+            AcademicYearName::try_new(name).unwrap(),
+            at(100),
+            at(200),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn class_on(year: Option<AcademicYearId>, db: &Database) -> ClassGroup {
         let manager = a_named_user(db, "manager").await;
         create(
             db,
             &manager,
             ClassName::try_new("9-A").unwrap(),
             None,
-            term,
+            year,
             None,
         )
         .await
         .unwrap()
     }
 
-    /// A class with a homeroom teacher, no term.
+    /// A class with a homeroom teacher, no year.
     async fn class_of(teacher: Option<UserId>, db: &Database) -> ClassGroup {
         let manager = a_named_user(db, "manager").await;
         create(
@@ -371,13 +497,6 @@ mod tests {
             .cloned()
     }
 
-    async fn a_term(db: &Database) -> Term {
-        let at = crate::domain::timestamp::Timestamp::from_millis;
-        crate::db::term::create(db, TermName::try_new("2026").unwrap(), at(100), at(200))
-            .await
-            .unwrap()
-    }
-
     /// The single integer `sql` selects — the stored counter, re-read, never
     /// off a return value. The SQL is built from literals in this module, so
     /// the audit wrapper is a formality.
@@ -390,11 +509,14 @@ mod tests {
             .unwrap()
     }
 
-    /// The stored `class_count` on one term, absent counting as zero.
-    async fn count_on(term: &TermId, db: &Database) -> i64 {
+    /// The stored `class_count` on one academic year, absent counting as zero.
+    async fn count_on(year: &AcademicYearId, db: &Database) -> i64 {
         one_i64(
             db,
-            format!("SELECT COALESCE(class_count, 0) FROM term WHERE id = '{}'", term.uuid()),
+            format!(
+                "SELECT COALESCE(class_count, 0) FROM academic_year WHERE id = '{}'",
+                year.uuid()
+            ),
         )
         .await
     }
@@ -494,29 +616,40 @@ mod tests {
         assert_eq!(teacher_of(none.get_id(), &db).await, None);
     }
 
-    /// The bite test for the class half of the term delete guard: a term is
-    /// undeletable while a *class* links it, on its own column, and every way
-    /// that link can end gives the reference back. Claiming into `course_count`
-    /// instead would pass the first assert and fail the roundtrip through boot.
+    /// The bite test for the class half of the academic-year delete guard
+    /// (D3): a year is undeletable while a *şube* links it, on its own
+    /// column, and every way that link can end gives the reference back.
+    /// Claiming into `term_count` instead would pass the first assert and
+    /// fail the roundtrip through the year's own delete.
     #[tokio::test]
-    async fn a_term_is_deletable_only_once_no_class_links_it() {
+    async fn a_year_is_deletable_only_once_no_class_links_it() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let term = a_term(&db).await;
+        let year = a_year("2026-2027", &db).await;
 
-        let linked = class_on(Some(*term.get_id()), &db).await;
-        let patched = class_on(Some(*term.get_id()), &db).await;
+        let linked = class_on(Some(*year.get_id()), &db).await;
+        let patched = class_on(Some(*year.get_id()), &db).await;
         assert_eq!(
-            one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
+            one_i64(
+                &db,
+                "SELECT COALESCE(class_count, 0) FROM academic_year".to_string()
+            )
+            .await,
             2,
-            "classes must count on class_count, not course_count"
+            "classes must count on class_count, not term_count"
         );
         assert_eq!(
-            one_i64(&db, "SELECT COALESCE(course_count, 0) FROM term".to_string()).await,
+            one_i64(
+                &db,
+                "SELECT COALESCE(term_count, 0) FROM academic_year".to_string()
+            )
+            .await,
             0,
-            "the courses' counter is seeded from course rows and must stay untouched"
+            "the terms' counter is seeded from term rows and must stay untouched"
         );
         assert!(
-            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
+            !crate::db::academic_year::delete(&db, year.clone())
+                .await
+                .unwrap(),
             "two linked classes must refuse the delete"
         );
 
@@ -524,33 +657,42 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
+            !crate::db::academic_year::delete(&db, year.clone())
+                .await
+                .unwrap(),
             "one link is still one link"
         );
 
         assert!(delete(&db, linked).await.unwrap());
         assert!(
-            crate::db::term::delete(&db, term.clone()).await.unwrap(),
-            "the last link gone, the term may go"
+            crate::db::academic_year::delete(&db, year.clone())
+                .await
+                .unwrap(),
+            "the last link gone, the year may go"
+        );
+        let again = crate::db::academic_year::delete(&db, year).await;
+        assert!(
+            matches!(again, Err(AppError::NotFound)),
+            "a second delete is a 404, not a refusal: {again:?}"
         );
     }
 
     /// The bite test for the class delete guard, both arms: either count above
-    /// zero refuses, having written nothing — the term reference least of all,
+    /// zero refuses, having written nothing — the year reference least of all,
     /// which a refusal that released it would strand.
     #[tokio::test]
     async fn a_class_with_members_or_courses_refuses_to_delete() {
         for field in ["class_member_count", "class_course_count"] {
             let (db, _leases) = crate::database::init_test_db().await;
-            let term = a_term(&db).await;
-            let class = class_on(Some(*term.get_id()), &db).await;
+            let year = a_year("2026-2027", &db).await;
+            let class = class_on(Some(*year.get_id()), &db).await;
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE class_group SET {field} = 1 WHERE id = $1"
             )))
-                .bind(class.get_id().uuid())
-                .execute(&db)
-                .await
-                .unwrap();
+            .bind(class.get_id().uuid())
+            .execute(&db)
+            .await
+            .unwrap();
 
             assert!(
                 !delete(&db, class.clone()).await.unwrap(),
@@ -561,24 +703,21 @@ mod tests {
                 "a refused delete may write nothing"
             );
             assert_eq!(
-                one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
+                count_on(year.get_id(), &db).await,
                 1,
-                "…the term reference least of all"
+                "…the year reference least of all"
             );
 
-            // Back to zero, and the same class deletes and releases the term.
+            // Back to zero, and the same class deletes and releases the year.
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE class_group SET {field} = 0 WHERE id = $1"
             )))
-                .bind(class.get_id().uuid())
-                .execute(&db)
-                .await
-                .unwrap();
+            .bind(class.get_id().uuid())
+            .execute(&db)
+            .await
+            .unwrap();
             assert!(delete(&db, class.clone()).await.unwrap());
-            assert_eq!(
-                one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
-                0
-            );
+            assert_eq!(count_on(year.get_id(), &db).await, 0);
             let again = delete(&db, class).await;
             assert!(
                 matches!(again, Err(AppError::NotFound)),
@@ -588,14 +727,14 @@ mod tests {
     }
 
     /// The class half of the invariant on the create path: a refused create
-    /// leaves neither the row nor a count stranded on a term (which the term's
+    /// leaves neither the row nor a count stranded on a year (which the year's
     /// delete guard reads, so a stray one would make it undeletable forever).
     #[tokio::test]
     async fn a_refused_create_writes_neither_row_nor_count() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let term = a_term(&db).await;
-        let id = *term.get_id();
-        assert!(crate::db::term::delete(&db, term).await.unwrap());
+        let year = a_year("2026-2027", &db).await;
+        let id = *year.get_id();
+        assert!(crate::db::academic_year::delete(&db, year).await.unwrap());
 
         let error = create(
             &db,
@@ -606,39 +745,33 @@ mod tests {
             None,
         )
         .await
-        .expect_err("a term that is gone must not be linkable");
-        assert!(error.to_string().contains("term does not exist"));
+        .expect_err("a year that is gone must not be linkable");
+        assert!(error.to_string().contains("academic year does not exist"));
         assert_eq!(
             row_count(&db, "class_group").await,
             0,
             "a refused create may write no row"
         );
         assert_eq!(
-            row_count(&db, "term").await,
+            row_count(&db, "academic_year").await,
             0,
-            "…and least of all a count on a term it just brought back"
+            "…and least of all a count on a year it just brought back"
         );
     }
 
     /// The class mirror of
-    /// [`crate::db::course`]'s move tests: a term move carries both
-    /// counters with the link, and a move to a term that is gone rolls the
-    /// release back with the abort (the transaction releases before it claims,
-    /// so the old count would be 0 if the abort did not undo it).
+    /// [`crate::db::course`]'s move tests: a year move carries the count with
+    /// the link, and a move to a year that is gone rolls the release back with
+    /// the abort (the transaction releases before it claims, so the old count
+    /// would be 0 if the abort did not undo it).
     #[tokio::test]
-    async fn a_class_term_move_moves_both_counts_or_neither() {
+    async fn a_class_year_move_moves_the_count_or_neither() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let at = crate::domain::timestamp::Timestamp::from_millis;
-        let from = a_term(&db).await;
-        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
-        let dead =
-            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-                .await
-                .unwrap();
+        let from = a_year("2026-2027", &db).await;
+        let to = a_year("2027-2028", &db).await;
+        let dead = a_year("2028-2029", &db).await;
         let dead_id = *dead.get_id();
-        assert!(crate::db::term::delete(&db, dead).await.unwrap());
+        assert!(crate::db::academic_year::delete(&db, dead).await.unwrap());
         let class = class_on(Some(*from.get_id()), &db).await;
 
         let error = update(
@@ -650,10 +783,10 @@ mod tests {
             None,
         )
         .await
-        .expect_err("a term that is gone must not be linkable");
-        assert!(error.to_string().contains("term does not exist"));
+        .expect_err("a year that is gone must not be linkable");
+        assert!(error.to_string().contains("academic year does not exist"));
         let stored = read(&db, class.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
+        assert_eq!(stored.get_year(), Some(from.get_id()), "the link stays put");
         assert_eq!(stored.get_name().as_str(), "9-A", "…and so does the row");
         assert_eq!(
             count_on(from.get_id(), &db).await,
@@ -661,28 +794,21 @@ mod tests {
             "the release must roll back with the abort"
         );
 
-        let moved = update(
-            &db,
-            class,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(moved.get_term(), Some(to.get_id()));
+        let moved = update(&db, class, None, None, Some(Some(*to.get_id())), None)
+            .await
+            .unwrap();
+        assert_eq!(moved.get_year(), Some(to.get_id()));
         assert_eq!(
             count_on(from.get_id(), &db).await,
             0,
-            "the old term is free"
+            "the old year is free"
         );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
     }
 
-    /// The class twin of
-    /// [`crate::domain::course`]'s `a_stale_mover_is_refused_and_claims_nothing`
-    /// and `a_stale_re_stater_is_refused_and_reverts_nothing`, in one: both
+    /// The class twin of [`crate::db::course`]'s
+    /// `a_stale_mover_is_refused_and_claims_nothing` and
+    /// `a_stale_re_stater_is_refused_and_reverts_nothing`, in one: both
     /// PATCHes compute their counter move from the row as *they* read it, so a
     /// second one running on the pre-move struct would claim a second seat for
     /// one link (the mover) or drag the link back and strand the winner's claim
@@ -690,29 +816,16 @@ mod tests {
     /// stopped by a guard armed off the *carried column*). Both must be refused
     /// with the counts reading as if they never ran.
     #[tokio::test]
-    async fn a_stale_class_term_write_is_refused_and_moves_no_count() {
+    async fn a_stale_class_year_write_is_refused_and_moves_no_count() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let at = crate::domain::timestamp::Timestamp::from_millis;
-        let from = a_term(&db).await;
-        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
-        let other =
-            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-                .await
-                .unwrap();
+        let from = a_year("2026-2027", &db).await;
+        let to = a_year("2027-2028", &db).await;
+        let other = a_year("2028-2029", &db).await;
         let class = class_on(Some(*from.get_id()), &db).await;
         let stale = class.clone();
-        update(
-            &db,
-            class,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
+        update(&db, class, None, None, Some(Some(*to.get_id())), None)
+            .await
+            .unwrap();
 
         // The mover: its snapshot says `from`, so it would release `from` and
         // claim `other` on top of the winner's claim on `to`.
@@ -741,73 +854,80 @@ mod tests {
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
 
         let stored = read(&db, stale.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
+        assert_eq!(stored.get_year(), Some(to.get_id()), "the winner's link");
         assert_eq!(count_on(from.get_id(), &db).await, 0, "released once");
         assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once");
         assert_eq!(count_on(other.get_id(), &db).await, 0, "never claimed");
 
         // A genuine no-op re-state still lands and still moves nothing.
-        let same = update(
-            &db,
-            stored,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .expect("re-stating the link the row really holds is not a conflict");
-        assert_eq!(same.get_term(), Some(to.get_id()));
+        let same = update(&db, stored, None, None, Some(Some(*to.get_id())), None)
+            .await
+            .expect("re-stating the link the row really holds is not a conflict");
+        assert_eq!(same.get_year(), Some(to.get_id()));
         assert_eq!(count_on(to.get_id(), &db).await, 1, "still one seat");
     }
 
-    /// [`crate::db::course::delete`]'s class sweep: deleting a course
-    /// takes its `class_course` attachments with it and gives each class its
-    /// count back, or the classes would be undeletable forever over rows that
-    /// point at nothing.
+    /// The delete guard counts *live* stints, and a soft-left student holds
+    /// none — so the class passes it with the history row still standing, and
+    /// `class_member.class` (a hard foreign key) is what used to answer this
+    /// delete, as a `23503` the route turns into a 500. The roster history
+    /// goes with the şube it belongs to.
     #[tokio::test]
-    async fn deleting_a_course_sweeps_its_class_attachments() {
-        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
+    async fn a_soft_left_member_does_not_block_the_delete_and_goes_with_it() {
+        use crate::db::class_pump::{self, Attached};
 
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = a_named_user(&db, "manager").await;
-        let course = crate::db::course::create(
-            &db,
-            &manager,
-            CourseTitle::try_new("algebra").unwrap(),
-            CourseDescription::try_new("").unwrap(),
-            CourseKind::course(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let class = class_on(None, &db).await;
-        sqlx::query("INSERT INTO class_course (class, course, attached_by) VALUES ($1, $2, $3)")
-            .bind(class.get_id().uuid())
-            .bind(course.get_id().uuid())
-            .bind(manager.uuid())
+        let class = class_of(None, &db).await;
+        // The pump's member axis claims the `student` role on the user row,
+        // and a stint is a real write, not a row fabricated into place.
+        let student = a_named_user(&db, "ada").await;
+        sqlx::query("UPDATE app_user SET role = 'student' WHERE id = $1")
+            .bind(student.uuid())
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("UPDATE class_group SET class_course_count = 1 WHERE id = $1")
-            .bind(class.get_id().uuid())
-            .execute(&db)
-            .await
-            .unwrap();
+        assert!(matches!(
+            class_pump::add_member(&db, class.get_id(), &student, &manager)
+                .await
+                .unwrap(),
+            Attached::Made(_)
+        ));
 
-        assert!(crate::db::course::delete(&db, course).await.unwrap());
         assert_eq!(
-            row_count(&db, "class_course").await,
-            0,
-            "the attachment rows must go with the course"
+            class_pump::leave_member(&db, class.get_id(), &student)
+                .await
+                .unwrap(),
+            1,
+            "the one live stint is the one the leave ends"
+        );
+        // Exactly what the guard is blind to: the counters read zero, the
+        // history does not.
+        assert_eq!(
+            one_i64(
+                &db,
+                format!(
+                    "SELECT class_member_count FROM class_group WHERE id = '{}'",
+                    class.get_id().uuid()
+                )
+            )
+            .await,
+            0
+        );
+        assert_eq!(row_count(&db, "class_member").await, 1);
+
+        assert!(
+            delete(&db, class.clone()).await.unwrap(),
+            "a soft-left member must not block the delete"
         );
         assert_eq!(
-            one_i64(&db, "SELECT COALESCE(class_course_count, 0) FROM class_group".to_string()).await,
+            row_count(&db, "class_member").await,
             0,
-            "…and each class must get its count back"
+            "…and the roster history goes with the şube"
         );
-        // Which is the whole point: the class is deletable again.
-        assert!(delete(&db, class).await.unwrap());
+        assert!(
+            matches!(delete(&db, class).await, Err(AppError::NotFound)),
+            "a second delete is still a 404"
+        );
     }
 }

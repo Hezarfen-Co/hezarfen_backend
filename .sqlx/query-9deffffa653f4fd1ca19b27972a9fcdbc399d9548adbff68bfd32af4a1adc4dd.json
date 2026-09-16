@@ -1,0 +1,215 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH new_row AS (\n               INSERT INTO settings (id, exam_kinds, grade_bands, max_file_bytes,\n                                     chatbot_history_turns, max_chatbot_message_len,\n                                     max_chatbot_threads, meal_slots,\n                                     meal_cancel_cutoff_minutes, branches, excuse_kinds,\n                                     max_excused_absent_days, max_unexcused_absent_days,\n                                     timezone)\n               VALUES ('school', $1, $3, $4, $5, $6, $7, $8, $10, $21, $22, $23, $24, $25)\n               ON CONFLICT (id) DO UPDATE SET\n                   exam_kinds = $1,\n                   grade_bands = $3,\n                   max_file_bytes = $4,\n                   chatbot_history_turns = $5,\n                   max_chatbot_message_len = $6,\n                   max_chatbot_threads = $7,\n                   meal_slots = $8,\n                   meal_cancel_cutoff_minutes = $10,\n                   branches = $21,\n                   excuse_kinds = $22,\n                   max_excused_absent_days = $23,\n                   max_unexcused_absent_days = $24,\n                   timezone = $25\n               WHERE settings.exam_kinds                 IS NOT DISTINCT FROM $13\n                 AND settings.grade_bands                IS NOT DISTINCT FROM $14\n                 AND settings.max_file_bytes             IS NOT DISTINCT FROM $15\n                 AND settings.chatbot_history_turns      IS NOT DISTINCT FROM $16\n                 AND settings.max_chatbot_message_len    IS NOT DISTINCT FROM $17\n                 AND settings.max_chatbot_threads        IS NOT DISTINCT FROM $18\n                 AND settings.meal_slots                 IS NOT DISTINCT FROM $19\n                 AND settings.meal_cancel_cutoff_minutes IS NOT DISTINCT FROM $20\n                 AND settings.branches                   IS NOT DISTINCT FROM $26\n                 AND settings.excuse_kinds               IS NOT DISTINCT FROM $27\n                 AND settings.max_excused_absent_days    IS NOT DISTINCT FROM $28\n                 AND settings.max_unexcused_absent_days  IS NOT DISTINCT FROM $29\n                 AND settings.timezone                   IS NOT DISTINCT FROM $30\n                 AND COALESCE((SELECT array_agg(s.status ORDER BY s.status)\n                               FROM settings_attendance_status s\n                               WHERE s.settings = settings.id), '{}')\n                     IS NOT DISTINCT FROM $11::text[]\n                 AND (SELECT array_agg(t.tag ORDER BY t.tag)\n                      FROM settings_dietary_tag t\n                      WHERE t.settings = settings.id)\n                     IS NOT DISTINCT FROM $12::text[]\n               RETURNING exam_kinds, grade_bands, max_file_bytes,\n                         chatbot_history_turns, max_chatbot_message_len,\n                         max_chatbot_threads, meal_slots, meal_cancel_cutoff_minutes,\n                         branches, excuse_kinds, max_excused_absent_days,\n                         max_unexcused_absent_days, timezone),\n           status_del AS (\n               DELETE FROM settings_attendance_status\n               WHERE settings = 'school' AND EXISTS (SELECT 1 FROM new_row)\n               RETURNING 1),\n           status_ins AS (\n               INSERT INTO settings_attendance_status (settings, status)\n               SELECT 'school', t.status FROM unnest($2::text[]) AS t(status)\n                    CROSS JOIN (SELECT count(*) AS deleted FROM status_del) d\n               WHERE EXISTS (SELECT 1 FROM new_row)\n               RETURNING status),\n           tag_del AS (\n               DELETE FROM settings_dietary_tag\n               WHERE settings = 'school' AND EXISTS (SELECT 1 FROM new_row)\n               RETURNING 1),\n           tag_ins AS (\n               INSERT INTO settings_dietary_tag (settings, tag)\n               SELECT 'school', t.tag FROM unnest($9::text[]) AS t(tag)\n                    CROSS JOIN (SELECT count(*) AS deleted FROM tag_del) d\n               WHERE EXISTS (SELECT 1 FROM new_row)\n               RETURNING tag)\n           SELECT r.exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                  COALESCE((SELECT array_agg(status ORDER BY status)\n                            FROM status_ins), '{}') AS \"attendance_statuses!: Vec<String>\",\n                  r.grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                  r.max_file_bytes,\n                  r.chatbot_history_turns,\n                  r.max_chatbot_message_len,\n                  r.max_chatbot_threads,\n                  r.meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                  (SELECT array_agg(tag ORDER BY tag) FROM tag_ins) AS dietary_tags,\n                  r.meal_cancel_cutoff_minutes,\n                  r.branches AS \"branches: Json<Vec<String>>\",\n                  r.excuse_kinds AS \"excuse_kinds: Json<Vec<String>>\",\n                  r.max_excused_absent_days,\n                  r.max_unexcused_absent_days,\n                  r.timezone\n           FROM new_row r",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam_kinds: Json<Vec<ExamKindDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "exam_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "attendance_statuses!: Vec<String>",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "grade_bands: Json<Vec<GradeBand>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "grade_bands"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "max_file_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_file_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "chatbot_history_turns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "chatbot_history_turns"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "max_chatbot_message_len",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_message_len"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_chatbot_threads",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_threads"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "meal_slots: Json<Vec<MealSlotDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_slots"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "dietary_tags",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "meal_cancel_cutoff_minutes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_cancel_cutoff_minutes"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "branches: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "branches"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "excuse_kinds: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "excuse_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "max_excused_absent_days",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_excused_absent_days"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "max_unexcused_absent_days",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_unexcused_absent_days"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "timezone",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "timezone"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Jsonb",
+        "TextArray",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "TextArray",
+        "Int8",
+        "TextArray",
+        "TextArray",
+        "Jsonb",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Int8",
+        "Jsonb",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "9deffffa653f4fd1ca19b27972a9fcdbc399d9548adbff68bfd32af4a1adc4dd"
+}

@@ -1,0 +1,129 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO academic_year (id, name, starts_at, ends_at, creator, grade_promotions)\n           VALUES ($1, $2, $3, $4, $5, $6)\n           RETURNING id AS \"id: AcademicYearId\", name AS \"name: AcademicYearName\",\n                     starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at: Timestamp\",\n                     archived_at AS \"archived_at: Timestamp\", creator AS \"creator: UserId\",\n                     grade_promotions AS \"grade_promotions: Json<Vec<GradePromotion>>\",\n                     class_count, term_count",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AcademicYearId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name: AcademicYearName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "archived_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "archived_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "grade_promotions: Json<Vec<GradePromotion>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "grade_promotions"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "class_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "class_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "term_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "academic_year",
+            "name": "term_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "786cd981b243bf0c325c5e3aedd34f93f78c53ca5744f1117af3701acdc4a26b"
+}

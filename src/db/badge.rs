@@ -111,7 +111,7 @@ pub async fn sync(db: &Database, user: &UserId) -> Result<(), AppError> {
                  SET earned_at = badge_award.earned_at \
                WHERE badge_award.earned_at IS NULL"
         )))
-.bind(user.uuid())
+        .bind(user.uuid())
         .bind(badge)
         .bind(now)
         .execute(db)

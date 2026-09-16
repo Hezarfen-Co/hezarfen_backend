@@ -22,6 +22,18 @@ fn sorted(values: &[String]) -> Vec<String> {
     sorted
 }
 
+/// One optional JSONB list as the value a statement binds: the list when the
+/// setting carries one, SQL `NULL` when it does not.
+fn encode_optional(
+    values: &Option<Json<Vec<String>>>,
+) -> Result<Option<serde_json::Value>, AppError> {
+    values
+        .as_ref()
+        .map(|list| serde_json::to_value(&list.0))
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("settings encode: {e}")))
+}
+
 /// The one read: row columns plus both vocabularies re-assembled from their
 /// child tables. An absent dietary set reads as `None` — the same shape an
 /// unset column used to carry.
@@ -44,7 +56,12 @@ where
                   (SELECT array_agg(t.tag ORDER BY t.tag)
                    FROM settings_dietary_tag t
                    WHERE t.settings = s.id) AS dietary_tags,
-                  s.meal_cancel_cutoff_minutes
+                  s.meal_cancel_cutoff_minutes,
+                  s.branches AS "branches: Json<Vec<String>>",
+                  s.excuse_kinds AS "excuse_kinds: Json<Vec<String>>",
+                  s.max_excused_absent_days,
+                  s.max_unexcused_absent_days,
+                  s.timezone
            FROM settings s WHERE s.id = 'school'"#
     )
     .fetch_optional(db)
@@ -113,6 +130,12 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
         .map(|slots| serde_json::to_value(&slots.0))
         .transpose()
         .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    // The two JSONB vocabularies ride the row like `meal_slots`: an unset
+    // list stays NULL rather than being coerced to `[]`, because a whole-row
+    // save that wrote `[]` for a field it never carried would erase the
+    // distinction an unset column carries.
+    let branches = encode_optional(&settings.branches)?;
+    let excuse_kinds = encode_optional(&settings.excuse_kinds)?;
     let attendance = sorted(&settings.attendance_statuses);
     let dietary = settings.dietary_tags.clone();
     tx_with_retry(db, true, async move |tx| {
@@ -120,8 +143,10 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
             r#"INSERT INTO settings (id, exam_kinds, grade_bands, max_file_bytes,
                                      chatbot_history_turns, max_chatbot_message_len,
                                      max_chatbot_threads, meal_slots,
-                                     meal_cancel_cutoff_minutes)
-               VALUES ('school', $1, $2, $3, $4, $5, $6, $7, $8)
+                                     meal_cancel_cutoff_minutes, branches, excuse_kinds,
+                                     max_excused_absent_days, max_unexcused_absent_days,
+                                     timezone)
+               VALUES ('school', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (id) DO UPDATE SET
                    exam_kinds = EXCLUDED.exam_kinds,
                    grade_bands = EXCLUDED.grade_bands,
@@ -130,7 +155,12 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
                    max_chatbot_message_len = EXCLUDED.max_chatbot_message_len,
                    max_chatbot_threads = EXCLUDED.max_chatbot_threads,
                    meal_slots = EXCLUDED.meal_slots,
-                   meal_cancel_cutoff_minutes = EXCLUDED.meal_cancel_cutoff_minutes"#,
+                   meal_cancel_cutoff_minutes = EXCLUDED.meal_cancel_cutoff_minutes,
+                   branches = EXCLUDED.branches,
+                   excuse_kinds = EXCLUDED.excuse_kinds,
+                   max_excused_absent_days = EXCLUDED.max_excused_absent_days,
+                   max_unexcused_absent_days = EXCLUDED.max_unexcused_absent_days,
+                   timezone = EXCLUDED.timezone"#,
             exam_kinds,
             grade_bands,
             settings.max_file_bytes,
@@ -139,6 +169,11 @@ pub async fn save(db: &Database, settings: Settings) -> Result<Settings, AppErro
             settings.max_chatbot_threads,
             meal_slots,
             settings.meal_cancel_cutoff_minutes,
+            branches,
+            excuse_kinds,
+            settings.max_excused_absent_days,
+            settings.max_unexcused_absent_days,
+            settings.timezone,
         )
         .execute(&mut *tx)
         .await?;
@@ -205,6 +240,10 @@ where
         .map(|slots| serde_json::to_value(&slots.0))
         .transpose()
         .map_err(|e| AppError::Internal(format!("settings encode: {e}")))?;
+    let branches = encode_optional(&settings.branches)?;
+    let excuse_kinds = encode_optional(&settings.excuse_kinds)?;
+    let expected_branches = encode_optional(&expected.branches)?;
+    let expected_excuse_kinds = encode_optional(&expected.excuse_kinds)?;
     let attendance = sorted(&settings.attendance_statuses);
     let expected_attendance = sorted(&expected.attendance_statuses);
     // An empty `Some` must compare equal to the stored NULL an empty set
@@ -220,8 +259,10 @@ where
                INSERT INTO settings (id, exam_kinds, grade_bands, max_file_bytes,
                                      chatbot_history_turns, max_chatbot_message_len,
                                      max_chatbot_threads, meal_slots,
-                                     meal_cancel_cutoff_minutes)
-               VALUES ('school', $1, $3, $4, $5, $6, $7, $8, $10)
+                                     meal_cancel_cutoff_minutes, branches, excuse_kinds,
+                                     max_excused_absent_days, max_unexcused_absent_days,
+                                     timezone)
+               VALUES ('school', $1, $3, $4, $5, $6, $7, $8, $10, $21, $22, $23, $24, $25)
                ON CONFLICT (id) DO UPDATE SET
                    exam_kinds = $1,
                    grade_bands = $3,
@@ -230,7 +271,12 @@ where
                    max_chatbot_message_len = $6,
                    max_chatbot_threads = $7,
                    meal_slots = $8,
-                   meal_cancel_cutoff_minutes = $10
+                   meal_cancel_cutoff_minutes = $10,
+                   branches = $21,
+                   excuse_kinds = $22,
+                   max_excused_absent_days = $23,
+                   max_unexcused_absent_days = $24,
+                   timezone = $25
                WHERE settings.exam_kinds                 IS NOT DISTINCT FROM $13
                  AND settings.grade_bands                IS NOT DISTINCT FROM $14
                  AND settings.max_file_bytes             IS NOT DISTINCT FROM $15
@@ -239,6 +285,11 @@ where
                  AND settings.max_chatbot_threads        IS NOT DISTINCT FROM $18
                  AND settings.meal_slots                 IS NOT DISTINCT FROM $19
                  AND settings.meal_cancel_cutoff_minutes IS NOT DISTINCT FROM $20
+                 AND settings.branches                   IS NOT DISTINCT FROM $26
+                 AND settings.excuse_kinds               IS NOT DISTINCT FROM $27
+                 AND settings.max_excused_absent_days    IS NOT DISTINCT FROM $28
+                 AND settings.max_unexcused_absent_days  IS NOT DISTINCT FROM $29
+                 AND settings.timezone                   IS NOT DISTINCT FROM $30
                  AND COALESCE((SELECT array_agg(s.status ORDER BY s.status)
                                FROM settings_attendance_status s
                                WHERE s.settings = settings.id), '{}')
@@ -249,7 +300,9 @@ where
                      IS NOT DISTINCT FROM $12::text[]
                RETURNING exam_kinds, grade_bands, max_file_bytes,
                          chatbot_history_turns, max_chatbot_message_len,
-                         max_chatbot_threads, meal_slots, meal_cancel_cutoff_minutes),
+                         max_chatbot_threads, meal_slots, meal_cancel_cutoff_minutes,
+                         branches, excuse_kinds, max_excused_absent_days,
+                         max_unexcused_absent_days, timezone),
            status_del AS (
                DELETE FROM settings_attendance_status
                WHERE settings = 'school' AND EXISTS (SELECT 1 FROM new_row)
@@ -280,7 +333,12 @@ where
                   r.max_chatbot_threads,
                   r.meal_slots AS "meal_slots: Json<Vec<MealSlotDef>>",
                   (SELECT array_agg(tag ORDER BY tag) FROM tag_ins) AS dietary_tags,
-                  r.meal_cancel_cutoff_minutes
+                  r.meal_cancel_cutoff_minutes,
+                  r.branches AS "branches: Json<Vec<String>>",
+                  r.excuse_kinds AS "excuse_kinds: Json<Vec<String>>",
+                  r.max_excused_absent_days,
+                  r.max_unexcused_absent_days,
+                  r.timezone
            FROM new_row r"#,
         exam_kinds,
         &attendance,
@@ -302,6 +360,16 @@ where
         expected.max_chatbot_threads,
         expected_meal_slots,
         expected.meal_cancel_cutoff_minutes,
+        branches,
+        excuse_kinds,
+        settings.max_excused_absent_days,
+        settings.max_unexcused_absent_days,
+        settings.timezone,
+        expected_branches,
+        expected_excuse_kinds,
+        expected.max_excused_absent_days,
+        expected.max_unexcused_absent_days,
+        expected.timezone,
     )
     .fetch_optional(db)
     .await?;

@@ -78,6 +78,7 @@ pub async fn create_with_role(
                      bio AS "bio: Bio",
                      avatar_file,
                      avatar_content_type AS "avatar_content_type: FileContentType",
+                     branch,
                      avatar_size"#,
         id.uuid(),
         username.as_str(),
@@ -121,6 +122,7 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
                   bio AS "bio: Bio",
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
+                  branch,
                   avatar_size
            FROM app_user WHERE id = $1"#,
         id.uuid()
@@ -165,6 +167,7 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
                   bio AS "bio: Bio",
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
+                  branch,
                   avatar_size
            FROM app_user WHERE id = ANY($1)"#,
         &ids
@@ -196,6 +199,7 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
                   bio AS "bio: Bio",
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
+                  branch,
                   avatar_size
            FROM app_user WHERE role = $1 ORDER BY id DESC"#,
         role.as_str()
@@ -417,6 +421,7 @@ pub async fn set_role_cascade(
                          bio AS "bio: Bio",
                          avatar_file,
                          avatar_content_type AS "avatar_content_type: FileContentType",
+                         branch,
                          avatar_size"#,
             target.uuid(),
             role.as_str(),
@@ -430,27 +435,49 @@ pub async fn set_role_cascade(
         };
 
         if role != Role::Student {
-            // Class memberships go, and each class they were on gets its
-            // seat back. One row per (class, user), so one decrement each.
+            // Class memberships go *soft*: the live stint is stamped, not
+            // deleted — membership history survives a demotion, and the
+            // partial unique index leaves the pair free to rejoin if the
+            // account is promoted back — while each class they were live in
+            // gets its seat back (the counter counts live rows). One live row
+            // per (class, user), so one decrement each.
             sqlx::query!(
                 r#"WITH gone AS (
-                       DELETE FROM class_member WHERE app_user = $1 RETURNING class
+                       UPDATE class_member SET left_at = $2
+                        WHERE app_user = $1 AND left_at IS NULL
+                        RETURNING class
                    )
                    UPDATE class_group
                    SET class_member_count = GREATEST(class_member_count - 1, 0)
                    WHERE id IN (SELECT gone.class FROM gone)"#,
                 target.uuid(),
+                now,
             )
             .execute(&mut *tx)
             .await?;
             // Every enrollment row — hand-placed included — and each
-            // course's seat with it.
+            // *instance's* roster count with it (the roster counter lives on
+            // the class×course instance now).
             sqlx::query!(
                 r#"WITH gone AS (
-                       DELETE FROM enrollment WHERE app_user = $1 RETURNING course
+                       DELETE FROM enrollment WHERE app_user = $1 RETURNING class_course
+                   )
+                   UPDATE class_course
+                   SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+                   WHERE id IN (SELECT gone.class_course FROM gone)"#,
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            // The individual club/etüt memberships go with them: a demoted
+            // account may hold no seat in a school-scoped course either, and
+            // each course gets its membership count back.
+            sqlx::query!(
+                r#"WITH gone AS (
+                       DELETE FROM course_membership WHERE app_user = $1 RETURNING course
                    )
                    UPDATE course
-                   SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+                   SET course_membership_count = GREATEST(course_membership_count - 1, 0)
                    WHERE id IN (SELECT gone.course FROM gone)"#,
                 target.uuid(),
             )
@@ -562,11 +589,12 @@ pub async fn set_role_cascade(
         }
 
         if !role.at_least(Role::Teacher) {
-            // Course staffing goes — only teacher+ may hold a seat, and the
-            // seat is a `course_teacher` row now: one `DELETE` by its
-            // `teacher` index takes every assignment.
+            // Instance staffing goes — only teacher+ may hold a seat, and the
+            // seat is a `class_course_teacher` row now (D6 moved assignment
+            // onto the instance): one `DELETE` by its `teacher` index takes
+            // every assignment.
             sqlx::query!(
-                "DELETE FROM course_teacher WHERE teacher = $1",
+                "DELETE FROM class_course_teacher WHERE teacher = $1",
                 target.uuid(),
             )
             .execute(&mut *tx)
@@ -643,6 +671,7 @@ pub async fn set_profile(
     birth_date: Option<Option<BirthDate>>,
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
+    branch: Option<Option<String>>,
 ) -> Result<User, AppError> {
     // `Some(None)` must bind an explicit NULL and `Some(Some(v))` a value:
     // `Param::OptText` carries both shapes of one nullable TEXT column.
@@ -681,6 +710,13 @@ pub async fn set_profile(
         .set(
             "bio",
             text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        // The branş is plain text, not a newtype: the school's own list is
+        // settings data, so its membership check belongs to the write path
+        // that holds that list (the web layer), not to a row type.
+        .set(
+            "branch",
+            text(branch.as_ref().map(|n| n.as_ref().map(String::as_str))),
         )
         .run(db)
         .await
@@ -729,6 +765,7 @@ pub async fn set_avatar(
                       bio AS "bio: Bio",
                       avatar_file,
                       avatar_content_type AS "avatar_content_type: FileContentType",
+                      branch,
                       avatar_size
                FROM app_user WHERE id = $1 FOR UPDATE"#,
             id.uuid()
@@ -777,6 +814,7 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
                       bio AS "bio: Bio",
                       avatar_file,
                       avatar_content_type AS "avatar_content_type: FileContentType",
+                      branch,
                       avatar_size
                FROM app_user WHERE id = $1 FOR UPDATE"#,
             id.uuid()
@@ -839,6 +877,7 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
                   bio AS "bio: Bio",
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
+                  branch,
                   avatar_size
            FROM app_user WHERE username = $1"#,
         username
@@ -890,6 +929,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -930,6 +970,7 @@ mod tests {
             None,
             None,
             Some(Some(display_name.clone())),
+            None,
             None,
         )
         .await

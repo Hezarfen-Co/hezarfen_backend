@@ -250,7 +250,6 @@ mod tests {
             (Attached::PivotGone, "course_deleted"),
             (Attached::ClassFull, "class_at_course_ceiling"),
             (Attached::ClassOverloaded, "class_roster_too_large"),
-            (Attached::Full("course:algebra".into()), "course_full"),
             (
                 Attached::CourseGone("course:algebra".into()),
                 "linked_course_missing",
@@ -298,7 +297,6 @@ mod tests {
             Attached::<ClassCourse>::Duplicate,
             Attached::Gone,
             Attached::PivotGone,
-            Attached::Full("course:algebra".into()),
             Attached::CourseGone("course:algebra".into()),
             Attached::SourceGone,
         ] {

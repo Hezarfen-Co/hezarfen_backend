@@ -29,11 +29,10 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
-use crate::service::exam_attempt::course_of;
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
-use super::courses::{can_manage_course, can_view_course, visible_courses};
+use super::instances::{can_manage_instance, can_view_instance, visible_instances};
 use super::{
     ChoiceBody, CurrentUser, ExamResponse, ImageUpload, Page, PageParams, PersonRef,
     RequireTeacher, Scheduled, UploadFileForm, WindowParams, blob_path, check_not_past, paginate,
@@ -131,7 +130,7 @@ struct UpdateExam {
     #[schema(max_length = 2000)]
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`).
-    /// Changing it re-weights the exam: the course average uses the kind's
+    /// Changing it re-weights the exam: the instance average uses the kind's
     /// settings-configured weight. For that reason an exam that already carries
     /// marks keeps its kind (`409`) — those marks would silently re-weight,
     /// exactly what the settings' kind-removal guard refuses.
@@ -228,11 +227,11 @@ struct ExamStatisticsResponse {
 }
 
 // ---- exams --------------------------------------------------------------
-// Exams are created inside a course: `POST /courses/{id}/exams`.
+// Exams are created inside an instance: `POST /instances/{id}/exams`.
 
 /// List the exams visible to the caller: every exam for manager+, otherwise
-/// the exams of the courses they created or are enrolled in — minus other
-/// people's drafts (a draft shows only to its course's managers). Paged via
+/// the exams of the instances they teach or are enrolled in — minus other
+/// people's drafts (a draft shows only to its instance's managers). Paged via
 /// `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope.
 ///
@@ -264,17 +263,17 @@ async fn list_exams(
     let exams = if user.get_role().at_least(Role::Manager) {
         service::exam::list_all(&st.db).await?
     } else {
-        let courses = visible_courses(&user, &st.db).await?;
-        let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
-        // Drafts show only where the caller manages the course (as its
-        // creator — the manager+ path above already saw everything).
-        let managed: Vec<String> = courses
+        let instances = visible_instances(&user, &st.db).await?;
+        let ids: Vec<_> = instances.iter().map(|(i, _)| i.get_id().clone()).collect();
+        // Drafts show only where the caller manages the instance (as one of
+        // its teachers — the manager+ path above already saw everything).
+        let managed: HashSet<String> = instances
             .iter()
-            .filter(|c| can_manage_course(c, &user))
-            .map(|c| c.get_id().key())
+            .filter(|(_, manages)| *manages)
+            .map(|(instance, _)| instance.get_id().key())
             .collect();
-        let mut exams = service::exam::list_for_courses(&st.db, &ids).await?;
-        exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_course().key()));
+        let mut exams = service::exam::list_for_class_course_courses(&st.db, &ids).await?;
+        exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_class_course().key()));
         exams
     };
     let exams = window.apply(exams)?;
@@ -287,17 +286,17 @@ async fn list_exams(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Fetch a single exam by id. Visible to its course's enrolled users, the
-/// course creator, and managers/admins — except drafts, which only the
-/// course's managers see (everyone else gets a `404`, as if the exam doesn't
-/// exist yet — because it doesn't, officially).
+/// Fetch a single exam by id. Visible to its instance's enrolled students, its
+/// teachers (or its class's homeroom teacher), and managers/admins — except
+/// drafts, which only the instance's managers see (everyone else gets a `404`,
+/// as if the exam doesn't exist yet — because it doesn't, officially).
 ///
 /// Gate order is deliberate and must stay as written: a caller with no view of
-/// the course is refused by the *view* gate (`403`) before the draft gate is
-/// reached, so the `404` rule covers only callers who can see the course — a
-/// demoted creator, for instance, gets the `403` unless they are enrolled.
-/// Moving the draft check above the view check to "make the 404 universal"
-/// would hand every unenrolled caller a probe for which exams exist.
+/// the instance is refused by the *view* gate (`403`) before the draft gate is
+/// reached, so the `404` rule covers only callers who can see the instance — a
+/// teacher since removed from it, for instance, gets the `403` unless they are
+/// enrolled. Moving the draft check above the view check to "make the 404
+/// universal" would hand every unenrolled caller a probe for which exams exist.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -307,7 +306,7 @@ async fn list_exams(
     responses(
         (status = 200, description = "The exam", body = ExamResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course, not its creator, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, and not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found (or a draft the caller may not see)", body = ErrorResponse),
     ),
 )]
@@ -319,23 +318,24 @@ async fn get_exam(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_view_course(&course, &user, &st.db).await? {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_view_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this exam",
+            "only this instance's enrolled students, its teachers, its class's homeroom teacher, or a manager/admin can view this exam",
         ));
     }
-    // A draft doesn't exist for anyone but its course's managers — 404, not
+    // A draft doesn't exist for anyone but its instance's managers — 404, not
     // 403, so its existence never leaks to the students it's hidden from.
-    if exam.is_draft() && !can_manage_course(&course, &user) {
+    if exam.is_draft() && !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::NotFound);
     }
     Ok(Json(ExamResponse::new(&exam)))
 }
 
 /// Update an exam. Requires teacher+ and management rights over the exam's
-/// course (its creator, or manager/admin). Omitted fields keep their value; an
-/// explicit `null` clears a schedule field; the course itself is not updatable.
+/// instance (an assigned teacher, its class's homeroom teacher, or a
+/// manager/admin). Omitted fields keep their value; an explicit `null` clears a
+/// schedule field; the instance an exam hangs off is not updatable here.
 /// The schedule must stay consistent as a whole (see the create endpoint), and
 /// `mode` is frozen once anyone has started an attempt — times, duration,
 /// `max_attempts`, and `allow_rejoin` stay editable so a running exam can be
@@ -354,9 +354,9 @@ async fn get_exam(
         (status = 200, description = "Updated exam", body = ExamResponse),
         (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, duration exceeding the window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, a kind change on an exam that already carries marks, the exam kept changing under concurrent edits, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, a kind change on an exam that already carries marks, the exam kept changing under concurrent edits, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -369,13 +369,13 @@ async fn update_exam(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can edit this exam",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    service::exam_attempt::require_open(&st.db, &exam).await?;
 
     // Field validation, in the order the request is judged — only values this
     // request sets are held to the rules (a stored kind survives list edits,
@@ -446,7 +446,8 @@ async fn update_exam(
 }
 
 /// Delete an exam. Requires teacher+ and management rights over the exam's
-/// course (its creator, or manager/admin). Cascades the exam's results,
+/// instance (an assigned teacher, its class's homeroom teacher, or a
+/// manager/admin). Cascades the exam's results,
 /// attempts, questions, answers, and question + answer images (blobs included).
 #[utoipa::path(
     delete,
@@ -457,9 +458,9 @@ async fn update_exam(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_exam(
@@ -470,10 +471,10 @@ async fn delete_exam(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can delete this exam",
         ));
     }
     // The workflow — the archived-term gate, the exam-row lock and the
@@ -493,8 +494,8 @@ async fn delete_exam(
 // ---- results ------------------------------------------------------------
 
 /// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
-/// management rights over the exam's course; the target must be a student and
-/// enrolled. Only students carry marks; students never grade — and nobody
+/// management rights over the exam's instance; the target must be a student
+/// and enrolled. Only students carry marks; students never grade — and nobody
 /// grades themselves. A draft can't be graded (`409`) — a mark would point at
 /// an exam its student can't see.
 #[utoipa::path(
@@ -508,9 +509,9 @@ async fn delete_exam(
         (status = 200, description = "Result recorded", body = ExamResultResponse),
         (status = 400, description = "Invalid mark, unknown user, user not a student, or not enrolled", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin, or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "The exam is a draft, its kind has been removed from the school's settings, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The exam is a draft, its kind has been removed from the school's settings, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -521,14 +522,15 @@ async fn grade(
     Json(req): Json<GradeResult>,
 ) -> Result<Json<ExamResultResponse>, AppError> {
     let exam_id = ExamId::from_key(&id);
-    // Exam must exist, and only a course manager may grade it.
+    // Exam must exist, and only someone with a right over its instance may
+    // grade it.
     let exam = service::exam::read(&st.db, &exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &teacher) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &teacher).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can grade this exam",
         ));
     }
     let target = UserId::from_key(&req.user_id);
@@ -548,8 +550,8 @@ async fn grade(
 }
 
 /// List an exam's results, paged via `?limit=&offset=` (omit `limit` for all
-/// of them). Requires teacher+ and management rights over the exam's course —
-/// students read only their own via `GET /exams/{id}/result`. Returns a
+/// of them). Requires teacher+ and management rights over the exam's instance
+/// — students read only their own via `GET /exams/{id}/result`. Returns a
 /// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -561,7 +563,7 @@ async fn grade(
         (status = 200, description = "A page of results (all of them when unpaged)", body = Page<ExamResultResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -576,10 +578,10 @@ async fn list_results(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can list results",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can list results",
         ));
     }
     let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;
@@ -623,16 +625,12 @@ async fn my_result(
     let result = service::exam_result::read_for_user(&st.db, &ExamId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let people = person_map(
-        [*result.get_user(), *result.get_graded_by()],
-        &st.db,
-    )
-    .await?;
+    let people = person_map([*result.get_user(), *result.get_graded_by()], &st.db).await?;
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
 
 /// Remove a student's result from an exam. Requires teacher+ and management
-/// rights over the exam's course.
+/// rights over the exam's instance.
 #[utoipa::path(
     delete,
     path = "/{id}/results/{user}",
@@ -645,9 +643,9 @@ async fn my_result(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_result(
@@ -658,10 +656,10 @@ async fn remove_result(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can remove results",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can remove results",
         ));
     }
     // The archived-term gate and the refunding delete are
@@ -674,7 +672,7 @@ async fn remove_result(
 }
 
 /// Summary statistics for an exam's graded results. Requires teacher+ and
-/// management rights over the exam's course.
+/// management rights over the exam's instance.
 #[utoipa::path(
     get,
     path = "/{id}/statistics",
@@ -684,7 +682,7 @@ async fn remove_result(
     responses(
         (status = 200, description = "The exam's mark statistics", body = ExamStatisticsResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -697,10 +695,10 @@ async fn exam_statistics(
     let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can view statistics",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can view statistics",
         ));
     }
     let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;

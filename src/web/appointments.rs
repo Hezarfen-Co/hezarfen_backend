@@ -182,7 +182,10 @@ impl AppointmentResponse {
             // A settled booking whose slot was withdrawn renders without a
             // window and without a slot id — the dangling reference the old
             // store permitted, now an explicit NULL.
-            slot: appointment.get_slot().map(|slot| slot.key()).unwrap_or_default(),
+            slot: appointment
+                .get_slot()
+                .map(|slot| slot.key())
+                .unwrap_or_default(),
             teacher: slot.map(|slot| PersonRef::resolve(people, slot.get_teacher())),
             requester: PersonRef::resolve(people, appointment.get_requester()),
             status: appointment.get_status().as_str().to_string(),
@@ -433,12 +436,13 @@ async fn list_slots(
             .filter(|teacher| seen.insert(teacher.key().to_string()))
             .cloned()
             .collect();
-        let people: HashMap<String, PersonRef> = crate::service::user::list_by_ids(&st.db, &teachers)
-            .await?
-            .iter()
-            .filter(|teacher| teacher.get_role().at_least(Role::Teacher))
-            .map(|teacher| (teacher.get_id().key().to_string(), PersonRef::new(teacher)))
-            .collect();
+        let people: HashMap<String, PersonRef> =
+            crate::service::user::list_by_ids(&st.db, &teachers)
+                .await?
+                .iter()
+                .filter(|teacher| teacher.get_role().at_least(Role::Teacher))
+                .map(|teacher| (teacher.get_id().key().to_string(), PersonRef::new(teacher)))
+                .collect();
         slots.retain(|slot| people.contains_key(slot.get_teacher().key().as_str()));
         (slots, people)
     };
@@ -909,7 +913,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), None)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// All five `can_manage` sites are `RequireTeacher` today, so this is
@@ -931,8 +938,10 @@ mod tests {
         assert!(can_manage(&slot, &owner));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted =
-                crate::service::user::set_role(&db, owner.get_id(), role).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, owner.get_id(), role)
+                .await
+                .unwrap()
+                .0;
             assert!(
                 !can_manage(&slot, &demoted),
                 "{role:?} slot owner still decides its bookings"

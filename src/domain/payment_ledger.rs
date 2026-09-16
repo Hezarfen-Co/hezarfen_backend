@@ -332,7 +332,8 @@ mod tests {
     fn a_charge_key_is_the_plan_the_student_and_the_installment() {
         const PLAN: &str = "018f1a00-0000-7000-8000-000000000001";
         const STU: &str = "018f1a00-0000-7000-8000-000000000002";
-        let assignment = FeePlanAssignmentId::composite(&FeePlanId::from_key(PLAN), &UserId::from_key(STU));
+        let assignment =
+            FeePlanAssignmentId::composite(&FeePlanId::from_key(PLAN), &UserId::from_key(STU));
         let first = PaymentLedgerId::for_installment(&assignment, 1);
         assert_eq!(first.key(), format!("{PLAN}_{STU}_c1"));
         assert_eq!(

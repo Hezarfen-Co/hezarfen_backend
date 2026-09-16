@@ -208,40 +208,41 @@ impl UserResponse {
     }
 }
 
-/// Public shape of a course. Shared by `courses` (CRUD) and `marks` (report
-/// blocks embed the course they average).
+/// Public shape of a course — the **catalog** row, the school's template for a
+/// ders. Shared by `courses` (CRUD) and the reports that embed the course an
+/// instance teaches. The taught thing is the *instance*
+/// ([`super::instances::InstanceResponse`]): teachers, weekly hours and the
+/// karne weight live there, per şube.
 #[derive(Serialize, ToSchema)]
 pub struct CourseResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
-    /// Who created (and owns) the course. Only they and managers/admins may
-    /// delete it or change who teaches it.
+    /// Who created (and owns) the catalog row. Only they and managers/admins
+    /// may edit or delete it.
     pub creator: PersonRef,
-    /// The staff a manager assigned to run this course. They manage everything
-    /// inside it — exams, sessions, subjects, the roster, grading — but cannot
-    /// delete the course or change this list. Empty when nobody was assigned.
-    pub teachers: Vec<PersonRef>,
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
     /// `course` (a regular class), `study` (a supervised study session —
-    /// etüt), or `club` (a student club — kulüp). Behaviorally identical; a
-    /// label for the UI.
+    /// etüt), or `club` (a student club — kulüp). Only a `course` is taught
+    /// through şube instances and carries exams; a `study`/`club` is joined
+    /// school-wide.
     #[schema(example = "course")]
     pub kind: String,
-    /// The academic term this course belongs to (`GET /terms`); `null` when
-    /// unassigned.
-    pub term: Option<String>,
-    /// Seat cap enforced when enrolling; `null` = unlimited.
+    /// How many şube instances teach this course right now — the count the
+    /// delete refusal watches (`0` is what lets the row go).
+    #[schema(example = 3)]
+    pub class_course_count: i64,
+    /// How many individual club/etüt memberships the course carries.
     #[schema(example = 12)]
-    pub capacity: Option<i64>,
+    pub course_membership_count: i64,
 }
 
-/// Every person a [`CourseResponse`] names: the creator plus the teachers
-/// assigned to run it. Feed this into `person_map` so the response can resolve
-/// all of them — a name the map is missing renders as an unknown person.
+/// Every person a [`CourseResponse`] names: its creator. Feed this into
+/// `person_map` so the response can resolve them — a name the map is missing
+/// renders as an unknown person.
 pub fn course_people(course: &Course) -> impl Iterator<Item = UserId> + '_ {
-    std::iter::once(*course.get_creator()).chain(course.get_teachers().iter().cloned())
+    std::iter::once(*course.get_creator())
 }
 
 impl CourseResponse {
@@ -249,16 +250,11 @@ impl CourseResponse {
         Self {
             id: course.get_id().key().to_string(),
             creator: PersonRef::resolve(people, course.get_creator()),
-            teachers: course
-                .get_teachers()
-                .iter()
-                .map(|teacher| PersonRef::resolve(people, teacher))
-                .collect(),
             title: course.get_title().as_str().to_string(),
             description: course.get_description().as_str().to_string(),
             kind: course.get_kind().as_str().to_string(),
-            term: course.get_term().map(|term| term.key().to_string()),
-            capacity: course.get_capacity(),
+            class_course_count: course.get_class_course_count(),
+            course_membership_count: course.get_course_membership_count(),
         }
     }
 }
@@ -288,9 +284,9 @@ impl SubjectResponse {
     }
 }
 
-/// Public shape of a homework assignment. Shared by `courses` (in-course
-/// creation and listing) and `homework` (cross-course list, lookup, edit).
-/// `assigned` is the student subset — `null` means the whole enrolled course
+/// Public shape of a homework assignment. Shared by the instance routes
+/// (creation and listing) and `homework` (cross-instance list, lookup, edit).
+/// `assigned` is the student subset — `null` means the whole enrolled roster
 /// (whoever is enrolled at submit time); a subset lists the named students' ids.
 /// `due_at`/`created_at` are UTC unix-milliseconds; lateness is judged per
 /// submission (against `due_at`), never stored on the homework itself.
@@ -298,8 +294,10 @@ impl SubjectResponse {
 pub struct HomeworkResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
-    /// The course this homework belongs to.
-    pub course: String,
+    /// The class×course instance this homework belongs to
+    /// (`GET /instances/{id}`) — the şube's own assignment, not a school-wide
+    /// course's.
+    pub class_course: String,
     /// The course subject this homework is tagged with.
     pub subject: String,
     #[schema(example = "Read chapter 3")]
@@ -323,7 +321,7 @@ impl HomeworkResponse {
     pub fn new(homework: &Homework) -> Self {
         Self {
             id: homework.get_id().key().to_string(),
-            course: homework.get_course().key().to_string(),
+            class_course: homework.get_class_course().key().to_string(),
             subject: homework.get_subject().key().to_string(),
             title: homework.get_title().as_str().to_string(),
             description: homework.get_description().map(|d| d.as_str().to_string()),
@@ -349,13 +347,14 @@ impl HomeworkResponse {
     }
 }
 
-/// Public shape of a course session (one lesson). Shared by `courses`
-/// (in-course creation and listing) and `sessions` (CRUD + roll call).
+/// Public shape of a course session (one lesson). Shared by the instance
+/// routes (creation and listing) and `sessions` (CRUD + roll call).
 #[derive(Serialize, ToSchema)]
 pub struct SessionResponse {
     pub id: String,
-    /// The course this lesson belongs to.
-    pub course: String,
+    /// The class×course instance this lesson belongs to
+    /// (`GET /instances/{id}`).
+    pub class_course: String,
     /// Who teaches this session.
     pub teacher: PersonRef,
     pub topic: String,
@@ -369,7 +368,7 @@ impl SessionResponse {
     pub fn new(session: &CourseSession, people: &HashMap<String, PersonRef>) -> Self {
         Self {
             id: session.get_id().key().to_string(),
-            course: session.get_course().key().to_string(),
+            class_course: session.get_class_course().key().to_string(),
             teacher: PersonRef::resolve(people, session.get_teacher()),
             topic: session.get_topic().as_str().to_string(),
             starts_at: session.get_starts_at().as_millis(),
@@ -378,15 +377,20 @@ impl SessionResponse {
     }
 }
 
-/// Public shape of an exam. Shared by `exams` (CRUD/results) and `courses`
-/// (in-course creation and listing). The schedule fields are all `null` for an
+/// Public shape of an exam. Shared by `exams` (CRUD/results) and the instance
+/// routes (creation and listing). The schedule fields are all `null` for an
 /// offline-graded exam (no mode); see the create/update endpoints for the
 /// rules tying them together.
 #[derive(Serialize, ToSchema)]
 pub struct ExamResponse {
     pub id: String,
     pub creator: String,
-    pub course: String,
+    /// The class×course instance the exam belongs to (`GET /instances/{id}`) —
+    /// two şubeler teaching the same course sit their own exams.
+    pub class_course: String,
+    /// The dönem the exam is sat in (`GET /terms`); its marks count into that
+    /// dönem's karne.
+    pub term: String,
     pub title: String,
     pub description: String,
     /// The assessment form. Its weight in the course average is school policy:
@@ -422,7 +426,8 @@ impl ExamResponse {
         Self {
             id: exam.get_id().key().to_string(),
             creator: exam.get_creator().key().to_string(),
-            course: exam.get_course().key().to_string(),
+            class_course: exam.get_class_course().key().to_string(),
+            term: exam.get_term().key().to_string(),
             title: exam.get_title().as_str().to_string(),
             description: exam.get_description().as_str().to_string(),
             kind: exam.get_kind().as_str().to_string(),

@@ -319,11 +319,8 @@ impl MealLedger {
         recorded_by: &UserId,
     ) -> Option<(MealLedgerId, MealLedger)> {
         let amount = booking.get_price_minor()?;
-        let charge = MealLedgerId::for_attempt(
-            &booking.id(),
-            booking.get_attempt(),
-            MealLedgerKind::Charge,
-        );
+        let charge =
+            MealLedgerId::for_attempt(&booking.id(), booking.get_attempt(), MealLedgerKind::Charge);
         let line = MealLedger {
             id: MealLedgerId::for_attempt(
                 &booking.id(),

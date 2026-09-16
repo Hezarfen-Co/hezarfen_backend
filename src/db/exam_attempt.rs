@@ -400,15 +400,19 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
-        let course = crate::db::course::a_test_course(db).await;
+        // The instance and the dönem are foreign keys now: real rows the
+        // fixture mints.
+        let (instance, _course) = crate::db::course::a_test_instance(db).await;
+        let term = crate::db::term::a_test_term(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
             db,
             &creator,
-            &course,
+            &instance,
+            &term,
             ExamTitle::try_new("practice").unwrap(),
             ExamDescription::try_new("").unwrap(),
-            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamKind::try_new("yazili", &kinds).unwrap(),
             ExamSchedule::try_new(Some(ExamMode::try_new("open").unwrap()), None, None, None)
                 .unwrap(),
             ExamAttemptLimit::try_new(max_attempts).unwrap(),

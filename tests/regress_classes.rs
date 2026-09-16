@@ -6,7 +6,10 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{ABSENT_ID, GHOST_ID, Res, app_and_db, create_course, login_as, me_id, send, total};
+use common::{
+    ABSENT_ID, GHOST_ID, Res, add_member, app_and_db, attach_instance, create_course, create_exam,
+    create_term, create_year, items, login_as, me_id, send, taught, total,
+};
 use hezarfen_backend::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_group::ClassName;
@@ -16,6 +19,12 @@ use hezarfen_backend::error::AppError;
 use hezarfen_backend::service::{class_course, class_group, class_member};
 use serde_json::json;
 use sqlx::Row as _;
+
+/// The instance id out of a `POST /classes/{id}/instances` response — the
+/// anchor every roster, exam and detach under that attachment keys on.
+fn instance_of(res: &Res) -> String {
+    res.body["id"].as_str().expect("instance id").to_string()
+}
 
 /// One counter, re-read out of the store — never off a response body. `sql`
 /// is a whole scalar query; each call spells the aggregate it asserts on.
@@ -120,16 +129,21 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
         "no link row may point at a course that does not exist"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
         0,
         "…and the class must not count one either, or it is undeletable forever"
     );
 }
 
 /// B1(b). The other half: a link that *did* land that way must still be
-/// removable. `DELETE /classes/{c}/courses/{id}` read the course before the
-/// link, so a deleted course made the route answer 404 forever — and the class
-/// 409 forever, over an attachment nothing could sweep.
+/// removable. The detach keys on the link row itself (`DELETE
+/// /classes/{c}/instances/{instance}`), so a course that vanished under it is
+/// still swept — a route that read the course first would answer 404 forever
+/// and leave the class 409 forever, over an attachment nothing could sweep.
 #[tokio::test]
 async fn a_stale_link_detaches_and_frees_its_class() {
     let (app, db) = app_and_db().await;
@@ -150,18 +164,21 @@ async fn a_stale_link_detaches_and_frees_its_class() {
     let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": course })),
     )
     .await;
     assert_eq!(attached.status, StatusCode::CREATED);
+    let instance = instance_of(&attached);
+    // The course row goes the way a concurrent `DELETE /courses/{id}` racing
+    // the attach would leave it: gone, the link it never saw still standing.
     wipe_course_row(&course, &db).await;
 
     let detached = send(
         &app,
         "DELETE",
-        &format!("/classes/{class}/courses/{course}"),
+        &format!("/classes/{class}/instances/{instance}"),
         Some(&manager),
         None,
     )
@@ -187,13 +204,13 @@ async fn a_stale_link_detaches_and_frees_its_class() {
         deleted.body
     );
 
-    // A course that was never attached is still a 404 — the guard that turns
-    // "sweep the stale link" into "delete anything" is the link row, not the
-    // course row.
+    // An instance that is no longer attached is still a 404 — the guard that
+    // turns "sweep the stale link" into "delete anything" is the link row, not
+    // the course row.
     let again = send(
         &app,
         "DELETE",
-        &format!("/classes/{class}/courses/{course}"),
+        &format!("/classes/{class}/instances/{instance}"),
         Some(&manager),
         None,
     )
@@ -201,10 +218,12 @@ async fn a_stale_link_detaches_and_frees_its_class() {
     assert_eq!(again.status, StatusCode::NOT_FOUND);
 }
 
-/// B2. Every member add into a class holding such a link answered
-/// `409 "<course> is full"` — a course that does not exist, so no capacity
-/// anyone could raise would ever let a student in. The two causes come out of
-/// one seat claim matching nothing, and they must not read as one answer.
+/// B2. A class whose link names a catalog row that is gone — the state a
+/// `DELETE /courses/{id}` racing the attach leaves behind — must not lock the
+/// operator out. The pump's pairs are `(instance, user)` and never read the
+/// catalog row, so the add lands and the student is enrolled; the stale link
+/// then sweeps through its *own* route (the link row is the guard, never the
+/// course row), and the class is deletable again once its roster has left.
 #[tokio::test]
 async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
     let (app, db) = app_and_db().await;
@@ -223,17 +242,19 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
     };
-    send(
+    let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": course })),
     )
     .await;
+    assert_eq!(attached.status, StatusCode::CREATED);
+    let instance = instance_of(&attached);
     wipe_course_row(&course, &db).await;
 
-    let refused = send(
+    let added = send(
         &app,
         "POST",
         &format!("/classes/{class}/members"),
@@ -241,27 +262,90 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
         Some(json!({ "user_id": student_id })),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT);
-    let message = refused.body["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("no longer exists") && message.contains(&course),
-        "the refusal must name the vanished course, not a capacity: {message}"
-    );
-    assert!(
-        !message.contains("full"),
-        "a course that does not exist is not a full one: {message}"
-    );
-    // …and it says so as a machine code too, the one a pump's skip list spells
-    // for this cause. A bilingual client branches on this, never on the words.
     assert_eq!(
-        refused.body["code"], "linked_course_missing",
-        "the stale-link refusal must carry its machine code: {:?}",
-        refused.body
+        added.status,
+        StatusCode::CREATED,
+        "a link whose course is gone must not lock the roster: {:?}",
+        added.body
+    );
+    // The student is on the instance's roster, tagged with the şube that
+    // pumped them: what the pump names is the instance, and the catalog row
+    // the link points at is not part of that pair.
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(roster.status, StatusCode::OK, "{:?}", roster.body);
+    assert_eq!(
+        total(&roster.body),
+        1,
+        "the pump enrolled the student: {:?}",
+        roster.body
+    );
+    assert_eq!(items(&roster.body)[0]["user"]["id"], json!(student_id));
+    assert_eq!(items(&roster.body)[0]["source"], json!(class));
+
+    // The stale link detaches through its own route, and the class is free
+    // once the roster has left it.
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/instances/{instance}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        detached.body
+    );
+    let left = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/members/{student_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(left.status, StatusCode::NO_CONTENT, "{:?}", left.body);
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::NO_CONTENT,
+        "…and the class the stale link blocked is deletable again: {:?}",
+        deleted.body
     );
     assert_eq!(
         rows("SELECT count(*) FROM class_member", &db).await,
         0,
-        "a refused add writes nothing"
+        "the şube delete takes its roster history with it"
+    );
+    assert_eq!(
+        rows("SELECT count(*) FROM enrollment", &db).await,
+        0,
+        "…and the instance's roster went with the detach"
+    );
+    assert_eq!(
+        counter(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course",
+            &db
+        )
+        .await,
+        0,
+        "…with each instance's seat counter"
     );
 }
 
@@ -286,14 +370,16 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
     };
-    send(
+    let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": course })),
     )
     .await;
+    assert_eq!(attached.status, StatusCode::CREATED);
+    let instance = instance_of(&attached);
     let added = send(
         &app,
         "POST",
@@ -309,7 +395,7 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
     let roster = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{instance}/enrollments"),
         Some(&manager),
         None,
     )
@@ -319,7 +405,7 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
     let by_hand = send(
         &app,
         "POST",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{instance}/enrollments"),
         Some(&manager),
         Some(json!({ "user_id": student_id })),
     )
@@ -331,7 +417,11 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
         "a hand enroll must take the row off the class"
     );
     assert_eq!(
-        rows("SELECT count(*) FROM enrollment WHERE source IS NOT NULL", &db).await,
+        rows(
+            "SELECT count(*) FROM enrollment WHERE source IS NOT NULL",
+            &db
+        )
+        .await,
         0,
         "…in the stored row, not just the response"
     );
@@ -353,7 +443,11 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
         "the class may not unenroll a student an operator enrolled by hand"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
+        counter(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course",
+            &db
+        )
+        .await,
         1,
         "…and the seat it never paid for may not be released"
     );
@@ -383,14 +477,16 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
     };
-    send(
+    let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": course })),
     )
     .await;
+    assert_eq!(attached.status, StatusCode::CREATED);
+    let instance = instance_of(&attached);
     send(
         &app,
         "POST",
@@ -411,26 +507,43 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
     .await;
     assert_eq!(promoted.status, StatusCode::OK);
 
-    assert_eq!(rows("SELECT count(*) FROM class_member", &db).await, 0);
+    assert_eq!(
+        rows(
+            "SELECT count(*) FROM class_member WHERE left_at IS NULL",
+            &db
+        )
+        .await,
+        0,
+        "a non-student holds no live stint; the history row is what a soft \
+         leave keeps"
+    );
     assert_eq!(
         rows("SELECT count(*) FROM enrollment", &db).await,
         0,
         "a non-student holds no roster row, whoever wrote it"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
+        counter(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course",
+            &db
+        )
+        .await,
         0,
         "the seat comes back exactly once"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
         0
     );
     // Nothing is left tagged with the class, so letting it go strands nothing.
     let detached = send(
         &app,
         "DELETE",
-        &format!("/classes/{class}/courses/{course}"),
+        &format!("/classes/{class}/instances/{instance}"),
         Some(&manager),
         None,
     )
@@ -445,91 +558,6 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
     )
     .await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-}
-
-/// B4. The roster cap is claimed off the course row's *own* `capacity` column
-/// now, not off an integer read moments earlier — so a capacity PATCH cannot be
-/// outrun by an enroll that snapshotted the old number. The over-admit that
-/// bug allowed needs two writers interleaved inside one request, which the
-/// in-memory engine cannot be made to schedule; what is pinned here is that the
-/// converted statement still refuses, still admits, and still tells a full
-/// course from a deleted one.
-#[tokio::test]
-async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
-    let (app, db) = app_and_db().await;
-    let manager = login_as(&app, &db, "manager", "manager").await;
-    let first = login_as(&app, &db, "sena", "student").await;
-    let second = login_as(&app, &db, "suat", "student").await;
-    let first_id = me_id(&app, &first).await;
-    let second_id = me_id(&app, &second).await;
-    let course = {
-        let res = send(
-            &app,
-            "POST",
-            "/courses",
-            Some(&manager),
-            Some(json!({ "title": "algebra", "capacity": 1 })),
-        )
-        .await;
-        assert_eq!(res.status, StatusCode::CREATED);
-        res.body["id"].as_str().unwrap().to_string()
-    };
-    let enroll = |who: String| {
-        let app = app.clone();
-        let manager = manager.clone();
-        let course = course.clone();
-        async move {
-            send(
-                &app,
-                "POST",
-                &format!("/courses/{course}/enrollments"),
-                Some(&manager),
-                Some(json!({ "user_id": who })),
-            )
-            .await
-        }
-    };
-
-    assert_eq!(enroll(first_id.clone()).await.status, StatusCode::OK);
-    assert_eq!(
-        enroll(second_id.clone()).await.status,
-        StatusCode::CONFLICT,
-        "the cap must bite at one"
-    );
-    // Re-enrolling the student who is already in is answered off their row, not
-    // off the (full) counter, and costs no seat.
-    assert_eq!(enroll(first_id.clone()).await.status, StatusCode::OK);
-    assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
-        1
-    );
-
-    // Raise the cap and the very next claim sees the new number, because it
-    // reads the column rather than a copy of it.
-    let raised = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course}"),
-        Some(&manager),
-        Some(json!({ "capacity": 2 })),
-    )
-    .await;
-    assert_eq!(raised.status, StatusCode::OK);
-    assert_eq!(enroll(second_id.clone()).await.status, StatusCode::OK);
-    assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
-        2
-    );
-
-    // And a course deleted out from under the claim is a 404, not a 409: the
-    // conditional write matches nothing either way, and only that path pays for
-    // the read that tells them apart.
-    wipe_course_row(&course, &db).await;
-    sqlx::query("DELETE FROM enrollment")
-        .execute(&db)
-        .await
-        .unwrap();
-    assert_eq!(enroll(first_id).await.status, StatusCode::NOT_FOUND);
 }
 
 /// D1. Both link tables key on the *pair* (`<class>_<user>`), so the
@@ -568,25 +596,35 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
         names.push((key, member));
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
-    let name_of =
-        |id: &UserId| names.iter().find(|(_, mid)| mid == id).map(|(k, _)| *k).unwrap();
+    let name_of = |id: &UserId| {
+        names
+            .iter()
+            .find(|(_, mid)| mid == id)
+            .map(|(k, _)| *k)
+            .unwrap()
+    };
 
     let (roster, _) = class_member::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
-    let order: Vec<&str> = roster.iter().map(|member| name_of(member.get_user())).collect();
+    let order: Vec<&str> = roster
+        .iter()
+        .map(|member| name_of(member.get_user()))
+        .collect();
     assert_eq!(
         order,
         vec!["b", "c", "a"],
         "the roster must come back newest-added first, not sorted by account id"
     );
 
-    // A row written before the stamp column existed carries no `added_at` at
-    // all — the state a real volume is in. It is of unknown age, and NONE
-    // sorting last under DESC is what makes that the oldest, rather than an
-    // invented number putting it anywhere else.
+    // A row whose age nobody knows: the shipped `joined_at` is `NOT NULL`
+    // since the K12 remodel (a stint is minted with a stamp, always), so
+    // "no stamp at all" is unrepresentable — the oldest stamp there is *is*
+    // the unknown age. It sorts last under DESC, which is what makes such a
+    // row read as the oldest rather than an invented number putting it
+    // anywhere else.
     sqlx::query(
-        "UPDATE class_member SET added_at = NULL
+        "UPDATE class_member SET joined_at = 0
          WHERE app_user = (SELECT id FROM app_user WHERE username = 'c')",
     )
     .execute(&db)
@@ -601,7 +639,7 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
             .map(|member| name_of(member.get_user()))
             .collect::<Vec<_>>(),
         vec!["b", "a", "c"],
-        "a stamp-less row must sort oldest, not first"
+        "a row of unknown age must sort oldest, not first"
     );
 }
 
@@ -699,7 +737,11 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
          must name the ceiling the prose does — the roster, not the course list: {refused:?}"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
         MAX_CLASS_MEMBERS,
         "a refused add may not tick the counter past the cap"
     );
@@ -765,7 +807,11 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         "a refused attach may not leave the link behind"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_course_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
         0,
         "…nor tick the axis it was refused on"
     );
@@ -819,7 +865,11 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
     );
     assert_eq!(rows("SELECT count(*) FROM class_member", &db).await, 0);
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
         0
     );
 }
@@ -1068,7 +1118,7 @@ async fn a_student_reads_exactly_their_own_classes() {
     let teacher_id = me_id(&app, &teacher).await;
     let student_id = me_id(&app, &student).await;
 
-    // Added oldest-first, with a gap wide enough that `added_at` really
+    // Added oldest-first, with a gap wide enough that `joined_at` really
     // orders them — the composite ids break a tie in account-ULID order, which
     // says nothing about who joined first.
     let mut mine = Vec::new();
@@ -1409,24 +1459,16 @@ async fn role_of(user: &str, db: &Database) -> String {
 
 /// `POST /classes` naming a teacher who is demoted while the row is being
 /// written: `409`, and the class is rolled back **whole** — no teacherless
-/// class left standing, and no reference stranded on the term it linked (which
-/// would make that term undeletable forever).
+/// class left standing, and no reference stranded on the academic year it
+/// linked (which would make that year undeletable forever).
 #[tokio::test]
 async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "manager", "manager").await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
-    let term = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({ "name": "2026", "starts_at": 100, "ends_at": 200 })),
-    )
-    .await;
-    assert_eq!(term.status, StatusCode::CREATED);
-    let term_id = term.body["id"].as_str().unwrap().to_string();
+    let year = create_year(&app, &manager, "2026-2027").await;
+    let term_id = create_term(&app, &manager, &year, "1. Dönem").await;
 
     demote_during_writes_to("class_group", "CREATE", &teacher_id, &db).await;
     let res = send(
@@ -1434,7 +1476,7 @@ async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "teacher_id": teacher_id, "term_id": term_id })),
+        Some(json!({ "name": "9-A", "teacher_id": teacher_id, "year": year })),
     )
     .await;
 
@@ -1456,9 +1498,13 @@ async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
         "the 409 promises nothing was created — so nothing may be there"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(class_count), 0)::bigint FROM term", &db).await,
+        counter(
+            "SELECT COALESCE(sum(class_count), 0)::bigint FROM academic_year",
+            &db
+        )
+        .await,
         0,
-        "…and least of all a reference stranded on the term"
+        "…and least of all a reference stranded on the year it linked"
     );
     let freed = send(
         &app,
@@ -1582,21 +1628,22 @@ async fn a_patch_whose_teacher_is_demoted_mid_write_undoes_the_column() {
 }
 
 /// The same guard on the other assignment it protects:
-/// `POST /courses/{id}/teachers` for an account demoted while the list is being
-/// written is a `409`, with the assignment dropped again.
+/// `POST /instances/{id}/teachers` for an account demoted while the list is
+/// being written is a `409`, with the assignment dropped again. Staffing is an
+/// *instance's* own list now — the catalog course carries no teachers.
 #[tokio::test]
-async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
+async fn an_instance_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "manager", "manager").await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
-    let course = create_course(&app, &manager, "algebra").await;
+    let instance = taught(&app, &manager, "algebra").await.instance;
 
-    demote_during_writes_to("course_teacher", "CREATE", &teacher_id, &db).await;
+    demote_during_writes_to("class_course_teacher", "CREATE", &teacher_id, &db).await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/teachers"),
+        &format!("/instances/{instance}/teachers"),
         Some(&manager),
         Some(json!({ "user_id": teacher_id })),
     )
@@ -1610,7 +1657,7 @@ async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
     );
     assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
     assert_eq!(
-        counter("SELECT count(*) FROM course_teacher", &db).await,
+        counter("SELECT count(*) FROM class_course_teacher", &db).await,
         0,
         "the assignment must be dropped again, not left granting nothing"
     );
@@ -1783,29 +1830,27 @@ async fn the_class_index_filters_by_grade() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
 
-/// The heir a detach hands a shared row to is **claimed**, not merely read —
-/// and a claim that matches nothing takes the release arm.
+/// The member exit releases the roster row its own section wrote — and the
+/// repair its sweep must *not* make is handing that row to a section whose row
+/// is gone.
 ///
-/// Two pure reads picked that heir: the rival classes attached to the course,
-/// then the ones the student is also in. Nothing in the sweep's write set
-/// touched the class it settled on, and SurrealDB conflict-checks no read, so
-/// `DELETE /classes/{heir}/members/{user}` and
-/// `DELETE /classes/{heir}/courses/{course}` could both commit *inside* this
-/// long sweep and leave the row tagged with a class holding neither link — a
-/// class whose own 0/0 delete guard then passes, stranding an enrollment no
-/// route can reach (both ends 404 on the link rows that are gone). The claim
-/// moves a counter on the heir's own row, which is the record every one of
-/// those writers moves too, so the store settles the pair.
+/// There is no shared row to hand anywhere since the K12 remodel: a şube
+/// teaches the course as its **own instance**, so the section the student
+/// leaves gives back exactly the seat that section pumped (the fixture asserts
+/// that first — each attach writes its own row, tagged with its own class).
+/// What survives from the old hand-off is its guard: when the sweep looks for a
+/// rival still claiming the row, the rival it may settle on can be a section
+/// deleted out from under its own links — a state this layer really carries
+/// (`a_membership_whose_class_is_gone_is_counted_but_skipped`) — and such a
+/// section must take the release arm. A row tagged with a class that is not
+/// there is an enrollment nothing can ever sweep: both ends 404 on link rows
+/// that are gone.
 ///
-/// The real interleaving needs the store's conflict detection, which the
-/// in-memory engine does not have (`class_pump::tests::a_detached_row_is_never_
-/// handed_to_a_class_that_let_it_go`, `#[ignore]`d, drives it on a real
-/// server). What is deterministic here is the other half of the same claim: an
-/// heir whose class row is *gone* while its link rows survive — a state this
-/// layer really carries (`a_membership_whose_class_is_gone_is_counted_but_
-/// skipped`) — must not be handed the row either.
+/// The real interleaving needs the store's conflict detection; what is
+/// deterministic here is that half of it: the gone section is never handed the
+/// row, the row is released, and the counter lands on zero with it.
 #[tokio::test]
-async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
+async fn a_member_exit_never_hands_a_row_to_a_class_that_is_gone() {
     let (app, db) = app_and_db().await;
     let staff = login_as(&app, &db, "manager", "manager").await;
     let manager = UserId::from_key(&me_id(&app, &staff).await);
@@ -1827,48 +1872,63 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
         class_member::add(&db, &class, &student, &manager)
             .await
             .unwrap();
-        class_course::attach(&db, &class, &algebra, &manager)
+        let instance = class_course::attach(&db, &class, &algebra, &manager)
             .await
             .unwrap();
-        made.push(class);
+        made.push((class, instance.get_id().clone()));
     }
-    let (owner, heir) = (made[0].clone(), made[1].clone());
+    let owner = made[0].0.clone();
+    let heir = made[1].0.clone();
+    let owner_instance = made[0].1.clone();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM enrollment WHERE source = $1",
-        )
-        .bind(owner.clone())
-        .fetch_one(&db)
-        .await
-        .unwrap(),
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM enrollment WHERE source = $1",)
+            .bind(owner.clone())
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         1,
-        "the second attach skips the row the first wrote, so the first owns it"
+        "each attach pumps its own instance: the first class owns the row it wrote"
     );
 
     // The heir's class row goes while both of its link rows stay: the state a
     // class deleted out from under its own links leaves.
     wipe_row("class_group", heir.uuid(), &db).await;
 
-    class_course::detach(&db, &owner, &algebra).await.unwrap();
+    class_member::leave(&db, &owner, &student).await.unwrap();
     assert_eq!(
-        rows("SELECT count(*) FROM enrollment", &db).await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM enrollment WHERE class_course = $1")
+            .bind(owner_instance.uuid())
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         0,
         "a row handed to a class that is not there is one nothing can ever sweep"
     );
     assert_eq!(
-        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", &db).await,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course WHERE id = $1"
+        )
+        .bind(owner_instance.uuid())
+        .fetch_one(&db)
+        .await
+        .unwrap(),
         0,
         "…and its seat must come back with it"
     );
 }
 
-/// #22. A class on an archived term is read-only: every write axis it has —
-/// the class itself, its roster, its attachments and the blueprint pump —
-/// answers the coded 409, while every read stays open. The term the *course*
-/// sits on holds the same bar from the other side, and re-opening the year
-/// thaws all of it.
+/// #22. A class in an archived academic year is read-only: every write axis it
+/// has — the class itself, its roster, its instances, their rosters and the
+/// blueprint pump — answers the coded `academic_year_archived` 409, while every
+/// read stays open. Re-opening the year thaws all of it.
+///
+/// The year is what a şube hangs off since the K12 remodel (a dönem is a
+/// grading slice *inside* it), so this is the same freeze the term used to
+/// carry, one level up. There is no archive route for a year yet — the `409`
+/// that would gate one has no door — so the past is minted the way an operator
+/// would: the column directly.
 #[tokio::test]
-async fn an_archived_term_freezes_every_class_write_and_no_read() {
+async fn an_archived_year_freezes_every_class_write_and_no_read() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "arch_manager", "manager").await;
     let student = login_as(&app, &db, "arch_student", "student").await;
@@ -1876,54 +1936,34 @@ async fn an_archived_term_freezes_every_class_write_and_no_read() {
     let student_id = me_id(&app, &student).await;
     let other_id = me_id(&app, &other).await;
 
-    let term = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2024",
-            "starts_at": 1_700_000_000_000_i64,
-            "ends_at": 1_710_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(term.status, StatusCode::CREATED);
-    let term_id = common::id_of(&term.body);
+    let year = create_year(&app, &manager, "2024-2025").await;
+    let term_id = create_term(&app, &manager, &year, "2024").await;
 
-    // A course on that same year, and one on no year at all — the second is
-    // what proves a refusal came from the *class's* side.
-    let dated = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&manager),
-        Some(json!({ "title": "algebra", "term_id": term_id })),
-    )
-    .await;
-    assert_eq!(dated.status, StatusCode::CREATED);
-    let dated = common::id_of(&dated.body);
+    // The course to attach, and a second one that stays unattached — what
+    // proves a refusal came from the *class's* side.
+    let dated = create_course(&app, &manager, "algebra").await;
     let open_course = create_course(&app, &manager, "geometry").await;
 
     let class = create_class(
         &app,
         &manager,
-        json!({ "name": "9-A", "grade": "9", "term_id": term_id }),
+        json!({ "name": "9-A", "grade": "9", "year": year }),
     )
     .await;
     let class = common::id_of(&class.body);
 
-    // Everything the frozen state must already hold: an attachment, a member,
+    // Everything the frozen state must already hold: an instance, a member,
     // and a blueprint at this grade for the pump to try.
     let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": dated })),
     )
     .await;
     assert_eq!(attached.status, StatusCode::CREATED, "attach while open");
+    let instance = instance_of(&attached);
     let joined = send(
         &app,
         "POST",
@@ -1943,18 +1983,17 @@ async fn an_archived_term_freezes_every_class_write_and_no_read() {
     .await;
     assert_eq!(blueprint.status, StatusCode::CREATED, "blueprint");
 
-    let archived = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(archived.status, StatusCode::OK);
+    // The year goes past: nothing in the API archives one yet, so the column
+    // is written the way the archive half of a term used to write it.
+    sqlx::query("UPDATE academic_year SET archived_at = $1 WHERE id = $2")
+        .bind(1_700_000_000_000_i64)
+        .bind(uuid::Uuid::parse_str(&year).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
 
     // One refusal per write route, each 409 with the machine code — never a
-    // bare 409, which a client cannot tell from a capacity conflict.
+    // bare 409, which a client cannot tell from any other refusal.
     let writes: Vec<(&str, String, Option<serde_json::Value>)> = vec![
         (
             "PATCH",
@@ -1973,25 +2012,51 @@ async fn an_archived_term_freezes_every_class_write_and_no_read() {
         ),
         (
             "POST",
-            format!("/classes/{class}/courses"),
-            // An *open* course: the class's own term is the refusal.
+            format!("/classes/{class}/instances"),
+            // An unattached *catalog* course: the class's own year is the
+            // refusal, which is what this probe is for.
             Some(json!({ "course_id": open_course })),
         ),
-        ("DELETE", format!("/classes/{class}/courses/{dated}"), None),
+        (
+            "DELETE",
+            format!("/classes/{class}/instances/{instance}"),
+            None,
+        ),
         ("POST", format!("/classes/{class}/blueprint"), None),
         ("DELETE", format!("/classes/{class}"), None),
+        (
+            "PATCH",
+            format!("/instances/{instance}"),
+            Some(json!({ "ders_saati": 4 })),
+        ),
+        (
+            "POST",
+            format!("/instances/{instance}/enrollments"),
+            Some(json!({ "user_id": other_id })),
+        ),
+        (
+            "POST",
+            format!("/instances/{instance}/sessions"),
+            Some(json!({ "starts_at": 1_900_000_000_000_i64 })),
+        ),
     ];
     for (method, uri, body) in writes {
         let res = send(&app, method, &uri, Some(&manager), body).await;
         assert_eq!(res.status, StatusCode::CONFLICT, "{method} {uri}");
-        assert_eq!(res.body["code"], "term_archived", "{method} {uri} code");
+        assert_eq!(
+            res.body["code"], "academic_year_archived",
+            "{method} {uri} code"
+        );
     }
 
     // Reads are untouched — a past year is read-only, not hidden.
     for uri in [
         format!("/classes/{class}"),
         format!("/classes/{class}/members"),
-        format!("/classes/{class}/courses"),
+        format!("/classes/{class}/instances"),
+        format!("/instances/{instance}"),
+        format!("/academic-years/{year}"),
+        format!("/terms/{term_id}"),
     ] {
         let res = send(&app, "GET", &uri, Some(&manager), None).await;
         assert_eq!(res.status, StatusCode::OK, "GET {uri}");
@@ -2006,35 +2071,12 @@ async fn an_archived_term_freezes_every_class_write_and_no_read() {
     .await;
     assert_eq!(total(&members.body), 1, "no write landed");
 
-    // The other side of the attach: an open class may not take a course whose
-    // own term is archived.
-    let open_class = create_class(&app, &manager, json!({ "name": "10-A" })).await;
-    let open_class = common::id_of(&open_class.body);
-    let cross = send(
-        &app,
-        "POST",
-        &format!("/classes/{open_class}/courses"),
-        Some(&manager),
-        Some(json!({ "course_id": dated })),
-    )
-    .await;
-    assert_eq!(
-        cross.status,
-        StatusCode::CONFLICT,
-        "open class, past course"
-    );
-    assert_eq!(cross.body["code"], "term_archived");
-
     // Re-opening the year thaws the whole set; one write is enough to show it.
-    let reopened = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(reopened.status, StatusCode::OK);
+    sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&year).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
     let patched = send(
         &app,
         "PATCH",
@@ -2043,6 +2085,357 @@ async fn an_archived_term_freezes_every_class_write_and_no_read() {
         Some(json!({ "name": "9-B" })),
     )
     .await;
-    assert_eq!(patched.status, StatusCode::OK, "thawed");
+    assert_eq!(patched.status, StatusCode::OK, "thawed: {:?}", patched.body);
     assert_eq!(patched.body["name"], "9-B");
+}
+
+// ---- the instance anchor ----------------------------------------------------
+
+/// The remodel's core promise: a catalog course is a *title* shared by every
+/// section that teaches it, and each şube teaching it is its own instance. Two
+/// şubeler attaching one course mint two instances; a student of 5-A is on
+/// 5-A's roster alone; and an exam written on 5-A's instance is invisible from
+/// 5-B's — which is exactly what the old school-wide singleton could not do.
+#[tokio::test]
+async fn two_subeler_teaching_one_course_are_two_instances() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let student = login_as(&app, &db, "student", "student").await;
+    let student_id = me_id(&app, &student).await;
+
+    let year = create_year(&app, &manager, "2026-2027").await;
+    let term = create_term(&app, &manager, &year, "1. Dönem").await;
+    let course = create_course(&app, &manager, "Matematik").await;
+
+    let a = create_class(
+        &app,
+        &manager,
+        json!({ "name": "5-A", "grade": "5", "year": year }),
+    )
+    .await;
+    let a = common::id_of(&a.body);
+    let b = create_class(
+        &app,
+        &manager,
+        json!({ "name": "5-B", "grade": "5", "year": year }),
+    )
+    .await;
+    let b = common::id_of(&b.body);
+
+    let ia = send(
+        &app,
+        "POST",
+        &format!("/classes/{a}/instances"),
+        Some(&manager),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(ia.status, StatusCode::CREATED, "{:?}", ia.body);
+    let ia = instance_of(&ia);
+    let ib = send(
+        &app,
+        "POST",
+        &format!("/classes/{b}/instances"),
+        Some(&manager),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(ib.status, StatusCode::CREATED, "{:?}", ib.body);
+    let ib = instance_of(&ib);
+    assert_ne!(
+        ia, ib,
+        "one catalog course taught by two şubeler is two instances"
+    );
+
+    // Each instance names the same catalog course, and its own şube.
+    for (instance, class) in [(&ia, &a), (&ib, &b)] {
+        let read = send(
+            &app,
+            "GET",
+            &format!("/instances/{instance}"),
+            Some(&manager),
+            None,
+        )
+        .await;
+        assert_eq!(read.status, StatusCode::OK, "{:?}", read.body);
+        assert_eq!(read.body["course"], json!(course), "both teach one course");
+        assert_eq!(read.body["class"], json!(class));
+    }
+
+    // A student put in 5-A lands on 5-A's roster — 5-B's stays empty.
+    add_member(&app, &manager, &a, &student_id).await;
+    let in_a = send(
+        &app,
+        "GET",
+        &format!("/instances/{ia}/enrollments"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(total(&in_a.body), 1, "{:?}", in_a.body);
+    assert_eq!(items(&in_a.body)[0]["user"]["id"], json!(student_id));
+    let in_b = send(
+        &app,
+        "GET",
+        &format!("/instances/{ib}/enrollments"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        total(&in_b.body),
+        0,
+        "5-B's roster is its own: {:?}",
+        in_b.body
+    );
+
+    // The exam belongs to the instance it was written on, not to the course.
+    let exam = create_exam(&app, &manager, &ia, &term, "1. Yazılı", "yazili").await;
+    let seen = send(
+        &app,
+        "GET",
+        &format!("/instances/{ia}/exams"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(total(&seen.body), 1, "{:?}", seen.body);
+    assert_eq!(items(&seen.body)[0]["id"], json!(exam));
+    let blind = send(
+        &app,
+        "GET",
+        &format!("/instances/{ib}/exams"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(blind.status, StatusCode::OK);
+    assert_eq!(
+        total(&blind.body),
+        0,
+        "5-B must not see the exam 5-A sat: {:?}",
+        blind.body
+    );
+}
+
+/// A leave is a *stint*, not a deletion: the history row stays, the counter
+/// counts live rows only, and rejoining opens a second stint. That is what
+/// keeps the roster cap honest — a şube whose students cycle through it must
+/// not fill up on rows nobody holds.
+#[tokio::test]
+async fn a_leaver_rejoins_into_a_second_stint() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let student = login_as(&app, &db, "student", "student").await;
+    let other = login_as(&app, &db, "other", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let other_id = me_id(&app, &other).await;
+
+    let class = create_class(&app, &manager, json!({ "name": "5-A" })).await;
+    let class = common::id_of(&class.body);
+
+    add_member(&app, &manager, &class, &student_id).await;
+    assert_eq!(
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
+        1
+    );
+
+    let left = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/members/{student_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(left.status, StatusCode::NO_CONTENT, "{:?}", left.body);
+    assert_eq!(
+        counter("SELECT count(*) FROM class_member WHERE app_user = (SELECT id FROM app_user WHERE username = 'student')", &db).await,
+        1,
+        "the stint is stamped, not swept: the section keeps the record"
+    );
+    assert_eq!(
+        counter(
+            "SELECT count(*) FROM class_member WHERE left_at IS NULL AND app_user = (SELECT id FROM app_user WHERE username = 'student')",
+            &db
+        )
+        .await,
+        0,
+        "…and nothing of it is live"
+    );
+    assert_eq!(
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
+        0,
+        "the counter follows the live stints, so the seat came back"
+    );
+
+    // The rejoined student is a fresh row beside the history — the partial
+    // index allows exactly that (one live stint per pair).
+    add_member(&app, &manager, &class, &student_id).await;
+    assert_eq!(
+        counter("SELECT count(*) FROM class_member WHERE app_user = (SELECT id FROM app_user WHERE username = 'student')", &db).await,
+        2
+    );
+    assert_eq!(
+        counter(
+            "SELECT count(*) FROM class_member WHERE left_at IS NULL AND app_user = (SELECT id FROM app_user WHERE username = 'student')",
+            &db
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
+        1,
+        "the counter is the live count, never the row count"
+    );
+
+    // The cap reads that counter, so a live leave frees the seat it was
+    // counting. Seeded rather than filled by `MAX_CLASS_MEMBERS` real adds:
+    // the counter *is* what the claim reads.
+    sqlx::query("UPDATE class_group SET class_member_count = $1 WHERE id = $2")
+        .bind(MAX_CLASS_MEMBERS)
+        .bind(uuid::Uuid::parse_str(&class).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    let refused = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": other_id })),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{:?}", refused.body);
+    assert_eq!(refused.body["code"], "class_at_roster_ceiling");
+
+    let freed = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/members/{student_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(freed.status, StatusCode::NO_CONTENT, "{:?}", freed.body);
+    let admitted = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": other_id })),
+    )
+    .await;
+    assert_eq!(
+        admitted.status,
+        StatusCode::CREATED,
+        "a leave hands the seat back to the cap: {:?}",
+        admitted.body
+    );
+    assert_eq!(
+        counter(
+            "SELECT COALESCE(sum(class_member_count), 0)::bigint FROM class_group",
+            &db
+        )
+        .await,
+        MAX_CLASS_MEMBERS,
+        "…and the counter lands back on the ceiling, not past it"
+    );
+}
+
+/// The dönem's own number is one average over the student's instances, each
+/// weighted by its `ders_saati` — the karne weight the şube set — and each line
+/// is labelled from the school's grade bands. Two instances at different hours
+/// are what makes the weighting visible: a plain mean of 60 and 80 is 70, the
+/// weighted one 75.
+#[tokio::test]
+async fn the_karne_weights_each_instance_by_its_ders_saati() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let student = login_as(&app, &db, "student", "student").await;
+    let student_id = me_id(&app, &student).await;
+
+    // One şube, two courses it teaches: two instances of one section.
+    let t = taught(&app, &manager, "Matematik").await;
+    let fizik = create_course(&app, &manager, "Fizik").await;
+    let fizik = attach_instance(&app, &manager, &t.class, &fizik).await;
+    let hours = send(
+        &app,
+        "PATCH",
+        &format!("/instances/{fizik}"),
+        Some(&manager),
+        Some(json!({ "ders_saati": 3 })),
+    )
+    .await;
+    assert_eq!(hours.status, StatusCode::OK, "{:?}", hours.body);
+    assert_eq!(hours.body["ders_saati"], json!(3));
+
+    add_member(&app, &manager, &t.class, &student_id).await;
+
+    // A mark in each instance, graded by the office.
+    for (instance, mark) in [(&t.instance, 60), (&fizik, 80)] {
+        let exam = create_exam(&app, &manager, instance, &t.term, "1. Yazılı", "yazili").await;
+        let graded = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&manager),
+            Some(json!({ "mark": mark, "user_id": student_id })),
+        )
+        .await;
+        assert_eq!(
+            graded.status,
+            StatusCode::OK,
+            "grade {mark}: {:?}",
+            graded.body
+        );
+    }
+
+    let karne = send(
+        &app,
+        "GET",
+        &format!("/marks/karne?term={}", t.term),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(karne.status, StatusCode::OK, "{:?}", karne.body);
+    let lines = karne.body["instances"].as_array().expect("instances[]");
+    assert_eq!(lines.len(), 2, "{:?}", karne.body);
+    let line = |instance: &str| {
+        lines
+            .iter()
+            .find(|line| line["class_course"] == json!(instance))
+            .unwrap_or_else(|| panic!("no line for {instance}: {}", karne.body))
+            .clone()
+    };
+    let math = line(&t.instance);
+    assert_eq!(math["course"], json!("Matematik"), "the catalog title");
+    assert_eq!(math["ders_saati"], json!(1));
+    assert_eq!(math["average"], json!(60.0));
+    assert_eq!(math["band"], json!("3"), "60 is a 3 on the default bands");
+    let physics = line(&fizik);
+    assert_eq!(physics["ders_saati"], json!(3));
+    assert_eq!(physics["average"], json!(80.0));
+    assert_eq!(physics["band"], json!("4"));
+    assert_eq!(
+        karne.body["year_average"],
+        json!(75.0),
+        "the hours weigh, not the line count: {:?}",
+        karne.body
+    );
+    assert_eq!(karne.body["verdict"], json!("gecti"));
 }

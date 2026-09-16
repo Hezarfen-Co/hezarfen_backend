@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 1 AS \"one\" FROM (\n               SELECT e.app_user FROM enrollment e\n                WHERE e.app_user = $2\n                  AND e.class_course IN (SELECT id FROM class_course WHERE course = $1)\n               UNION ALL\n               SELECT m.app_user FROM course_membership m\n                WHERE m.course = $1 AND m.app_user = $2\n           ) people LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6fafd69d5084dbc0da5c59746eeb6bdbb55926ea72f4ab85493e1bceb94f2754"
+}

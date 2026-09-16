@@ -675,9 +675,10 @@ mod tests {
         use crate::domain::user::Username;
 
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator = crate::service::user::create(&db, Username::try_new("ogretmen").unwrap(), None)
-            .await
-            .unwrap();
+        let creator =
+            crate::service::user::create(&db, Username::try_new("ogretmen").unwrap(), None)
+                .await
+                .unwrap();
         let mate = crate::service::user::create(&db, Username::try_new("ogrenci").unwrap(), None)
             .await
             .unwrap();

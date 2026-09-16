@@ -13,7 +13,7 @@
 
 use crate::database::Database;
 use crate::db::homework;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::role::Role;
 use crate::domain::subject::SubjectId;
@@ -27,7 +27,7 @@ use crate::error::AppError;
 )]
 pub async fn create(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     subject: &SubjectId,
     title: HomeworkTitle,
     description: Option<HomeworkDescription>,
@@ -37,7 +37,7 @@ pub async fn create(
 ) -> Result<Homework, AppError> {
     homework::create(
         db,
-        course,
+        class_course,
         subject,
         title,
         description,
@@ -58,27 +58,32 @@ pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
     homework::list_all(db).await
 }
 
-pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Homework>, AppError> {
-    homework::list_for_course(db, course).await
-}
-
-/// Every homework of every course in `courses` (one query) — the catalog as
-/// one user sees it.
-pub async fn list_for_courses(
+/// The homework of one class×course instance, newest first — the read behind
+/// `GET /instances/{id}/homework`.
+pub async fn list_for_class_course(
     db: &Database,
-    courses: &[CourseId],
+    class_course: &ClassCourseId,
 ) -> Result<Vec<Homework>, AppError> {
-    homework::list_for_courses(db, courses).await
+    homework::list_for_class_course(db, class_course).await
 }
 
-/// The homework of `course` that `user` is meant to see — the per-course
-/// block of a homework report.
-pub async fn list_for_user_in_course(
+/// Every homework of every instance in `instances` (one query) — the read
+/// behind a caller's visible courses.
+pub async fn list_for_class_courses(
     db: &Database,
-    course: &CourseId,
+    instances: &[ClassCourseId],
+) -> Result<Vec<Homework>, AppError> {
+    homework::list_for_class_courses(db, instances).await
+}
+
+/// The homework of one instance that `user` is meant to see — the per-instance
+/// block of a homework report.
+pub async fn list_for_user_in_class_course(
+    db: &Database,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<Homework>, AppError> {
-    homework::list_for_user_in_course(db, course, user).await
+    homework::list_for_user_in_course(db, class_course, user).await
 }
 
 /// Re-scope (or re-tag, re-title, re-describe, re-schedule) the homework.
@@ -110,12 +115,18 @@ pub async fn delete(db: &Database, homework: Homework) -> Result<Vec<String>, Ap
     Ok(blob_keys)
 }
 
-/// A 403 unless `user` is enrolled in `course` — the homework twin of the exam
-/// sitting wall ([`crate::service::exam_attempt::ensure_enrolled`], which is `Exam`-shaped).
-/// Submitting is course content, so leaving the course closes it; re-checked on
-/// every submission and file write, so an unenrollment mid-task bites the next.
-async fn ensure_enrolled(course: &CourseId, user: &UserId, db: &Database) -> Result<(), AppError> {
-    if crate::service::enrollment::read_for_user(db, course, user)
+/// A 403 unless `user` is enrolled in the instance the homework belongs to —
+/// the homework twin of the exam sitting wall
+/// ([`crate::service::exam_attempt::ensure_enrolled`], which is `Exam`-shaped).
+/// Submitting is course content, so leaving the instance closes it; re-checked
+/// on every submission and file write, so an unenrollment mid-task bites the
+/// next.
+async fn ensure_enrolled(
+    class_course: &ClassCourseId,
+    user: &UserId,
+    db: &Database,
+) -> Result<(), AppError> {
+    if crate::service::enrollment::read_for_user(db, class_course, user)
         .await?
         .is_none()
     {
@@ -151,25 +162,25 @@ pub async fn gate_own_submission(
             "only students have homework submissions",
         ));
     }
-    ensure_enrolled(homework.get_course(), user.get_id(), db).await?;
+    ensure_enrolled(homework.get_class_course(), user.get_id(), db).await?;
     if !homework.student_sees(user.get_id()) {
         return Err(AppError::NotFound);
     }
     Ok(homework)
 }
 
-/// The term wall of the student side: an archived term makes past years
+/// The year wall of the student side: an archived year makes past structure
 /// read-only. Deliberately *not* inside [`gate_own_submission`] — that gate
 /// also fronts the download read, and an archived year is still browsable. So
 /// every student *write* calls this right after the gate, which keeps the
 /// order that matters: a student the homework never named is refused by the
-/// audience check with a 404 and never learns the homework exists. A course
-/// that vanished under us is the gates' own business, not this one's.
-pub async fn require_open_term(homework: &Homework, db: &Database) -> Result<(), AppError> {
-    if let Some(course) = crate::service::course::read(db, homework.get_course()).await? {
-        crate::service::course::require_open(db, &course).await?;
-    }
-    Ok(())
+/// audience check with a 404 and never learns the homework exists.
+///
+/// The gate keys on the homework's instance → its şube → that şube's year
+/// (D8): a dönem archived inside an open year does not close homework, the
+/// year does.
+pub async fn require_open_instance(homework: &Homework, db: &Database) -> Result<(), AppError> {
+    crate::service::class_course::require_open(db, homework.get_class_course()).await
 }
 
 /// Bring one user's badge awards up to date after a write moved their counters

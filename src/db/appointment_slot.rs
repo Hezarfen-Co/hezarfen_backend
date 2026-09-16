@@ -138,7 +138,12 @@ pub async fn windows_in_span(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|row| (Timestamp::from_millis(row.starts_at), Timestamp::from_millis(row.ends_at)))
+        .map(|row| {
+            (
+                Timestamp::from_millis(row.starts_at),
+                Timestamp::from_millis(row.ends_at),
+            )
+        })
         .collect())
 }
 

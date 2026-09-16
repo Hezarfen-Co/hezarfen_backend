@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT class_course AS \"class_course: ClassCourseId\", app_user AS \"user: UserId\",\n               enrolled_by AS \"enrolled_by: UserId\", source AS \"source: ClassGroupId\",\n               created_at AS \"created_at: Timestamp\"\n           FROM enrollment WHERE class_course = $1 AND app_user = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "enrolled_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "enrolled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "source: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "da4c055f25da6b0e2fae8a7ccc4c7e7f806e731ca5dbaffe3cfc83b2a548be9f"
+}

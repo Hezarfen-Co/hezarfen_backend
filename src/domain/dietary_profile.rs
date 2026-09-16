@@ -13,7 +13,6 @@
 //!
 //! [`Settings::get_dietary_tags`]: crate::domain::settings::Settings::get_dietary_tags
 
-
 use crate::constant::{MAX_DIETARY_NOTE_LEN, MAX_DIETARY_TAGS};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -30,9 +29,7 @@ pub struct DietaryProfileId {
 
 impl DietaryProfileId {
     pub fn of(student: &UserId) -> Self {
-        Self {
-            student: *student,
-        }
+        Self { student: *student }
     }
 
     /// The student's wire key, which is the profile's.

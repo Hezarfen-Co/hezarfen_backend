@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM enrollment WHERE class_course = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "caad4a6fe3555a38b1ac2f7dc3a4df74def95a0356454a07f9281103b19fdacc"
+}

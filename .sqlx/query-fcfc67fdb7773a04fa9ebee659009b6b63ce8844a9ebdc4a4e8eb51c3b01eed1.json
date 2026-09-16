@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_member SET source_class_group = NULL WHERE source_class_group = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fcfc67fdb7773a04fa9ebee659009b6b63ce8844a9ebdc4a4e8eb51c3b01eed1"
+}

@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT session AS \"session: CourseSessionId\", app_user AS \"user: UserId\",\n               class_course AS \"class_course: ClassCourseId\",\n               status AS \"status: AttendanceStatus\",\n               marked_by AS \"marked_by: UserId\"\n               FROM session_attendance\n               WHERE session = $1 AND app_user = $2\n               FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session: CourseSessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_attendance",
+            "name": "session"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_attendance",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_attendance",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: AttendanceStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "session_attendance",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "marked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_attendance",
+            "name": "marked_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "852e8ede2b2713be5244b108c8e74d5fe800c12fa4e1f6c30f68b80f07509ef9"
+}

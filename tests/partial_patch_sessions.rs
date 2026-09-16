@@ -16,13 +16,14 @@ const FUTURE: i64 = 1_900_000_000_000;
 async fn concurrent_partial_patches_keep_both_fields() {
     let (app, db) = app_and_db().await;
     let who = login_as(&app, &db, "ali", "teacher").await;
-    let course = create_course(&app, &who, "math").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &who, "math").await;
 
     for round in 0..20 {
         let created = send(
             &app,
             "POST",
-            &format!("/courses/{course}/sessions"),
+            &format!("/instances/{}/sessions", t.instance),
             Some(&who),
             Some(json!({ "topic": "old topic", "starts_at": FUTURE })),
         )
@@ -68,14 +69,15 @@ async fn concurrent_partial_patches_keep_both_fields() {
 async fn concurrent_range_patches_never_invert_the_stored_row() {
     let (app, db) = app_and_db().await;
     let who = login_as(&app, &db, "range", "teacher").await;
-    let course = create_course(&app, &who, "math").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &who, "math").await;
     let ends = FUTURE + 3_600_000;
 
     for round in 0..20 {
         let created = send(
             &app,
             "POST",
-            &format!("/courses/{course}/sessions"),
+            &format!("/instances/{}/sessions", t.instance),
             Some(&who),
             Some(json!({ "starts_at": FUTURE, "ends_at": ends })),
         )
@@ -120,8 +122,9 @@ async fn concurrent_range_patches_never_invert_the_stored_row() {
 async fn ends_at_stays_clearable_and_range_checked() {
     let (app, db) = app_and_db().await;
     let who = login_as(&app, &db, "veli", "teacher").await;
-    let course = create_course(&app, &who, "physics").await;
-    let session = create_session(&app, &who, &course, FUTURE).await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &who, "physics").await;
+    let session = create_session(&app, &who, &t.instance, FUTURE).await;
     let uri = format!("/sessions/{session}");
 
     let set = send(

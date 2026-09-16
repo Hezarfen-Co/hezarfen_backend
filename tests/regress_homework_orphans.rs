@@ -4,6 +4,12 @@
 //! handed every named student the whole roster, and a file delete that answered
 //! a lost round with a 500.
 //!
+//! The K12 remodel keyed homework — and every `homework_*` child with it — on
+//! the class×course **instance**, and moved its routes under `/instances/{id}`.
+//! The defects and their fixes are unchanged; what changed is the fixture: each
+//! test below mints the whole academic stack and hands the *instance* to the
+//! routes, the DB-level calls and the roster helpers.
+//!
 //! Two of them share one root cause and one shape of fix: a child keyed by a
 //! deterministic id does not fail against a parent a cascade removed, it
 //! *re-creates* it — so both the submission and the grade now move a value on
@@ -22,8 +28,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    Res, app_and_db, create_course, create_homework, create_homework_with, create_subject, enroll,
-    id_of, items, login_as, me_id, multipart_file, send, send_raw, unenroll, upload_file_at,
+    Res, add_member, app_and_db, create_homework, create_homework_with, create_subject, enroll,
+    id_of, items, login_as, me_id, multipart_file, send, send_raw, taught_under, unenroll,
+    upload_file_at,
 };
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::user::UserId;
@@ -67,20 +74,27 @@ async fn upload_hw_file(app: &axum::Router, cookie: &str, hw: &str) -> StatusCod
     status
 }
 
-/// A course with one subject and one enrolled student. Returns
-/// `(course, subject, student cookie, student id)`.
+/// A taught instance carrying one subject and one enrolled student. `staff`
+/// must hold manager+ (the şube is school structure), while `homeroom` is the
+/// plain teacher cookie every test below acts with — naming them as the şube's
+/// sınıf öğretmeni is what keeps their rights over the instance.
+///
+/// Returns `(instance, subject, student cookie, student id)`: the *instance*,
+/// because the homework routes, the roster and the instance's own homework
+/// listing all key on it now.
 async fn course_with_student(
     app: &axum::Router,
     db: &Database,
-    teacher: &str,
+    staff: &str,
+    homeroom: &str,
     name: &str,
 ) -> (String, String, String, String) {
+    let t = taught_under(app, staff, homeroom, name).await;
     let student = login_as(app, db, &format!("ogrenci_{name}"), "student").await;
     let student_id = me_id(app, &student).await;
-    let course = create_course(app, teacher, name).await;
-    let subject = create_subject(app, teacher, &course, "konu").await;
-    enroll(app, teacher, &course, &student_id).await;
-    (course, subject, student, student_id)
+    let subject = create_subject(app, homeroom, &t.course, "konu").await;
+    enroll(app, homeroom, &t.instance, &student_id).await;
+    (t.instance, subject, student, student_id)
 }
 
 /// The upload used to stream its body *before* it took `HOMEWORK_LOCK`, and
@@ -92,20 +106,21 @@ async fn course_with_student(
 /// homework, so nothing could ever read or delete it again, and the counters
 /// stayed up for good.
 ///
-/// The window is the delete's own: a `DEFINE EVENT` on `homework` holds its
-/// transaction open after the cascade has swept the children, which is exactly
-/// the interleaving — the upload's gate read lands inside it (the row is
-/// deleted but uncommitted, so it still reads), and its write lands after. The
-/// upload's own duration is asserted too: one that arrived after the delete had
-/// already committed would be answered by a plain lookup and leave this test
-/// green over the hole.
+/// The window is the delete's own: an `AFTER DELETE` trigger on `homework`
+/// holds its transaction open after the cascade has swept the children, which
+/// is exactly the interleaving — the upload's gate read lands inside it (the
+/// row is deleted but uncommitted, so it still reads), and its write lands
+/// after. The upload's own duration is asserted too: one that arrived after the
+/// delete had already committed would be answered by a plain lookup and leave
+/// this test green over the hole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_inside_a_homework_delete_never_orphans() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_odev", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_odev", "teacher").await;
-    let (course, subject, student, student_id) =
-        course_with_student(&app, &db, &teacher, "fizik").await;
-    let hw = create_homework(&app, &teacher, &course, &subject, "deneme", far_future()).await;
+    let (instance, subject, student, student_id) =
+        course_with_student(&app, &db, &mudur, &teacher, "fizik").await;
+    let hw = create_homework(&app, &teacher, &instance, &subject, "deneme", far_future()).await;
 
     // Hold the delete open once the cascade has run but before it commits: an
     // AFTER DELETE trigger sleeping inside the delete's own transaction.
@@ -195,26 +210,27 @@ async fn an_upload_inside_a_homework_delete_never_orphans() {
 /// submission and a file for a student the homework no longer names — the exact
 /// orphan `ensure_no_orphans` exists to refuse.
 ///
-/// The lease is the interleaving: a `DEFINE EVENT` on `homework` holds the
-/// PATCH's write open, the upload's pre-flight gate reads the old audience
+/// The lease is the interleaving: an `AFTER UPDATE` trigger on `homework` holds
+/// the PATCH's write open, the upload's pre-flight gate reads the old audience
 /// inside that window, and its own lease is granted only once the new audience
 /// is committed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_upload_inside_an_audience_patch_is_refused() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_kapsam", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_kapsam", "teacher").await;
-    let course = create_course(&app, &teacher, "Coğrafya").await;
-    let subject = create_subject(&app, &teacher, &course, "iklim").await;
+    let t = taught_under(&app, &mudur, &teacher, "Coğrafya").await;
+    let subject = create_subject(&app, &teacher, &t.course, "iklim").await;
     let dropped_student = login_as(&app, &db, "ogrenci_cikan", "student").await;
     let dropped_id = me_id(&app, &dropped_student).await;
     let kept = login_as(&app, &db, "ogrenci_kalan", "student").await;
     let kept_id = me_id(&app, &kept).await;
-    enroll(&app, &teacher, &course, &dropped_id).await;
-    enroll(&app, &teacher, &course, &kept_id).await;
+    enroll(&app, &teacher, &t.instance, &dropped_id).await;
+    enroll(&app, &teacher, &t.instance, &kept_id).await;
     let res = create_homework_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
             "title": "harita",
             "subject_id": subject,
@@ -314,10 +330,11 @@ async fn a_submission_under_a_vanished_homework_is_refused() {
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_alan", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_alan", "teacher").await;
-    let (course, subject, student, student_id) =
-        course_with_student(&app, &db, &teacher, "kimya").await;
-    let hw = create_homework(&app, &teacher, &course, &subject, "deneme", far_future()).await;
+    let (instance, subject, student, student_id) =
+        course_with_student(&app, &db, &mudur, &teacher, "kimya").await;
+    let hw = create_homework(&app, &teacher, &instance, &subject, "deneme", far_future()).await;
     // The stale snapshot a handler would still be holding.
     let stale = read(&db, &HomeworkId::from_key(&hw))
         .await
@@ -384,11 +401,12 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_not", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_not", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
-    let (course, subject, _student, student_id) =
-        course_with_student(&app, &db, &teacher, "muzik").await;
-    let hw = create_homework(&app, &teacher, &course, &subject, "solfej", far_future()).await;
+    let (instance, subject, _student, student_id) =
+        course_with_student(&app, &db, &mudur, &teacher, "muzik").await;
+    let hw = create_homework(&app, &teacher, &instance, &subject, "solfej", far_future()).await;
 
     let dropped = send(
         &app,
@@ -448,12 +466,14 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
 /// orphan `homework_result` under a vanished homework, readable ever after at
 /// `GET /homework/{id}/result`, which has no existence check of its own.
 ///
-/// The window is the grade's, not the delete's: a course delete is refused
-/// while anyone is enrolled, so the roster has to empty *while* the grade is
-/// mid-write — a `DEFINE EVENT` on `homework_result` holds it, gates already
-/// passed, across the unenroll and the delete that follow. The grade's own
-/// duration is asserted, because a grade that never reached its window would
-/// leave this suite green over the very hole it exists for.
+/// The window is the grade's, not the sweep's: the grade is held mid-write, its
+/// gates already passed, by an `AFTER INSERT` trigger on `homework_result`,
+/// across the roster change and the sweep that follow. The sweep is the
+/// instance's detach now — a catalog course is refused while an instance still
+/// teaches it, so the detach is what takes the homework and the course delete
+/// follows onto an empty catalog. The grade's own duration is asserted, because
+/// a grade that never reached its window would leave this suite green over the
+/// very hole it exists for.
 ///
 /// `marks_given_total` is deliberately *not* asserted at zero: no cascade ever
 /// gives that counter back (the 08-05 sweep left that standing on purpose), so
@@ -472,10 +492,14 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grade_inside_a_course_delete_never_orphans() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_ders", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_ders", "teacher").await;
-    let (course, subject, _student, student_id) =
-        course_with_student(&app, &db, &teacher, "tarih").await;
-    let hw = create_homework(&app, &teacher, &course, &subject, "ödev", far_future()).await;
+    let t = taught_under(&app, &mudur, &teacher, "tarih").await;
+    let subject = create_subject(&app, &teacher, &t.course, "konu").await;
+    let student = login_as(&app, &db, "ogrenci_ders", "student").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let hw = create_homework(&app, &teacher, &t.instance, &subject, "ödev", far_future()).await;
 
     // Hold the grade's own write open, every gate already cleared. Three
     // seconds against a one-second wait below: under a loaded test binary the
@@ -511,14 +535,23 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
     };
     // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
-    // The roster empties mid-grade — the only staging in which the course
-    // delete is admitted at all.
-    unenroll(&app, &teacher, &course, &student_id).await;
+    // The roster empties mid-grade, then the instance goes: the catalog course
+    // cannot be deleted while an instance still teaches it, and detaching is
+    // what sweeps the homework the grade is cleaning up after.
+    unenroll(&app, &teacher, &t.instance, &student_id).await;
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{}/instances/{}", t.class, t.instance),
+        Some(&mudur),
+        None,
+    )
+    .await;
     let dropped = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
-        Some(&teacher),
+        &format!("/courses/{}", t.course),
+        Some(&mudur),
         None,
     )
     .await;
@@ -530,9 +563,15 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
         graded.status
     );
     assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the instance detach must succeed: {:?}",
+        detached.body
+    );
+    assert_eq!(
         dropped.status,
         StatusCode::NO_CONTENT,
-        "the course delete must succeed: {:?}",
+        "the course delete must succeed once the instance is gone: {:?}",
         dropped.body
     );
     assert!(
@@ -564,20 +603,24 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
 #[tokio::test]
 async fn a_student_sees_only_themselves_in_an_assigned_subset() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_liste", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_liste", "teacher").await;
-    let course = create_course(&app, &teacher, "Biyoloji").await;
-    let subject = create_subject(&app, &teacher, &course, "hücre").await;
+    let t = taught_under(&app, &mudur, &teacher, "Biyoloji").await;
+    let subject = create_subject(&app, &teacher, &t.course, "hücre").await;
     let ali = login_as(&app, &db, "ali", "student").await;
     let ali_id = me_id(&app, &ali).await;
     let veli = login_as(&app, &db, "veli", "student").await;
     let veli_id = me_id(&app, &veli).await;
-    enroll(&app, &teacher, &course, &ali_id).await;
-    enroll(&app, &teacher, &course, &veli_id).await;
+    // Seated the way a class seats anyone: a student's own lists (`/instances/me`
+    // and the homework list behind it) read the şubeler they are a live member
+    // of, and the pump enrolls them into every instance the şube carries.
+    add_member(&app, &mudur, &t.class, &ali_id).await;
+    add_member(&app, &mudur, &t.class, &veli_id).await;
 
     let res = create_homework_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
             "title": "sunum",
             "subject_id": subject,
@@ -616,17 +659,17 @@ async fn a_student_sees_only_themselves_in_an_assigned_subset() {
     assert_eq!(listed.status, StatusCode::OK);
     assert_eq!(assigned(&items(&listed.body)[0]), vec![ali_id.clone()]);
 
-    // ... and the per-course one.
-    let in_course = send(
+    // ... and the per-instance one.
+    let in_instance = send(
         &app,
         "GET",
-        &format!("/courses/{course}/homework"),
+        &format!("/instances/{}/homework", t.instance),
         Some(&ali),
         None,
     )
     .await;
-    assert_eq!(in_course.status, StatusCode::OK);
-    assert_eq!(assigned(&items(&in_course.body)[0]), vec![ali_id.clone()]);
+    assert_eq!(in_instance.status, StatusCode::OK);
+    assert_eq!(assigned(&items(&in_instance.body)[0]), vec![ali_id.clone()]);
 
     // The teacher who runs the course still sees the roster whole — narrowing
     // it for them would break the audience they just set.
@@ -655,18 +698,19 @@ async fn a_student_sees_only_themselves_in_an_assigned_subset() {
 ///
 /// The window is the *delete's* own — the retry-less side has to be the one
 /// holding a stale write when the other commits, or nothing it does can be
-/// answered "conflict, retry": a `DEFINE EVENT` on `homework_file` holds the
-/// delete's transaction open after it has re-stamped the submission row, and an
-/// upload lands on that same row inside it. Held short (150ms): the retry
-/// budget is 8 tries over ~250ms of backoff, so a window wider than the budget
-/// would fail a *correct* implementation too.
+/// answered "conflict, retry": an `AFTER DELETE` trigger on `homework_file`
+/// holds the delete's transaction open after it has re-stamped the submission
+/// row, and an upload lands on that same row inside it. Held short (150ms):
+/// the retry budget is 8 tries over ~250ms of backoff, so a window wider than
+/// the budget would fail a *correct* implementation too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_add_racing_a_file_delete_never_500s() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_dosya", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_dosya", "teacher").await;
-    let (course, subject, student, _student_id) =
-        course_with_student(&app, &db, &teacher, "resim").await;
-    let hw = create_homework(&app, &teacher, &course, &subject, "çizim", far_future()).await;
+    let (instance, subject, student, _student_id) =
+        course_with_student(&app, &db, &mudur, &teacher, "resim").await;
+    let hw = create_homework(&app, &teacher, &instance, &subject, "çizim", far_future()).await;
     assert_eq!(
         upload_hw_file(&app, &student, &hw).await,
         StatusCode::CREATED,
@@ -739,59 +783,38 @@ async fn a_file_add_racing_a_file_delete_never_500s() {
     );
 }
 
-/// An archived term freezes every homework write under its courses (#22): the
-/// teacher's edit/delete/grade/un-grade and the student's submit, withdraw,
-/// file add and file remove all answer `409 term_archived`, while the reads
-/// stay open — a past year is browsable, not editable. The student wall sits
-/// *after* the audience check, so a student the homework never named still
-/// gets the 404 it always did: the archive must not turn a subset assignment
-/// into a "this exists" signal.
+/// An archived academic year freezes every homework write under its şubeler'
+/// instances (#22): the teacher's edit/delete/grade/un-grade and the student's
+/// submit, withdraw, file add and file remove all answer
+/// `409 academic_year_archived`, while the reads stay open — a past year is
+/// browsable, not editable. The student wall sits *after* the audience check, so
+/// a student the homework never named still gets the 404 it always did: the
+/// archive must not turn a subset assignment into a "this exists" signal.
 #[tokio::test]
-async fn an_archived_term_freezes_every_homework_write() {
+async fn an_archived_year_freezes_every_homework_write() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mudur_arsiv", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_arsiv", "teacher").await;
 
-    let res = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2025 Guz",
-            "starts_at": 1_600_000_000_000_i64,
-            "ends_at": 1_610_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create term");
-    let term = id_of(&res.body);
-
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "tarih", "term_id": term })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create course in term");
-    let course = id_of(&res.body);
-    let subject = create_subject(&app, &teacher, &course, "konu").await;
+    // The freeze is the *year's* now: every homework write reads its instance's
+    // year (`class_course::require_open`), so the whole stack has to sit in the
+    // year that gets archived.
+    let t = taught_under(&app, &manager, &teacher, "tarih").await;
+    let subject = create_subject(&app, &teacher, &t.course, "konu").await;
 
     let student = login_as(&app, &db, "ogrenci_arsiv", "student").await;
     let student_id = me_id(&app, &student).await;
     let outsider = login_as(&app, &db, "ogrenci_disarida", "student").await;
     let outsider_id = me_id(&app, &outsider).await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    enroll(&app, &teacher, &course, &outsider_id).await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    enroll(&app, &teacher, &t.instance, &outsider_id).await;
 
     // A subset assignment: the outsider is enrolled but not named, so their
     // 404 is the one the archive must leave alone.
     let res = create_homework_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
             "title": "odev",
             "subject_id": subject,
@@ -825,20 +848,21 @@ async fn an_archived_term_freezes_every_homework_write() {
     assert_eq!(res.status, StatusCode::CREATED, "upload before archiving");
     let file = id_of(&res.body);
 
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "archive the term");
+    // The year goes past. No route archives one — a year is frozen when the
+    // office declares it done — so the stored state is written straight into
+    // the store, the way the role bootstrap and the sibling suites do it.
+    let year = uuid::Uuid::parse_str(&t.year).unwrap();
+    let archived = sqlx::query("UPDATE academic_year SET archived_at = 1 WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(archived.rows_affected(), 1, "archive the year");
 
     let frozen = |res: Res, what: &str| {
         assert_eq!(res.status, StatusCode::CONFLICT, "{what} after archiving");
         assert_eq!(
-            res.body["code"], "term_archived",
+            res.body["code"], "academic_year_archived",
             "{what} carries the machine-readable code: {:?}",
             res.body
         );
@@ -976,15 +1000,12 @@ async fn an_archived_term_freezes_every_homework_write() {
     );
 
     // Re-opening the year hands the writes back.
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "unarchive the term");
+    let reopened = sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(reopened.rows_affected(), 1, "unarchive the year");
     let res = send(
         &app,
         "POST",

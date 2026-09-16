@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n             DELETE FROM enrollment\n              WHERE class_course = $1 AND app_user = $2\n              RETURNING class_course, app_user, enrolled_by, source, created_at),\n           seated AS (\n             UPDATE class_course\n                SET enrollment_count = GREATEST(\n                    enrollment_count - (SELECT count(*) FROM gone), 0)\n              WHERE id = $1\n              RETURNING 1)\n           SELECT class_course AS \"class_course: ClassCourseId\",\n               app_user AS \"user: UserId\", enrolled_by AS \"enrolled_by: UserId\",\n               source AS \"source: ClassGroupId\", created_at AS \"created_at: Timestamp\"\n           FROM gone",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "enrolled_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "enrolled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "source: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "b2c9927ef99caca43fd99d7d733a6aa2fa38683560363486a80505005b5ef03d"
+}

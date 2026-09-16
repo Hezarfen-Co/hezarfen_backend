@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_member SET left_at = $3\n                   WHERE class = $1 AND app_user = $2 AND left_at IS NULL\n                   RETURNING 1 AS \"one\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "45b22b65eb9eaa820596249c17fd6d110892e40a200fb22f4998a375067fc1d1"
+}

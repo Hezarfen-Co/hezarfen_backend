@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n                       UPDATE class_member SET left_at = $2\n                        WHERE app_user = $1 AND left_at IS NULL\n                        RETURNING class\n                   )\n                   UPDATE class_group\n                   SET class_member_count = GREATEST(class_member_count - 1, 0)\n                   WHERE id IN (SELECT gone.class FROM gone)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "528eb8c289d6edc05eaa85b4f0361933a88f3d8ecce63236da73f0b03b59d722"
+}

@@ -113,12 +113,7 @@ async fn load_people(messages: &[Message], db: &Database) -> Result<People, AppE
     let mut seen = HashSet::new();
     let ids: Vec<UserId> = messages
         .iter()
-        .flat_map(|message| {
-            [
-                *message.get_sender(),
-                *message.get_recipient(),
-            ]
-        })
+        .flat_map(|message| [*message.get_sender(), *message.get_recipient()])
         .filter(|id| seen.insert(id.key().to_string()))
         .collect();
     let users = crate::service::user::list_by_ids(db, &ids).await?;

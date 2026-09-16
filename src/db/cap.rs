@@ -236,7 +236,12 @@ pub(crate) enum FullKind {
 /// guard/gone case, folds into [`FullKind::Hard`], whose contract already
 /// covers it. This is the old claim order (hard claim, guard attached, before
 /// the soft one) expressed as a re-read.
-pub(crate) fn full_kind(soft_count: i64, soft_cap: i64, hard_count: i64, hard_cap: i64) -> FullKind {
+pub(crate) fn full_kind(
+    soft_count: i64,
+    soft_cap: i64,
+    hard_count: i64,
+    hard_cap: i64,
+) -> FullKind {
     if soft_count >= soft_cap && hard_count < hard_cap {
         FullKind::Soft
     } else {

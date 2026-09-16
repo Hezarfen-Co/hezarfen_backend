@@ -1,5 +1,5 @@
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course_session::CourseSessionId;
 use crate::domain::user::UserId;
 
@@ -63,13 +63,13 @@ pub(crate) fn counts_as_attended(status: &AttendanceStatus) -> bool {
     matches!(status.as_str(), "present" | "late")
 }
 
-/// One person's roll-call state for one lesson. `course` is denormalized from
-/// the session so the per-course attendance report is a single indexed query
-/// (`WHERE app_user = $u`) with no join.
+/// One person's roll-call state for one lesson. `class_course` is
+/// denormalized from the session so the per-instance attendance report is a
+/// single indexed query (`WHERE app_user = $u`) with no join.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SessionAttendance {
     pub(crate) session: CourseSessionId,
-    pub(crate) course: CourseId,
+    pub(crate) class_course: ClassCourseId,
     #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: AttendanceStatus,
@@ -81,8 +81,8 @@ impl SessionAttendance {
         &self.session
     }
 
-    pub fn get_course(&self) -> &CourseId {
-        &self.course
+    pub fn get_class_course(&self) -> &ClassCourseId {
+        &self.class_course
     }
 
     pub fn get_user(&self) -> &UserId {

@@ -22,8 +22,8 @@ use axum::http::StatusCode;
 use common::{app_and_db, login_as, me_id, send, set_role};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::db::enrollment;
+use hezarfen_backend::domain::class_course::ClassCourseId;
 use hezarfen_backend::domain::class_group::{ClassGroupId, ClassName};
-use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::timestamp::Timestamp;
@@ -35,12 +35,20 @@ use sqlx::Row as _;
 
 /// How many rows `table` holds.
 async fn rows(table: &str, db: &Database) -> usize {
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM {table}"
-    )))
-    .fetch_one(db)
-    .await
-    .unwrap() as usize
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+        .fetch_one(db)
+        .await
+        .unwrap() as usize
+}
+
+/// The *live* class memberships — unstamped stints only. The demotion's sweep
+/// is soft since the K12 remodel (the row is stamped `left_at`, not deleted),
+/// so a total count no longer answers "is anyone still on a roster".
+async fn live_memberships(db: &Database) -> usize {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM class_member WHERE left_at IS NULL")
+        .fetch_one(db)
+        .await
+        .unwrap() as usize
 }
 
 /// Every row's counter added up, re-read out of the store — never off a return
@@ -202,8 +210,8 @@ async fn a_seat_is_refused_once_the_holder_is_a_parent() {
     let event = a_registration_event(&app, &teacher, 1).await;
     demote(&student, Role::Parent, &db).await;
 
-    let refused = registration::register(&db, &event, &student, &fixture_actor(&db, "staff").await)
-        .await;
+    let refused =
+        registration::register(&db, &event, &student, &fixture_actor(&db, "staff").await).await;
     assert!(
         refused.is_err(),
         "a parent may not be given a seat: {refused:?}"
@@ -239,9 +247,7 @@ async fn a_seat_never_survives_the_demotion_it_raced() {
     let seat = {
         let (db, event) = (db.clone(), event);
         let staff = fixture_actor(&db, "staff").await;
-        tokio::spawn(async move {
-            registration::register(&db, &event, &student, &staff).await
-        })
+        tokio::spawn(async move { registration::register(&db, &event, &student, &staff).await })
     };
     still_queued(&seat).await;
     demoting.await.unwrap();
@@ -301,29 +307,36 @@ async fn a_stranded_parent_seat_is_freeable_by_a_teacher() {
 }
 
 // ---- defect 2: the course enrollment ---------------------------------------
+//
+// The K12 remodel keys the roster on the *instance* — one şube teaching one
+// catalog course — so the grant these probes race is a `class_course` row's
+// roster seat, and its counter lives on that row.
 
-async fn a_course(app: &axum::Router, teacher: &str) -> CourseId {
-    CourseId::from_key(&common::create_course(app, teacher, "cebir").await)
+/// The instance the enrollment races key on: a manager mints the şube (school
+/// structure), attaches the catalog course, and hands back the pair's id.
+async fn an_instance(app: &axum::Router, db: &Database, title: &str) -> ClassCourseId {
+    let mudur = login_as(app, db, "mudur", "manager").await;
+    ClassCourseId::from_key(&common::taught(app, &mudur, title).await.instance)
 }
 
 #[tokio::test]
 async fn an_enrollment_is_refused_once_the_student_is_demoted() {
     let (app, db) = app_and_db().await;
-    let (teacher, student) = a_school(&app, &db).await;
-    let course = a_course(&app, &teacher).await;
+    let (_teacher, student) = a_school(&app, &db).await;
+    let instance = an_instance(&app, &db, "cebir").await;
     demote(&student, Role::Teacher, &db).await;
 
     let staff = fixture_actor(&db, "staff").await;
-    let refused = enrollment::enroll(&db, &course, &student, &staff).await;
+    let refused = enrollment::enroll(&db, &instance, &student, &staff, None).await;
     assert!(
         refused.is_err(),
         "only students hold enrollments: {refused:?}"
     );
     assert_eq!(rows("enrollment", &db).await, 0);
     assert_eq!(
-        counter("enrollment_count", "course", &db).await,
+        counter("enrollment_count", "class_course", &db).await,
         0,
-        "…and a counted seat would also freeze the course's delete guard"
+        "…and a counted seat would also freeze the instance's detach guard"
     );
 }
 
@@ -331,20 +344,22 @@ async fn an_enrollment_is_refused_once_the_student_is_demoted() {
 async fn an_enrollment_never_survives_the_demotion_it_raced() {
     let _serialized = ONE_WINDOW_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
-    let (teacher, student) = a_school(&app, &db).await;
-    let course = a_course(&app, &teacher).await;
+    let (_teacher, student) = a_school(&app, &db).await;
+    let instance = an_instance(&app, &db, "cebir").await;
     // The bait: a row the sweep will delete, which is what holds it open.
-    let earlier = CourseId::from_key(&common::create_course(&app, &teacher, "fizik").await);
+    let earlier = an_instance(&app, &db, "fizik").await;
     let staff = fixture_actor(&db, "staff").await;
-    enrollment::enroll(&db, &earlier, &student, &staff)
+    enrollment::enroll(&db, &earlier, &student, &staff, None)
         .await
         .unwrap();
     hold_the_sweep("enrollment", &db).await;
 
     let demoting = demote_in_the_window(&student, Role::Teacher, &db).await;
     let enrolled = {
-        let (db, course) = (db.clone(), course);
-        tokio::spawn(async move { enrollment::enroll(&db, &course, &student, &staff).await })
+        let (db, instance) = (db.clone(), instance);
+        tokio::spawn(
+            async move { enrollment::enroll(&db, &instance, &student, &staff, None).await },
+        )
     };
     still_queued(&enrolled).await;
     demoting.await.unwrap();
@@ -353,12 +368,9 @@ async fn an_enrollment_never_survives_the_demotion_it_raced() {
     assert_eq!(
         rows("enrollment", &db).await,
         0,
-        "a teacher may not be left on a course roster ({enrolled:?})"
+        "a teacher may not be left on an instance roster ({enrolled:?})"
     );
-    assert_eq!(
-        counter("enrollment_count", "course", &db).await,
-        0
-    );
+    assert_eq!(counter("enrollment_count", "class_course", &db).await, 0);
 }
 
 // ---- defect 3: the class membership ----------------------------------------
@@ -408,15 +420,21 @@ async fn a_membership_is_refused_once_the_student_is_demoted() {
 async fn a_membership_never_survives_the_demotion_it_raced() {
     let _serialized = ONE_WINDOW_AT_A_TIME.lock().await;
     let (app, db) = app_and_db().await;
-    let (_teacher, student) = a_school(&app, &db).await;
+    let (teacher, student) = a_school(&app, &db).await;
     let class = a_class(&db).await;
-    // The bait: a membership the sweep will delete, which holds it open.
+    // The bait: a row the sweep *deletes*, which is what holds the window
+    // open. A class membership alone would not do since the K12 remodel — the
+    // demotion stamps those (`left_at`) rather than deleting them — so the
+    // bait is the enrollment row the şube's pump wrote when the student
+    // joined a class that carries a course.
     let earlier = a_class_named("9-B", &db).await;
     let manager = fixture_actor(&db, "manager").await;
+    let algebra = common::create_course(&app, &teacher, "algebra").await;
+    common::attach_instance(&app, &teacher, &earlier.key(), &algebra).await;
     class_member::add(&db, &earlier, &student, &manager)
         .await
         .unwrap();
-    hold_the_sweep("class_member", &db).await;
+    hold_the_sweep("enrollment", &db).await;
 
     let demoting = demote_in_the_window(&student, Role::Parent, &db).await;
     let joined = {
@@ -428,12 +446,130 @@ async fn a_membership_never_survives_the_demotion_it_raced() {
     let joined = joined.await.expect("raced membership task");
 
     assert_eq!(
-        rows("class_member", &db).await,
+        live_memberships(&db).await,
         0,
         "a parent may not be left on a class roster ({joined:?})"
     );
     assert_eq!(
-        counter("class_member_count", "class_group", &db).await,
-        0
+        rows("class_member", &db).await,
+        1,
+        "…while the stint itself is stamped, not deleted: history survives"
+    );
+    assert_eq!(counter("class_member_count", "class_group", &db).await, 0);
+}
+
+// ---- who may grade where ----------------------------------------------------
+
+/// Record a mark for `student_id` on `exam` as `cookie`; the status alone is
+/// what this probe reads.
+async fn grade(app: &axum::Router, cookie: &str, exam: &str, student_id: &str) -> StatusCode {
+    send(
+        app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(cookie),
+        Some(json!({ "mark": 85, "user_id": student_id })),
+    )
+    .await
+    .status
+}
+
+/// Grading is an *instance* right since the K12 remodel, not a course one: a
+/// teacher assigned to one instance grades there and nowhere else, while the
+/// şube's own homeroom teacher grades every instance their section carries.
+/// Both answers come out of `ensure_instance_teacher`, which is what this pins
+/// — the grant must be read per instance, never per catalog course, or a
+/// teacher given 5-A's Matematik could grade 5-B's.
+#[tokio::test]
+async fn grading_rights_are_per_instance_and_per_subes_homeroom() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let homeroom = login_as(&app, &db, "homeroom", "teacher").await;
+    let student = login_as(&app, &db, "student", "student").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let homeroom_id = me_id(&app, &homeroom).await;
+    let student_id = me_id(&app, &student).await;
+
+    let year = common::create_year(&app, &manager, "2026-2027").await;
+    let term = common::create_term(&app, &manager, &year, "1. Dönem").await;
+    let maths = common::create_course(&app, &manager, "Matematik").await;
+    let physics = common::create_course(&app, &manager, "Fizik").await;
+
+    // 5-A carries a homeroom teacher and two courses; 5-B carries none and
+    // teaches one of the same two — so the same catalog course is taught by
+    // both sections, as its own instance each.
+    let a = common::create_class(
+        &app,
+        &manager,
+        "5-A",
+        json!({ "year": year, "teacher_id": homeroom_id }),
+    )
+    .await;
+    let b = common::create_class(&app, &manager, "5-B", json!({ "year": year })).await;
+    let x = common::attach_instance(&app, &manager, &a, &maths).await;
+    let z = common::attach_instance(&app, &manager, &a, &physics).await;
+    let y = common::attach_instance(&app, &manager, &b, &maths).await;
+    common::add_member(&app, &manager, &a, &student_id).await;
+    common::add_member(&app, &manager, &b, &student_id).await;
+
+    // One exam per instance, written by the office, so every later answer is
+    // about the *grader* and not about who wrote the exam.
+    let exam_x = common::create_exam(&app, &manager, &x, &term, "1. Yazılı", "yazili").await;
+    let exam_z = common::create_exam(&app, &manager, &z, &term, "1. Yazılı", "yazili").await;
+    let exam_y = common::create_exam(&app, &manager, &y, &term, "1. Yazılı", "yazili").await;
+
+    // The teacher runs 5-A's Matematik and nothing else.
+    let assigned = send(
+        &app,
+        "POST",
+        &format!("/instances/{x}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(assigned.status, StatusCode::OK, "{:?}", assigned.body);
+
+    assert_eq!(
+        grade(&app, &teacher, &exam_x, &student_id).await,
+        StatusCode::OK,
+        "an assigned teacher grades in their own instance"
+    );
+    let own = send(
+        &app,
+        "POST",
+        &format!("/instances/{x}/exams"),
+        Some(&teacher),
+        Some(json!({ "title": "2. Yazılı", "kind": "yazili", "term": term })),
+    )
+    .await;
+    assert_eq!(own.status, StatusCode::CREATED, "{:?}", own.body);
+
+    assert_eq!(
+        grade(&app, &teacher, &exam_z, &student_id).await,
+        StatusCode::FORBIDDEN,
+        "the sibling course of the same şube is not theirs"
+    );
+    assert_eq!(
+        grade(&app, &teacher, &exam_y, &student_id).await,
+        StatusCode::FORBIDDEN,
+        "the same catalog course in another şube is not theirs"
+    );
+
+    // The homeroom teacher needs no assignment: every instance their section
+    // carries is theirs — and only their section's.
+    assert_eq!(
+        grade(&app, &homeroom, &exam_x, &student_id).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        grade(&app, &homeroom, &exam_z, &student_id).await,
+        StatusCode::OK,
+        "any instance of their own şube"
+    );
+    assert_eq!(
+        grade(&app, &homeroom, &exam_y, &student_id).await,
+        StatusCode::FORBIDDEN,
+        "…but another section's instance is not"
     );
 }

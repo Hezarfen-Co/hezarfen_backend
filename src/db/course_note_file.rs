@@ -186,8 +186,6 @@ mod tests {
             CourseTitle::try_new("c").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::try_new("course").unwrap(),
-            None,
-            None,
         )
         .await
         .unwrap();

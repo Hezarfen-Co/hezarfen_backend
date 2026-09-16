@@ -168,7 +168,9 @@ struct EventLimits {
 struct CourseLimits {
     max_title_len: usize,
     max_description_len: usize,
-    /// The only accepted `kind` values — behaviorally identical labels.
+    /// The only accepted `kind` values. Only `course` is taught through class
+    /// instances (exams, sessions, homework); `study` (etüt) and `club` are
+    /// joined school-wide.
     #[schema(example = json!(["course", "study", "club"]))]
     kinds: Vec<&'static str>,
     max_subject_name_len: usize,
@@ -180,8 +182,13 @@ struct CourseLimits {
     max_class_grade_len: usize,
     /// Students one class may hold. Removing one frees a place.
     max_class_members: i64,
-    /// Courses one class may be attached to. Detaching one frees a place.
+    /// Instances one class may carry. Detaching one frees a place.
     max_class_courses: i64,
+    /// Inclusive bounds for an instance's weekly lesson hours (`ders_saati`).
+    min_ders_saati: i64,
+    max_ders_saati: i64,
+    /// An academic year's name (`POST /academic-years`).
+    max_academic_year_name_len: usize,
 }
 
 /// Exams, their questions, answers, and marks.
@@ -550,6 +557,9 @@ impl LimitsResponse {
                 max_class_grade_len: MAX_CLASS_GRADE_LEN,
                 max_class_members: MAX_CLASS_MEMBERS,
                 max_class_courses: MAX_CLASS_COURSES,
+                min_ders_saati: MIN_DERS_SAATI,
+                max_ders_saati: MAX_DERS_SAATI,
+                max_academic_year_name_len: MAX_ACADEMIC_YEAR_NAME_LEN,
             },
             exam: ExamLimits {
                 max_title_len: MAX_EXAM_TITLE_LEN,

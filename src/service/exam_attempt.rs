@@ -18,7 +18,7 @@
 /// ([`crate::db::subject::delete`]) needs no partner lock at all.
 use crate::database::Database;
 use crate::db::cap;
-use crate::domain::course::Course;
+use crate::domain::class_course::ClassCourse;
 
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
@@ -27,7 +27,6 @@ use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
-
 
 /// Rejects sitting an exam that can't be sat. A draft is a `404`, not a
 /// `409` — sitting is a student act, drafts are invisible to students, and a
@@ -74,12 +73,13 @@ pub async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppE
     ensure_student(&user)
 }
 
-/// A 403 unless `user` is enrolled in the exam's course — the same wall the
-/// exam room checks at its door, re-applied to the sitting's content paths so
-/// an unenrollment mid-exam cuts them too. Finishing stays exempt: like the
-/// rejoin lock, submitting what's already saved writes nothing new.
+/// A 403 unless `user` is enrolled in the instance the exam belongs to — the
+/// same wall the exam room checks at its door, re-applied to the sitting's
+/// content paths so an unenrollment mid-exam cuts them too. Finishing stays
+/// exempt: like the rejoin lock, submitting what's already saved writes
+/// nothing new.
 pub async fn ensure_enrolled(exam: &Exam, user: &UserId, db: &Database) -> Result<(), AppError> {
-    if crate::db::enrollment::read_for_user(db, exam.get_course(), user)
+    if crate::db::enrollment::read_for_user(db, exam.get_class_course(), user)
         .await?
         .is_none()
     {
@@ -122,12 +122,25 @@ pub async fn writable_attempt(
     }
 }
 
-/// The course an exam belongs to. A dangling reference means the course-delete
-/// cascade was violated — surface it loudly as a 500, not a user-facing 404.
-pub async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
-    crate::db::course::read(db, exam.get_course())
+/// The class×course instance an exam belongs to. A dangling reference means
+/// the instance's delete cascade was violated — surface it loudly as a 500,
+/// not a user-facing 404.
+pub async fn class_course_of(exam: &Exam, db: &Database) -> Result<ClassCourse, AppError> {
+    crate::db::class_course::read(db, exam.get_class_course())
         .await?
-        .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
+        .ok_or_else(|| AppError::Internal("exam references a missing class instance".into()))
+}
+
+/// The archived-year refusal every exam write pays: the exam's instance must
+/// still sit under an open year. Past years are read-only, and the year — not
+/// the dönem the exam names — is what the exam's structure belongs to.
+///
+/// The instance read doubles as the dangling-reference check
+/// ([`class_course_of`]); the year itself is read by
+/// [`crate::service::class_course::require_open`].
+pub async fn require_open(db: &Database, exam: &Exam) -> Result<(), AppError> {
+    let instance = class_course_of(exam, db).await?;
+    crate::service::class_course::require_open(db, instance.get_id()).await
 }
 
 /// Start, resume, or retake `user`'s attempt at `exam`. Returns the attempt
@@ -254,7 +267,7 @@ pub async fn start_attempt(
     ensure_sittable(&exam)?;
     ensure_student(user)?;
     ensure_enrolled(&exam, user.get_id(), db).await?;
-    crate::service::course::require_open(db, &course_of(&exam, db).await?).await?;
+    crate::service::exam_attempt::require_open(db, &exam).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
         && now < starts_at
@@ -294,7 +307,7 @@ pub async fn finish_attempt(
     {
         return Err(AppError::Conflict("time is up — the attempt has expired"));
     }
-    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
+    crate::service::exam_attempt::require_open(db, exam).await?;
     crate::db::exam_attempt::finish(db, attempt).await
 }
 
@@ -338,7 +351,7 @@ pub async fn save_answer_in(
     ensure_student_now(attempt.get_user(), db).await?;
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
-    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
+    crate::service::exam_attempt::require_open(db, exam).await?;
     let question =
         crate::service::exam_question::question_of_exam(exam.get_id(), question_id, db).await?;
     crate::db::exam_answer::save(
@@ -453,15 +466,38 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
-        let course = crate::db::course::a_test_course(db).await;
+        let (class_course, _course) = crate::db::course::a_test_instance(db).await;
+        // A dönem for the exam to be sat in: the year it belongs to is real
+        // (the create claims it), and the shape is the calendar's own.
+        let manager = crate::db::class_member::tests::fixture_user(db, "manager").await;
+        let year = crate::db::academic_year::create(
+            db,
+            &manager,
+            crate::domain::academic_year::AcademicYearName::try_new("2026-2027").unwrap(),
+            Timestamp::from_millis(0),
+            Timestamp::from_millis(1),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let term = crate::db::term::create(
+            db,
+            crate::domain::term::TermName::try_new("1. Dönem").unwrap(),
+            *year.get_id(),
+            Timestamp::from_millis(0),
+            Timestamp::from_millis(1),
+        )
+        .await
+        .unwrap();
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
             db,
             &creator,
-            &course,
+            &class_course,
+            term.get_id(),
             ExamTitle::try_new("practice").unwrap(),
             ExamDescription::try_new("").unwrap(),
-            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamKind::try_new("yazili", &kinds).unwrap(),
             ExamSchedule::try_new(Some(ExamMode::try_new("open").unwrap()), None, None, None)
                 .unwrap(),
             ExamAttemptLimit::try_new(max_attempts).unwrap(),

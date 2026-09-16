@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n               DELETE FROM homework WHERE class_course = $1\n               RETURNING subject),\n           subs AS (\n               SELECT subject, count(*) AS n FROM gone GROUP BY subject)\n           UPDATE subject s SET homework_count = GREATEST(s.homework_count - c.n, 0)\n           FROM subs c WHERE s.id = c.subject",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f0670cba23b45c7dd4e88531aed7c10ecbdf9f108165b055794a3c8ba5d7031b"
+}

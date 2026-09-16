@@ -255,6 +255,14 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             MAX_DISPLAY_NAME_LEN as i64,
         ),
         ("UpdateProfile", "bio", "maxLength", MAX_BIO_LEN as i64),
+        // A branş is one entry of the school's `branches` list, so it is
+        // bounded by the same per-entry length the list itself is.
+        (
+            "UpdateProfile",
+            "branch",
+            "maxLength",
+            MAX_SETTINGS_ITEM_LEN as i64,
+        ),
         (
             "CreateNote",
             "title",
@@ -795,6 +803,50 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maximum",
             MAX_MAX_CHATBOT_MESSAGE_LEN,
         ),
+        // --- the devamsızlık axes: the branş vocabulary, what an absence may
+        // be excused as, and the per-dönem day limits. The two lists are
+        // school policy like `exam_kinds`, so they carry the same bounds; the
+        // limits are days, bounded so a typo cannot disable the rule.
+        (
+            "UpdateSettings",
+            "branches",
+            "maxItems",
+            MAX_SETTINGS_LIST_LEN as i64,
+        ),
+        (
+            "UpdateSettings",
+            "excuse_kinds",
+            "maxItems",
+            MAX_SETTINGS_LIST_LEN as i64,
+        ),
+        ("UpdateSettings", "max_excused_absent_days", "minimum", 0),
+        (
+            "UpdateSettings",
+            "max_excused_absent_days",
+            "maximum",
+            MAX_ABSENCE_DAYS,
+        ),
+        ("UpdateSettings", "max_unexcused_absent_days", "minimum", 0),
+        (
+            "UpdateSettings",
+            "max_unexcused_absent_days",
+            "maximum",
+            MAX_ABSENCE_DAYS,
+        ),
+        // The read side publishes the same two lists, and the bound has to
+        // hold on both or a client validating a `GET` against them is wrong.
+        (
+            "SettingsResponse",
+            "branches",
+            "maxItems",
+            MAX_SETTINGS_LIST_LEN as i64,
+        ),
+        (
+            "SettingsResponse",
+            "excuse_kinds",
+            "maxItems",
+            MAX_SETTINGS_LIST_LEN as i64,
+        ),
         // --- food program (the school-editable lists live in /settings) ---
         (
             "MealSlotDto",
@@ -1041,6 +1093,38 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxItems",
             MAX_BOARD_PARTICIPANTS as i64,
         ),
+        // --- academic years and the class×course instance (the K12 anchor) ---
+        // A year is named like a term ("2026-2027"), so it shares the term
+        // name's bound; its two grade labels are şube grades, bounded like
+        // `CreateClass.grade`.
+        (
+            "CreateYear",
+            "name",
+            "maxLength",
+            MAX_ACADEMIC_YEAR_NAME_LEN as i64,
+        ),
+        (
+            "UpdateYear",
+            "name",
+            "maxLength",
+            MAX_ACADEMIC_YEAR_NAME_LEN as i64,
+        ),
+        (
+            "PromotionBody",
+            "from_grade",
+            "maxLength",
+            MAX_CLASS_GRADE_LEN as i64,
+        ),
+        (
+            "PromotionBody",
+            "to_grade",
+            "maxLength",
+            MAX_CLASS_GRADE_LEN as i64,
+        ),
+        // The instance's weekly hours: the karne weight, bounded so one
+        // instance cannot be made to dominate the year average by a typo.
+        ("UpdateInstance", "ders_saati", "minimum", MIN_DERS_SAATI),
+        ("UpdateInstance", "ders_saati", "maximum", MAX_DERS_SAATI),
     ]
 }
 
@@ -1326,6 +1410,9 @@ async fn the_image_meta_bodies_stay_the_same_shape() {
 /// fail: `course_full` survived as a `#[schema(example)]` and `duplicate` in
 /// prose, so a code dropped from a `409` description, moved to the wrong route
 /// or added undocumented all passed.
+///
+/// `course_full` itself is gone with the seat claim: an instance no longer
+/// holds a capacity, so a full course is not a refusal any more.
 #[tokio::test]
 async fn the_class_refusal_codes_stay_published() {
     let spec = spec().await;
@@ -1358,33 +1445,32 @@ async fn the_class_refusal_codes_stay_published() {
         "course_deleted",
         "class_at_course_ceiling",
         "class_roster_too_large",
-        "course_full",
         "blueprint_deleted",
     ];
     // Per route, in the axis's own words: `class_at_*_ceiling` is the axis being
-    // attached, the `*_too_large` pair the other one.
-    let courses = [
+    // attached, the `*_too_large` pair the other one. The instance route is
+    // where a course is attached to a section now; the second path segment of
+    // its `DELETE` is the instance id, not a course id.
+    let instances = [
         "duplicate",
         "class_at_course_ceiling",
         "class_roster_too_large",
-        "course_full",
-        "term_archived",
+        "academic_year_archived",
     ];
     let members = [
         "duplicate",
         "class_at_roster_ceiling",
         "class_course_list_too_large",
-        "course_full",
         "linked_course_missing",
-        "term_archived",
+        "academic_year_archived",
     ];
-    // `term_archived` refuses the whole request up front (the class's or the
-    // course's term is archived), so no pump ever *skips* an item for it —
-    // it belongs on the two routes' 409s, never in `SkipResponse.reason`.
-    let whole_request = ["term_archived"];
+    // `academic_year_archived` refuses the whole request up front (the class's
+    // academic year is archived), so no pump ever *skips* an item for it — it
+    // belongs on the two routes' 409s, never in `SkipResponse.reason`.
+    let whole_request = ["academic_year_archived"];
 
     for (path, expected) in [
-        ("/classes/{id}/courses", courses.as_slice()),
+        ("/classes/{id}/instances", instances.as_slice()),
         ("/classes/{id}/members", members.as_slice()),
     ] {
         let description = spec["paths"][path]["post"]["responses"]["409"]["description"]
@@ -1416,7 +1502,7 @@ async fn the_class_refusal_codes_stay_published() {
             .expect("SkipResponse.reason must document the code vocabulary");
     let everything: Vec<&str> = pump
         .iter()
-        .chain(courses.iter())
+        .chain(instances.iter())
         .chain(members.iter())
         .copied()
         .filter(|code| !whole_request.contains(code))

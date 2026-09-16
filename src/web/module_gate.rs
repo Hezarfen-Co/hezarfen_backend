@@ -11,18 +11,18 @@
 //!
 //! # The nested exceptions
 //!
-//! Four route pairs live under `/courses` but belong to another module, and so
-//! carry a second gate of their own ([`crate::web::courses`] splits them out
-//! for exactly this):
+//! Four route pairs live under another nest but belong to a foreign module, and
+//! so carry a second gate of their own ([`crate::web::courses`] and
+//! [`crate::web::instances`] split them out for exactly this):
 //!
-//! - `/courses/{id}/exams`     → `Module::Exams`
-//! - `/courses/{id}/sessions`  → `Module::Sessions`
-//! - `/courses/{id}/subjects`  → `Module::Subjects`
-//! - `/courses/{id}/homework`  → `Module::Homework`
+//! - `/courses/{id}/subjects`   → `Module::Subjects`
+//! - `/instances/{id}/exams`    → `Module::Exams`
+//! - `/instances/{id}/sessions` → `Module::Sessions`
+//! - `/instances/{id}/homework` → `Module::Homework`
 //!
-//! Both gates run (the child's, then the outer `/courses` one), so either
-//! module being off refuses — which is right: `POST /courses/{id}/exams` is an
-//! exams feature reached through a course.
+//! Both gates run (the child's, then the outer one), so either module being off
+//! refuses — which is right: `POST /instances/{id}/exams` is an exams feature
+//! reached through a class's course.
 //!
 //! One surface this cannot reach: `crate::ai::server`'s blob stream, which
 //! answers `BlobRequest`s without going through the router at all. It checks

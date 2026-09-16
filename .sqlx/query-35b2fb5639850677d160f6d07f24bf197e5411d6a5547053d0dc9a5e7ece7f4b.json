@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO enrollment (class_course, app_user, enrolled_by, source, created_at)\n               VALUES ($1, $2, $3, $4, $5)\n               ON CONFLICT (class_course, app_user) DO NOTHING\n               RETURNING 1 AS \"one\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "35b2fb5639850677d160f6d07f24bf197e5411d6a5547053d0dc9a5e7ece7f4b"
+}

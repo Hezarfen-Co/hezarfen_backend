@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n               DELETE FROM exam_result WHERE exam = ANY($1)\n               RETURNING exam),\n           kinds AS (\n               SELECT e.kind AS kind, count(*) AS n\n               FROM gone g JOIN exam e ON e.id = g.exam\n               GROUP BY e.kind)\n           UPDATE kind_ref k SET count = GREATEST(k.count - c.n, 0)\n           FROM kinds c WHERE k.name = c.kind",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b9bd402798dd82f0b13e78b03ac9ba1278fcd5fe3d956d9996e1c615b346b1b8"
+}

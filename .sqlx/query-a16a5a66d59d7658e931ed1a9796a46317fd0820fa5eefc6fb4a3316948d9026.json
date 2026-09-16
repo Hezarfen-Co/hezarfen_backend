@@ -1,0 +1,184 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                  COALESCE((SELECT array_agg(t.status ORDER BY t.status)\n                            FROM settings_attendance_status t\n                            WHERE t.settings = s.id), '{}') AS \"attendance_statuses!: Vec<String>\",\n                  s.grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                  s.max_file_bytes,\n                  s.chatbot_history_turns,\n                  s.max_chatbot_message_len,\n                  s.max_chatbot_threads,\n                  s.meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                  (SELECT array_agg(t.tag ORDER BY t.tag)\n                   FROM settings_dietary_tag t\n                   WHERE t.settings = s.id) AS dietary_tags,\n                  s.meal_cancel_cutoff_minutes,\n                  s.branches AS \"branches: Json<Vec<String>>\",\n                  s.excuse_kinds AS \"excuse_kinds: Json<Vec<String>>\",\n                  s.max_excused_absent_days,\n                  s.max_unexcused_absent_days,\n                  s.timezone\n           FROM settings s WHERE s.id = 'school'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam_kinds: Json<Vec<ExamKindDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "exam_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "attendance_statuses!: Vec<String>",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "grade_bands: Json<Vec<GradeBand>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "grade_bands"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "max_file_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_file_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "chatbot_history_turns",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "chatbot_history_turns"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "max_chatbot_message_len",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_message_len"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_chatbot_threads",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_chatbot_threads"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "meal_slots: Json<Vec<MealSlotDef>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_slots"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "dietary_tags",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "meal_cancel_cutoff_minutes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "meal_cancel_cutoff_minutes"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "branches: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "branches"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "excuse_kinds: Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "excuse_kinds"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "max_excused_absent_days",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_excused_absent_days"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "max_unexcused_absent_days",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "max_unexcused_absent_days"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "timezone",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "settings",
+            "name": "timezone"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "a16a5a66d59d7658e931ed1a9796a46317fd0820fa5eefc6fb4a3316948d9026"
+}

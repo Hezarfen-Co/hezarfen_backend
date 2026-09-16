@@ -13,7 +13,7 @@
 //! same-course by the web layer, exactly like an exam question's subject.
 
 use crate::constant::{MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN};
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
@@ -90,7 +90,7 @@ impl HomeworkDescription {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Homework {
     pub(crate) id: HomeworkId,
-    pub(crate) course: CourseId,
+    pub(crate) class_course: ClassCourseId,
     pub(crate) subject: SubjectId,
     pub(crate) title: HomeworkTitle,
     pub(crate) description: Option<HomeworkDescription>,
@@ -105,8 +105,8 @@ impl Homework {
         &self.id
     }
 
-    pub fn get_course(&self) -> &CourseId {
-        &self.course
+    pub fn get_class_course(&self) -> &ClassCourseId {
+        &self.class_course
     }
 
     pub fn get_subject(&self) -> &SubjectId {
@@ -177,7 +177,7 @@ mod tests {
         let b = UserId::from_key(B);
         let with = |assigned| Homework {
             id: HomeworkId::generate(),
-            course: CourseId::from_key("0198f1a2-3b4c-7d5e-8f90-cccc3c4d5e6f"),
+            class_course: ClassCourseId::from_key("0198f1a2-3b4c-7d5e-8f90-cccc3c4d5e6f"),
             subject: SubjectId::from_key("0198f1a2-3b4c-7d5e-8f90-dddd4c4d5e6f"),
             title: HomeworkTitle::try_new("hw").unwrap(),
             description: None,

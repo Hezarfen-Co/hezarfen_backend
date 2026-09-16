@@ -1960,9 +1960,14 @@ async fn course_notes_fixture(
     let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
     let student = common::me_id(&app, &student_cookie).await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let mudur = common::login_as(&app, &db, "mudur", "manager").await;
 
-    let course = common::create_course(&app, &teacher, "Physics").await;
-    common::enroll(&app, &teacher, &course, &student).await;
+    // A şube (class) is school structure, so the stack is minted by a manager
+    // with `teacher` named as its homeroom teacher — which is what lets the
+    // plain teacher cookie act on the instance the roster hangs off.
+    let t = common::taught_under(&app, &mudur, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &t.instance, &student).await;
+    let course = t.course.clone();
     let foreign = common::create_course(&app, &teacher, "Chemistry").await;
 
     let res = common::send(
@@ -2413,8 +2418,12 @@ async fn blob_fixture(bridge: &AiBridge) -> (FakeService, String, String, Vec<u8
     let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
     let student = common::me_id(&app, &student_cookie).await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
-    let course = common::create_course(&app, &teacher, "Physics").await;
-    common::enroll(&app, &teacher, &course, &student).await;
+    let mudur = common::login_as(&app, &db, "mudur", "manager").await;
+    // The roster hangs off the şube's instance, so a manager mints the stack
+    // with the teacher as its homeroom teacher.
+    let t = common::taught_under(&app, &mudur, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &t.instance, &student).await;
+    let course = t.course.clone();
 
     let res = common::send(
         &app,

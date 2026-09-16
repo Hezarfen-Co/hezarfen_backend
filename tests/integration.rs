@@ -6,14 +6,15 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, app_and_tenants, create_course, create_exam, create_exam_with, create_homework,
-    create_session, create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
-    unenroll, upload_course_note_file,
+    add_member, app_and_db, app_and_tenants, attach_instance, create_class, create_course,
+    create_exam, create_exam_with, create_homework, create_session, create_subject, create_term,
+    create_year, enroll, ensure_year, id_of, login, login_as, me_id, mem_app, send, set_role,
+    taught_under, unenroll, upload_course_note_file,
 };
 use hezarfen_backend::build_router;
 use hezarfen_backend::constant::{
-    BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_COURSE_NOTE_FILES,
-    MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
+    BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_CLASS_MEMBERS,
+    MAX_COURSE_NOTE_FILES, MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
 };
 use hezarfen_backend::db::exam_attempt::any_for_exam;
 use hezarfen_backend::db::session;
@@ -2045,10 +2046,12 @@ async fn event_audience_gates_marking() {
         "caller-defaulted target must still clear the audience gate"
     );
 
-    // Course audience: enrollment decides, live.
-    let course = create_course(&app, &ali, "algebra").await;
-    enroll(&app, &ali, &course, &veli_id).await;
-    let ev = create(json!({ "kind": "course", "course": course })).await;
+    // Course audience: enrollment decides, live. The enrollment that decides is
+    // the one on a şube's instance — a catalog row teaches nobody by itself.
+    let mudur = login_as(&app, &db, "ev_mgr", "manager").await;
+    let t = taught_under(&app, &mudur, &ali, "algebra").await;
+    enroll(&app, &ali, &t.instance, &veli_id).await;
+    let ev = create(json!({ "kind": "course", "course": t.course })).await;
     assert_eq!(mark(ev.clone(), veli_id.clone()).await, StatusCode::OK);
     assert_eq!(
         mark(ev.clone(), mina_id.clone()).await,
@@ -2085,9 +2088,13 @@ async fn event_roster_joins_expected_with_marks() {
     let s1 = login(&app, "selin").await;
     let s2 = login(&app, "zeynep").await;
     let s1_id = me_id(&app, &s1).await;
-    let course = create_course(&app, &ali, "algebra").await;
-    enroll(&app, &ali, &course, &s1_id).await;
-    enroll(&app, &ali, &course, &me_id(&app, &s2).await).await;
+    // The audience names the catalog course; the roster it resolves is the
+    // instance's, so the şube the teacher runs is what seats them.
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &ali, "algebra").await;
+    let course = t.course.clone();
+    enroll(&app, &ali, &t.instance, &s1_id).await;
+    enroll(&app, &ali, &t.instance, &me_id(&app, &s2).await).await;
 
     let ev = send(
         &app,
@@ -2155,7 +2162,7 @@ async fn event_roster_joins_expected_with_marks() {
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}/enrollments/{s1_id}"),
+        &format!("/instances/{}/enrollments/{s1_id}", t.instance),
         Some(&ali),
         None,
     )
@@ -2186,29 +2193,37 @@ async fn event_roster_joins_expected_with_marks() {
 // --- exams + results -----------------------------------------------------
 
 #[tokio::test]
-async fn exams_are_course_scoped_and_course_guarded() {
+async fn exams_are_instance_scoped_and_instance_guarded() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
 
-    let course_id = create_course(&app, &ali, "algebra").await;
+    // The exam keys on the instance — one şube teaching the catalog course —
+    // and ali is that şube's homeroom teacher, which is what carries the right.
+    let t = taught_under(&app, &mudur, &ali, "algebra").await;
     let ex = send(
         &app,
         "POST",
-        &format!("/courses/{course_id}/exams"),
+        &format!("/instances/{}/exams", t.instance),
         Some(&ali),
-        Some(json!({ "title": "ch3", "description": "algebra", "kind": "quiz" })),
+        Some(json!({
+            "title": "ch3",
+            "description": "algebra",
+            "kind": "yazili",
+            "term": &t.term,
+        })),
     )
     .await;
     assert_eq!(ex.status, StatusCode::CREATED);
-    assert_eq!(ex.body["kind"], "quiz");
-    assert_eq!(ex.body["course"], course_id);
+    assert_eq!(ex.body["kind"], "yazili");
+    assert_eq!(ex.body["class_course"], t.instance);
     // Weight lives on the kind (settings), not the exam.
     assert_eq!(ex.body.get("weight"), None);
     let exam_id = id_of(&ex.body);
 
-    // A teacher outside the course sees none of it: not the exam, not the
-    // course's exam list, and an empty catalog.
+    // A teacher outside the instance sees none of it: not the exam, not the
+    // instance's exam list, and an empty catalog.
     assert_eq!(
         send(&app, "GET", &format!("/exams/{exam_id}"), Some(&veli), None)
             .await
@@ -2223,7 +2238,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
         send(
             &app,
             "GET",
-            &format!("/courses/{course_id}/exams"),
+            &format!("/instances/{}/exams", t.instance),
             Some(&veli),
             None
         )
@@ -2232,7 +2247,24 @@ async fn exams_are_course_scoped_and_course_guarded() {
         StatusCode::FORBIDDEN
     );
 
-    // The course creator reads all three views.
+    // Assign ali to the instance itself: the flat exam catalog lists the
+    // instances a teacher is *assigned* to (the şube's homeroom teacher reads
+    // it through the instance routes, not through this catalog).
+    let ali_id = me_id(&app, &ali).await;
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!("/instances/{}/teachers", t.instance),
+            Some(&mudur),
+            Some(json!({ "user_id": ali_id }))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    // The instance's own teacher reads all three views.
     assert_eq!(
         send(&app, "GET", &format!("/exams/{exam_id}"), Some(&ali), None)
             .await
@@ -2248,7 +2280,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
             &send(
                 &app,
                 "GET",
-                &format!("/courses/{course_id}/exams"),
+                &format!("/instances/{}/exams", t.instance),
                 Some(&ali),
                 None
             )
@@ -2259,7 +2291,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
         1
     );
 
-    // A teacher who doesn't manage the course cannot edit or delete its exams.
+    // A teacher who doesn't teach the instance cannot edit or delete its exams.
     assert_eq!(
         send(
             &app,
@@ -2285,17 +2317,17 @@ async fn exams_are_course_scoped_and_course_guarded() {
         StatusCode::FORBIDDEN
     );
 
-    // Course creator edits (partial) — kind flips homework, title kept.
+    // The instance's teacher edits (partial) — kind flips sozlu, title kept.
     let res = send(
         &app,
         "PATCH",
         &format!("/exams/{exam_id}"),
         Some(&ali),
-        Some(json!({ "kind": "homework" })),
+        Some(json!({ "kind": "sozlu" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["kind"], "homework");
+    assert_eq!(res.body["kind"], "sozlu");
     assert_eq!(res.body["title"], "ch3");
 }
 
@@ -2303,8 +2335,9 @@ async fn exams_are_course_scoped_and_course_guarded() {
 async fn exam_input_validation() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
-    let course_id = create_course(&app, &ali, "algebra").await;
-    let exams_uri = format!("/courses/{course_id}/exams");
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &ali, "algebra").await;
+    let exams_uri = format!("/instances/{}/exams", t.instance);
 
     // Missing/blank title -> 400.
     assert_eq!(
@@ -2313,20 +2346,20 @@ async fn exam_input_validation() {
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"  ","kind":"quiz"}))
+            Some(json!({"title":"  ","kind":"yazili","term": &t.term}))
         )
         .await
         .status,
         StatusCode::BAD_REQUEST
     );
-    // Unknown kind -> 400 ("final" is valid now; "essay" is not).
+    // Unknown kind -> 400 ("yazili" is a default kind; "essay" is not).
     assert_eq!(
         send(
             &app,
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"t","kind":"essay"}))
+            Some(json!({"title":"t","kind":"essay","term": &t.term}))
         )
         .await
         .status,
@@ -2338,7 +2371,7 @@ async fn exam_input_validation() {
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"t","kind":"final"}))
+            Some(json!({"title":"t","kind":"yazili","term": &t.term}))
         )
         .await
         .status,
@@ -2361,9 +2394,10 @@ async fn grading_upsert_and_own_result() {
     let bob = login(&app, "bob").await; // student
     let alice_id = me_id(&app, &alice).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "mt", "yazili").await;
 
     // Before grading, the student's own result is 404.
     assert_eq!(
@@ -2493,18 +2527,19 @@ async fn grading_rbac_and_validation() {
     let alice_id = me_id(&app, &alice).await;
     let bob_id = me_id(&app, &bob).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "homework").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "e", "yazili").await;
 
     // Students cannot create exams, grade anyone, list all results, or delete a result.
     assert_eq!(
         send(
             &app,
             "POST",
-            &format!("/courses/{course_id}/exams"),
+            &format!("/instances/{}/exams", t.instance),
             Some(&alice),
-            Some(json!({"title":"x","kind":"quiz"}))
+            Some(json!({"title":"x","kind":"yazili","term": &t.term}))
         )
         .await
         .status,
@@ -2573,7 +2608,7 @@ async fn grading_rbac_and_validation() {
         .status,
         StatusCode::BAD_REQUEST
     );
-    // Target exists but is not enrolled in the course -> 400.
+    // Target exists but is not enrolled in the instance -> 400.
     assert_eq!(
         send(
             &app,
@@ -2608,9 +2643,10 @@ async fn deleting_exam_cascades_results() {
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "e", "yazili").await;
     send(
         &app,
         "POST",
@@ -2702,7 +2738,7 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
         0
     );
 
-    // The creator and a manager see it — in the catalog too.
+    // The creator and a manager read the row itself.
     for caller in [&ali, &boss] {
         assert_eq!(
             send(
@@ -2716,14 +2752,22 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
             .status,
             StatusCode::OK
         );
-        let catalog = send(&app, "GET", "/courses", Some(caller), None).await.body;
-        let rows = common::items(&catalog);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0]["creator"]["username"], "ali",
-            "the catalog embeds the creator ref on every row"
-        );
     }
+    // The catalog list is a "courses this caller is reached by" list now:
+    // teaching an instance of it, or being enrolled. ali only created the row
+    // and teaches no şube, so it is absent from their catalog; the manager
+    // sees every course.
+    assert!(
+        common::items(&send(&app, "GET", "/courses", Some(&ali), None).await.body).is_empty(),
+        "a course nobody teaches and nobody is enrolled in is not in the catalog"
+    );
+    let catalog = send(&app, "GET", "/courses", Some(&boss), None).await.body;
+    let rows = common::items(&catalog);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["creator"]["username"], "ali",
+        "the catalog embeds the creator ref on every row"
+    );
 
     // Non-creator teacher cannot edit or delete.
     assert_eq!(
@@ -2779,11 +2823,12 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
     );
 }
 
-/// A manager can put a second teacher in charge of someone else's course. The
-/// assignee then manages everything inside it, but the course stays its
-/// creator's to delete — and a demotion takes the assignment away.
+/// A manager can put a second teacher in charge of an instance. The assignee
+/// then runs everything inside it — its roster, its exams — but the catalog
+/// course stays its creator's to write, and a demotion takes the assignment
+/// away.
 #[tokio::test]
-async fn assigned_teacher_manages_course_without_owning_it() {
+async fn assigned_teacher_manages_instance_without_owning_the_course() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
@@ -2791,25 +2836,15 @@ async fn assigned_teacher_manages_course_without_owning_it() {
     let rektor = login_as(&app, &db, "rektor", "admin").await;
     let veli_id = id_of(&send(&app, "GET", "/auth/me", Some(&veli), None).await.body);
 
-    let course_id = id_of(
-        &send(
-            &app,
-            "POST",
-            "/courses",
-            Some(&ali),
-            Some(json!({ "title": "algebra" })),
-        )
-        .await
-        .body,
-    );
-    let teachers = format!("/courses/{course_id}/teachers");
+    let t = taught_under(&app, &boss, &ali, "algebra").await;
+    let staff = format!("/instances/{}/teachers", t.instance);
 
-    // Before assignment veli is just another teacher: no read, no write.
+    // Before assignment veli is just another teacher: no read of the instance.
     assert_eq!(
         send(
             &app,
             "GET",
-            &format!("/courses/{course_id}"),
+            &format!("/instances/{}/enrollments", t.instance),
             Some(&veli),
             None
         )
@@ -2818,12 +2853,12 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         StatusCode::FORBIDDEN
     );
 
-    // Staffing is the office's call — the course's own creator cannot do it.
+    // Staffing is the office's call — the instance's own teacher cannot do it.
     assert_eq!(
         send(
             &app,
             "POST",
-            &teachers,
+            &staff,
             Some(&ali),
             Some(json!({ "user_id": veli_id }))
         )
@@ -2843,7 +2878,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "POST",
-            &teachers,
+            &staff,
             Some(&boss),
             Some(json!({ "user_id": student_id }))
         )
@@ -2852,24 +2887,23 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         StatusCode::BAD_REQUEST
     );
 
-    // The manager assigns veli; the course echoes its staff back.
+    // The manager assigns veli; the instance echoes its staff back.
     let res = send(
         &app,
         "POST",
-        &teachers,
+        &staff,
         Some(&boss),
         Some(json!({ "user_id": veli_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["creator"]["username"], "ali");
     assert_eq!(res.body["teachers"][0]["username"], "veli");
 
     // Assigning twice is idempotent — no duplicate row in the list.
     let again = send(
         &app,
         "POST",
-        &teachers,
+        &staff,
         Some(&boss),
         Some(json!({ "user_id": veli_id })),
     )
@@ -2877,17 +2911,15 @@ async fn assigned_teacher_manages_course_without_owning_it() {
     assert_eq!(again.status, StatusCode::OK);
     assert_eq!(again.body["teachers"].as_array().unwrap().len(), 1);
 
-    // Veli now runs the course: it shows in their catalog, and they can edit
-    // it and enroll students.
-    let catalog = send(&app, "GET", "/courses", Some(&veli), None).await.body;
-    assert_eq!(common::items(&catalog).len(), 1);
+    // Veli now runs the instance: its roster answers and they can enroll
+    // students into it — but the catalog row is not theirs to write.
     assert_eq!(
         send(
             &app,
-            "PATCH",
-            &format!("/courses/{course_id}"),
+            "GET",
+            &format!("/instances/{}/enrollments", t.instance),
             Some(&veli),
-            Some(json!({"description":"letters"}))
+            None
         )
         .await
         .status,
@@ -2896,8 +2928,20 @@ async fn assigned_teacher_manages_course_without_owning_it() {
     assert_eq!(
         send(
             &app,
+            "PATCH",
+            &format!("/courses/{}", t.course),
+            Some(&veli),
+            Some(json!({"description":"letters"}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &app,
             "POST",
-            &format!("/courses/{course_id}/enrollments"),
+            &format!("/instances/{}/enrollments", t.instance),
             Some(&veli),
             Some(json!({ "user_id": student_id }))
         )
@@ -2906,12 +2950,13 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         StatusCode::OK
     );
 
-    // But the course is not theirs to delete, nor to re-staff.
+    // But the catalog row is not theirs to delete, nor the instance theirs to
+    // hand on.
     assert_eq!(
         send(
             &app,
             "DELETE",
-            &format!("/courses/{course_id}"),
+            &format!("/courses/{}", t.course),
             Some(&veli),
             None
         )
@@ -2923,7 +2968,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "DELETE",
-            &format!("{teachers}/{veli_id}"),
+            &format!("{staff}/{veli_id}"),
             Some(&veli),
             None
         )
@@ -2932,8 +2977,8 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         StatusCode::FORBIDDEN
     );
 
-    // Demoting veli below teacher sweeps the assignment: the course drops off
-    // their catalog and the rights go with it.
+    // Demoting veli below teacher sweeps the assignment: the instance's staff
+    // list drops them and the rights go with it.
     assert_eq!(
         send(
             &app,
@@ -2949,7 +2994,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
     let after = send(
         &app,
         "GET",
-        &format!("/courses/{course_id}"),
+        &format!("/instances/{}", t.instance),
         Some(&ali),
         None,
     )
@@ -2957,7 +3002,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
     assert_eq!(
         after.body["teachers"].as_array().unwrap().len(),
         0,
-        "a demoted teacher is swept off the courses they were assigned to"
+        "a demoted teacher is swept off the instances they were assigned to"
     );
 
     // Re-assign, then unassign by hand: the second removal is a 404.
@@ -2973,7 +3018,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "POST",
-            &teachers,
+            &staff,
             Some(&boss),
             Some(json!({ "user_id": veli_id }))
         )
@@ -2985,7 +3030,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "DELETE",
-            &format!("{teachers}/{veli_id}"),
+            &format!("{staff}/{veli_id}"),
             Some(&boss),
             None
         )
@@ -2997,7 +3042,7 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "DELETE",
-            &format!("{teachers}/{veli_id}"),
+            &format!("{staff}/{veli_id}"),
             Some(&boss),
             None
         )
@@ -3009,14 +3054,14 @@ async fn assigned_teacher_manages_course_without_owning_it() {
         send(
             &app,
             "GET",
-            &format!("/courses/{course_id}"),
+            &format!("/instances/{}/enrollments", t.instance),
             Some(&veli),
             None
         )
         .await
         .status,
         StatusCode::FORBIDDEN,
-        "unassigning takes the course back out of their reach"
+        "unassigning takes the instance back out of their reach"
     );
 }
 
@@ -3119,13 +3164,15 @@ async fn enrollment_upsert_roster_and_my_courses() {
     let alice = login(&app, "alice").await; // student
     let bob = login(&app, "bob").await; // student
     let alice_id = me_id(&app, &alice).await;
-    let course_id = create_course(&app, &teacher, "algebra").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let roster_uri = format!("/instances/{}/enrollments", t.instance);
 
     // Enrolling twice is an upsert: same row id both times.
     let first = send(
         &app,
         "POST",
-        &format!("/courses/{course_id}/enrollments"),
+        &roster_uri,
         Some(&teacher),
         Some(json!({ "user_id": alice_id })),
     )
@@ -3134,7 +3181,7 @@ async fn enrollment_upsert_roster_and_my_courses() {
     let second = send(
         &app,
         "POST",
-        &format!("/courses/{course_id}/enrollments"),
+        &roster_uri,
         Some(&teacher),
         Some(json!({ "user_id": alice_id })),
     )
@@ -3142,29 +3189,17 @@ async fn enrollment_upsert_roster_and_my_courses() {
     assert_eq!(id_of(&first.body), id_of(&second.body), "upsert same row");
 
     // Roster lists alice once; students can't read the roster.
-    let roster = send(
-        &app,
-        "GET",
-        &format!("/courses/{course_id}/enrollments"),
-        Some(&teacher),
-        None,
-    )
-    .await;
+    let roster = send(&app, "GET", &roster_uri, Some(&teacher), None).await;
     assert_eq!(common::items(&roster.body).len(), 1);
     assert_eq!(
-        send(
-            &app,
-            "GET",
-            &format!("/courses/{course_id}/enrollments"),
-            Some(&alice),
-            None
-        )
-        .await
-        .status,
+        send(&app, "GET", &roster_uri, Some(&alice), None)
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
 
-    // /courses/me shows the course for alice, stays empty for bob.
+    // /courses/me shows the catalog course alice's instance teaches; it stays
+    // empty for bob.
     assert_eq!(
         common::items(
             &send(&app, "GET", "/courses/me", Some(&alice), None)
@@ -3189,7 +3224,7 @@ async fn enrollment_upsert_roster_and_my_courses() {
         send(
             &app,
             "DELETE",
-            &format!("/courses/{course_id}/enrollments/{alice_id}"),
+            &format!("{roster_uri}/{alice_id}"),
             Some(&teacher),
             None
         )
@@ -3201,7 +3236,7 @@ async fn enrollment_upsert_roster_and_my_courses() {
         send(
             &app,
             "DELETE",
-            &format!("/courses/{course_id}/enrollments/{alice_id}"),
+            &format!("{roster_uri}/{alice_id}"),
             Some(&teacher),
             None
         )
@@ -3212,102 +3247,23 @@ async fn enrollment_upsert_roster_and_my_courses() {
 }
 
 #[tokio::test]
-async fn capacity_caps_the_roster() {
-    let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "teacher", "teacher").await;
-    let alice = login(&app, "alice").await; // student
-    let bob = login(&app, "bob").await; // student
-    let alice_id = me_id(&app, &alice).await;
-    let bob_id = me_id(&app, &bob).await;
-
-    // A zero-seat club is nonsense.
-    assert_eq!(
-        send(
-            &app,
-            "POST",
-            "/courses",
-            Some(&teacher),
-            Some(json!({ "title": "chess", "kind": "club", "capacity": 0 })),
-        )
-        .await
-        .status,
-        StatusCode::BAD_REQUEST
-    );
-
-    // A one-seat club.
-    let created = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "chess", "kind": "club", "capacity": 1 })),
-    )
-    .await;
-    assert_eq!(created.status, StatusCode::CREATED);
-    assert_eq!(created.body["kind"], "club");
-    assert_eq!(created.body["capacity"], 1);
-    let course_id = id_of(&created.body);
-
-    // The seat goes to alice; bob bounces off the full roster; re-enrolling
-    // the member stays an idempotent OK even at the cap.
-    let enroll = |cookie: String, user_id: String| {
-        let app = app.clone();
-        let path = format!("/courses/{course_id}/enrollments");
-        async move {
-            send(
-                &app,
-                "POST",
-                &path,
-                Some(&cookie),
-                Some(json!({ "user_id": user_id })),
-            )
-            .await
-            .status
-        }
-    };
-    assert_eq!(
-        enroll(teacher.clone(), alice_id.clone()).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        enroll(teacher.clone(), bob_id.clone()).await,
-        StatusCode::CONFLICT
-    );
-    assert_eq!(
-        enroll(teacher.clone(), alice_id.clone()).await,
-        StatusCode::OK
-    );
-
-    // `null` lifts the cap and the door reopens.
-    let lifted = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course_id}"),
-        Some(&teacher),
-        Some(json!({ "capacity": null })),
-    )
-    .await;
-    assert_eq!(lifted.status, StatusCode::OK);
-    assert!(lifted.body["capacity"].is_null());
-    assert_eq!(enroll(teacher.clone(), bob_id).await, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn enrollment_requires_course_management() {
+async fn enrollment_requires_instance_management() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
     let boss = login_as(&app, &db, "boss", "manager").await;
     let alice = login(&app, "alice").await; // student
     let alice_id = me_id(&app, &alice).await;
-    let course_id = create_course(&app, &teacher, "algebra").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let roster_uri = format!("/instances/{}/enrollments", t.instance);
 
-    // A teacher who doesn't manage the course cannot enroll anyone.
+    // A teacher who doesn't run the instance cannot enroll anyone into it.
     assert_eq!(
         send(
             &app,
             "POST",
-            &format!("/courses/{course_id}/enrollments"),
+            &roster_uri,
             Some(&veli),
             Some(json!({ "user_id": alice_id }))
         )
@@ -3320,7 +3276,7 @@ async fn enrollment_requires_course_management() {
         send(
             &app,
             "POST",
-            &format!("/courses/{course_id}/enrollments"),
+            &roster_uri,
             Some(&boss),
             Some(json!({ "user_id": alice_id }))
         )
@@ -3328,12 +3284,12 @@ async fn enrollment_requires_course_management() {
         .status,
         StatusCode::OK
     );
-    // Unknown target -> 400; missing course -> 404.
+    // Unknown target -> 400; missing instance -> 404.
     assert_eq!(
         send(
             &app,
             "POST",
-            &format!("/courses/{course_id}/enrollments"),
+            &roster_uri,
             Some(&teacher),
             Some(json!({ "user_id": "ghost" }))
         )
@@ -3345,7 +3301,7 @@ async fn enrollment_requires_course_management() {
         send(
             &app,
             "POST",
-            "/courses/nope/enrollments",
+            "/instances/nope/enrollments",
             Some(&teacher),
             Some(json!({ "user_id": alice_id }))
         )
@@ -3356,11 +3312,14 @@ async fn enrollment_requires_course_management() {
 }
 
 #[tokio::test]
-async fn exam_creation_lives_under_courses() {
+async fn exam_creation_lives_under_instances() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
     let alice = login(&app, "alice").await; // student
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let exams_uri = format!("/instances/{}/exams", t.instance);
 
     // The old flat creation route is gone: /exams only serves GET now.
     assert_eq!(
@@ -3369,81 +3328,52 @@ async fn exam_creation_lives_under_courses() {
             "POST",
             "/exams",
             Some(&teacher),
-            Some(json!({"title":"t","kind":"quiz"}))
+            Some(json!({"title":"t","kind":"yazili","term": &t.term}))
         )
         .await
         .status,
         StatusCode::METHOD_NOT_ALLOWED
     );
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    // Creation inside the course echoes the course.
+    // Creation inside the instance echoes the instance it belongs to.
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course_id}/exams"),
+        &exams_uri,
         Some(&teacher),
-        Some(json!({"title":"mt","kind":"midterm"})),
+        Some(json!({"title":"mt","kind":"yazili","term": &t.term})),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    assert_eq!(res.body["course"], course_id);
+    assert_eq!(res.body["class_course"], t.instance);
 
-    // A teacher who doesn't manage the course cannot add exams to it.
+    // A teacher who doesn't run the instance cannot add exams to it.
     assert_eq!(
         send(
             &app,
             "POST",
-            &format!("/courses/{course_id}/exams"),
+            &exams_uri,
             Some(&veli),
-            Some(json!({"title":"x","kind":"quiz"}))
+            Some(json!({"title":"x","kind":"yazili","term": &t.term}))
         )
         .await
         .status,
         StatusCode::FORBIDDEN
     );
 
-    // An unenrolled student cannot list the course's exams …
+    // An unenrolled student cannot list the instance's exams …
     assert_eq!(
-        send(
-            &app,
-            "GET",
-            &format!("/courses/{course_id}/exams"),
-            Some(&alice),
-            None
-        )
-        .await
-        .status,
+        send(&app, "GET", &exams_uri, Some(&alice), None)
+            .await
+            .status,
         StatusCode::FORBIDDEN
     );
 
     // … but an enrolled one can.
     let alice_id = me_id(&app, &alice).await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
     assert_eq!(
-        send(
-            &app,
-            "POST",
-            &format!("/courses/{course_id}/enrollments"),
-            Some(&teacher),
-            Some(json!({ "user_id": alice_id }))
-        )
-        .await
-        .status,
-        StatusCode::OK
-    );
-    assert_eq!(
-        common::items(
-            &send(
-                &app,
-                "GET",
-                &format!("/courses/{course_id}/exams"),
-                Some(&alice),
-                None
-            )
-            .await
-            .body
-        )
-        .len(),
+        common::items(&send(&app, "GET", &exams_uri, Some(&alice), None).await.body).len(),
         1
     );
 }
@@ -3455,8 +3385,9 @@ async fn grading_requires_enrollment() {
     let alice = login(&app, "alice").await; // student
     let alice_id = me_id(&app, &alice).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "mt", "yazili").await;
     let grade_uri = format!("/exams/{exam_id}/results");
     let grade_body = json!({ "mark": 70, "user_id": alice_id });
 
@@ -3474,8 +3405,8 @@ async fn grading_requires_enrollment() {
         StatusCode::BAD_REQUEST
     );
 
-    // Enrolled -> 200.
-    enroll(&app, &teacher, &course_id, &alice_id).await;
+    // In the şube: the pump enrolls her into the instance it carries -> 200.
+    add_member(&app, &mudur, &t.class, &alice_id).await;
     assert_eq!(
         send(
             &app,
@@ -3489,20 +3420,10 @@ async fn grading_requires_enrollment() {
         StatusCode::OK
     );
 
-    // Unenrolling blocks further grading but keeps the recorded result:
-    // the row still lists for the teacher and the student still reads it.
-    assert_eq!(
-        send(
-            &app,
-            "DELETE",
-            &format!("/courses/{course_id}/enrollments/{alice_id}"),
-            Some(&teacher),
-            None
-        )
-        .await
-        .status,
-        StatusCode::NO_CONTENT
-    );
+    // Dropping the roster row blocks further grading but keeps the recorded
+    // result: the row still lists for the teacher and the student still reads
+    // it.
+    unenroll(&app, &teacher, &t.instance, &alice_id).await;
     assert_eq!(
         send(&app, "POST", &grade_uri, Some(&teacher), Some(grade_body))
             .await
@@ -3531,26 +3452,43 @@ async fn grading_requires_enrollment() {
         70
     );
 
-    // ...but the mark vanishes from the report until re-enrollment restores it.
+    // The report follows the student's section, not the roster row, so the
+    // mark stays on it while she is off the roster.
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
-    assert_eq!(report.body["courses"].as_array().unwrap().len(), 0);
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
+    assert_eq!(report.body["courses"].as_array().unwrap().len(), 1);
     assert_eq!(report.body["courses"][0]["average"], 70.0);
+
+    // Re-enrolling reopens grading, and the new mark lands in the report.
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &grade_uri,
+            Some(&teacher),
+            Some(json!({ "mark": 80, "user_id": alice_id }))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
+    assert_eq!(report.body["courses"][0]["average"], 80.0);
 }
 
 #[tokio::test]
-async fn exam_writes_follow_course_management() {
+async fn exam_writes_follow_instance_management() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
     let boss = login_as(&app, &db, "boss", "manager").await;
-    let course_id = create_course(&app, &teacher, "algebra").await;
+    let t = taught_under(&app, &boss, &teacher, "algebra").await;
 
-    // A manager creates an exam in the teacher's course...
-    let exam_id = create_exam(&app, &boss, &course_id, "mt", "midterm").await;
+    // A manager creates an exam in the teacher's instance...
+    let exam_id = create_exam(&app, &boss, &t.instance, &t.term, "mt", "yazili").await;
 
-    // ...and the course creator (not the exam's creator) can edit and delete it.
+    // ...and the instance's own teacher (not the exam's creator) can edit and
+    // delete it.
     assert_eq!(
         send(
             &app,
@@ -3599,10 +3537,11 @@ async fn exam_statistics_summarize_results() {
     let alice_id = me_id(&app, &alice).await;
     let bob_id = me_id(&app, &bob).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    enroll(&app, &teacher, &course_id, &bob_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    enroll(&app, &teacher, &t.instance, &bob_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "mt", "yazili").await;
     let stats_uri = format!("/exams/{exam_id}/statistics");
 
     // Nothing graded yet: zero count, null aggregates.
@@ -3665,12 +3604,38 @@ async fn weighted_averages_follow_kind_weights() {
     assert_eq!(res.status, StatusCode::OK);
 
     // Course A: quiz (w1, mark 50) + midterm (w3, mark 90) -> (50 + 270) / 4 = 80.
-    let algebra = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &algebra, &alice_id).await;
-    let quiz = create_exam(&app, &teacher, &algebra, "quiz", "quiz").await;
-    let midterm = create_exam(&app, &teacher, &algebra, "midterm", "midterm").await;
+    let algebra = taught_under(&app, &manager, &teacher, "algebra").await;
+    // The report follows the student's section, so she is a member of the şube
+    // each instance hangs off (the pump enrolls her there).
+    add_member(&app, &manager, &algebra.class, &alice_id).await;
+    let quiz = create_exam(
+        &app,
+        &teacher,
+        &algebra.instance,
+        &algebra.term,
+        "quiz",
+        "quiz",
+    )
+    .await;
+    let midterm = create_exam(
+        &app,
+        &teacher,
+        &algebra.instance,
+        &algebra.term,
+        "midterm",
+        "midterm",
+    )
+    .await;
     // A third exam stays ungraded and must not drag the average.
-    create_exam(&app, &teacher, &algebra, "final", "final").await;
+    create_exam(
+        &app,
+        &teacher,
+        &algebra.instance,
+        &algebra.term,
+        "final",
+        "final",
+    )
+    .await;
     for (exam, mark) in [(&quiz, 50), (&midterm, 90)] {
         let res = send(
             &app,
@@ -3684,9 +3649,17 @@ async fn weighted_averages_follow_kind_weights() {
     }
 
     // Course B: enrolled, nothing graded -> null average.
-    let physics = create_course(&app, &teacher, "physics").await;
-    enroll(&app, &teacher, &physics, &alice_id).await;
-    create_exam(&app, &teacher, &physics, "hw", "homework").await;
+    let physics = taught_under(&app, &manager, &teacher, "physics").await;
+    add_member(&app, &manager, &physics.class, &alice_id).await;
+    create_exam(
+        &app,
+        &teacher,
+        &physics.instance,
+        &physics.term,
+        "hw",
+        "homework",
+    )
+    .await;
 
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
     assert_eq!(report.status, StatusCode::OK);
@@ -3728,12 +3701,36 @@ async fn kind_weight_edits_reweight_reports_live() {
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &alice_id).await;
-    let quiz = create_exam(&app, &teacher, &course, "q", "quiz").await;
-    let oral = create_exam(&app, &teacher, &course, "o", "oral").await;
+    // The kinds this test re-weights are the school's own: it lists them
+    // first, since the shipped defaults are yazili/sozlu/uygulama.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "quiz", "weight": 1},
+            {"name": "oral", "weight": 1},
+            {"name": "project", "weight": 1},
+        ]})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let course = taught_under(&app, &manager, &teacher, "algebra").await;
+    add_member(&app, &manager, &course.class, &alice_id).await;
+    let quiz = create_exam(&app, &teacher, &course.instance, &course.term, "q", "quiz").await;
+    let oral = create_exam(&app, &teacher, &course.instance, &course.term, "o", "oral").await;
     // Ungraded for now — its kind gets retired below, out from under it.
-    let project = create_exam(&app, &teacher, &course, "p", "project").await;
+    let project = create_exam(
+        &app,
+        &teacher,
+        &course.instance,
+        &course.term,
+        "p",
+        "project",
+    )
+    .await;
     for (exam, mark) in [(&quiz, 40), (&oral, 80)] {
         let res = send(
             &app,
@@ -3746,7 +3743,7 @@ async fn kind_weight_edits_reweight_reports_live() {
         assert_eq!(res.status, StatusCode::OK);
     }
 
-    // Default weights (all 1): plain mean of 40 and 80.
+    // The school's weights, all 1: plain mean of 40 and 80.
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
     assert_eq!(report.body["courses"][0]["average"], 60.0);
 
@@ -3862,9 +3859,11 @@ async fn course_data_is_walled_off_from_other_teachers() {
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
 
-    let course_id = create_course(&app, &owner, "algebra").await;
-    enroll(&app, &owner, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &owner, &course_id, "mt", "quiz").await;
+    let t = taught_under(&app, &boss, &owner, "algebra").await;
+    // Alice sits in the şube: the pump enrolls her into the instance it carries
+    // and puts the instance in her catalog and report.
+    add_member(&app, &boss, &t.class, &alice_id).await;
+    let exam_id = create_exam(&app, &owner, &t.instance, &t.term, "mt", "yazili").await;
     let res = send(
         &app,
         "POST",
@@ -3875,9 +3874,9 @@ async fn course_data_is_walled_off_from_other_teachers() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
-    // Every course-scoped teacher read is refused for the rival …
+    // Every instance-scoped teacher read is refused for the rival …
     for uri in [
-        format!("/courses/{course_id}/enrollments"),
+        format!("/instances/{}/enrollments", t.instance),
         format!("/exams/{exam_id}/results"),
         format!("/exams/{exam_id}/statistics"),
         format!("/exams/{exam_id}/live"),
@@ -3892,7 +3891,7 @@ async fn course_data_is_walled_off_from_other_teachers() {
     // 404 once authorization clears: alice never sat the exam.)
     for caller in [&owner, &boss] {
         for uri in [
-            format!("/courses/{course_id}/enrollments"),
+            format!("/instances/{}/enrollments", t.instance),
             format!("/exams/{exam_id}/results"),
             format!("/exams/{exam_id}/statistics"),
             format!("/exams/{exam_id}/live"),
@@ -3912,7 +3911,7 @@ async fn course_data_is_walled_off_from_other_teachers() {
         assert_eq!(res.status, StatusCode::NOT_FOUND);
     }
 
-    // The marks report narrows to the caller's courses: the rival gets an
+    // The marks report narrows to the caller's instances: the rival gets an
     // empty shell, the owner and the manager get the graded course.
     let res = send(
         &app,
@@ -3940,7 +3939,10 @@ async fn course_data_is_walled_off_from_other_teachers() {
 
     // The enrolled student reads the course and its exam, and both catalogs
     // include them; the rival's catalogs stay empty; a manager sees all.
-    for uri in [format!("/courses/{course_id}"), format!("/exams/{exam_id}")] {
+    for uri in [
+        format!("/courses/{}", t.course),
+        format!("/exams/{exam_id}"),
+    ] {
         let res = send(&app, "GET", &uri, Some(&alice), None).await;
         assert_eq!(res.status, StatusCode::OK, "{uri}");
     }
@@ -3963,9 +3965,11 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+
+    add_member(&app, &mudur, &t.class, &alice_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "mt", "yazili").await;
     send(
         &app,
         "POST",
@@ -3975,12 +3979,41 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
     )
     .await;
 
-    unenroll(&app, &teacher, &course_id, &alice_id).await;
+    // A course a şube still teaches is not deletable: the guard that keeps a
+    // taught catalog row from being dropped by accident.
     assert_eq!(
         send(
             &app,
             "DELETE",
-            &format!("/courses/{course_id}"),
+            &format!("/courses/{}", t.course),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+
+    // Detaching the instance is what takes its exams, results and roster.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{}/instances/{}", t.class, t.instance),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+
+    // Now free, the catalog row goes.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/courses/{}", t.course),
             Some(&teacher),
             None
         )
@@ -3994,7 +4027,7 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
         send(
             &app,
             "GET",
-            &format!("/courses/{course_id}"),
+            &format!("/courses/{}", t.course),
             Some(&teacher),
             None
         )
@@ -4054,13 +4087,14 @@ async fn concurrent_enrollments_never_collide() {
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
-    let course_id = create_course(&app, &teacher, "algebra").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
 
     let mut handles = Vec::new();
     for _ in 0..24 {
         let app = app.clone();
         let teacher = teacher.clone();
-        let uri = format!("/courses/{course_id}/enrollments");
+        let uri = format!("/instances/{}/enrollments", t.instance);
         let body = json!({ "user_id": alice_id });
         handles.push(tokio::spawn(async move {
             send(&app, "POST", &uri, Some(&teacher), Some(body))
@@ -4079,7 +4113,7 @@ async fn concurrent_enrollments_never_collide() {
     let roster = send(
         &app,
         "GET",
-        &format!("/courses/{course_id}/enrollments"),
+        &format!("/instances/{}/enrollments", t.instance),
         Some(&teacher),
         None,
     )
@@ -4568,179 +4602,6 @@ async fn concurrent_placements_never_exceed_capacity() {
     }
 }
 
-/// The course capacity cap is a counter column on the course row now, not a
-/// process mutex: `UPDATE ... SET n += 1 WHERE n < capacity` is atomic per
-/// record, so it holds however the racing enrolls interleave. Removing
-/// that `WHERE` (or the claim entirely) puts a third student on a capacity-2
-/// course and fails this. The unenroll each round proves the seat comes back —
-/// without the decrement the course is permanently full by round two.
-#[tokio::test]
-async fn concurrent_enrolls_never_exceed_course_capacity() {
-    let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "teacher", "teacher").await;
-    let mut students = Vec::new();
-    for name in ["ali", "veli", "ayse"] {
-        let cookie = login(&app, name).await;
-        let id = me_id(&app, &cookie).await;
-        students.push(id);
-    }
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "small", "description": "", "capacity": 2 })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    let uri = format!("/courses/{course}/enrollments");
-
-    for _round in 0..8 {
-        for id in &students {
-            let _ = send(&app, "DELETE", &format!("{uri}/{id}"), Some(&teacher), None).await;
-        }
-        let mut handles = Vec::new();
-        for id in &students {
-            let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
-            let body = json!({ "user_id": id });
-            handles.push(tokio::spawn(async move {
-                send(&app, "POST", &uri, Some(&teacher), Some(body))
-                    .await
-                    .status
-            }));
-        }
-        for handle in handles {
-            let status = handle.await.unwrap();
-            assert!(
-                status == StatusCode::OK || status == StatusCode::CONFLICT,
-                "a lost capacity race must be a 409, got {status}"
-            );
-        }
-        let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
-        assert!(
-            common::total(&roster.body) <= 2,
-            "capacity 2 must never over-admit, roster={}",
-            roster.body
-        );
-    }
-}
-
-/// The same (user, course) pair enrolled concurrently must cost exactly one
-/// seat: the row is idempotent by its composite id, so a second enroll that
-/// finds the pair already there returns it *without* claiming, and a `CREATE`
-/// that loses the id race releases the seat it claimed before reading the
-/// winner's row back. Either way the counter must equal the roster — a drift
-/// above it is permanent (nothing recomputes the counter), so the course would
-/// be full forever. Stored state is the only witness: the embedded engine can
-/// tell two racers they both won, so the HTTP statuses prove nothing.
-//
-// Nothing serializes these any more: the seat and the row are claimed in one
-// transaction (`cap::claim_and_create`), so a racer that loses the id has its
-// own increment rolled back with the transaction and reads the winner's row
-// instead of being told the course is full. Both the early return and that
-// rollback are pinned by the assertion below (counter == roster).
-#[tokio::test]
-async fn concurrent_enrolls_of_one_pair_claim_one_seat() {
-    let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "teacher", "teacher").await;
-    let alice = login(&app, "alice").await;
-    let alice_id = me_id(&app, &alice).await;
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "seats", "description": "", "capacity": 2 })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    let uri = format!("/courses/{course}/enrollments");
-
-    let mut handles = Vec::new();
-    for _ in 0..16 {
-        let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
-        let body = json!({ "user_id": alice_id });
-        handles.push(tokio::spawn(async move {
-            send(&app, "POST", &uri, Some(&teacher), Some(body))
-                .await
-                .status
-        }));
-    }
-    for handle in handles {
-        let status = handle.await.unwrap();
-        assert_eq!(status, StatusCode::OK, "a same-pair enroll is idempotent");
-    }
-
-    let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
-    assert_eq!(common::total(&roster.body), 1, "one pair, one row");
-    let counted: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course WHERE id = $1")
-        .bind(Uuid::parse_str(&course).expect("course id"))
-        .fetch_one(&db)
-        .await
-        .expect("counter read");
-    assert_eq!(
-        counted, 1,
-        "one row on the roster must have cost exactly one seat"
-    );
-}
-
-/// The same stampede on a course with exactly one seat. Every racer enrolls the
-/// *same* student, so between them they owe one seat — but on a cap this tight
-/// the claim is the first thing to fail, and answering that with "the course is
-/// full" would refuse a student the enrollment that just succeeded on their
-/// behalf. So the pair's own row is looked for inside the claim's transaction,
-/// before the seat is blamed. Drop that gate and every loser here is a 409.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_enrolls_of_one_seat_never_refuse_their_own_winner() {
-    let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "tight_teacher", "teacher").await;
-    let student = login(&app, "tight_student").await;
-    let student_id = me_id(&app, &student).await;
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "one seat", "description": "", "capacity": 1 })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    let uri = format!("/courses/{course}/enrollments");
-
-    let mut tasks = Vec::new();
-    for _ in 0..8 {
-        let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
-        let body = json!({ "user_id": student_id });
-        tasks.push(tokio::spawn(async move {
-            send(&app, "POST", &uri, Some(&teacher), Some(body)).await
-        }));
-    }
-    for task in tasks {
-        let res = task.await.unwrap();
-        assert_eq!(
-            res.status,
-            StatusCode::OK,
-            "one student, one seat, no refusal: {}",
-            res.body
-        );
-    }
-
-    let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
-    assert_eq!(common::total(&roster.body), 1, "one seat: {}", roster.body);
-    let counted: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course WHERE id = $1")
-        .bind(Uuid::parse_str(&course).expect("course id"))
-        .fetch_one(&db)
-        .await
-        .expect("counter read");
-    assert_eq!(
-        counted, 1,
-        "and the seat it cost is the one seat the course has"
-    );
-}
-
 /// The two reference counters a subject carries — the whole basis of its
 /// delete guard — must equal the rows that actually point at it, through every
 /// writer: create, re-tag, delete, and the exam cascade. Nothing recomputes
@@ -4753,10 +4614,11 @@ async fn concurrent_enrolls_of_one_seat_never_refuse_their_own_winner() {
 async fn subject_reference_counts_track_every_writer() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "refc_t", "teacher").await;
-    let course = create_course(&app, &teacher, "physics").await;
-    let from = create_subject(&app, &teacher, &course, "optics").await;
-    let to = create_subject(&app, &teacher, &course, "waves").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "midterm").await;
+    let mudur = login_as(&app, &db, "refc_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "physics").await;
+    let from = create_subject(&app, &teacher, &t.course, "optics").await;
+    let to = create_subject(&app, &teacher, &t.course, "waves").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "yazili").await;
     let due = Timestamp::now().as_millis() + 86_400_000;
 
     let counts = async |subject: &str| -> (i64, i64) {
@@ -4785,7 +4647,7 @@ async fn subject_reference_counts_track_every_writer() {
         json!({ "text": "How bright?", "kind": "text", "points": 10 }),
     )
     .await;
-    let homework = create_homework(&app, &teacher, &course, &from, "lenses", due).await;
+    let homework = create_homework(&app, &teacher, &t.instance, &from, "lenses", due).await;
     assert_eq!(counts(&from).await, (2, 1), "two questions and a homework");
     assert_eq!(counts(&to).await, (0, 0), "the spare subject holds nothing");
 
@@ -4895,9 +4757,10 @@ async fn subject_reference_counts_track_every_writer() {
 async fn a_subject_delete_racing_question_creates_leaves_no_orphan() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "race_t", "teacher").await;
-    let course = create_course(&app, &teacher, "chemistry").await;
-    let subject = create_subject(&app, &teacher, &course, "bonds").await;
-    let exam = create_exam(&app, &teacher, &course, "quiz", "quiz").await;
+    let mudur = login_as(&app, &db, "race_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "chemistry").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bonds").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "quiz", "yazili").await;
     // One question already tagged before the race starts, so the delete is
     // never legal: whichever way the interleaving falls, it must be refused.
     create_question(
@@ -6005,9 +5868,10 @@ async fn concurrent_exam_grades_never_collide() {
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let student = login(&app, "student").await;
     let student_id = me_id(&app, &student).await;
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &student_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "e", "yazili").await;
 
     let mut handles = Vec::new();
     for mark in 0..24i64 {
@@ -6237,12 +6101,13 @@ async fn graders_cannot_grade_themselves() {
     let student = login(&app, "veli").await;
     let student_id = me_id(&app, &student).await;
 
-    let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &student_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "t", "quiz").await;
+    let mudur = login_as(&app, &db, "mudur2", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let exam_id = create_exam(&app, &teacher, &t.instance, &t.term, "t", "yazili").await;
 
     // Self-grading is forbidden at every privilege level, not just for teachers.
-    // (The teacher owns the course; the manager clears the gate by role.)
+    // (The teacher runs the instance; the manager clears the gate by role.)
     for (cookie, own_id) in [(&teacher, &teacher_id), (&boss, &boss_id)] {
         let res = send(
             &app,
@@ -6300,14 +6165,15 @@ async fn only_students_can_be_enrolled() {
     let colleague_id = me_id(&app, &colleague).await;
     let manager_id = me_id(&app, &manager).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
+    let mudur = login_as(&app, &db, "mudur_of_staff", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
 
     // A fellow teacher and a manager are both refused — staff don't enroll.
     for staff_id in [&colleague_id, &manager_id] {
         let res = send(
             &app,
             "POST",
-            &format!("/courses/{course}/enrollments"),
+            &format!("/instances/{}/enrollments", t.instance),
             Some(&teacher),
             Some(json!({ "user_id": staff_id })),
         )
@@ -6322,7 +6188,7 @@ async fn only_students_can_be_enrolled() {
     // A student enrolls without complaint (the helper asserts 200).
     let student = login(&app, "veli").await;
     let student_id = me_id(&app, &student).await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 }
 
 /// The student-only rule is enforced on the *live* role, not merely at enroll
@@ -6338,15 +6204,16 @@ async fn promotion_out_of_student_freezes_the_seat() {
     let student = login(&app, "veli").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "promo_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let future = Timestamp::now().as_millis() + 3_600_000;
-    let session = create_session(&app, &teacher, &course, future).await;
+    let session = create_session(&app, &teacher, &t.instance, future).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "essay", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "essay", "kind": "yazili", "mode": "open" }),
     )
     .await;
 
@@ -6441,12 +6308,13 @@ async fn promotion_via_role_endpoint_sweeps_enrollments() {
     let student = login(&app, "veli").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "mudur_of_promotion", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let roster = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{}/enrollments", t.instance),
         Some(&teacher),
         None,
     )
@@ -6466,7 +6334,7 @@ async fn promotion_via_role_endpoint_sweeps_enrollments() {
     let roster = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{}/enrollments", t.instance),
         Some(&teacher),
         None,
     )
@@ -7102,14 +6970,15 @@ async fn admin_seed_refuses_existing_non_admin() {
 
 // --- scheduled exams: sync/async attempts + the live monitor ---------------
 
-/// Create a scheduled exam from a full body and return its id (asserts 201).
+/// Create a scheduled exam inside `instance` from a full body (which carries
+/// its own `term`) and return its id (asserts 201).
 async fn scheduled_exam(
     app: &axum::Router,
     cookie: &str,
-    course: &str,
+    instance: &str,
     body: serde_json::Value,
 ) -> String {
-    let res = create_exam_with(app, cookie, course, body).await;
+    let res = create_exam_with(app, cookie, instance, body).await;
     assert_eq!(
         res.status,
         StatusCode::CREATED,
@@ -7119,20 +6988,44 @@ async fn scheduled_exam(
     id_of(&res.body)
 }
 
+/// The kinds this section's probes write with, installed as the school's own
+/// list: exam kinds are settings now (the shipped defaults are
+/// yazili/sozlu/uygulama) and an exam of a kind the school does not list is a
+/// 400. Asserted 200, so a broken settings PATCH fails here, not as a puzzling
+/// 400 three lines later.
+async fn scheduling_kinds(app: &axum::Router, manager: &str) {
+    let res = send(
+        app,
+        "PATCH",
+        "/settings",
+        Some(manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "quiz", "weight": 1},
+            {"name": "midterm", "weight": 1},
+            {"name": "homework", "weight": 1},
+            {"name": "final", "weight": 1},
+        ]})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "install kinds: {}", res.body);
+}
+
 #[tokio::test]
 async fn exam_scheduling_validates_and_echoes() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "sched_t", "teacher").await;
-    let course = create_course(&app, &teacher, "algebra").await;
+    let mudur = login_as(&app, &db, "sched_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
     let now = Timestamp::now().as_millis();
 
     // Sync: the window is echoed, no duration.
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "midterm", "kind": "midterm",
+            "term": &t.term, "title": "midterm", "kind": "midterm",
             "mode": "sync", "starts_at": now + 60_000, "ends_at": now + 120_000,
         }),
     )
@@ -7147,9 +7040,9 @@ async fn exam_scheduling_validates_and_echoes() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "takehome", "kind": "quiz",
+            "term": &t.term, "title": "takehome", "kind": "quiz",
             "mode": "async", "starts_at": now, "ends_at": now + 7_200_000,
             "duration_ms": 5_400_000,
         }),
@@ -7164,9 +7057,9 @@ async fn exam_scheduling_validates_and_echoes() {
     scheduled_exam(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "exact-fit", "kind": "quiz",
+            "term": &t.term, "title": "exact-fit", "kind": "quiz",
             "mode": "async", "starts_at": now, "ends_at": now + 3_600_000,
             "duration_ms": 3_600_000,
         }),
@@ -7178,8 +7071,8 @@ async fn exam_scheduling_validates_and_echoes() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "homework", "kind": "homework" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "homework", "kind": "homework" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -7195,9 +7088,9 @@ async fn exam_scheduling_validates_and_echoes() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "practice", "kind": "quiz", "mode": "open",
+            "term": &t.term, "title": "practice", "kind": "quiz", "mode": "open",
             "duration_ms": 5_400_000, "max_attempts": 0, "allow_rejoin": false,
         }),
     )
@@ -7214,90 +7107,90 @@ async fn exam_scheduling_validates_and_echoes() {
     for (label, body) in [
         (
             "unknown mode",
-            json!({ "title": "x", "kind": "quiz", "mode": "weekly",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "weekly",
                     "starts_at": now, "ends_at": now + 1_000 }),
         ),
         (
             "times without mode",
-            json!({ "title": "x", "kind": "quiz", "starts_at": now }),
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "starts_at": now }),
         ),
         (
             "duration without mode",
-            json!({ "title": "x", "kind": "quiz", "duration_ms": 60_000 }),
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "duration_ms": 60_000 }),
         ),
         (
             "sync missing ends_at",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now }),
         ),
         (
             "sync with duration",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now, "ends_at": now + 1_000, "duration_ms": 60_000 }),
         ),
         (
             "async without duration",
-            json!({ "title": "x", "kind": "quiz", "mode": "async",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 1_000 }),
         ),
         (
             "backwards window",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now + 2_000, "ends_at": now + 1_000 }),
         ),
         (
             "empty window",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now, "ends_at": now }),
         ),
         (
             "duration too short",
-            json!({ "title": "x", "kind": "quiz", "mode": "async",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 59_999 }),
         ),
         (
             "duration too long",
-            json!({ "title": "x", "kind": "quiz", "mode": "async",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 86_400_001 }),
         ),
         (
             // Within the global 1min-24h bounds, but longer than its own
             // window: a 90-minute duration inside a 60-minute window.
             "duration exceeds window",
-            json!({ "title": "x", "kind": "quiz", "mode": "async",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 3_600_000, "duration_ms": 5_400_000 }),
         ),
         (
             "past starts_at",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now - 3_600_000, "ends_at": now + 3_600_000 }),
         ),
         (
             // starts_at is future so the rejection can only come from ends_at.
             "past ends_at",
-            json!({ "title": "x", "kind": "quiz", "mode": "sync",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 }),
         ),
         (
             "open with a window",
-            json!({ "title": "x", "kind": "quiz", "mode": "open",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "open",
                     "starts_at": now + 60_000, "ends_at": now + 120_000 }),
         ),
         (
             "open with only an ends_at",
-            json!({ "title": "x", "kind": "quiz", "mode": "open",
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "mode": "open",
                     "ends_at": now + 120_000 }),
         ),
         (
             "negative attempt limit",
-            json!({ "title": "x", "kind": "quiz", "max_attempts": -1 }),
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "max_attempts": -1 }),
         ),
         (
             "attempt limit over the cap",
-            json!({ "title": "x", "kind": "quiz", "max_attempts": 101 }),
+            json!({ "term": &t.term, "title": "x", "kind": "quiz", "max_attempts": 101 }),
         ),
     ] {
-        let res = create_exam_with(&app, &teacher, &course, body).await;
+        let res = create_exam_with(&app, &teacher, &t.instance, body).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
     }
 }
@@ -7309,15 +7202,17 @@ async fn exam_scheduling_validates_and_echoes() {
 async fn schedule_times_cannot_be_backdated() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "past_t", "teacher").await;
-    let course = create_course(&app, &teacher, "history").await;
+    let mudur = login_as(&app, &db, "past_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
     let now = Timestamp::now().as_millis();
 
     // A running exam: started seconds ago (inside the clock-skew grace).
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "running", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "running", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -7345,7 +7240,7 @@ async fn schedule_times_cannot_be_backdated() {
         "PATCH",
         &format!("/exams/{exam}"),
         Some(&teacher),
-        Some(json!({ "title": "renamed" })),
+        Some(json!({ "term": &t.term, "title": "renamed" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -7365,8 +7260,8 @@ async fn schedule_times_cannot_be_backdated() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "graced", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "graced", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 30_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -7391,17 +7286,19 @@ async fn sync_attempt_lifecycle_feeds_the_live_monitor() {
     let veli = login(&app, "veli").await;
     let ayse_id = me_id(&app, &ayse).await;
     let veli_id = me_id(&app, &veli).await;
-    let course = create_course(&app, &teacher, "physics").await;
-    enroll(&app, &teacher, &course, &ayse_id).await;
-    enroll(&app, &teacher, &course, &veli_id).await;
+    let mudur = login_as(&app, &db, "live_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "physics").await;
+    enroll(&app, &teacher, &t.instance, &ayse_id).await;
+    enroll(&app, &teacher, &t.instance, &veli_id).await;
 
     let now = Timestamp::now().as_millis();
     let ends = now + 600_000;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
+        &t.instance,
+        json!({ "term": &t.term, "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends }),
     )
     .await;
@@ -7544,17 +7441,19 @@ async fn closed_window_flags_no_shows_as_absent() {
     let ayse_id = me_id(&app, &ayse).await;
     let veli_id = me_id(&app, &veli).await;
     let cem_id = me_id(&app, &cem).await;
-    let course = create_course(&app, &teacher, "history").await;
-    enroll(&app, &teacher, &course, &ayse_id).await;
-    enroll(&app, &teacher, &course, &veli_id).await;
-    enroll(&app, &teacher, &course, &cem_id).await;
+    let mudur = login_as(&app, &db, "abs_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    enroll(&app, &teacher, &t.instance, &ayse_id).await;
+    enroll(&app, &teacher, &t.instance, &veli_id).await;
+    enroll(&app, &teacher, &t.instance, &cem_id).await;
 
     let now = Timestamp::now().as_millis();
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "midterm", "kind": "midterm",
+        &t.instance,
+        json!({ "term": &t.term, "title": "midterm", "kind": "midterm",
                 "mode": "sync", "starts_at": now - 50_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -7646,8 +7545,8 @@ async fn closed_window_flags_no_shows_as_absent() {
     let open = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "essay", "kind": "homework", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "essay", "kind": "homework", "mode": "open" }),
     )
     .await;
     let res = send(
@@ -7669,16 +7568,18 @@ async fn async_deadline_is_start_plus_duration_clamped_to_window() {
     let teacher = login_as(&app, &db, "async_t", "teacher").await;
     let student = login(&app, "asli").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "chem").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "async_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "chem").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
 
     // Roomy window: the personal duration is the binding constraint.
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "quiz", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "quiz", "kind": "quiz",
                 "mode": "async", "starts_at": now - 1_000, "ends_at": now + 6_000_000,
                 "duration_ms": 60_000 }),
     )
@@ -7703,8 +7604,8 @@ async fn async_deadline_is_start_plus_duration_clamped_to_window() {
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "quiz2", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "quiz2", "kind": "quiz",
                 "mode": "async", "starts_at": starts, "ends_at": ends,
                 "duration_ms": 60_000 }),
     )
@@ -7727,12 +7628,14 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
     let teacher = login_as(&app, &db, "gate_t", "teacher").await;
     let student = login(&app, "gita").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "bio").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "gate_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bio").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
 
     // Unscheduled exams cannot be sat at all.
-    let unscheduled = create_exam(&app, &teacher, &course, "hw", "homework").await;
+    let unscheduled = create_exam(&app, &teacher, &t.instance, &t.term, "hw", "homework").await;
     let res = send(
         &app,
         "POST",
@@ -7747,8 +7650,8 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
     let future = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "later", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "later", "kind": "quiz",
                 "mode": "sync", "starts_at": now + 600_000, "ends_at": now + 1_200_000 }),
     )
     .await;
@@ -7765,9 +7668,9 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
     let past = scheduled_exam(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         // Inside the backdating grace, yet already closed by the clock.
-        json!({ "title": "gone", "kind": "quiz",
+        json!({ "term": &t.term, "title": "gone", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 50_000, "ends_at": now - 10_000 }),
     )
     .await;
@@ -7785,8 +7688,8 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
     let open = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "open", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "open", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -7828,15 +7731,17 @@ async fn finish_rejects_double_submit_missing_attempt_and_expiry() {
     let teacher = login_as(&app, &db, "fin_t", "teacher").await;
     let student = login(&app, "fern").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "cs").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "fin_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "cs").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
 
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
+        &t.instance,
+        json!({ "term": &t.term, "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -7885,8 +7790,8 @@ async fn finish_rejects_double_submit_missing_attempt_and_expiry() {
     let brief = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "blitz", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "blitz", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000,
                 "ends_at": Timestamp::now().as_millis() + 1_500 }),
     )
@@ -7932,16 +7837,18 @@ async fn mode_freezes_after_attempts_but_times_extend_live() {
     let teacher = login_as(&app, &db, "ext_t", "teacher").await;
     let student = login(&app, "elif").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "math").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "ext_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "math").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
     let ends = now + 60_000;
 
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
+        &t.instance,
+        json!({ "term": &t.term, "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends }),
     )
     .await;
@@ -8043,19 +7950,21 @@ async fn mode_freezes_after_attempts_but_times_extend_live() {
 }
 
 #[tokio::test]
-async fn attempts_cascade_with_exam_and_course_deletion() {
+async fn attempts_cascade_with_instance_detach_and_course_delete() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "casc_t", "teacher").await;
     let student = login(&app, "cansu").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "hist").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "casc_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "hist").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
-    let schedule = json!({ "title": "final", "kind": "final",
+    let schedule = json!({ "term": &t.term, "title": "final", "kind": "final",
                            "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 });
 
     // Deleting the exam removes its attempts.
-    let exam = scheduled_exam(&app, &teacher, &course, schedule.clone()).await;
+    let exam = scheduled_exam(&app, &teacher, &t.instance, schedule.clone()).await;
     let res = send(
         &app,
         "POST",
@@ -8077,8 +7986,10 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     assert!(!any_for_exam(&db, &ExamId::from_key(&exam)).await.unwrap());
 
-    // Deleting the whole course cascades through its exams' attempts too.
-    let exam = scheduled_exam(&app, &teacher, &course, schedule).await;
+    // Detaching the şube takes the whole chain with it — the instance's exams
+    // and their attempts. (A catalog course a şube still teaches is not
+    // deletable, so this is where that cascade lives now.)
+    let exam = scheduled_exam(&app, &teacher, &t.instance, schedule).await;
     let res = send(
         &app,
         "POST",
@@ -8088,17 +7999,34 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    unenroll(&app, &teacher, &course, &student_id).await;
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/courses/{course}"),
-        Some(&teacher),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    unenroll(&app, &teacher, &t.instance, &student_id).await;
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{}/instances/{}", t.class, t.instance),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
     assert!(!any_for_exam(&db, &ExamId::from_key(&exam)).await.unwrap());
+
+    // The freed catalog row goes too.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/courses/{}", t.course),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
 }
 
 /// An `open` exam is sittable anytime — no window, no deadline — and
@@ -8111,14 +8039,16 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
     let teacher = login_as(&app, &db, "open_t", "teacher").await;
     let student = login(&app, "omer").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "practice").await;
-    let subject = create_subject(&app, &teacher, &course, "drills").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "open_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "practice").await;
+    let subject = create_subject(&app, &teacher, &t.course, "drills").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "drill", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "drill", "kind": "quiz",
                 "mode": "open", "max_attempts": 2 }),
     )
     .await;
@@ -8303,15 +8233,17 @@ async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
     let teacher = login_as(&app, &db, "dur_t", "teacher").await;
     let student = login(&app, "duru").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "timing").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "dur_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "timing").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // Open + duration: the deadline is exactly start + budget.
     let timed = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "sprint", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "sprint", "kind": "quiz",
                 "mode": "open", "duration_ms": 60_000 }),
     )
     .await;
@@ -8339,8 +8271,8 @@ async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
+        &t.instance,
+        json!({ "term": &t.term, "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends,
                 "max_attempts": 3 }),
     )
@@ -8424,30 +8356,30 @@ async fn subject_crud_validation_and_rbac() {
     let boss = login_as(&app, &db, "sub_m", "manager").await;
     let student = login(&app, "selin").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "calculus").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &boss, &teacher, "calculus").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // Create echoes the full shape; description defaults to empty.
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&teacher),
         Some(json!({ "name": "limits", "description": "epsilon-delta" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    assert_eq!(res.body["course"], course);
+    assert_eq!(res.body["course"], t.course);
     assert_eq!(res.body["name"], "limits");
     assert_eq!(res.body["description"], "epsilon-delta");
     let subject = id_of(&res.body);
-    let second = create_subject(&app, &teacher, &course, "derivatives").await;
+    let second = create_subject(&app, &teacher, &t.course, "derivatives").await;
 
     // Validation: a blank name is a 400, a missing course a 404.
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&teacher),
         Some(json!({ "name": "  " })),
     )
@@ -8468,7 +8400,7 @@ async fn subject_crud_validation_and_rbac() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&student),
         Some(json!({ "name": "nope" })),
     )
@@ -8477,7 +8409,7 @@ async fn subject_crud_validation_and_rbac() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&other_teacher),
         Some(json!({ "name": "nope" })),
     )
@@ -8507,7 +8439,7 @@ async fn subject_crud_validation_and_rbac() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&student),
         None,
     )
@@ -8531,7 +8463,7 @@ async fn subject_crud_validation_and_rbac() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/subjects"),
+        &format!("/courses/{}/subjects", t.course),
         Some(&other_teacher),
         None,
     )
@@ -8595,10 +8527,12 @@ async fn subject_crud_validation_and_rbac() {
 async fn subject_delete_blocks_while_questions_reference_it() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "sdb_t", "teacher").await;
-    let course = create_course(&app, &teacher, "history").await;
-    let tagged = create_subject(&app, &teacher, &course, "antiquity").await;
-    let spare = create_subject(&app, &teacher, &course, "middle ages").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let mudur = login_as(&app, &db, "sdb_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    let tagged = create_subject(&app, &teacher, &t.course, "antiquity").await;
+    let spare = create_subject(&app, &teacher, &t.course, "middle ages").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -8732,26 +8666,33 @@ fn choice_of(question: &serde_json::Value, index: usize) -> String {
 }
 
 /// A course with an open sync window, one subject, and one enrolled student —
-/// the spine of the question/answer tests. Returns (course, exam, subject).
+/// the spine of the question/answer tests. The fixture's dönem is what the
+/// extra exams these tests write file under; the open exam itself is the
+/// `final` of the kinds `scheduling_kinds` installs.
 async fn open_exam_with_student(
     app: &axum::Router,
+    db: &Database,
     teacher: &str,
     student_id: &str,
     course_title: &str,
-) -> (String, String, String) {
-    let course = create_course(app, teacher, course_title).await;
-    let subject = create_subject(app, teacher, &course, "general").await;
-    enroll(app, teacher, &course, student_id).await;
+) -> (common::Taught, String, String) {
+    let mudur = login_as(app, db, "spine_m", "manager").await;
+    scheduling_kinds(app, &mudur).await;
+    let t = taught_under(app, &mudur, teacher, course_title).await;
+    let subject = create_subject(app, teacher, &t.course, "general").await;
+    // The student joins the şube: the pump writes the roster row this fixture
+    // used to place by hand, so the spine is the route a school actually walks.
+    add_member(app, &mudur, &t.class, student_id).await;
     let now = Timestamp::now().as_millis();
     let exam = scheduled_exam(
         app,
         teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
+        &t.instance,
+        json!({ "term": &t.term, "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
-    (course, exam, subject)
+    (t, exam, subject)
 }
 
 #[tokio::test]
@@ -8760,9 +8701,11 @@ async fn question_crud_validation_and_rbac() {
     let teacher = login_as(&app, &db, "q_t", "teacher").await;
     let other_teacher = login_as(&app, &db, "q_t2", "teacher").await;
     let student = login(&app, "quinn").await;
-    let course = create_course(&app, &teacher, "logic").await;
-    let subject = create_subject(&app, &teacher, &course, "propositions").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let mudur = login_as(&app, &db, "q_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "logic").await;
+    let subject = create_subject(&app, &teacher, &t.course, "propositions").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
 
     // A choice question echoes its full authoring view, correct included.
     let res = send(
@@ -8965,7 +8908,7 @@ async fn question_crud_validation_and_rbac() {
 
     // Re-tagging stays inside the course: another of its subjects is fine, a
     // foreign course's subject is a 400.
-    let second_subject = create_subject(&app, &teacher, &course, "predicates").await;
+    let second_subject = create_subject(&app, &teacher, &t.course, "predicates").await;
     let res = send(
         &app,
         "PATCH",
@@ -9035,7 +8978,7 @@ async fn question_crud_validation_and_rbac() {
     assert_eq!(res.status, StatusCode::FORBIDDEN);
 
     // Unknown ids are 404s — including a question under the wrong exam.
-    let other_exam = create_exam(&app, &teacher, &course, "quiz", "quiz").await;
+    let other_exam = create_exam(&app, &teacher, &t.instance, &t.term, "rehearsal", "quiz").await;
     for (method, uri) in [
         ("POST", "/exams/missing/questions".to_string()),
         ("GET", "/exams/missing/questions".to_string()),
@@ -9094,8 +9037,8 @@ async fn questions_freeze_once_attempts_start() {
     let teacher = login_as(&app, &db, "frz_t", "teacher").await;
     let student = login(&app, "firat").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam, subject) =
-        open_exam_with_student(&app, &teacher, &student_id, "algo").await;
+    let (_t, exam, subject) =
+        open_exam_with_student(&app, &db, &teacher, &student_id, "algo").await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -9153,7 +9096,7 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
     let teacher = login_as(&app, &db, "sv_t", "teacher").await;
     let student = login(&app, "sona").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "art").await;
+    let (_t, exam, subject) = open_exam_with_student(&app, &db, &teacher, &student_id, "art").await;
     let choice_q_body = create_question_body(
         &app,
         &teacher,
@@ -9232,7 +9175,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
     let teacher = login_as(&app, &db, "ans_t", "teacher").await;
     let student = login(&app, "arda").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "phys").await;
+    let (t, exam, subject) = open_exam_with_student(&app, &db, &teacher, &student_id, "phys").await;
     let choice_q_body = create_question_body(
         &app,
         &teacher,
@@ -9361,7 +9304,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
-    let foreign_exam = create_exam(&app, &teacher, &course, "other", "quiz").await;
+    let foreign_exam = create_exam(&app, &teacher, &t.instance, &t.term, "other", "quiz").await;
     let foreign_q_body = create_question_body(
         &app,
         &teacher,
@@ -9440,7 +9383,7 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
     let teacher = login_as(&app, &db, "cut_t", "teacher").await;
     let student = login(&app, "cansu").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
+    let (t, exam, subject) = open_exam_with_student(&app, &db, &teacher, &student_id, "chem").await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -9481,14 +9424,14 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    // Unenrolled mid-exam: the course wall closes over the sitting too. The
-    // question list is course content (`GET /exams/{id}` is already walled),
-    // and answering from outside the course would dodge the same wall the
+    // Unenrolled mid-exam: the instance wall closes over the sitting too. The
+    // question list is instance content (`GET /exams/{id}` is already walled),
+    // and answering from outside the roster would dodge the same wall the
     // exam room enforces on entry.
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}/enrollments/{student_id}"),
+        &format!("/instances/{}/enrollments/{student_id}", t.instance),
         Some(&teacher),
         None,
     )
@@ -9558,9 +9501,11 @@ async fn answer_saves_stop_at_the_deadline() {
     let teacher = login_as(&app, &db, "dl_t", "teacher").await;
     let student = login(&app, "dila").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "geo").await;
-    let subject = create_subject(&app, &teacher, &course, "general").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "dl_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "geo").await;
+    let subject = create_subject(&app, &teacher, &t.course, "general").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let now = Timestamp::now().as_millis();
 
     // A window that closes right after the start — real time, the server
@@ -9568,8 +9513,8 @@ async fn answer_saves_stop_at_the_deadline() {
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "blitz", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "blitz", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 1_500 }),
     )
     .await;
@@ -9641,8 +9586,8 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
     let teacher = login_as(&app, &db, "sc_t", "teacher").await;
     let student = login(&app, "sena").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam, subject) =
-        open_exam_with_student(&app, &teacher, &student_id, "chem").await;
+    let (_t, exam, subject) =
+        open_exam_with_student(&app, &db, &teacher, &student_id, "chem").await;
     let q1_body = create_question_body(
         &app,
         &teacher,
@@ -9736,8 +9681,8 @@ async fn live_monitor_tracks_answer_progress() {
     let bora = login(&app, "bora").await;
     let ayla_id = me_id(&app, &ayla).await;
     let bora_id = me_id(&app, &bora).await;
-    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &ayla_id, "stats").await;
-    enroll(&app, &teacher, &course, &bora_id).await;
+    let (t, exam, subject) = open_exam_with_student(&app, &db, &teacher, &ayla_id, "stats").await;
+    enroll(&app, &teacher, &t.instance, &bora_id).await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -9810,7 +9755,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     let teacher = login_as(&app, &db, "qc_t", "teacher").await;
     let student = login(&app, "cem").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "geo2").await;
+    let (t, exam, subject) = open_exam_with_student(&app, &db, &teacher, &student_id, "geo2").await;
     let q1_body = create_question_body(
         &app,
         &teacher,
@@ -9939,13 +9884,15 @@ async fn questions_and_answers_cascade_with_deletes() {
             .is_empty()
     );
 
-    // And a course delete cascades through its exams' questions and answers.
+    // And detaching the şube cascades through its exams' questions and
+    // answers. (A catalog course a şube still teaches is not deletable, so the
+    // detach is where this cascade lives now.)
     let now = Timestamp::now().as_millis();
     let exam2 = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "retake", "kind": "quiz",
+        &t.instance,
+        json!({ "term": &t.term, "title": "retake", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -9978,11 +9925,23 @@ async fn questions_and_answers_cascade_with_deletes() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
-    unenroll(&app, &teacher, &course, &student_id).await;
+    unenroll(&app, &teacher, &t.instance, &student_id).await;
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{}/instances/{}", t.class, t.instance),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
+        &format!("/courses/{}", t.course),
         Some(&teacher),
         None,
     )
@@ -10018,9 +9977,11 @@ async fn questions_and_answers_cascade_with_deletes() {
 async fn question_patch_revalidates_the_stale_kind_bundle() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "rv_t", "teacher").await;
-    let course = create_course(&app, &teacher, "sets").await;
-    let subject = create_subject(&app, &teacher, &course, "unions").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let mudur = login_as(&app, &db, "rv_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "sets").await;
+    let subject = create_subject(&app, &teacher, &t.course, "unions").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -10111,12 +10072,13 @@ async fn question_authoring_follows_course_management() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "own_t", "teacher").await;
     let boss = login_as(&app, &db, "own_m", "manager").await;
-    let course = create_course(&app, &teacher, "greek").await;
-    let subject = create_subject(&app, &boss, &course, "alphabet").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    scheduling_kinds(&app, &boss).await;
+    let t = taught_under(&app, &boss, &teacher, "greek").await;
+    let subject = create_subject(&app, &boss, &t.course, "alphabet").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
 
-    // A manager+ authors questions in anyone's course, like every other
-    // course-management write.
+    // A manager+ authors questions in anyone's instance, like every other
+    // instance-management write.
     let question_body = create_question_body(
         &app,
         &boss,
@@ -10153,8 +10115,8 @@ async fn concurrent_answer_saves_never_collide() {
     let teacher = login_as(&app, &db, "cc_t", "teacher").await;
     let student = login(&app, "cana").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam, subject) =
-        open_exam_with_student(&app, &teacher, &student_id, "race").await;
+    let (_t, exam, subject) =
+        open_exam_with_student(&app, &db, &teacher, &student_id, "race").await;
     let question_body = create_question_body(
         &app,
         &teacher,
@@ -10227,7 +10189,8 @@ async fn session_crud_follows_course_management() {
     let rival = login_as(&app, &db, "rival", "teacher").await;
     let boss = login_as(&app, &db, "boss", "manager").await;
     let student = login(&app, "ali").await;
-    let course = create_course(&app, &owner, "algebra").await;
+    let mudur = login_as(&app, &db, "mudur_of_sessions", "manager").await;
+    let t = taught_under(&app, &mudur, &owner, "algebra").await;
     let now = Timestamp::now().as_millis();
     let start = now + 3_600_000;
 
@@ -10236,7 +10199,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&student),
         Some(body.clone()),
     )
@@ -10245,7 +10208,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&rival),
         Some(body.clone()),
     )
@@ -10254,7 +10217,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(body.clone()),
     )
@@ -10269,7 +10232,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&boss),
         Some(body.clone()),
     )
@@ -10284,7 +10247,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now + 60_000, "teacher_id": "01UNKNOWN" })),
     )
@@ -10294,7 +10257,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now + 60_000, "teacher_id": ali_id })),
     )
@@ -10308,7 +10271,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now + 120_000, "teacher_id": rival_id })),
     )
@@ -10321,7 +10284,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now + 10_000, "ends_at": now + 5_000 })),
     )
@@ -10333,7 +10296,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now - 3_600_000 })),
     )
@@ -10342,7 +10305,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 })),
     )
@@ -10353,7 +10316,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&student),
         None,
     )
@@ -10364,7 +10327,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/instances/{}/enrollments", t.instance),
         Some(&owner),
         Some(json!({ "user_id": ali_id })),
     )
@@ -10373,7 +10336,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&student),
         None,
     )
@@ -10481,7 +10444,7 @@ async fn session_crud_follows_course_management() {
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(json!({ "topic": "underway", "starts_at": now - 1_000 })),
     )
@@ -10551,12 +10514,13 @@ async fn roll_call_rbac_and_upsert() {
     let veli_id = me_id(&app, &veli).await;
     let hoca_id = me_id(&app, &hoca).await;
 
-    let course = create_course(&app, &owner, "algebra").await;
-    enroll(&app, &owner, &course, &ali_id).await;
+    let mudur = login_as(&app, &db, "mudur_of_roll_call", "manager").await;
+    let t = taught_under(&app, &mudur, &owner, "algebra").await;
+    enroll(&app, &owner, &t.instance, &ali_id).await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&owner),
         Some(
             json!({ "starts_at": Timestamp::now().as_millis() + 3_600_000, "teacher_id": hoca_id }),
@@ -10579,7 +10543,7 @@ async fn roll_call_rbac_and_upsert() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["user"]["username"], "ali");
     assert_eq!(res.body["marked_by"]["username"], "hoca");
-    assert_eq!(res.body["course"].as_str().unwrap(), course);
+    assert_eq!(res.body["class_course"].as_str().unwrap(), t.instance);
 
     // Re-marking overwrites — one row per session+user (course manager may too).
     let res = send(
@@ -10759,11 +10723,12 @@ async fn deleting_session_or_course_cascades_roll_call() {
     let ali = login(&app, "ali").await;
     let ali_id = me_id(&app, &ali).await;
 
-    let course = create_course(&app, &owner, "algebra").await;
-    enroll(&app, &owner, &course, &ali_id).await;
+    let mudur = login_as(&app, &db, "cascade_m", "manager").await;
+    let t = taught_under(&app, &mudur, &owner, "algebra").await;
+    enroll(&app, &owner, &t.instance, &ali_id).await;
     let now = Timestamp::now().as_millis();
-    let s1 = create_session(&app, &owner, &course, now + 3_600_000).await;
-    let s2 = create_session(&app, &owner, &course, now + 7_200_000).await;
+    let s1 = create_session(&app, &owner, &t.instance, now + 3_600_000).await;
+    let s2 = create_session(&app, &owner, &t.instance, now + 7_200_000).await;
     for s in [&s1, &s2] {
         let res = send(
             &app,
@@ -10791,22 +10756,34 @@ async fn deleting_session_or_course_cascades_roll_call() {
     let report = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
     assert_eq!(report.body["sessions"]["total"], 1);
 
-    // ...and deleting the course removes the rest, sessions included.
-    unenroll(&app, &owner, &course, &ali_id).await;
+    // ...and tearing the teaching down removes the rest, sessions included:
+    // detaching the instance sweeps its lessons and their roll call, which
+    // frees the catalog row to go with them.
+    unenroll(&app, &owner, &t.instance, &ali_id).await;
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
+        &format!("/classes/{}/instances/{}", t.class, t.instance),
         Some(&owner),
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     let res = send(&app, "GET", &format!("/sessions/{s2}"), Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let report = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
     assert_eq!(report.body["sessions"]["total"], 0);
     assert!(report.body["courses"].as_array().unwrap().is_empty());
+    // The catalog row is free now, and goes the same way.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{}", t.course),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }
 
 // --- work log ---------------------------------------------------------------
@@ -11178,19 +11155,21 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     )
     .await;
 
-    // Roll call across two courses: algebra present+late, physics absent+excused.
-    let algebra = create_course(&app, &owner, "algebra").await;
-    let physics = create_course(&app, &owner, "physics").await;
-    for (course, statuses) in [
+    // Roll call across two instances: algebra present+late, physics
+    // absent+excused.
+    let mudur = login_as(&app, &db, "att_m", "manager").await;
+    let algebra = taught_under(&app, &mudur, &owner, "algebra").await;
+    let physics = taught_under(&app, &mudur, &owner, "physics").await;
+    for (t, statuses) in [
         (&algebra, ["present", "late"]),
         (&physics, ["absent", "excused"]),
     ] {
-        enroll(&app, &owner, course, &ali_id).await;
+        enroll(&app, &owner, &t.instance, &ali_id).await;
         for (n, status) in statuses.iter().enumerate() {
             let session = create_session(
                 &app,
                 &owner,
-                course,
+                &t.instance,
                 Timestamp::now().as_millis() + (n as i64 + 1) * 3_600_000,
             )
             .await;
@@ -11238,15 +11217,7 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     assert_eq!(block("physics")["counts"]["excused"], 1);
 
     // Unenrolling hides marks, never absences: the physics block stays.
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/courses/{physics}/enrollments/{ali_id}"),
-        Some(&owner),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    unenroll(&app, &owner, &physics.instance, &ali_id).await;
     let res = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
     assert_eq!(res.body["courses"].as_array().unwrap().len(), 2);
 
@@ -11275,12 +11246,12 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     // chemistry, so ali's report shows that block alone — the overall session
     // tally follows, while event tallies stay school-wide.
     let rival = login_as(&app, &db, "rival", "teacher").await;
-    let chemistry = create_course(&app, &rival, "chemistry").await;
-    enroll(&app, &rival, &chemistry, &ali_id).await;
+    let chemistry = taught_under(&app, &mudur, &rival, "chemistry").await;
+    enroll(&app, &rival, &chemistry.instance, &ali_id).await;
     let session = create_session(
         &app,
         &rival,
-        &chemistry,
+        &chemistry.instance,
         Timestamp::now().as_millis() + 10 * 3_600_000,
     )
     .await;
@@ -11597,29 +11568,37 @@ async fn user_search_folds_turkish_casing() {
 /// and enrolled sources are deduplicated. Enrollment is student-only now, so
 /// that overlap can only arise across a role change; the dedup must still hold.
 #[tokio::test]
-async fn course_catalog_lists_a_creator_enrolled_course_once() {
+async fn course_catalog_follows_reach_not_creation() {
     let (app, db) = app_and_db().await;
     let creator = login_as(&app, &db, "teacher", "teacher").await;
     let boss = login_as(&app, &db, "boss", "manager").await;
     let creator_id = me_id(&app, &creator).await;
 
-    let course = create_course(&app, &creator, "algebra").await;
+    let t = taught_under(&app, &boss, &creator, "algebra").await;
     // Author the exam while still staff, before the demotion below.
-    let exam = create_exam(&app, &creator, &course, "mt", "quiz").await;
+    let exam = create_exam(&app, &creator, &t.instance, &t.term, "mt", "yazili").await;
 
-    // Demote the creator to student, then have a manager enroll them into their
-    // own course: they now show up in both the created and enrolled sources.
+    // Demoted to student the ex-creator owns nothing: the catalog is the
+    // courses a caller is *reached* by, and creation is not a source any more.
     set_role(&db, "teacher", "student").await;
-    enroll(&app, &boss, &course, &creator_id).await;
-
     let res = send(&app, "GET", "/courses", Some(&creator), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    let courses = common::items(&res.body);
-    assert_eq!(courses.len(), 1, "created+enrolled must dedup: {courses:?}");
-    assert_eq!(courses[0]["id"], json!(course));
+    assert!(
+        common::items(&res.body).is_empty(),
+        "a demoted creator's catalog is empty: {}",
+        res.body
+    );
 
-    // The exam catalog derives from the same visible set and must not double
-    // the course's exams either.
+    // The şube enrolls them into the instance its course carries: now they are
+    // reached by it, and it is listed exactly once.
+    add_member(&app, &boss, &t.class, &creator_id).await;
+    let res = send(&app, "GET", "/courses", Some(&creator), None).await;
+    let courses = common::items(&res.body);
+    assert_eq!(courses.len(), 1, "reached once, listed once: {courses:?}");
+    assert_eq!(courses[0]["id"], json!(t.course));
+
+    // The exam catalog derives from the same visible set and lists the exam
+    // once.
     let res = send(&app, "GET", "/exams", Some(&creator), None).await;
     let exams = common::items(&res.body);
     assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
@@ -11639,26 +11618,34 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
     let res = send(&app, "GET", "/settings", None, None).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 
-    // Any authenticated user reads; the defaults mirror the old constants,
-    // every kind weighing 1 until the school says otherwise.
+    // Any authenticated user reads. The defaults are the Turkish K12
+    // classroom's own — yazılı, sözlü, uygulama, each weighing 1 until the
+    // school says otherwise — over the Türkiye 5-point band scale, so a mark
+    // always labels.
     let res = send(&app, "GET", "/settings", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(
         res.body["exam_kinds"],
         json!([
-            {"name": "homework", "weight": 1},
-            {"name": "quiz", "weight": 1},
-            {"name": "midterm", "weight": 1},
-            {"name": "final", "weight": 1},
-            {"name": "project", "weight": 1},
-            {"name": "oral", "weight": 1},
+            {"name": "yazili", "weight": 1},
+            {"name": "sozlu", "weight": 1},
+            {"name": "uygulama", "weight": 1},
         ])
     );
     assert_eq!(
         res.body["attendance_statuses"],
         json!(["absent", "excused", "late", "present"])
     );
-    assert_eq!(res.body["grade_bands"], json!([]));
+    assert_eq!(
+        res.body["grade_bands"],
+        json!([
+            {"min": 85, "label": "5"},
+            {"min": 70, "label": "4"},
+            {"min": 55, "label": "3"},
+            {"min": 45, "label": "2"},
+            {"min": 0, "label": "1"},
+        ])
+    );
 
     // Students and teachers cannot edit school policy.
     for cookie in [&student, &teacher] {
@@ -11740,10 +11727,27 @@ async fn settings_validation_rejects_bad_lists_and_bands() {
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
     }
 
-    // No failed PATCH half-applied anything.
+    // No failed PATCH half-applied anything: the school still carries the
+    // shipped policy.
     let res = send(&app, "GET", "/settings", Some(&manager), None).await;
-    assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 6);
-    assert_eq!(res.body["grade_bands"], json!([]));
+    assert_eq!(
+        res.body["exam_kinds"],
+        json!([
+            {"name": "yazili", "weight": 1},
+            {"name": "sozlu", "weight": 1},
+            {"name": "uygulama", "weight": 1},
+        ])
+    );
+    assert_eq!(
+        res.body["grade_bands"],
+        json!([
+            {"min": 85, "label": "5"},
+            {"min": 70, "label": "4"},
+            {"min": 55, "label": "3"},
+            {"min": 45, "label": "2"},
+            {"min": 0, "label": "1"},
+        ])
+    );
 }
 
 #[tokio::test]
@@ -11752,8 +11756,20 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
     let teacher = login_as(&app, &db, "kind.teacher", "teacher").await;
     let manager = login_as(&app, &db, "kind.manager", "manager").await;
 
-    let course = create_course(&app, &teacher, "Chemistry").await;
-    let exam = create_exam(&app, &teacher, &course, "Midterm", "midterm").await;
+    // The school's own list, naming the kind the first exam is written with
+    // (the shipped defaults are yazili/sozlu/uygulama).
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [{"name": "midterm", "weight": 1}] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let t = taught_under(&app, &manager, &teacher, "Chemistry").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "Midterm", "midterm").await;
 
     // The school swaps its kind list wholesale.
     let res = send(
@@ -11770,16 +11786,16 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "Retired kind", "kind": "midterm" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "Retired kind", "kind": "midterm" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "Lab 1", "kind": "lab" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "Lab 1", "kind": "lab" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -11926,9 +11942,9 @@ async fn grade_bands_label_the_marks_report() {
     // Bands echo highest-first — the canonical order.
     assert_eq!(res.body["grade_bands"][0]["label"], "AA");
 
-    let course = create_course(&app, &teacher, "Physics").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Final", "final").await;
+    let t = taught_under(&app, &manager, &teacher, "Physics").await;
+    add_member(&app, &manager, &t.class, &student_id).await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "Final", "yazili").await;
     let res = send(
         &app,
         "POST",
@@ -11968,17 +11984,35 @@ async fn grade_bands_label_the_marks_report() {
 }
 
 #[tokio::test]
-async fn terms_crud_gates_and_links_to_courses() {
+async fn terms_crud_gates_and_the_catalog_lives_outside_the_calendar() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "term.manager", "manager").await;
     let teacher = login_as(&app, &db, "term.teacher", "teacher").await;
     let student = login(&app, "term.student").await;
+
+    // A dönem is a slice of an academic year since the K12 remodel, so the
+    // calendar above it is minted first.
+    let res = send(
+        &app,
+        "POST",
+        "/academic-years",
+        Some(&manager),
+        Some(json!({
+            "name": "2025-2026",
+            "starts_at": 1_590_000_000_000_i64,
+            "ends_at": 1_620_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let year = id_of(&res.body);
 
     // Writes are manager+; and a term may lie fully in the past — a school
     // adopting the app mid-year backfills its calendar, unlike the no-past
     // rule on exams/lessons/events.
     let past_term = json!({
         "name": "2025 Fall",
+        "year": year,
         "starts_at": 1_600_000_000_000_i64,
         "ends_at": 1_610_000_000_000_i64,
     });
@@ -12001,7 +12035,7 @@ async fn terms_crud_gates_and_links_to_courses() {
         "POST",
         "/terms",
         Some(&manager),
-        Some(json!({ "name": "Broken", "starts_at": 2, "ends_at": 1 })),
+        Some(json!({ "name": "Broken", "year": year, "starts_at": 2, "ends_at": 1 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -12030,48 +12064,27 @@ async fn terms_crud_gates_and_links_to_courses() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(common::items(&res.body).len(), 1);
 
-    // Courses link to a term at creation; a bogus id is a 400, not a silent null.
+    // The catalog is outside the calendar now: a course carries no dönem to
+    // link, unlink or be judged by. What a dönem's delete guard counts is the
+    // *exams* filed under it (its own section pins that), so the two are
+    // independent — which is what this arm now says.
     let res = send(
         &app,
         "POST",
         "/courses",
         Some(&teacher),
-        Some(json!({ "title": "History", "term_id": term })),
+        Some(json!({ "title": "History" })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let course = id_of(&res.body);
-    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "Broken", "term_id": "nope" })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(
+        res.body.get("term").is_none(),
+        "a catalog course has no dönem to carry: {}",
+        res.body
+    );
 
-    // PATCH: null unlinks, a value re-links, omitting keeps.
-    let res = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course}"),
-        Some(&teacher),
-        Some(json!({ "term_id": null })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["term"], serde_json::Value::Null);
-    let res = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course}"),
-        Some(&teacher),
-        Some(json!({ "term_id": term })),
-    )
-    .await;
-    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
+    // Its own PATCH is what changes it, and the calendar does not ride along.
     let res = send(
         &app,
         "PATCH",
@@ -12080,28 +12093,9 @@ async fn terms_crud_gates_and_links_to_courses() {
         Some(json!({ "title": "History II" })),
     )
     .await;
-    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
-
-    // A term a course still points at cannot be deleted; unlinking the course
-    // clears the way, and the course itself survives untouched.
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/terms/{term}"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CONFLICT);
-    let res = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course}"),
-        Some(&teacher),
-        Some(json!({ "term_id": null })),
-    )
-    .await;
     assert_eq!(res.status, StatusCode::OK);
+
+    // Deleting the dönem leaves the catalog row standing.
     let res = send(
         &app,
         "DELETE",
@@ -12110,7 +12104,7 @@ async fn terms_crud_gates_and_links_to_courses() {
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     let res = send(&app, "GET", &format!("/terms/{term}"), Some(&student), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let res = send(
@@ -12148,10 +12142,10 @@ async fn roll_call_accepts_school_statuses_and_buckets_session_reports() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
-    let course = create_course(&app, &teacher, "Biology").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &manager, &teacher, "Biology").await;
+    add_member(&app, &manager, &t.class, &student_id).await;
     let future = Timestamp::now().as_millis() + 3_600_000;
-    let session = create_session(&app, &teacher, &course, future).await;
+    let session = create_session(&app, &teacher, &t.instance, future).await;
 
     // Custom status marks; garbage still dies.
     let res = send(
@@ -12196,12 +12190,16 @@ async fn terms_list_newest_first_require_auth_and_guard_delete_per_term() {
     let res = send(&app, "GET", "/terms", None, None).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 
+    let year = create_year(&app, &manager, "2025-2026").await;
     let older = send(
         &app,
         "POST",
         "/terms",
         Some(&manager),
-        Some(json!({ "name": "2025 Fall", "starts_at": 1_000, "ends_at": 2_000 })),
+        Some(json!({
+            "name": "2025 Fall", "year": year,
+            "starts_at": 1_000, "ends_at": 2_000,
+        })),
     )
     .await;
     let newer = send(
@@ -12209,7 +12207,10 @@ async fn terms_list_newest_first_require_auth_and_guard_delete_per_term() {
         "POST",
         "/terms",
         Some(&manager),
-        Some(json!({ "name": "2026 Spring", "starts_at": 5_000, "ends_at": 6_000 })),
+        Some(json!({
+            "name": "2026 Spring", "year": year,
+            "starts_at": 5_000, "ends_at": 6_000,
+        })),
     )
     .await;
     let (older, newer) = (id_of(&older.body), id_of(&newer.body));
@@ -12222,52 +12223,43 @@ async fn terms_list_newest_first_require_auth_and_guard_delete_per_term() {
         .collect();
     assert_eq!(names, ["2026 Spring", "2025 Fall"]);
 
-    // The delete guard counts EVERY linked course — unlinking one of two is
-    // not enough — and it is per term: a course on another term never blocks.
+    // The delete guard counts EVERY exam filed under the dönem — removing one
+    // of two is not enough — and it is per dönem: an exam on another dönem
+    // never blocks this one.
+    let t = taught_under(&app, &manager, &teacher, "Algebra").await;
     let mut linked = Vec::new();
-    for title in ["Algebra", "Geometry"] {
-        let res = send(
-            &app,
-            "POST",
-            "/courses",
-            Some(&teacher),
-            Some(json!({ "title": title, "term_id": newer })),
-        )
-        .await;
-        assert_eq!(res.status, StatusCode::CREATED);
-        linked.push(id_of(&res.body));
+    for title in ["Midterm", "Final"] {
+        linked.push(create_exam(&app, &teacher, &t.instance, &newer, title, "yazili").await);
     }
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "History", "term_id": older })),
-    )
-    .await;
-    let unrelated = id_of(&res.body);
+    let unrelated = create_exam(&app, &teacher, &t.instance, &older, "History", "yazili").await;
 
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/terms/{newer}"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CONFLICT);
-
-    for (i, course) in linked.iter().enumerate() {
-        let res = send(
+    assert_eq!(
+        send(
             &app,
-            "PATCH",
-            &format!("/courses/{course}"),
-            Some(&teacher),
-            Some(json!({ "term_id": null })),
+            "DELETE",
+            &format!("/terms/{newer}"),
+            Some(&manager),
+            None
         )
-        .await;
-        assert_eq!(res.status, StatusCode::OK);
-        // Still blocked until the LAST linked course lets go.
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+
+    for (i, exam) in linked.iter().enumerate() {
+        assert_eq!(
+            send(
+                &app,
+                "DELETE",
+                &format!("/exams/{exam}"),
+                Some(&teacher),
+                None
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
+        // Still blocked until the LAST exam lets go.
         let res = send(
             &app,
             "DELETE",
@@ -12281,17 +12273,60 @@ async fn terms_list_newest_first_require_auth_and_guard_delete_per_term() {
         } else {
             StatusCode::CONFLICT
         };
-        assert_eq!(res.status, expected, "after unlinking {course}");
+        assert_eq!(res.status, expected, "after deleting {exam}");
     }
-    let res = send(
-        &app,
-        "GET",
-        &format!("/courses/{unrelated}"),
-        Some(&teacher),
-        None,
-    )
-    .await;
-    assert_eq!(res.body["term"].as_str(), Some(older.as_str()));
+
+    // The unrelated exam is filed under the other dönem and never blocked
+    // this one: it is gone from the calendar's view only when its own dönem
+    // goes, and that dönem is blocked by its own exam.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/exams/{unrelated}"),
+            Some(&teacher),
+            None
+        )
+        .await
+        .body["term"],
+        older
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/terms/{older}"),
+            Some(&manager),
+            None
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/exams/{unrelated}"),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/terms/{older}"),
+            Some(&manager),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[tokio::test]
@@ -12317,10 +12352,10 @@ async fn grade_band_boundary_applies_to_the_weighted_average() {
     // Two equal-weight marks straddling the band edge: 80 and 90 → average
     // exactly 85.0, which is INSIDE the AA band (min is inclusive), while
     // the 80 itself still reads FF.
-    let course = create_course(&app, &teacher, "Calculus").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &manager, &teacher, "Calculus").await;
+    add_member(&app, &manager, &t.class, &student_id).await;
     for (title, mark) in [("Quiz A", 80), ("Quiz B", 90)] {
-        let exam = create_exam(&app, &teacher, &course, title, "quiz").await;
+        let exam = create_exam(&app, &teacher, &t.instance, &t.term, title, "yazili").await;
         let res = send(
             &app,
             "POST",
@@ -12397,7 +12432,18 @@ async fn settings_accept_admin_edits_trim_entries_and_noop_on_empty_patch() {
     // An empty PATCH is a valid no-op: current policy back, nothing changed.
     let res = send(&app, "PATCH", "/settings", Some(&admin), Some(json!({}))).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 6);
+    let kinds: Vec<&str> = res.body["exam_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kind| kind["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["yazili", "sozlu", "uygulama"],
+        "the shipped default kinds: {}",
+        res.body
+    );
 
     // Admin clears the manager bar (hierarchy, not equality), and kind names
     // arrive trimmed on the wire.
@@ -12644,14 +12690,15 @@ async fn question_images_author_serve_and_cascade() {
     let student_id = me_id(&app, &student).await;
     let outsider = login(&app, "img_o").await;
 
-    let course = create_course(&app, &teacher, "geography").await;
-    let subject = create_subject(&app, &teacher, &course, "maps").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "img_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "geography").await;
+    let subject = create_subject(&app, &teacher, &t.course, "maps").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "map quiz", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "map quiz", "kind": "yazili", "mode": "open" }),
     )
     .await;
     let question_body = create_question_body(
@@ -12854,15 +12901,17 @@ async fn student_answer_images_serve_and_cascade() {
     let student_id = me_id(&app, &student).await;
     let outsider = login(&app, "ans_o").await;
 
-    let course = create_course(&app, &teacher, "science").await;
-    let subject = create_subject(&app, &teacher, &course, "biology").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "ans_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "science").await;
+    let subject = create_subject(&app, &teacher, &t.course, "biology").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     // Retakes allowed (max_attempts: 2) so the wipe path is reachable.
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "cell quiz", "kind": "yazili",
+                "mode": "open", "max_attempts": 2 }),
     )
     .await;
     let question_body = create_question_body(
@@ -13069,14 +13118,15 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
     let student = login(&app, "draw_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "art").await;
-    let subject = create_subject(&app, &teacher, &course, "drawing").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "draw_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "art").await;
+    let subject = create_subject(&app, &teacher, &t.course, "drawing").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "sketch", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "sketch", "kind": "yazili", "mode": "open" }),
     )
     .await;
     let question_body = create_question_body(
@@ -13165,13 +13215,14 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
 async fn question_image_edits_follow_the_choices() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "imge_t", "teacher").await;
-    let course = create_course(&app, &teacher, "history").await;
-    let subject = create_subject(&app, &teacher, &course, "eras").await;
+    let mudur = login_as(&app, &db, "imge_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    let subject = create_subject(&app, &teacher, &t.course, "eras").await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "eras", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "eras", "kind": "yazili", "mode": "open" }),
     )
     .await;
     let question_body = create_question_body(
@@ -13346,15 +13397,18 @@ async fn draft_exams_hide_from_students_until_published() {
     let teacher = login_as(&app, &db, "draft_t", "teacher").await;
     let student = login(&app, "draft_s").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "history").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "mudur_of_drafts", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    // The student's seat is the şube's: that is what puts them in the instance
+    // the section teaches, and what the exam lists resolve against.
+    add_member(&app, &mudur, &t.class, &student_id).await;
 
     // Saved as a draft: an open (sittable-were-it-published) exam.
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "wip final", "kind": "final", "mode": "open", "draft": true }),
+        &t.instance,
+        json!({ "title": "wip final", "kind": "yazili", "term": t.term, "mode": "open", "draft": true }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -13373,7 +13427,7 @@ async fn draft_exams_hide_from_students_until_published() {
     let in_course = send(
         &app,
         "GET",
-        &format!("/courses/{course}/exams"),
+        &format!("/instances/{}/exams", t.instance),
         Some(&student),
         None,
     )
@@ -13439,11 +13493,20 @@ async fn results_alone_also_freeze_re_drafting() {
     let teacher = login_as(&app, &db, "redraft_t", "teacher").await;
     let student = login(&app, "redraft_s").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "geo").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "redraft_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "geo").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // A published offline-graded exam (no mode, no attempts — marks by hand).
-    let exam = create_exam(&app, &teacher, &course, "field trip report", "project").await;
+    let exam = create_exam(
+        &app,
+        &teacher,
+        &t.instance,
+        &t.term,
+        "field trip report",
+        "yazili",
+    )
+    .await;
     let res = send(
         &app,
         "POST",
@@ -13466,7 +13529,7 @@ async fn results_alone_also_freeze_re_drafting() {
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 
     // Ungraded siblings still re-draft freely.
-    let other = create_exam(&app, &teacher, &course, "map quiz", "quiz").await;
+    let other = create_exam(&app, &teacher, &t.instance, &t.term, "map quiz", "sozlu").await;
     let res = send(
         &app,
         "PATCH",
@@ -13614,10 +13677,10 @@ async fn parent_observes_linked_students_and_nothing_else() {
     let bob = login(&app, "bob").await;
     let bob_id = me_id(&app, &bob).await;
 
-    // ali gets a graded exam in a course the parent has nothing to do with.
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &ali_id).await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "quiz").await;
+    // ali gets a graded exam in a şube the parent has nothing to do with.
+    let t = taught_under(&app, &admin, &teacher, "algebra").await;
+    add_member(&app, &admin, &t.class, &ali_id).await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "yazili").await;
     let res = send(
         &app,
         "POST",
@@ -13697,8 +13760,8 @@ async fn parent_observes_linked_students_and_nothing_else() {
     let sittable = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "anytime", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "anytime", "kind": "sozlu", "mode": "open" }),
     )
     .await;
     assert_eq!(sittable.status, StatusCode::CREATED, "{}", sittable.body);
@@ -14821,14 +14884,15 @@ async fn answer_image_round_trip_keeps_the_stroke_text_chunk_intact() {
     let student = login(&app, "rt_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "art").await;
-    let subject = create_subject(&app, &teacher, &course, "sketching").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "rt_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "art").await;
+    let subject = create_subject(&app, &teacher, &t.course, "sketching").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "sketch quiz", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "sketch quiz", "kind": "yazili", "mode": "open" }),
     )
     .await;
     let question_body = create_question_body(
@@ -15108,8 +15172,11 @@ async fn pool_photo_reads_require_student_role() {
 
 // --- homework -------------------------------------------------------------
 
-/// A teacher-run course with a subject and two enrolled students — the stage
-/// most homework tests play on.
+/// A teacher-run şube with a subject and two students in it — the stage most
+/// homework tests play on. The homework itself keys on the instance (the pair
+/// of catalog course and şube), so that is what the fields below name: `course`
+/// is the catalog row, `instance` the anchor every `/instances/{id}/…` route and
+/// every homework takes.
 struct HwWorld {
     teacher: String,
     ali: String,
@@ -15117,26 +15184,32 @@ struct HwWorld {
     veli: String,
     veli_id: String,
     course: String,
+    class: String,
+    instance: String,
     subject: String,
 }
 
 async fn hw_world(app: &axum::Router, db: &hezarfen_backend::database::Database) -> HwWorld {
     let teacher = login_as(app, db, "teacher", "teacher").await;
+    let mudur = login_as(app, db, "hw.mudur", "manager").await;
     let ali = login(app, "ali").await;
     let ali_id = me_id(app, &ali).await;
     let veli = login(app, "veli").await;
     let veli_id = me_id(app, &veli).await;
-    let course = create_course(app, &teacher, "math").await;
-    let subject = create_subject(app, &teacher, &course, "algebra").await;
-    enroll(app, &teacher, &course, &ali_id).await;
-    enroll(app, &teacher, &course, &veli_id).await;
+    let t = taught_under(app, &mudur, &teacher, "math").await;
+    let subject = create_subject(app, &teacher, &t.course, "algebra").await;
+    // The students sit in the şube: the pump enrolls them into the instance.
+    add_member(app, &mudur, &t.class, &ali_id).await;
+    add_member(app, &mudur, &t.class, &veli_id).await;
     HwWorld {
         teacher,
         ali,
         ali_id,
         veli,
         veli_id,
-        course,
+        course: t.course,
+        class: t.class,
+        instance: t.instance,
         subject,
     }
 }
@@ -15242,7 +15315,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "old", "subject_id": w.subject, "due_at": now - 120_000 }),
     )
     .await;
@@ -15254,7 +15327,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "x", "subject_id": foreign, "due_at": now + 3_600_000 }),
     )
     .await;
@@ -15266,7 +15339,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": [mehmet_id] }),
     )
@@ -15279,7 +15352,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": fakes }),
     )
@@ -15290,7 +15363,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.ali,
-        &w.course,
+        &w.instance,
         json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000 }),
     )
     .await;
@@ -15300,7 +15373,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "just now", "subject_id": w.subject, "due_at": now - 30_000 }),
     )
     .await;
@@ -15308,7 +15381,7 @@ async fn homework_create_validates_due_subject_and_subset() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "ch. 3",
         now + 3_600_000,
@@ -15336,7 +15409,7 @@ async fn homework_subset_hides_from_outsiders() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "secret drill", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": [w.ali_id] }),
     )
@@ -15345,7 +15418,7 @@ async fn homework_subset_hides_from_outsiders() {
     let hw = id_of(&res.body);
 
     // ali is named: both lists carry it and the fetch works.
-    let uri = format!("/courses/{}/homework", w.course);
+    let uri = format!("/instances/{}/homework", w.instance);
     let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
     assert_eq!(common::total(&res.body), 1);
     let res = send(&app, "GET", "/homework", Some(&w.ali), None).await;
@@ -15426,7 +15499,7 @@ async fn homework_patch_rechecks_and_blocks_orphaning() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "drill", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": [w.ali_id, w.veli_id] }),
     )
@@ -15511,7 +15584,15 @@ async fn homework_patch_rechecks_and_blocks_orphaning() {
 
     // A title-only edit on a graced, already-due homework keeps its stored
     // due date without tripping the not-past check.
-    let old = create_homework(&app, &w.teacher, &w.course, &w.subject, "old", now - 30_000).await;
+    let old = create_homework(
+        &app,
+        &w.teacher,
+        &w.instance,
+        &w.subject,
+        "old",
+        now - 30_000,
+    )
+    .await;
     let res = send(
         &app,
         "PATCH",
@@ -15534,7 +15615,7 @@ async fn homework_submission_lifecycle_and_stamps() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "essay",
         now + 3_600_000,
@@ -15594,7 +15675,7 @@ async fn homework_lateness_is_computed_across_due() {
     let overdue = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "late one",
         now - 30_000,
@@ -15607,7 +15688,7 @@ async fn homework_lateness_is_computed_across_due() {
     let open = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "open one",
         now + 3_600_000,
@@ -15656,7 +15737,7 @@ async fn homework_grading_gates_and_bounds() {
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "drill", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": [w.ali_id] }),
     )
@@ -15725,7 +15806,7 @@ async fn concurrent_homework_uploads_never_exceed_the_file_cap() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "essay",
         now + 3_600_000,
@@ -15801,7 +15882,7 @@ async fn homework_grade_freezes_until_removed() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "essay",
         now + 3_600_000,
@@ -15895,7 +15976,7 @@ async fn homework_files_roundtrip_and_scope() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "photo hw",
         now + 3_600_000,
@@ -15939,7 +16020,7 @@ async fn homework_files_roundtrip_and_scope() {
     let other = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "other",
         now + 3_600_000,
@@ -15990,7 +16071,7 @@ async fn homework_file_limits_follow_cap_and_settings() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "many files",
         now + 3_600_000,
@@ -16024,7 +16105,7 @@ async fn homework_file_limits_follow_cap_and_settings() {
     let hw2 = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "sized",
         now + 3_600_000,
@@ -16049,7 +16130,7 @@ async fn homework_roster_covers_audience_and_stragglers() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "for all",
         now + 3_600_000,
@@ -16067,7 +16148,7 @@ async fn homework_roster_covers_audience_and_stragglers() {
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{}/enrollments/{}", w.course, w.ali_id),
+        &format!("/instances/{}/enrollments/{}", w.instance, w.ali_id),
         Some(&w.teacher),
         None,
     )
@@ -16104,11 +16185,11 @@ async fn homework_roster_covers_audience_and_stragglers() {
     assert_eq!(res.body["offset"], 1);
 
     // A subset roster is the named students, nobody else.
-    enroll(&app, &w.teacher, &w.course, &w.ali_id).await;
+    enroll(&app, &w.teacher, &w.instance, &w.ali_id).await;
     let res = common::create_homework_with(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         json!({ "title": "subset", "subject_id": w.subject, "due_at": now + 3_600_000,
                 "assigned": [w.ali_id] }),
     )
@@ -16137,17 +16218,18 @@ async fn homework_report_serves_observers_only() {
     let admin = login_as(&app, &db, "boss", "admin").await;
     let now = Timestamp::now().as_millis();
 
-    // A second course under another teacher; ali sits in both.
+    // A second şube under another teacher; ali sits in both.
     let rival = login_as(&app, &db, "rival", "teacher").await;
-    let course2 = create_course(&app, &rival, "physics").await;
-    let subject2 = create_subject(&app, &rival, &course2, "optics").await;
-    enroll(&app, &rival, &course2, &w.ali_id).await;
+    let mudur2 = login_as(&app, &db, "hw.mudur2", "manager").await;
+    let t2 = taught_under(&app, &mudur2, &rival, "physics").await;
+    let subject2 = create_subject(&app, &rival, &t2.course, "optics").await;
+    add_member(&app, &mudur2, &t2.class, &w.ali_id).await;
 
     // Three states across the two courses: graded, submitted-late, missing.
     let graded = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "graded",
         now + 3_600_000,
@@ -16157,10 +16239,26 @@ async fn homework_report_serves_observers_only() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let res = grade_hw(&app, &w.teacher, &graded, &w.ali_id, "done", Some(90)).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let overdue = create_homework(&app, &rival, &course2, &subject2, "overdue", now - 30_000).await;
+    let overdue = create_homework(
+        &app,
+        &rival,
+        &t2.instance,
+        &subject2,
+        "overdue",
+        now - 30_000,
+    )
+    .await;
     let res = submit_hw(&app, &w.ali, &overdue, Some("late")).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let missing = create_homework(&app, &rival, &course2, &subject2, "skipped", now - 30_000).await;
+    let missing = create_homework(
+        &app,
+        &rival,
+        &t2.instance,
+        &subject2,
+        "skipped",
+        now - 30_000,
+    )
+    .await;
 
     // The admin reads all three rows, each in its computed state.
     let report_uri = format!("/homework/report/{}", w.ali_id);
@@ -16193,7 +16291,10 @@ async fn homework_report_serves_observers_only() {
     // A teacher reads only the slice they manage.
     let res = send(&app, "GET", &report_uri, Some(&w.teacher), None).await;
     assert_eq!(common::total(&res.body), 1);
-    assert_eq!(common::items(&res.body)[0]["course"], w.course.as_str());
+    assert_eq!(
+        common::items(&res.body)[0]["class_course"],
+        w.instance.as_str()
+    );
 
     // A linked parent reads all of it (paged like every list)…
     let mom = login_as(&app, &db, "mom", "parent").await;
@@ -16278,7 +16379,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     let hw1 = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "one",
         now + 3_600_000,
@@ -16287,7 +16388,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     let hw2 = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "two",
         now + 3_600_000,
@@ -16350,24 +16451,28 @@ async fn homework_gc_removes_rows_and_blobs() {
         );
     }
 
-    // Deleting the course takes everything left.
+    // Detaching the şube takes everything left.
     let res = upload_hw_file(&app, &w.ali, &hw2, "d.txt", "text/plain", b"data").await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let res = grade_hw(&app, &w.teacher, &hw2, &w.veli_id, "missing", None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let keys = homework_blob_keys(&db).await;
     assert_eq!(keys.len(), 1);
-    unenroll(&app, &w.teacher, &w.course, &w.ali_id).await;
-    unenroll(&app, &w.teacher, &w.course, &w.veli_id).await;
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/courses/{}", w.course),
-        Some(&w.teacher),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    unenroll(&app, &w.teacher, &w.instance, &w.ali_id).await;
+    unenroll(&app, &w.teacher, &w.instance, &w.veli_id).await;
+    // Detaching the şube takes the whole chain with it.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{}/instances/{}", w.class, w.instance),
+            Some(&w.teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
     for table in [
         "homework",
         "homework_submission",
@@ -16377,15 +16482,29 @@ async fn homework_gc_removes_rows_and_blobs() {
         assert_eq!(
             hw_row_count(&db, table).await,
             0,
-            "{table} died with course"
+            "{table} died with the instance"
         );
     }
     for key in &keys {
         assert!(
             !common::blob_dir().join(key).exists(),
-            "blob {key} must die with the course"
+            "blob {key} must die with the instance"
         );
     }
+
+    // The freed catalog row goes too.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/courses/{}", w.course),
+            Some(&w.teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
 }
 
 /// A promotion sweeps the enrollment but never the homework rows; the gates
@@ -16400,7 +16519,7 @@ async fn homework_rows_survive_promotion_but_gates_deny() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "before",
         now + 3_600_000,
@@ -16468,7 +16587,7 @@ async fn homework_blocks_subject_delete_until_retagged() {
     let hw = create_homework(
         &app,
         &w.teacher,
-        &w.course,
+        &w.instance,
         &w.subject,
         "tagged",
         now + 3_600_000,
@@ -16531,7 +16650,7 @@ async fn homework_lists_paginate() {
         create_homework(
             &app,
             &w.teacher,
-            &w.course,
+            &w.instance,
             &w.subject,
             &format!("hw {i}"),
             now + 3_600_000,
@@ -16539,7 +16658,7 @@ async fn homework_lists_paginate() {
         .await;
     }
     for uri in [
-        format!("/courses/{}/homework?limit=2&offset=2", w.course),
+        format!("/instances/{}/homework?limit=2&offset=2", w.instance),
         "/homework?limit=2&offset=2".to_string(),
     ] {
         let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
@@ -16551,16 +16670,37 @@ async fn homework_lists_paginate() {
     }
 }
 
-/// A course carrying students can't be deleted (409) until the roster is
-/// emptied — the cascade would otherwise take the enrollments with it.
+/// A course carrying students can't be deleted (409) until they are detached —
+/// the cascade would otherwise take the membership with it. A club or etüt
+/// carries students on its own member list; a ders carries them through the
+/// şubeler that teach it (see
+/// `deleting_course_cascades_enrollments_exams_and_results`).
 #[tokio::test]
-async fn course_delete_blocks_while_students_are_enrolled() {
+async fn course_delete_blocks_while_students_are_attached() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "cdb_t", "teacher").await;
     let student = login(&app, "cdb_s").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Chemistry").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "Chemistry club", "kind": "club" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/members"),
+        Some(&teacher),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     let res = send(
         &app,
@@ -16581,11 +16721,11 @@ async fn course_delete_blocks_while_students_are_enrolled() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
-    // Empty the roster: the delete goes through.
+    // Detach the member: the delete goes through.
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}/enrollments/{student_id}"),
+        &format!("/courses/{course}/members/{student_id}"),
         Some(&teacher),
         None,
     )
@@ -16613,9 +16753,23 @@ async fn exam_kind_removal_blocks_while_marks_exist() {
     let student = login(&app, "ekd_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "Biology").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Final", "final").await;
+    // The school lists the two kinds this test weighs against each other.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "final", "weight": 1},
+            {"name": "quiz", "weight": 1},
+        ]})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let t = taught_under(&app, &manager, &teacher, "Biology").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "Final", "final").await;
     let res = send(
         &app,
         "POST",
@@ -18472,14 +18626,16 @@ async fn attempt_history_preserves_each_prior_sitting() {
     let student = login(&app, "hist_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "biology").await;
-    let subject = create_subject(&app, &teacher, &course, "cells").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "hist_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "cell quiz", "kind": "yazili",
+                "mode": "open", "max_attempts": 2 }),
     )
     .await;
     let question_body = create_question_body(
@@ -18601,13 +18757,15 @@ async fn grade_of_record_is_latest_but_history_keeps_both() {
     let student = login(&app, "grd_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "grd_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "drill", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "drill", "kind": "yazili",
+                "mode": "open", "max_attempts": 2 }),
     )
     .await;
 
@@ -18702,13 +18860,14 @@ async fn attempt_history_endpoints_are_teacher_walled() {
     let student_id = me_id(&app, &student).await;
     let snooper = login(&app, "wall_o").await;
 
-    let course = create_course(&app, &teacher, "history").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "wall_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "quiz", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "quiz", "kind": "yazili", "mode": "open" }),
     )
     .await;
 
@@ -18734,13 +18893,14 @@ async fn self_review_is_forbidden_until_the_teacher_enables_it() {
     let student = login(&app, "rev_off_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "physics").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "physics_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "physics").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "kinematics", "kind": "quiz", "mode": "open" }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "kinematics", "kind": "yazili", "mode": "open" }),
     )
     .await;
 
@@ -18782,13 +18942,15 @@ async fn self_review_is_not_found_until_a_mark_exists() {
     let student = login(&app, "rev_ungraded_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "chemistry").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "chemistry_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "chemistry").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "moles", "kind": "quiz", "mode": "open", "allow_review": true }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "moles", "kind": "yazili",
+                "mode": "open", "allow_review": true }),
     )
     .await;
 
@@ -18822,14 +18984,15 @@ async fn self_review_of_a_draft_exam_is_not_found() {
     let student = login(&app, "rev_draft_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "geography").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "geography_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "geography").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "maps", "kind": "quiz", "mode": "open",
+            "term": &t.term, "title": "maps", "kind": "yazili", "mode": "open",
             "allow_review": true, "draft": true,
         }),
     )
@@ -18854,15 +19017,16 @@ async fn self_review_returns_own_seqs_and_per_sitting_answers() {
     let student = login(&app, "rev_ok_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "biology").await;
-    let subject = create_subject(&app, &teacher, &course, "cells").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let mudur = login_as(&app, &db, "biology_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "cell quiz", "kind": "quiz", "mode": "open",
+            "term": &t.term, "title": "cell quiz", "kind": "yazili", "mode": "open",
             "max_attempts": 2, "allow_review": true,
         }),
     )
@@ -19013,15 +19177,17 @@ async fn self_review_is_own_scoped_between_students() {
     let bob = login(&app, "rev_iso_b").await;
     let bob_id = me_id(&app, &bob).await;
 
-    let course = create_course(&app, &teacher, "history").await;
-    let subject = create_subject(&app, &teacher, &course, "rome").await;
-    enroll(&app, &teacher, &course, &alice_id).await;
-    enroll(&app, &teacher, &course, &bob_id).await;
+    let mudur = login_as(&app, &db, "history_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "history").await;
+    let subject = create_subject(&app, &teacher, &t.course, "rome").await;
+    enroll(&app, &teacher, &t.instance, &alice_id).await;
+    enroll(&app, &teacher, &t.instance, &bob_id).await;
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "quiz", "kind": "quiz", "mode": "open", "allow_review": true }),
+        &t.instance,
+        json!({ "term": &t.term, "title": "quiz", "kind": "yazili",
+                "mode": "open", "allow_review": true }),
     )
     .await;
     let question_body = create_question_body(
@@ -19106,8 +19272,9 @@ async fn self_review_is_own_scoped_between_students() {
 async fn bank_question_create_get_list_and_instantiate() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bank_t", "teacher").await;
-    let course = create_course(&app, &teacher, "algebra").await;
-    let subject = create_subject(&app, &teacher, &course, "linear").await;
+    let mudur = login_as(&app, &db, "algebra_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let subject = create_subject(&app, &teacher, &t.course, "linear").await;
 
     // Create a template — subject is origin metadata, not held to a course.
     let res = send(
@@ -19164,8 +19331,8 @@ async fn bank_question_create_get_list_and_instantiate() {
     let exam = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "midterm", "kind": "final", "mode": "sync",
+        &t.instance,
+        json!({ "term": &t.term, "title": "midterm", "kind": "yazili", "mode": "sync",
                 "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -19204,9 +19371,10 @@ async fn bank_question_list_pages_filters_and_names() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bank_p", "teacher").await;
     let other = login_as(&app, &db, "bank_p2", "teacher").await;
-    let course = create_course(&app, &teacher, "algebra").await;
-    let subject = create_subject(&app, &teacher, &course, "linear").await;
-    let other_subject = create_subject(&app, &teacher, &course, "quadratic").await;
+    let mudur = login_as(&app, &db, "algebra_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "algebra").await;
+    let subject = create_subject(&app, &teacher, &t.course, "linear").await;
+    let other_subject = create_subject(&app, &teacher, &t.course, "quadratic").await;
 
     // 120 templates — more than the clients' `limit=100`.
     for i in 0..120 {
@@ -19334,9 +19502,10 @@ async fn bank_question_list_filters_by_visibility() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bank_v", "teacher").await;
     let other = login_as(&app, &db, "bank_v2", "teacher").await;
-    let course = create_course(&app, &teacher, "biology").await;
-    let subject = create_subject(&app, &teacher, &course, "cells").await;
-    let other_subject = create_subject(&app, &teacher, &course, "genes").await;
+    let mudur = login_as(&app, &db, "biology_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    let other_subject = create_subject(&app, &teacher, &t.course, "genes").await;
 
     // Mine: 3 drafts on `subject`, 2 published on `other_subject`.
     let mut published = Vec::new();
@@ -19496,8 +19665,9 @@ async fn bank_question_list_filters_by_visibility() {
 async fn bank_question_search_folds_turkish_casing() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bank_tr", "teacher").await;
-    let course = create_course(&app, &teacher, "cografya").await;
-    let subject = create_subject(&app, &teacher, &course, "iller").await;
+    let mudur = login_as(&app, &db, "cografya_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "cografya").await;
+    let subject = create_subject(&app, &teacher, &t.course, "iller").await;
     for text in ["İSTANBUL kaç ilçedir?", "istanbul boğazı nerededir?"] {
         let res = send(
             &app,
@@ -19554,8 +19724,10 @@ async fn bank_question_owner_gate_cross_course_and_freeze() {
     let other = login_as(&app, &db, "bank_x", "teacher").await;
     let admin = login_as(&app, &db, "bank_a", "admin").await;
 
-    let course = create_course(&app, &owner, "geo").await;
-    let subject = create_subject(&app, &owner, &course, "angles").await;
+    let mudur = login_as(&app, &db, "bank_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &owner, "geo").await;
+    let subject = create_subject(&app, &owner, &t.course, "angles").await;
     let res = send(
         &app,
         "POST",
@@ -19618,14 +19790,14 @@ async fn bank_question_owner_gate_cross_course_and_freeze() {
     assert_eq!(res.body["points"], 7);
 
     // Instantiate with a subject from ANOTHER course is a 400.
-    let course2 = create_course(&app, &owner, "chem").await;
-    let subject2 = create_subject(&app, &owner, &course2, "bonds").await;
+    let t2 = taught_under(&app, &mudur, &owner, "chem").await;
+    let subject2 = create_subject(&app, &owner, &t2.course, "bonds").await;
     let now = Timestamp::now().as_millis();
     let exam = scheduled_exam(
         &app,
         &owner,
-        &course,
-        json!({ "title": "t", "kind": "final", "mode": "sync",
+        &t.instance,
+        json!({ "term": &t.term, "title": "t", "kind": "final", "mode": "sync",
                 "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -19642,7 +19814,7 @@ async fn bank_question_owner_gate_cross_course_and_freeze() {
     // Once a student sits the exam, instantiate freezes (409).
     let student = login(&app, "sinem").await;
     let student_id = me_id(&app, &student).await;
-    enroll(&app, &owner, &course, &student_id).await;
+    enroll(&app, &owner, &t.instance, &student_id).await;
     let res = send(
         &app,
         "POST",
@@ -19675,8 +19847,10 @@ async fn bank_private_template_is_invisible_until_published() {
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "bvis_o", "teacher").await;
     let other = login_as(&app, &db, "bvis_x", "teacher").await;
-    let course = create_course(&app, &owner, "bio").await;
-    let subject = create_subject(&app, &owner, &course, "cells").await;
+    let mudur = login_as(&app, &db, "bvis_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &owner, "bio").await;
+    let subject = create_subject(&app, &owner, &t.course, "cells").await;
 
     // Two templates; only the second is ever published.
     let res = send(
@@ -19725,9 +19899,9 @@ async fn bank_private_template_is_invisible_until_published() {
     assert_eq!(status, StatusCode::CREATED);
 
     // The other teacher's own exam, to attempt an instantiate from.
-    let course2 = create_course(&app, &other, "bio2").await;
-    let subject2 = create_subject(&app, &other, &course2, "cells2").await;
-    let exam2 = create_exam(&app, &other, &course2, "quiz", "final").await;
+    let t2 = taught_under(&app, &mudur, &other, "bio2").await;
+    let subject2 = create_subject(&app, &other, &t2.course, "cells2").await;
+    let exam2 = create_exam(&app, &other, &t2.instance, &t2.term, "quiz", "final").await;
     let owner_id = me_id(&app, &owner).await;
 
     // --- the stranger sees nothing, and is told nothing ---
@@ -19819,7 +19993,7 @@ async fn bank_private_template_is_invisible_until_published() {
     )
     .await;
     assert_eq!((status, bytes.as_slice()), (StatusCode::OK, pic));
-    let exam = create_exam(&app, &owner, &course, "midterm", "final").await;
+    let exam = create_exam(&app, &owner, &t.instance, &t.term, "midterm", "final").await;
     let res = send(
         &app,
         "POST",
@@ -19919,8 +20093,9 @@ async fn bank_private_template_is_visible_to_admins() {
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "badm_o", "teacher").await;
     let admin = login_as(&app, &db, "badm_a", "admin").await;
-    let course = create_course(&app, &owner, "hist").await;
-    let subject = create_subject(&app, &owner, &course, "ottoman").await;
+    let mudur = login_as(&app, &db, "hist_m", "manager").await;
+    let t = taught_under(&app, &mudur, &owner, "hist").await;
+    let subject = create_subject(&app, &owner, &t.course, "ottoman").await;
     let res = send(
         &app,
         "POST",
@@ -19948,9 +20123,11 @@ async fn bank_private_template_is_visible_to_admins() {
 async fn exam_question_saves_to_bank() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "s2b_t", "teacher").await;
-    let course = create_course(&app, &teacher, "phys").await;
-    let subject = create_subject(&app, &teacher, &course, "kinematics").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let mudur = login_as(&app, &db, "phys_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "phys").await;
+    let subject = create_subject(&app, &teacher, &t.course, "kinematics").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -19997,8 +20174,10 @@ async fn exam_question_saves_to_bank() {
 async fn bank_instantiate_copies_images() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bimg_t", "teacher").await;
-    let course = create_course(&app, &teacher, "geo1").await;
-    let subject = create_subject(&app, &teacher, &course, "maps1").await;
+    let mudur = login_as(&app, &db, "geo1_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "geo1").await;
+    let subject = create_subject(&app, &teacher, &t.course, "maps1").await;
 
     // A choice template with an illustration and one option picture.
     let res = send(
@@ -20038,7 +20217,7 @@ async fn bank_instantiate_copies_images() {
     assert_eq!(src_bank_keys.len(), 2);
 
     // Instantiate into an exam.
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let res = send(
         &app,
         "POST",
@@ -20120,9 +20299,11 @@ async fn bank_instantiate_copies_images() {
 async fn bank_save_copies_images() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "simg_t", "teacher").await;
-    let course = create_course(&app, &teacher, "phys1").await;
-    let subject = create_subject(&app, &teacher, &course, "kin1").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let mudur = login_as(&app, &db, "phys1_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "phys1").await;
+    let subject = create_subject(&app, &teacher, &t.course, "kin1").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
     let qid_body = create_question_body(
         &app,
         &teacher,
@@ -20226,9 +20407,11 @@ async fn bank_save_copies_images() {
 async fn bank_round_trip_preserves_image_bytes() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "rt_t", "teacher").await;
-    let course = create_course(&app, &teacher, "hist1").await;
-    let subject = create_subject(&app, &teacher, &course, "eras1").await;
-    let exam1 = create_exam(&app, &teacher, &course, "e1", "final").await;
+    let mudur = login_as(&app, &db, "hist1_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "hist1").await;
+    let subject = create_subject(&app, &teacher, &t.course, "eras1").await;
+    let exam1 = create_exam(&app, &teacher, &t.instance, &t.term, "e1", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -20261,7 +20444,7 @@ async fn bank_round_trip_preserves_image_bytes() {
     let bid = id_of(&res.body);
 
     // Hop two: bank -> a second exam.
-    let exam2 = create_exam(&app, &teacher, &course, "e2", "final").await;
+    let exam2 = create_exam(&app, &teacher, &t.instance, &t.term, "e2", "final").await;
     let res = send(
         &app,
         "POST",
@@ -20293,8 +20476,10 @@ async fn bank_round_trip_preserves_image_bytes() {
 async fn bank_instantiate_rolls_back_on_missing_source_blob() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "rb_t", "teacher").await;
-    let course = create_course(&app, &teacher, "geo2").await;
-    let subject = create_subject(&app, &teacher, &course, "maps2").await;
+    let mudur = login_as(&app, &db, "geo2_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "geo2").await;
+    let subject = create_subject(&app, &teacher, &t.course, "maps2").await;
 
     // Two images so the copy loop has multiple steps.
     let res = send(
@@ -20335,7 +20520,7 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
         .await
         .unwrap();
 
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let res = send(
         &app,
         "POST",
@@ -20399,8 +20584,9 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
 async fn bank_rejects_unknown_subject() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bsub_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bsub_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bsub_s").await;
+    let mudur = login_as(&app, &db, "bsub_c_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "bsub_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bsub_s").await;
 
     // Create with a bogus subject id — 400, not a stored row.
     let res = send(
@@ -20444,9 +20630,10 @@ async fn subject_delete_clears_the_bank_templates_subject() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bdel_t", "teacher").await;
     let manager = login_as(&app, &db, "bdel_m", "manager").await;
-    let course = create_course(&app, &teacher, "bdel_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bdel_s").await;
-    let other = create_subject(&app, &teacher, &course, "bdel_s2").await;
+    let mudur = login_as(&app, &db, "bdel_c_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "bdel_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bdel_s").await;
+    let other = create_subject(&app, &teacher, &t.course, "bdel_s2").await;
 
     let mut ids = Vec::new();
     for subject_id in [&subject, &other] {
@@ -20526,8 +20713,9 @@ async fn bank_owner_filter() {
     let (app, db) = app_and_db().await;
     let alice = login_as(&app, &db, "bown_a", "teacher").await;
     let bob = login_as(&app, &db, "bown_b", "teacher").await;
-    let course = create_course(&app, &alice, "bown_c").await;
-    let subject = create_subject(&app, &alice, &course, "bown_s").await;
+    let mudur = login_as(&app, &db, "bown_c_m", "manager").await;
+    let t = taught_under(&app, &mudur, &alice, "bown_c").await;
+    let subject = create_subject(&app, &alice, &t.course, "bown_s").await;
 
     for who in [&alice, &bob] {
         let res = send(
@@ -20583,8 +20771,9 @@ async fn bank_owner_filter() {
 async fn bank_response_carries_image_metas() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bmeta_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bmeta_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bmeta_s").await;
+    let mudur = login_as(&app, &db, "bmeta_c_m", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "bmeta_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bmeta_s").await;
     let res = send(
         &app,
         "POST",
@@ -20656,8 +20845,10 @@ async fn bank_response_carries_image_metas() {
 async fn bank_provenance_both_directions() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bprov_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bprov_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bprov_s").await;
+    let mudur = login_as(&app, &db, "bprov_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bprov_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bprov_s").await;
 
     // Bank -> exam: from_bank is the template id, banked_as stays null.
     let res = send(
@@ -20669,7 +20860,7 @@ async fn bank_provenance_both_directions() {
     )
     .await;
     let bid = id_of(&res.body);
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let res = send(
         &app,
         "POST",
@@ -20752,9 +20943,11 @@ async fn bank_provenance_both_directions() {
 async fn to_bank_links_the_question_at_the_new_template() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bback_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bback_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bback_s").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let mudur = login_as(&app, &db, "bback_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bback_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bback_s").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -20838,9 +21031,11 @@ async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
 
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bclob_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bclob_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bclob_s").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let mudur = login_as(&app, &db, "bclob_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bclob_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bclob_s").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -20912,9 +21107,11 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
 
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bpatch_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bpatch_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bpatch_s").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let mudur = login_as(&app, &db, "bpatch_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bpatch_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bpatch_s").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -20995,9 +21192,11 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
 async fn deleting_a_template_clears_both_question_links() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bdang_t", "teacher").await;
-    let course = create_course(&app, &teacher, "bdang_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bdang_s").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let mudur = login_as(&app, &db, "bdang_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bdang_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bdang_s").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
 
     // Question A: authored here, then saved to the bank -> banked_as = saved.
     let authored = create_question(
@@ -21099,9 +21298,11 @@ async fn deleting_a_template_clears_both_question_links() {
 async fn deleting_an_exam_clears_the_templates_source_exam() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "edang_t", "teacher").await;
-    let course = create_course(&app, &teacher, "edang_c").await;
-    let subject = create_subject(&app, &teacher, &course, "edang_s").await;
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let mudur = login_as(&app, &db, "edang_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "edang_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "edang_s").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let qid = create_question(
         &app,
         &teacher,
@@ -21154,8 +21355,10 @@ async fn deleting_an_exam_clears_the_templates_source_exam() {
 async fn bank_list_counts_the_copies_made_from_each_template() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "buse_t", "teacher").await;
-    let course = create_course(&app, &teacher, "buse_c").await;
-    let subject = create_subject(&app, &teacher, &course, "buse_s").await;
+    let mudur = login_as(&app, &db, "buse_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "buse_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "buse_s").await;
 
     let template = |text: &'static str| {
         send(
@@ -21172,7 +21375,7 @@ async fn bank_list_counts_the_copies_made_from_each_template() {
     // Two exams, three copies: twice out of `used` in one exam, once in the other.
     let mut exams = Vec::new();
     for title in ["one", "two"] {
-        exams.push(create_exam(&app, &teacher, &course, title, "final").await);
+        exams.push(create_exam(&app, &teacher, &t.instance, &t.term, title, "final").await);
     }
     for (exam, times) in [(&exams[0], 2), (&exams[1], 1)] {
         for _ in 0..times {
@@ -21273,8 +21476,10 @@ async fn refreshing_a_question_recopies_its_template() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bref_t", "teacher").await;
     let manager = login_as(&app, &db, "bref_m", "manager").await;
-    let course = create_course(&app, &teacher, "bref_c").await;
-    let subject = create_subject(&app, &teacher, &course, "bref_s").await;
+    let mudur = login_as(&app, &db, "bref_c_m", "manager").await;
+    scheduling_kinds(&app, &mudur).await;
+    let t = taught_under(&app, &mudur, &teacher, "bref_c").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bref_s").await;
 
     // A template with an illustration and a picture on its first option.
     let res = send(
@@ -21310,7 +21515,7 @@ async fn refreshing_a_question_recopies_its_template() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "final").await;
     let res = send(
         &app,
         "POST",
@@ -21446,8 +21651,8 @@ async fn refreshing_a_question_recopies_its_template() {
     let live = scheduled_exam(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "live", "kind": "final", "mode": "sync",
+        &t.instance,
+        json!({ "term": &t.term, "title": "live", "kind": "final", "mode": "sync",
                 "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -21463,7 +21668,7 @@ async fn refreshing_a_question_recopies_its_template() {
     let live_qid = id_of(&res.body);
     let student = login(&app, "bref_s").await;
     let student_id = me_id(&app, &student).await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = send(
         &app,
         "POST",
@@ -21519,35 +21724,33 @@ async fn refreshing_a_question_recopies_its_template() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
 
-/// A course PATCH is a field-scoped write. The handler reads the course, then
-/// awaits a term lookup before saving, holding nothing over the course row
-/// itself — so a manager's teacher assignment can land in that window. A
-/// whole-row save from the stale struct would silently revert the staffing.
+/// A course PATCH is a field-scoped write: the handler reads the course, then
+/// saves only the fields the request actually carried, holding nothing over
+/// the row — so a second PATCH of another field can land in that window. A
+/// whole-row save from the stale struct would silently revert it.
 /// Driven at the domain level: HTTP offers no way to interleave inside the
 /// handler.
 #[tokio::test]
-async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
+async fn a_course_patch_does_not_clobber_a_concurrent_edit() {
     use hezarfen_backend::db::course;
-    use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
+    use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseTitle};
 
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "cclob_o", "teacher").await;
-    let helper = login_as(&app, &db, "cclob_h", "teacher").await;
     let boss = login_as(&app, &db, "cclob_m", "manager").await;
-    let helper_id = me_id(&app, &helper).await;
     let course = create_course(&app, &owner, "cclob_c").await;
 
-    // The handler's read, then the assignment lands mid-window.
+    // The handler's read, then the other field's PATCH lands mid-window.
     let stale = course::read(&db, &CourseId::from_key(&course))
         .await
         .unwrap()
         .expect("course exists");
     let res = send(
         &app,
-        "POST",
-        &format!("/courses/{course}/teachers"),
+        "PATCH",
+        &format!("/courses/{course}"),
         Some(&boss),
-        Some(json!({ "user_id": helper_id })),
+        Some(json!({ "kind": "study" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -21557,19 +21760,17 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
         stale,
         Some(CourseTitle::try_new("renamed").unwrap()),
         Some(CourseDescription::try_new("").unwrap()),
-        Some(CourseKind::course()),
-        None,
         None,
     )
     .await
     .expect("update written");
     assert_eq!(
-        updated.get_teachers().len(),
-        1,
-        "the assignment was reverted"
+        updated.get_kind().as_str(),
+        "study",
+        "the concurrent kind change was reverted"
     );
 
-    // The rename landed and the assigned teacher stayed assigned.
+    // The rename landed and the kind change stayed.
     let res = send(
         &app,
         "GET",
@@ -21579,77 +21780,91 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
     )
     .await;
     assert_eq!(res.body["title"], "renamed");
-    assert_eq!(res.body["teachers"][0]["username"], "cclob_h");
+    assert_eq!(res.body["kind"], "study");
 }
 
-/// The mirror image: staffing writes only `teachers`. `assign_teacher` reads
-/// the course, then awaits the target user's row (a role check) before saving,
-/// so a course PATCH can land in between — and a whole-row save would revert
-/// the rename. `unassign_teacher` gets the same field-scoped treatment.
+/// The mirror image: staffing writes only the junction row. `assign_teacher`
+/// reads the actor and the target user before writing, so an instance PATCH can
+/// land in between — and a whole-row save would revert it. `unassign_teacher`
+/// gets the same field-scoped treatment.
 #[tokio::test]
-async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
-    use hezarfen_backend::db::course;
-    use hezarfen_backend::domain::course::CourseId;
+async fn staffing_an_instance_does_not_clobber_a_concurrent_edit() {
+    use hezarfen_backend::domain::class_course::ClassCourseId;
+    use hezarfen_backend::service::class_course;
 
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "cstaff_o", "teacher").await;
     let helper = login_as(&app, &db, "cstaff_h", "teacher").await;
+    let boss = login_as(&app, &db, "cstaff_m", "manager").await;
     let helper_id = me_id(&app, &helper).await;
-    let course = create_course(&app, &owner, "cstaff_c").await;
+    let boss_id = me_id(&app, &boss).await;
+    let t = taught_under(&app, &boss, &owner, "cstaff_c").await;
 
-    // The handler's read, then someone else's edit lands mid-window.
-    let stale = course::read(&db, &CourseId::from_key(&course))
+    // The staffing's read, then the policy write lands mid-window.
+    let stale = class_course::read(&db, &ClassCourseId::from_key(&t.instance))
         .await
         .unwrap()
-        .expect("course exists");
+        .expect("instance exists");
     let res = send(
         &app,
         "PATCH",
-        &format!("/courses/{course}"),
+        &format!("/instances/{}", t.instance),
         Some(&owner),
-        Some(json!({ "title": "edited by someone else", "capacity": 9 })),
+        Some(json!({ "ders_saati": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    let assigned = course::assign_teacher(&db, stale, &UserId::from_key(&helper_id))
-        .await
-        .expect("assignment written");
-    assert_eq!(assigned.get_title().as_str(), "edited by someone else");
-    assert_eq!(assigned.get_capacity(), Some(9));
-    assert_eq!(assigned.get_teachers().len(), 1);
-
-    // Unassigning from a struct read before another edit is just as safe.
-    let stale = course::read(&db, &CourseId::from_key(&course))
-        .await
-        .unwrap()
-        .expect("course exists");
-    let res = send(
-        &app,
-        "PATCH",
-        &format!("/courses/{course}"),
-        Some(&owner),
-        Some(json!({ "title": "edited again" })),
+    class_course::assign_teacher(
+        &db,
+        stale.get_id(),
+        &UserId::from_key(&helper_id),
+        &UserId::from_key(&boss_id),
     )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let dropped = course::unassign_teacher(&db, stale, &UserId::from_key(&helper_id))
-        .await
-        .expect("unassignment written")
-        .expect("teacher was assigned");
-    assert_eq!(dropped.get_title().as_str(), "edited again");
-    assert!(dropped.get_teachers().is_empty());
+    .await
+    .expect("assignment written");
 
+    // The policy write survives and the teacher is assigned.
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}"),
+        &format!("/instances/{}", t.instance),
         Some(&owner),
         None,
     )
     .await;
-    assert_eq!(res.body["title"], "edited again");
-    assert_eq!(res.body["capacity"], 9);
+    assert_eq!(res.body["ders_saati"], 9);
+    assert_eq!(res.body["teachers"][0]["username"], "cstaff_h");
+
+    // Unassigning from a read taken before another policy write is just as safe.
+    let stale = class_course::read(&db, &ClassCourseId::from_key(&t.instance))
+        .await
+        .unwrap()
+        .expect("instance exists");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/instances/{}", t.instance),
+        Some(&owner),
+        Some(json!({ "counts_toward_karne": false })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let removed =
+        class_course::unassign_teacher(&db, stale.get_id(), &UserId::from_key(&helper_id))
+            .await
+            .expect("unassignment written");
+    assert!(removed, "the teacher was assigned");
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/instances/{}", t.instance),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["counts_toward_karne"], false);
     assert_eq!(res.body["teachers"].as_array().unwrap().len(), 0);
 }
 
@@ -21752,39 +21967,48 @@ async fn exams_schedule_window_applies_after_visibility_and_drafts() {
     let ayse = login_as(&app, &db, "ayse", "student").await;
     let now = Timestamp::now().as_millis();
 
-    let course = create_course(&app, &ali, "math").await;
-    let other = create_course(&app, &ali, "hidden").await;
-    enroll(&app, &ali, &course, &me_id(&app, &ayse).await).await;
+    let mudur = login_as(&app, &db, "win_m", "manager").await;
+    let math = taught_under(&app, &mudur, &ali, "math").await;
+    let other = taught_under(&app, &mudur, &ali, "hidden").await;
+    // The student's visibility is their şube: being on the section's roster is
+    // what puts them in the instance it teaches.
+    let ayse_id = me_id(&app, &ayse).await;
+    add_member(&app, &mudur, &math.class, &ayse_id).await;
 
-    // Windowed exams in the student's course, plus a draft, an open-mode exam
-    // (no window at all), and one in a course they cannot see.
-    for (course, body) in [
+    // Windowed exams in the student's instance, plus a draft, an open-mode exam
+    // (no window at all), and one in an instance they cannot see.
+    for (instance, body) in [
         (
-            &course,
-            json!({ "title": "soon", "kind": "quiz", "mode": "sync",
+            &math.instance,
+            json!({ "term": &math.term, "title": "soon", "kind": "yazili",
+                          "mode": "sync",
                           "starts_at": now + 600_000, "ends_at": now + 900_000 }),
         ),
         (
-            &course,
-            json!({ "title": "late", "kind": "quiz", "mode": "sync",
+            &math.instance,
+            json!({ "term": &math.term, "title": "late", "kind": "yazili",
+                          "mode": "sync",
                           "starts_at": now + 1_800_000, "ends_at": now + 2_400_000 }),
         ),
         (
-            &course,
-            json!({ "title": "draft", "kind": "quiz", "mode": "sync", "draft": true,
+            &math.instance,
+            json!({ "term": &math.term, "title": "draft", "kind": "yazili",
+                          "mode": "sync", "draft": true,
                           "starts_at": now + 60_000, "ends_at": now + 120_000 }),
         ),
         (
-            &course,
-            json!({ "title": "open", "kind": "quiz", "mode": "open" }),
+            &math.instance,
+            json!({ "term": &math.term, "title": "open", "kind": "yazili",
+                          "mode": "open" }),
         ),
         (
-            &other,
-            json!({ "title": "unseen", "kind": "quiz", "mode": "sync",
-                         "starts_at": now + 60_000, "ends_at": now + 120_000 }),
+            &other.instance,
+            json!({ "term": &other.term, "title": "unseen", "kind": "yazili",
+                         "mode": "sync",
+                         "starts_at": now + 90_000, "ends_at": now + 150_000 }),
         ),
     ] {
-        let res = create_exam_with(&app, &ali, course, body).await;
+        let res = create_exam_with(&app, &ali, instance, body).await;
         assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
     }
 
@@ -26268,7 +26492,7 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&other),
         Some(attach.clone()),
     )
@@ -26281,28 +26505,32 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         Some(attach.clone()),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
+    let instance = id_of(&res.body);
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         Some(attach),
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "a second attach is a 409");
 
-    // The membership is a real enrollment: it shows up on the course roster.
+    // The attach minted the instance, and it is what the seats are on now: the
+    // membership is a real enrollment, so it shows up on the pair's roster.
+    // (The pairing is the office's — a teacher attached to nothing here holds
+    // no rights over the instance itself.)
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
-        Some(&teacher),
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
         None,
     )
     .await;
@@ -26327,7 +26555,7 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
         send(
             &app,
             "DELETE",
-            &format!("/classes/{class}/courses/{course}"),
+            &format!("/classes/{class}/instances/{instance}"),
             Some(&manager),
             None,
         )
@@ -26360,16 +26588,28 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
         StatusCode::NO_CONTENT,
         "empty on both axes, it goes"
     );
-    // And the pumped enrollment left with the detach.
+    // And the pumped enrollment left with the detach: the instance is gone from
+    // the catalog's own count, and the student who is still on the class roster
+    // has no instance left to sit.
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/courses/{course}"),
         Some(&teacher),
         None,
     )
     .await;
-    assert_eq!(common::total(&res.body), 0);
+    assert_eq!(
+        res.body["class_course_count"], 0,
+        "the detached instance is not the catalog's any more: {}",
+        res.body
+    );
+    let res = send(&app, "GET", "/instances/me", Some(&student), None).await;
+    assert_eq!(
+        common::total(&res.body),
+        0,
+        "a seat on a detached instance left with it"
+    );
     assert_eq!(
         send(
             &app,
@@ -26426,7 +26666,7 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
             "/classes".to_string(),
             format!("/classes/{class}"),
             format!("/classes/{class}/members"),
-            format!("/classes/{class}/courses"),
+            format!("/classes/{class}/instances"),
         ] {
             let res = send(&app, "GET", &uri, Some(cookie), None).await;
             assert_eq!(res.status, StatusCode::FORBIDDEN, "GET {uri} for {who}");
@@ -26444,7 +26684,7 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
         let res = send(
             &app,
             "POST",
-            &format!("/classes/{class}/courses"),
+            &format!("/classes/{class}/instances"),
             Some(cookie),
             Some(json!({ "course_id": course })),
         )
@@ -26457,17 +26697,19 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": course })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    // Stored, not merely answered: the link is on the class and the roster moved.
+    let instance = id_of(&res.body);
+    // Stored, not merely answered: the instance is on the class and the roster
+    // moved with it.
     let res = send(
         &app,
         "GET",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         None,
     )
@@ -26477,8 +26719,8 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
-        Some(&teacher),
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
         None,
     )
     .await;
@@ -26513,12 +26755,13 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         Some(json!({ "course_id": course })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let instance = id_of(&res.body);
     let res = send(
         &app,
         "POST",
@@ -26531,8 +26774,8 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
-        Some(&teacher),
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
         None,
     )
     .await;
@@ -26561,12 +26804,12 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
-        Some(&teacher),
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
         None,
     )
     .await;
-    assert_eq!(common::total(&res.body), 0, "and so did the course");
+    assert_eq!(common::total(&res.body), 0, "and so did the instance");
 
     // Both tables and both counters, read off the store itself.
     let count = |sql: &'static str| {
@@ -26578,10 +26821,17 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
                 .expect("read the swept state")
         }
     };
+    // A leave is a *stint*: the row stays, the live stint does not — and the
+    // counter counts live stints, which is what the class's guard reads.
+    assert_eq!(
+        count("SELECT count(*) FROM class_member WHERE left_at IS NULL").await,
+        0,
+        "no live stint may outlive the demotion"
+    );
     assert_eq!(
         count("SELECT count(*) FROM class_member").await,
-        0,
-        "the membership row is deleted, not merely filtered out"
+        1,
+        "…while the history row the section keeps is still there"
     );
     assert_eq!(
         count("SELECT count(*) FROM enrollment").await,
@@ -26593,11 +26843,13 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
         .await
         .expect("read the swept state");
     assert_eq!(class_members, 0, "the class counter came back");
-    let enrolled: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course")
-        .fetch_one(&db)
-        .await
-        .expect("read the swept state");
-    assert_eq!(enrolled, 0, "the course counter came back");
+    let enrolled: i64 =
+        sqlx::query_scalar("SELECT enrollment_count FROM class_course WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&instance).unwrap())
+            .fetch_one(&db)
+            .await
+            .expect("read the swept state");
+    assert_eq!(enrolled, 0, "the instance counter came back");
 
     // The bite: a membership left behind (or a counter never released) makes
     // the class undeletable forever.
@@ -26605,7 +26857,7 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
         send(
             &app,
             "DELETE",
-            &format!("/classes/{class}/courses/{course}"),
+            &format!("/classes/{class}/instances/{instance}"),
             Some(&teacher),
             None,
         )
@@ -26624,44 +26876,46 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }
 
-/// A class files itself under a term exactly as a course does, so the term's
-/// delete guard has to count classes too — otherwise deleting the calendar
-/// entry would leave the class pointing at nothing.
+/// A class files itself under an **academic year** — the same calendar a course
+/// no longer carries — so the year's delete guard has to count classes too:
+/// otherwise deleting the calendar entry would leave the class pointing at
+/// nothing. (It was the dönem's guard until the class became the academic
+/// anchor; the guard moved up with it.)
 #[tokio::test]
-async fn a_term_a_class_points_at_refuses_to_delete() {
+async fn a_year_a_class_points_at_refuses_to_delete() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
 
     let res = send(
         &app,
         "POST",
-        "/terms",
+        "/academic-years",
         Some(&manager),
         Some(json!({
-            "name": "2025 Fall",
+            "name": "2025-2026",
             "starts_at": 1_600_000_000_000_i64,
             "ends_at": 1_610_000_000_000_i64,
         })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let term = id_of(&res.body);
+    let year = id_of(&res.body);
     let res = send(
         &app,
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "term_id": term })),
+        Some(json!({ "name": "9-A", "year": year })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    assert_eq!(res.body["class"]["term"].as_str(), Some(term.as_str()));
+    assert_eq!(res.body["class"]["year"].as_str(), Some(year.as_str()));
     let class = id_of(&res.body["class"]);
 
     let res = send(
         &app,
         "DELETE",
-        &format!("/terms/{term}"),
+        &format!("/academic-years/{year}"),
         Some(&manager),
         None,
     )
@@ -26680,21 +26934,21 @@ async fn a_term_a_class_points_at_refuses_to_delete() {
         "PATCH",
         &format!("/classes/{class}"),
         Some(&manager),
-        Some(json!({ "term_id": null })),
+        Some(json!({ "year": null })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(res.body["term"].is_null());
+    assert!(res.body["year"].is_null());
     let res = send(
         &app,
         "DELETE",
-        &format!("/terms/{term}"),
+        &format!("/academic-years/{year}"),
         Some(&manager),
         None,
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
-    // And the class outlives the term it was filed under.
+    // And the class outlives the year it was filed under.
     assert_eq!(
         send(
             &app,
@@ -26709,35 +26963,28 @@ async fn a_term_a_class_points_at_refuses_to_delete() {
     );
 }
 
-/// All-or-nothing where a client can see it: a course with one free seat and a
-/// class of two takes *neither* of them. The 409 names the course so a manager
-/// knows whose capacity to raise, and — the half only stored state can show —
-/// the seats spent on the way to that refusal are all given back.
+/// All-or-nothing where a client can see it: a class already standing above
+/// `MAX_CLASS_MEMBERS` takes *no* new instance, because attaching one writes an
+/// enrollment per member in a single transaction. The 409 names the axis it is
+/// over, and — the half only stored state can show — nothing is left behind:
+/// no instance, no enrollment, no counter ticked.
+///
+/// This is the same all-or-nothing subject the file used to pin on a course's
+/// `capacity` (a class of two with one free seat took neither); capacity is gone
+/// from the model, so the ceiling that still bounds the write is the one the
+/// class itself carries. The counter is seeded rather than filled by
+/// `MAX_CLASS_MEMBERS` real adds: it *is* what the attach reads.
 #[tokio::test]
-async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
+async fn an_attach_that_cannot_seat_the_whole_class_seats_none_of_it() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let teacher = login_as(&app, &db, "tch", "teacher").await;
-    let hand = login(&app, "hand").await;
     let ali = login(&app, "ali").await;
     let veli = login(&app, "veli").await;
-    let hand_id = me_id(&app, &hand).await;
     let ali_id = me_id(&app, &ali).await;
     let veli_id = me_id(&app, &veli).await;
 
-    // Two seats, one of them already spent by hand: the class of two needs two.
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&teacher),
-        Some(json!({ "title": "small", "capacity": 2 })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    enroll(&app, &teacher, &course, &hand_id).await;
-
+    let course = create_course(&app, &teacher, "small").await;
     let res = send(
         &app,
         "POST",
@@ -26760,88 +27007,86 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     }
 
+    // A volume that grew past the ceiling (the shape a real school's section
+    // arrives in): the attach of two seats must refuse *before* the loop runs.
+    let seed = |count: i64| {
+        let db = &db;
+        let class = uuid::Uuid::parse_str(&class).unwrap();
+        async move {
+            sqlx::query("UPDATE class_group SET class_member_count = $1 WHERE id = $2")
+                .bind(count)
+                .bind(class)
+                .execute(db)
+                .await
+                .expect("seed the roster counter")
+        }
+    };
+    seed(MAX_CLASS_MEMBERS + 1).await;
+
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         Some(json!({ "course_id": course })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
-    let message = res.body["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(&course),
-        "the refusal must name the full course: {message}"
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a section over its ceiling attaches nothing: {}",
+        res.body
     );
+    assert_eq!(res.body["code"], "class_roster_too_large", "{}", res.body);
 
-    // Nothing at all was written: not the seat that did fit, not the link.
+    // Nothing on any of the three ends: no instance, no enrollment, no tick.
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         None,
     )
     .await;
-    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+    assert_eq!(common::total(&res.body), 0, "no instance was minted");
+    let enrolled: i64 = sqlx::query_scalar("SELECT count(*) FROM enrollment")
+        .fetch_one(&db)
+        .await
+        .expect("read the stored roster");
     assert_eq!(
-        common::items(&res.body)[0]["user"]["id"],
-        hand_id,
-        "only the hand-placed row survives"
+        enrolled, 0,
+        "and no seat was written on the way to the refusal"
     );
-    let res = send(
-        &app,
-        "GET",
-        &format!("/classes/{class}/courses"),
-        Some(&teacher),
-        None,
-    )
-    .await;
-    assert_eq!(common::total(&res.body), 0);
-    assert!(common::items(&res.body).is_empty(), "no link row");
-    let enrolled: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course")
-        .fetch_one(&db)
-        .await
-        .expect("read the refused state");
-    assert_eq!(enrolled, 1, "the counter must not have moved");
-    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM class_course")
-        .fetch_one(&db)
-        .await
-        .expect("read the refused state");
-    assert_eq!(links, 0, "no class_course row was written");
+    let counted: i64 =
+        sqlx::query_scalar("SELECT class_course_count FROM class_group WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&class).unwrap())
+            .fetch_one(&db)
+            .await
+            .expect("read the class counter");
+    assert_eq!(counted, 0, "nor ticked the axis it was refused on");
 
-    // It really was a seat shortfall: a class of one fits, and lands.
-    assert_eq!(
-        send(
-            &app,
-            "DELETE",
-            &format!("/classes/{class}/members/{veli_id}"),
-            Some(&manager),
-            None,
-        )
-        .await
-        .status,
-        StatusCode::NO_CONTENT
-    );
+    // Back under the ceiling, the very same attach goes through — and it seats
+    // the whole roster, which is the other half of all-or-nothing.
+    seed(2).await;
     let res = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&teacher),
         Some(json!({ "course_id": course })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let instance = id_of(&res.body);
     let res = send(
         &app,
         "GET",
-        &format!("/courses/{course}/enrollments"),
-        Some(&teacher),
+        &format!("/instances/{instance}/enrollments"),
+        Some(&manager),
         None,
     )
     .await;
-    assert_eq!(common::total(&res.body), 2, "{}", res.body);
+    assert_eq!(common::total(&res.body), 2, "both members, in one go");
 }
 
 // --- course notes: authz matrix over HTTP -----------------------------------
@@ -26865,40 +27110,59 @@ async fn create_course_note(app: &axum::Router, cookie: &str, course: &str, titl
     id_of(&res.body)
 }
 
-/// (a) an assigned (not creating) teacher writes a note+file on their course;
-/// an enrolled student reads it end to end — list, get, file list, download —
-/// with byte-identical bytes and the right `Content-Disposition`.
-/// (d) the course *creator*, who was never added to the assigned-teacher
-/// list, still manages it (update + delete).
+/// (a) the course's *creator* writes a note+file on it, while a teacher merely
+/// assigned to an instance of that course is refused the same write — the
+/// assignment gives them the instance, never the catalog row; an enrolled
+/// student reads it end to end — list, get, file list, download — with
+/// byte-identical bytes and the right `Content-Disposition`.
+/// (d) the creator manages what it wrote (update + delete).
 #[tokio::test]
-async fn course_note_assigned_teacher_and_creator_manage_enrolled_student_reads() {
+async fn course_note_creator_writes_assigned_teacher_refused_and_enrolled_student_reads() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "boss", "manager").await;
     let creator = login_as(&app, &db, "creator_teacher", "teacher").await;
     let assigned = login_as(&app, &db, "assigned_teacher", "teacher").await;
     let student = login_as(&app, &db, "stu", "student").await;
 
-    let course = create_course(&app, &creator, "algebra").await;
+    let t = taught_under(&app, &manager, &creator, "algebra").await;
+    let course = t.course;
     let assigned_id = me_id(&app, &assigned).await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/teachers"),
+        &format!("/instances/{}/teachers", t.instance),
         Some(&manager),
         Some(json!({ "user_id": assigned_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    let student_id = me_id(&app, &student).await;
-    enroll(&app, &creator, &course, &student_id).await;
+    // The assignment is real, and still does not reach the catalog row: the
+    // course note is the creator's (or a manager's) to write.
+    let res = send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&assigned),
+        Some(json!({ "course": course, "title": "not mine", "content": "body" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "an instance's teacher keeps no catalog rights: {}",
+        res.body
+    );
 
-    // (a) assigned teacher writes note + file.
-    let note = create_course_note(&app, &assigned, &course, "recap").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &creator, &t.instance, &student_id).await;
+
+    // (a) the creator writes note + file.
+    let note = create_course_note(&app, &creator, &course, "recap").await;
     let bytes = b"%PDF-1.4 fake";
     let up = upload_course_note_file(
         &app,
-        &assigned,
+        &creator,
         &note,
         "recap.pdf",
         "application/pdf",
@@ -26959,7 +27223,7 @@ async fn course_note_assigned_teacher_and_creator_manage_enrolled_student_reads(
         "attachment; filename=\"recap.pdf\"; filename*=UTF-8''recap.pdf"
     );
 
-    // (d) the creator, never assigned, still manages: update then delete.
+    // (d) the creator manages its own note as well: update then delete.
     let upd = send(
         &app,
         "PATCH",
@@ -27460,9 +27724,11 @@ async fn course_note_rag_outputs_read_and_delete() {
     let student = login_as(&app, &db, "rag_student", "student").await;
     let stranger = login_as(&app, &db, "rag_stranger", "student").await;
 
-    let course = create_course(&app, &creator, "chemistry").await;
+    let mudur = login_as(&app, &db, "rag_mgr", "manager").await;
+    let t = taught_under(&app, &mudur, &creator, "chemistry").await;
+    let course = t.course;
     let student_id = me_id(&app, &student).await;
-    enroll(&app, &creator, &course, &student_id).await;
+    enroll(&app, &creator, &t.instance, &student_id).await;
 
     let note = create_course_note(&app, &creator, &course, "indexed").await;
     let sibling = create_course_note(&app, &creator, &course, "also indexed").await;
@@ -27648,7 +27914,11 @@ const LIST_ROUTES: [&str; 19] = [
 async fn seed_school_b(app: &axum::Router, cookie: &str) -> serde_json::Value {
     let course = create_course(app, cookie, "B Course").await;
     let subject = create_subject(app, cookie, &course, "B Subject").await;
-    let exam = create_exam(app, cookie, &course, "B Exam", "quiz").await;
+    // The exam keys on the instance an instance-teaching şube carries, so the
+    // calendar, the şube (which must sit in a year to take an exam) and that
+    // pair come first.
+    let year = ensure_year(app, cookie).await;
+    let term = create_term(app, cookie, &year, "1. Dönem").await;
     let note = send(
         app,
         "POST",
@@ -27667,15 +27937,9 @@ async fn seed_school_b(app: &axum::Router, cookie: &str) -> serde_json::Value {
     )
     .await;
     assert_eq!(event.status, StatusCode::CREATED, "{}", event.body);
-    let class = send(
-        app,
-        "POST",
-        "/classes",
-        Some(cookie),
-        Some(json!({ "name": "9-B" })),
-    )
-    .await;
-    assert_eq!(class.status, StatusCode::CREATED, "{}", class.body);
+    let class_id = create_class(app, cookie, "9-B", json!({ "year": year })).await;
+    let instance_id = attach_instance(app, cookie, &class_id, &course).await;
+    let exam = create_exam(app, cookie, &instance_id, &term, "B Exam", "yazili").await;
     let board = send(
         app,
         "POST",
@@ -27734,7 +27998,8 @@ async fn seed_school_b(app: &axum::Router, cookie: &str) -> serde_json::Value {
         "exam": exam,
         "note": idf("note", &note.body),
         "event": idf("event", &event.body),
-        "class": idf("class", &class.body["class"]),
+        "class": class_id,
+        "instance": instance_id,
         "board": idf("board", &board.body),
         "course_note": idf("course_note", &course_note.body),
         "bank": idf("bank", &bank.body),
@@ -28981,11 +29246,14 @@ async fn a_course_child_route_is_gated_by_its_own_module() {
         .await
         .unwrap();
 
-    // An empty body: the gate must answer before the payload is even parsed.
+    // An empty body, and an id nothing minted: the gate must answer before the
+    // payload is parsed and before any row is looked up, so which id the path
+    // names is immaterial — the exams nest lives under `/instances` since the
+    // class became the academic anchor.
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/exams"),
+        &format!("/instances/{course}/exams"),
         Some(&cookie),
         Some(json!({})),
     )
@@ -29184,31 +29452,35 @@ async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
     }
 }
 
-/// All four foreign-module route pairs under `/courses`, not just the one the
+/// Every foreign-module route pair the two anchors carry, not just the one the
 /// foundation test drives: each answers for its *own* module while `courses`
-/// stays on.
+/// stays on. The exam, session and homework pairs hang off `/instances` — the
+/// class×course anchor, gated by the course module out here and by their own
+/// module inside — while the subject pair still hangs off the catalog row.
 #[tokio::test]
 async fn every_course_child_route_names_its_own_module() {
     let (app, db, tenants) = common::app_and_tenants().await;
     let slug = Slug::try_new(DEMO_SLUG).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
     let course = create_course(&app, &cookie, "Fizik").await;
+    let class = create_class(&app, &cookie, "9-F", json!({})).await;
+    let instance = attach_instance(&app, &cookie, &class, &course).await;
 
-    for (module, child) in [
-        (Module::Exams, "exams"),
-        (Module::Sessions, "sessions"),
-        (Module::Subjects, "subjects"),
-        (Module::Homework, "homework"),
+    for (module, path) in [
+        (Module::Exams, format!("/instances/{instance}/exams")),
+        (Module::Sessions, format!("/instances/{instance}/sessions")),
+        (Module::Homework, format!("/instances/{instance}/homework")),
+        (Module::Subjects, format!("/courses/{course}/subjects")),
     ] {
-        // Three of the four are needed by another module (marks, attendance,
-        // exams), so the builder API would `409` here — the set is written
-        // directly, uniformly, since the API's own refusal is proven above.
+        // The three foreign pairs are needed by another module (marks,
+        // attendance, exams), so the builder API would `409` here — the set is
+        // written directly, uniformly, since the API's own refusal is proven
+        // above.
         tenants
             .set_modules(&slug, &all_without(module))
             .await
             .unwrap();
 
-        let path = format!("/courses/{course}/{child}");
         let res = send(&app, "GET", &path, Some(&cookie), None).await;
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}: {}", res.body);
         assert_eq!(
@@ -29296,7 +29568,7 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
 
 /// Route prefixes that are deliberately ungated, each with the reason it is —
 /// a nest here is one no school can be sold or refused.
-const CORE_PREFIXES: [(&str, &str); 12] = [
+const CORE_PREFIXES: [(&str, &str); 13] = [
     ("/", "the health mirror at the root"),
     ("/health", "liveness, read before any school is resolved"),
     ("/time", "the server clock, a deploy constant"),
@@ -29320,6 +29592,10 @@ const CORE_PREFIXES: [(&str, &str); 12] = [
         "the academic calendar every other module hangs off",
     ),
     (
+        "/academic-years",
+        "the calendar above the dönemler — every şube sits in one",
+    ),
+    (
         "/builder",
         "the vendor principal, which is not a school user",
     ),
@@ -29329,13 +29605,14 @@ const CORE_PREFIXES: [(&str, &str); 12] = [
 /// Every module's nest prefix. Written down rather than derived: the point is
 /// to catch a nest that was mounted without a gate, and a derived list would
 /// be derived from the same code it is checking.
-const MODULE_PREFIXES: [(Module, &str); 21] = [
+const MODULE_PREFIXES: [(Module, &str); 22] = [
     (Module::Chatbot, "/chatbot"),
     (Module::Notes, "/notes"),
     (Module::Messages, "/messages"),
     (Module::Events, "/events"),
     (Module::Appointments, "/appointments"),
     (Module::Courses, "/courses"),
+    (Module::Courses, "/instances"),
     (Module::CourseNotes, "/course-notes"),
     (Module::Classes, "/classes"),
     (Module::Sessions, "/sessions"),
@@ -29362,10 +29639,12 @@ fn under(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
-/// The published surface is exactly: the ungated core, plus the 21 gated
-/// nests. A nest added to `build_router` without a gate matches neither list
-/// and fails here by name — which is the only way an ungated nest is ever
-/// noticed, since nothing else in the suite knows a new route exists.
+/// The published surface is exactly: the ungated core, plus the gated module
+/// nests (one per module, and one more — `/instances`, the instance anchor that
+/// carries the course gate). A nest added to `build_router` without a gate
+/// matches neither list and fails here by name — which is the only way an
+/// ungated nest is ever noticed, since nothing else in the suite knows a new
+/// route exists.
 ///
 /// corner-cut: it reads the OpenAPI document, so it sees only routes mounted
 /// with `.routes(routes!(…))` — a bare `.route()` is invisible to it. Every

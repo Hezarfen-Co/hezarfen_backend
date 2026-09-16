@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT teacher AS \"teacher: UserId\" FROM class_course_teacher\n           WHERE class_course = $1 ORDER BY teacher",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "teacher: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course_teacher",
+            "name": "teacher"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6d9fc2433d41081225b1d03b1944965c9e35f61c3423e7c0ea36fd951ea9f988"
+}

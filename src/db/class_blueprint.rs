@@ -375,9 +375,12 @@ async fn delete_claimed(
     if stored != held {
         return Ok(false);
     }
-    sqlx::query!(r#"DELETE FROM blueprint_course WHERE blueprint = $1"#, row.key)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query!(
+        r#"DELETE FROM blueprint_course WHERE blueprint = $1"#,
+        row.key
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query!(r#"DELETE FROM class_blueprint WHERE id = $1"#, row.key)
         .execute(&mut *tx)
         .await?;
@@ -533,13 +536,28 @@ pub async fn sourced_links(
 /// detached detached, each with its counter released and its enrollments
 /// swept, and the rest exactly as they were: a partial removal the next call
 /// finishes.
+///
+/// Answers the **blob keys** every detach's cascade removed — the
+/// question/answer images and homework files of each swept instance subtree —
+/// for the caller's route to unlink after the commits. Each detach commits its
+/// own transaction, so the keys of the rows already swept come back even when
+/// a later link refuses ([`crate::db::class_pump::detach_course`] answers
+/// `None` for a pair that held no instance, which contributes nothing); a
+/// failure before a link's detach returns the Err and drops the keys gathered
+/// so far, which is the same accepted window
+/// [`crate::service::course::delete`] documents: at worst an unreachable blob.
 pub async fn drop_links(
     db: &Database,
     id: &ClassBlueprintId,
     links: Vec<Held>,
-) -> Result<(), AppError> {
+) -> Result<Vec<String>, AppError> {
+    let mut blobs = Vec::new();
     for link in links {
-        class_pump::detach_course(db, &link.class, &link.course, Some(id)).await?;
+        if let Some(keys) =
+            class_pump::detach_course(db, &link.class, &link.course, Some(id)).await?
+        {
+            blobs.extend(keys);
+        }
     }
-    Ok(())
+    Ok(blobs)
 }

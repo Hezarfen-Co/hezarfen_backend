@@ -135,6 +135,17 @@ pub const MAX_CLASS_GRADE_LEN: usize = 20;
 pub const MAX_CLASS_MEMBERS: i64 = 200;
 pub const MAX_CLASS_COURSES: i64 = 50;
 
+/// Weekly lesson hours of a class×course instance (D8's karne weight). Bounded
+/// so a typo cannot make one instance dominate the year average.
+pub const MIN_DERS_SAATI: i64 = 1;
+pub const MAX_DERS_SAATI: i64 = 40;
+
+/// The default grade-display bands: the Türkiye 5-point scale (85–100 = 5,
+/// … 0–44 = 1). Schools edit the list via `PATCH /settings`; the karne verdict
+/// reads the band labelled `"2"` as the pass boundary.
+pub const DEFAULT_GRADE_BANDS: [(i64, &str); 5] =
+    [(85, "5"), (70, "4"), (55, "3"), (45, "2"), (0, "1")];
+
 pub const MAX_SUBJECT_NAME_LEN: usize = 200;
 pub const MAX_SUBJECT_DESCRIPTION_LEN: usize = 2_000;
 
@@ -161,15 +172,9 @@ pub const MAX_SESSION_TOPIC_LEN: usize = 200;
 /// The default exam kinds with their weights; schools replace the list via
 /// `PATCH /settings`. An exam's kind decides how heavily it counts into the
 /// course average — the defaults all weigh 1 (a plain average) so weighting
-/// is opt-in policy, not baked-in opinion.
-pub const DEFAULT_EXAM_KINDS: [(&str, i64); 6] = [
-    ("homework", 1),
-    ("quiz", 1),
-    ("midterm", 1),
-    ("final", 1),
-    ("project", 1),
-    ("oral", 1),
-];
+/// is opt-in policy, not baked-in opinion. The defaults are the Turkish K12
+/// classroom's own: yazılı, sözlü, uygulama.
+pub const DEFAULT_EXAM_KINDS: [(&str, i64); 3] = [("yazili", 1), ("sozlu", 1), ("uygulama", 1)];
 
 /// Bounds for the school-editable lists in settings (exam kinds, attendance
 /// statuses): entry count and per-entry character length.
@@ -188,6 +193,22 @@ pub const MAX_GRADE_LABEL_LEN: usize = 20;
 pub const CAS_UPDATE_RETRIES: usize = 3;
 
 pub const MAX_TERM_NAME_LEN: usize = 100;
+
+/// An academic year is named like a term ("2026-2027").
+pub const MAX_ACADEMIC_YEAR_NAME_LEN: usize = 100;
+
+/// The per-dönem devamsızlık limits a school may configure; a bound so a typo
+/// cannot disable the rule or make it absurd.
+pub const MAX_ABSENCE_DAYS: i64 = 365;
+
+/// The timezone a school's day-bucketing falls back to when none is set, and
+/// the one the default deployment runs in.
+pub const DEFAULT_TIMEZONE: &str = "Europe/Istanbul";
+
+/// The timezones a school may configure. A short allow-list on purpose: the
+/// backend has no timezone database of its own, and day-bucketing needs the
+/// offset to be trustworthy.
+pub const TIMEZONES: [&str; 2] = ["Europe/Istanbul", "UTC"];
 
 /// A published availability slot's optional note ("bring your report card").
 pub const MAX_APPOINTMENT_NOTE_LEN: usize = 500;
@@ -908,19 +929,14 @@ pub const SLOT_REF_TABLE: &str = "slot_ref";
 /// SCHEMAFULL refusing the write.
 pub const ENROLLMENT_COUNT_FIELD: &str = "enrollment_count";
 pub const REGISTRATION_COUNT_FIELD: &str = "registration_count";
-/// Not a cap — a refcount, and the whole of the term delete guard: how many
-/// courses link this term. A term may only be dropped at zero, and the count
-/// is claimed before a course's link is written, so the two decisions contend
-/// on the term row instead of on a cross-table `SELECT` no transaction orders.
-pub const COURSE_COUNT_FIELD: &str = "course_count";
 /// The two refcounts on a class row: how many students it holds and how many
 /// courses it is attached to. A class may only be dropped at zero on both.
 pub const CLASS_MEMBER_COUNT_FIELD: &str = "class_member_count";
 pub const CLASS_COURSE_COUNT_FIELD: &str = "class_course_count";
-/// Classes linking a term, the second half of the term delete guard. Deliberately
-/// *not* `COURSE_COUNT_FIELD`: boot recounts that one from the course rows alone,
-/// so a class claiming into it would be wiped on the next migration.
-pub const TERM_CLASS_COUNT_FIELD: &str = "class_count";
+/// Classes belonging to an academic year, the second half of the year's delete
+/// guard. Its own column: a class's share is never confused with another
+/// roster's count.
+pub const ACADEMIC_YEAR_CLASS_COUNT_FIELD: &str = "class_count";
 /// A refcount too, and the whole of the fee-plan edit *and* delete guard: how
 /// many students are on this plan. A plan may only be edited or deleted at
 /// zero, and the count is claimed in the same transaction as the assignment

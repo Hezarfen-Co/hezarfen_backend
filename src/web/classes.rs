@@ -18,7 +18,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Pumped, Skip};
-use crate::domain::class_course::ClassCourse;
+use crate::domain::class_course::{ClassCourse, ClassCourseId};
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
 use crate::domain::class_member::ClassMember;
 use crate::domain::course::CourseId;
@@ -26,14 +26,13 @@ use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::parent_link::ensure_can_observe;
-use crate::service::term;
-use crate::service::{class_blueprint, class_course, class_group, class_member};
+use crate::service::{academic_year, class_blueprint, class_course, class_group, class_member};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, person_map,
-    set_or_clear, undo_if_demoted,
+    remove_blob, set_or_clear, undo_if_demoted,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -69,8 +68,9 @@ struct CreateClass {
     /// "anaokulu"). Free text; omit (or send `""`) for a class with no grade.
     #[schema(max_length = 20, example = "9")]
     grade: Option<String>,
-    /// The academic term this class belongs to (`GET /terms`). Optional.
-    term_id: Option<String>,
+    /// The academic year this class sits in (`GET /academic-years`). Optional;
+    /// a şube with no year takes no exam and is never rolled over.
+    year: Option<String>,
     /// The class's homeroom teacher (sınıf öğretmeni) — a teacher, manager or
     /// admin account. Optional; omit (or send `""`) for a class with none.
     #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
@@ -86,11 +86,11 @@ struct UpdateClass {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>, max_length = 20)]
     grade: Option<Option<String>>,
-    /// Omit to keep the current term, send `null` to unlink, or send a term id
-    /// to (re)assign.
+    /// Omit to keep the current academic year, send `null` to unlink, or send
+    /// a year id to (re)assign.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>)]
-    term_id: Option<Option<String>>,
+    year: Option<Option<String>>,
     /// Omit to keep the current homeroom teacher, send `null` (or `""`) to
     /// clear it, or send a teacher+ user id to (re)assign.
     #[serde(default, deserialize_with = "set_or_clear")]
@@ -127,9 +127,9 @@ struct ClassResponse {
     /// The school's own free-text grade label; `null` when the class has none.
     #[schema(example = "9")]
     grade: Option<String>,
-    /// The academic term this class belongs to (`GET /terms`); `null` when
-    /// unassigned.
-    term: Option<String>,
+    /// The academic year this class sits in (`GET /academic-years`); `null`
+    /// when unassigned.
+    year: Option<String>,
     /// The class's homeroom teacher (sınıf öğretmeni); `null` when none is
     /// assigned — as it is for every class after the account was demoted below
     /// `teacher`.
@@ -151,7 +151,7 @@ impl ClassResponse {
             creator: with_creator.then(|| PersonRef::resolve(people, class.get_creator())),
             name: class.get_name().as_str().to_string(),
             grade: class.get_grade().map(|g| g.as_str().to_string()),
-            term: class.get_term().map(|term| term.key().to_string()),
+            year: class.get_year().map(|year| year.key().to_string()),
             teacher: class
                 .get_teacher()
                 .map(|teacher| PersonRef::resolve(people, teacher)),
@@ -195,12 +195,23 @@ fn class_people(class: &ClassGroup, with_creator: bool) -> impl Iterator<Item = 
 
 #[derive(Serialize, ToSchema)]
 struct ClassMemberResponse {
+    /// The stint's own id — a fresh one each time a student is added, so a
+    /// leave-and-rejoin is two rows and this names which one is live.
     id: String,
     class: String,
     /// The student in the class.
     user: PersonRef,
     /// Who put them there.
     added_by: PersonRef,
+    /// When the stint began, UTC unix-milliseconds.
+    joined_at: i64,
+    /// When they left, UTC unix-millis; `null` while the stint is live. Only
+    /// ever non-null on a history read — every route here lists live rows.
+    left_at: Option<i64>,
+    /// The şube this member was copied out of by a year rollover, or `null`
+    /// when a human placed them.
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
+    source_class_group: Option<String>,
 }
 
 impl ClassMemberResponse {
@@ -210,6 +221,11 @@ impl ClassMemberResponse {
             class: member.get_class().key().to_string(),
             user: PersonRef::resolve(people, member.get_user()),
             added_by: PersonRef::resolve(people, member.get_added_by()),
+            joined_at: member.get_joined_at().as_millis(),
+            left_at: member.get_left_at().map(|at| at.as_millis()),
+            source_class_group: member
+                .get_source_class_group()
+                .map(|class| class.key().to_string()),
         }
     }
 }
@@ -218,19 +234,43 @@ impl ClassMemberResponse {
 struct ClassCourseResponse {
     id: String,
     class: String,
-    /// The course the class takes.
+    /// The catalog course the class takes (`GET /courses/{id}`) — its title
+    /// lives there; what this class actually teaches is the row this response
+    /// describes.
     course: String,
     /// Who attached it.
     attached_by: PersonRef,
+    /// Weekly lesson hours; the instance's weight in the year's karne average.
+    #[schema(example = 5)]
+    ders_saati: i64,
+    /// Whether this instance's marks count toward the karne.
+    counts_toward_karne: bool,
+    /// How many students are enrolled right now.
+    #[schema(example = 28)]
+    enrollment_count: i64,
+    /// The staff assigned to run this instance, beyond the şube's homeroom
+    /// teacher (who may act on it too).
+    teachers: Vec<PersonRef>,
 }
 
 impl ClassCourseResponse {
-    fn new(link: &ClassCourse, people: &std::collections::HashMap<String, PersonRef>) -> Self {
+    fn new(
+        link: &ClassCourse,
+        teachers: &[UserId],
+        people: &std::collections::HashMap<String, PersonRef>,
+    ) -> Self {
         Self {
             id: link.get_id().key().to_string(),
             class: link.get_class().key().to_string(),
             course: link.get_course().key().to_string(),
             attached_by: PersonRef::resolve(people, link.get_attached_by()),
+            ders_saati: link.get_ders_saati().as_i64(),
+            counts_toward_karne: link.counts_toward_karne(),
+            enrollment_count: link.get_enrollment_count(),
+            teachers: teachers
+                .iter()
+                .map(|teacher| PersonRef::resolve(people, teacher))
+                .collect(),
         }
     }
 }
@@ -322,8 +362,9 @@ async fn classes_page(
 
 /// Create a class. Requires manager+ — a class is school structure, not a
 /// teacher's own room. `grade` is a free-text label for the year ("9", "10-A"),
-/// `term_id` links the school calendar, `teacher_id` names the homeroom teacher
-/// (sınıf öğretmeni, a teacher+ account); all optional.
+/// `year` links the academic year (which is what binds the şube to a karne and
+/// to the rollover), `teacher_id` names the homeroom teacher (sınıf öğretmeni,
+/// a teacher+ account); all optional.
 ///
 /// If a blueprint covers the new class's grade, the class is **stocked from it
 /// at once** — the same best-effort pump `POST /classes/{id}/blueprint` runs, so
@@ -338,10 +379,10 @@ async fn classes_page(
     request_body = CreateClass,
     responses(
         (status = 201, description = "Class created, stocked from its grade's blueprint when one covers it", body = CreateClassResponse),
-        (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran (the class was rolled back, nothing was created), or the named term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran (the class was rolled back, nothing was created), or the named academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -352,17 +393,17 @@ async fn create_class(
 ) -> Result<(StatusCode, Json<CreateClassResponse>), AppError> {
     let name = ClassName::try_new(&req.name)?;
     let grade = grade_or_none(req.grade.as_deref())?;
-    // Pre-flight only: `ClassGroup::create` claims a reference on the term
-    // before it writes the link, and a term deleted in between fails that claim
+    // Pre-flight only: `ClassGroup::create` claims a reference on the year
+    // before it writes the link, and a year deleted in between fails that claim
     // with this very error — so an unknown id reads the same whichever side wins.
-    let term = term::resolve(&st.db, req.term_id.as_deref()).await?;
+    let year = academic_year::resolve(&st.db, req.year.as_deref()).await?;
     let teacher = teacher_or_none(req.teacher_id.as_deref(), &st.db).await?;
     let class = class_group::create(
         &st.db,
         user.get_id(),
         name,
         grade,
-        term,
+        year,
         teacher.as_ref().map(|t| *t.get_id()),
     )
     .await?;
@@ -528,7 +569,7 @@ async fn get_class(
 }
 
 /// Update a class. Requires manager+. Omitted fields keep their value; `grade`,
-/// `term_id` and `teacher_id` are nullable, so an explicit `null` clears them.
+/// `year` and `teacher_id` are nullable, so an explicit `null` clears them.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -538,11 +579,11 @@ async fn get_class(
     request_body = UpdateClass,
     responses(
         (status = 200, description = "Updated class", body = ClassResponse),
-        (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term this update moves the class off changed since the caller read it (nothing was written, re-read and retry), the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone), or the class's own term — or the named one — is archived: past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The year this update moves the class off changed since the caller read it (nothing was written, re-read and retry), the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone), or the class's own year — or the named one — is archived: past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -553,8 +594,9 @@ async fn update_class(
     Json(req): Json<UpdateClass>,
 ) -> Result<Json<ClassResponse>, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    // The class's *current* term, so a move off an archived year is refused
-    // too; `term::resolve` below holds the other end (the term moved onto).
+    // The class's *current* year, so a move off an archived one is refused
+    // too; `academic_year::resolve` below holds the other end (the year moved
+    // onto).
     class_group::require_open(&st.db, &class).await?;
 
     // Only what the request actually carried is validated and written — an
@@ -565,9 +607,9 @@ async fn update_class(
         Some(ref update) => Some(grade_or_none(update.as_deref())?),
         None => None,
     };
-    let term = match req.term_id {
-        // Explicit `null` clears the link; a value must name a real term.
-        Some(ref update) => Some(term::resolve(&st.db, update.as_deref()).await?),
+    let year = match req.year {
+        // Explicit `null` clears the link; a value must name a real year.
+        Some(update) => Some(academic_year::resolve(&st.db, update.as_deref()).await?),
         None => None,
     };
     let teacher = match req.teacher_id {
@@ -584,7 +626,7 @@ async fn update_class(
         class,
         name,
         grade,
-        term,
+        year,
         teacher.map(|teacher| teacher.map(|teacher| *teacher.get_id())),
     )
     .await?;
@@ -697,7 +739,7 @@ async fn classes_of(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Students or courses are still on this class, or its term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Students or instances are still on this class, or its academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_class(
@@ -709,7 +751,7 @@ async fn delete_class(
     class_group::require_open(&st.db, &class).await?;
     if !class_group::delete(&st.db, class).await? {
         return Err(AppError::Conflict(
-            "this class still holds students or courses — remove its members and detach its courses first",
+            "this class still holds students or instances — remove its members and detach its              courses first",
         ));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -718,10 +760,11 @@ async fn delete_class(
 // ---- members ---------------------------------------------------------------
 
 /// Put a student in a class. Requires manager+. They are enrolled into every
-/// course the class already carries, in one go: a course with no free seat
-/// refuses the whole join with a 409 naming it, and a student already enrolled
-/// by hand keeps the row they have (no second seat, and it survives their
-/// removal from the class). Adding the same student twice is a 409.
+/// instance the class already carries, in one go, and a student already
+/// enrolled by hand keeps the row they have (and it survives their removal from
+/// the class). Adding the same student twice is a 409; a student who *left* is
+/// added afresh — the roster is a history, and the partial index only holds one
+/// live stint per pair.
 #[utoipa::path(
     post,
     path = "/{id}/members",
@@ -735,7 +778,7 @@ async fn delete_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), it carries more courses than one add may enroll at once, one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing`, `term_archived` (the class sits on an archived term — past years are read-only)", body = ErrorResponse),
+        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), it carries more instances than one add may enroll at once, or one of those instances was detached while the add was walking them (retry against the class as it now stands). The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `linked_course_missing`, `academic_year_archived` (the class sits in an archived academic year — past years are read-only)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -756,7 +799,7 @@ async fn add_member(
         }));
     };
     // A class membership is enrollment in bulk, and enrollment is student
-    // membership — the same bar `POST /courses/{id}/enrollments` holds.
+    // membership — the same bar `POST /instances/{id}/enrollments` holds.
     if target_user.get_role() != Role::Student {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
@@ -813,9 +856,17 @@ async fn list_members(
 }
 
 /// Take a student out of a class. Requires manager+. The enrollments the class
-/// pumped for them are swept with it — except rows another attached class still
-/// claims (re-tagged to it) and rows placed by hand (left standing). A student
-/// who was not in the class is a 404.
+/// pumped for them are swept with it — except rows placed by hand, which are
+/// left standing. There is no heir to hand a swept row to: a second section
+/// teaching the same course holds its **own** instance, so its roster is its
+/// own row and this one is released. A student who was not in the class is a
+/// 404.
+///
+/// The membership itself is **soft**: the stint is stamped `left_at` and the
+/// class's live-member counter comes down, but the row stays as the record of
+/// who was in the section. Re-adding the same student is a new stint — two rows
+/// for the pair, one live, which the `(class, app_user) WHERE left_at IS NULL`
+/// index is what allows.
 #[utoipa::path(
     delete,
     path = "/{id}/members/{user}",
@@ -826,11 +877,11 @@ async fn list_members(
         ("user" = String, Path, description = "User id"),
     ),
     responses(
-        (status = 204, description = "Removed"),
+        (status = 204, description = "Left the class"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found, or that student was not in it", body = ErrorResponse),
-        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The class's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_member(
@@ -840,32 +891,34 @@ async fn remove_member(
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
     class_group::require_open(&st.db, &class).await?;
-    class_member::remove(&st.db, class.get_id(), &UserId::from_key(&target)).await?;
+    class_member::leave(&st.db, class.get_id(), &UserId::from_key(&target)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- attached courses ------------------------------------------------------
+// ---- attached courses (the class's instances) ------------------------------
 
-/// Attach a course to a class. Requires teacher+ and management rights **on
-/// that course** — attaching writes its roster, so it takes exactly the right
-/// enrolling into it does. The class's whole roster is enrolled in one go: a
-/// course that cannot hold all of them takes none (409), and students already
+/// Attach a course to a class: this is what **mints the instance** — the
+/// class×course row every exam, session, lesson and roster under this class's
+/// course now keys on. Requires teacher+ and catalog rights on that course
+/// (its creator, or a manager/admin): attaching writes that course's roster for
+/// this section, and the weekly hours and karne policy the instance starts
+/// with. The class's whole roster is enrolled in one go, and students already
 /// enrolled by hand keep their own rows. Attaching the same course twice is a
 /// 409.
 #[utoipa::path(
     post,
-    path = "/{id}/courses",
+    path = "/{id}/instances",
     tag = "classes",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Class id")),
     request_body = AttachCourse,
     responses(
-        (status = 201, description = "Course attached to the class", body = ClassCourseResponse),
+        (status = 201, description = "Course attached — a new instance for this class", body = ClassCourseResponse),
         (status = 400, description = "Unknown course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), it holds more students than one attach may enroll at once, or the course cannot hold the whole class. The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`, `term_archived` (the class's or the course's term is archived — past years are read-only)", body = ErrorResponse),
+        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or it holds more students than one attach may enroll at once. The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `academic_year_archived` (the class's academic year is archived — past years are read-only)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -886,32 +939,34 @@ async fn attach_course(
     };
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can attach this course to a class",
+            "only the course creator or a manager/admin can attach this course to a class",
         ));
     }
-    // Both ends: neither a class nor a course on a past year takes a new link.
+    // The class's own year is the instance's year, so this one gate covers
+    // both: a past year takes no new structure.
     class_group::require_open(&st.db, &class).await?;
-    crate::service::course::require_open(&st.db, &course).await?;
 
     let link = class_course::attach(&st.db, class.get_id(), course.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok((
         StatusCode::CREATED,
-        Json(ClassCourseResponse::new(&link, &people)),
+        Json(ClassCourseResponse::new(&link, &[], &people)),
     ))
 }
 
-/// List the courses a class is attached to, newest first, paged via
-/// `?limit=&offset=` (omit `limit` for all of them). Requires teacher+. Returns
-/// a `{items, total, limit, offset}` envelope.
+/// List the instances a class carries — each a catalog course as this section
+/// teaches it, with its hours, karne policy and teachers — newest first, paged
+/// via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+.
+/// Returns a `{items, total, limit, offset}` envelope. `POST /instances/{id}`
+/// edits one; this is the read that names them.
 #[utoipa::path(
     get,
-    path = "/{id}/courses",
+    path = "/{id}/instances",
     tag = "classes",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Class id"), PageParams),
     responses(
-        (status = 200, description = "A page of the class's courses (all of them when unpaged)", body = Page<ClassCourseResponse>),
+        (status = 200, description = "A page of the class's instances (all of them when unpaged)", body = Page<ClassCourseResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
@@ -927,66 +982,95 @@ async fn list_class_courses(
     let (limit, offset) = page.resolve()?;
     let class = class_or_404(&id, &st.db).await?;
     let (rows, total) = class_course::list_for_class(&st.db, class.get_id(), limit, offset).await?;
-    let people = person_map(rows.iter().map(|row| *row.get_attached_by()), &st.db).await?;
-    let items = rows
+    // One batch read for the page's teacher links, and one for every person
+    // this page names (each instance's attacher plus its teachers).
+    let with_teachers = crate::db::class_course_teacher::into_instances(&st.db, rows).await?;
+    let people = person_map(
+        with_teachers.iter().flat_map(|(row, teachers)| {
+            std::iter::once(*row.get_attached_by()).chain(teachers.iter().cloned())
+        }),
+        &st.db,
+    )
+    .await?;
+    let items = with_teachers
         .iter()
-        .map(|row| ClassCourseResponse::new(row, &people))
+        .map(|(row, teachers)| ClassCourseResponse::new(row, teachers, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Detach a course from a class. Requires teacher+ and management rights on
-/// that course, like attaching. The enrollments the class pumped into it are
-/// swept — except rows another attached class still claims (re-tagged to it)
-/// and rows placed by hand (left standing). A course that was not attached is a
-/// 404 — but a course row that is *gone* is not: the link a deleted course left
-/// behind detaches (the rights check has nothing left to read, and no roster
-/// left to protect), or the class holding it could never be deleted.
+/// Detach an instance from a class: the instance and everything the class
+/// taught under it — exams (with results, questions and images), homework (with
+/// submissions and grades), sessions and roll call, the roster it pumped and
+/// its teacher links — are swept, and the uploaded files those rows named are
+/// unlinked from disk. Requires teacher+ and catalog rights on the course the
+/// instance teaches (its creator, or a manager/admin): this is the inverse of
+/// attaching.
+///
+/// The second path segment is the **instance id** (`GET
+/// /classes/{id}/instances`), not a course id — two sections teaching the same
+/// course hold two instances, and only one of them is this class's. The detach
+/// takes the whole instance, so its roster goes with it: every enrollment on it
+/// is swept, the rows this class pumped and the ones an operator placed by hand
+/// alike — an enrollment cannot outlive the instance it hangs off, and "a hand
+/// row survives the şube" is the *member* exit's rule, applied where the
+/// instance is still standing. An instance that exists but belongs to another
+/// class, or one that is already gone, is a 404.
 #[utoipa::path(
     delete,
-    path = "/{id}/courses/{course}",
+    path = "/{id}/instances/{instance}",
     tag = "classes",
     security(("session_cookie" = [])),
     params(
         ("id" = String, Path, description = "Class id"),
-        ("course" = String, Path, description = "Course id"),
+        ("instance" = String, Path, description = "Instance id (a class_course id)"),
     ),
     responses(
         (status = 204, description = "Detached"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Class not found, or that course was not attached — a course row that is gone does not refuse the detach, it is the reason for it", body = ErrorResponse),
-        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Class not found, or no such instance under it", body = ErrorResponse),
+        (status = 409, description = "The class's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn detach_course(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
-    Path((id, course)): Path<(String, String)>,
+    Path((id, instance)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let course = CourseId::from_key(&course);
-    // The rights check is skipped when the course row is gone, rather than the
-    // whole detach refused: management rights are read *off* the course, so a
-    // link left pointing at a deleted course had no readable owner and this
-    // route answered 404 forever — which also left the class undeletable, its
-    // attachment counter counting a row nothing could sweep. There is no roster
-    // left to protect, and the caller is already teacher+.
-    let row = crate::service::course::read(&st.db, &course).await?;
-    if let Some(row) = row.as_ref()
-        && !can_manage_course(row, &user)
+    let Some(row) =
+        crate::service::class_course::read(&st.db, &ClassCourseId::from_key(&instance)).await?
+    else {
+        return Err(AppError::NotFound);
+    };
+    // The instance belongs to *this* class or the pair names nothing: the
+    // detach keys on (class, course), but saying so here is what keeps an
+    // instance of another section from reading as a detach.
+    if row.get_class() != class.get_id() {
+        return Err(AppError::NotFound);
+    }
+    // The catalog row the instance teaches is the rights subject: detaching
+    // undoes an attach, and attaching takes catalog rights. A *gone* course row
+    // skips the check rather than refusing the detach: management rights are
+    // read *off* that row, so a link left pointing at a deleted course had no
+    // readable owner and the row could never be swept — which left the class
+    // undeletable, its instance counter counting a row nothing could take out.
+    // There is no roster left to protect, and the caller is already teacher+.
+    if let Some(course) = crate::service::course::read(&st.db, row.get_course()).await?
+        && !can_manage_course(&course, &user)
     {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can detach this course from a class",
+            "only the course creator or a manager/admin can detach this course from a class",
         ));
     }
-    // Both ends, and only what is still there: a link whose course row is gone
-    // has no term to read, and sweeping it is the whole point of the route.
     class_group::require_open(&st.db, &class).await?;
-    if let Some(row) = row.as_ref() {
-        crate::service::course::require_open(&st.db, row).await?;
+    // The rows are gone by the time this returns: the returned blob keys are
+    // the only record of the files they named, so they are unlinked here.
+    let files = class_course::detach(&st.db, class.get_id(), row.get_course()).await?;
+    for file in &files {
+        remove_blob(&st.files_path, file).await;
     }
-    class_course::detach(&st.db, class.get_id(), &course).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1060,26 +1144,25 @@ struct SkipResponse {
     /// `class_at_course_ceiling` (the
     /// section already holds `max_class_courses`), `class_roster_too_large`
     /// (the section holds more students than one attach may enroll at once),
-    /// `course_full` (the course has no free seat for the whole section), and
-    /// `blueprint_deleted` (the blueprint itself was deleted while the pump
+    /// and `blueprint_deleted` (the blueprint itself was deleted while the pump
     /// ran; nothing was attached, and there is nothing left to retry — it ends
     /// the run, so it appears once however many sections were left).
     ///
     /// The **same vocabulary** answers the manual routes as their `code`
-    /// field. `POST /classes/{id}/courses` attaches along this very axis and so
-    /// answers this list's ceilings, plus `duplicate` — a refusal there (the
+    /// field. `POST /classes/{id}/instances` attaches along this very axis and
+    /// so answers this list's ceilings, plus `duplicate` — a refusal there (the
     /// call asked for a row and did not get it) but not here (the course is
     /// already on the class, which is what the blueprint asks for).
     /// `POST /classes/{id}/members` attaches along the *other* axis, so its two
     /// ceilings are the mirror ones, named for the ceiling actually hit:
     /// `class_at_roster_ceiling` (the section already holds
     /// `max_class_members`) and `class_course_list_too_large` (it carries more
-    /// courses than one member add may enroll at once). It also owns
-    /// `linked_course_missing` (another course already attached to that section
-    /// no longer exists — detach it first): it is the one attach that walks the
-    /// section's existing course links, while a pump attaches a course it has
-    /// just proved alive.
-    #[schema(example = "course_full")]
+    /// instances than one member add may enroll at once). It also owns
+    /// `linked_course_missing` (one of the section's instances was detached
+    /// while this add was walking them — retry against the section as it now
+    /// stands): it is the one attach that walks the section's existing instance
+    /// links, while a pump attaches a course it has just proved alive.
+    #[schema(example = "class_at_course_ceiling")]
     reason: String,
 }
 
@@ -1249,9 +1332,7 @@ async fn list_blueprints(
     let (limit, offset) = page.resolve()?;
     let (blueprints, total) = class_blueprint::list_all(&st.db, limit, offset).await?;
     let people = person_map(
-        blueprints
-            .iter()
-            .map(|blueprint| *blueprint.get_creator()),
+        blueprints.iter().map(|blueprint| *blueprint.get_creator()),
         &st.db,
     )
     .await?;
@@ -1326,8 +1407,14 @@ async fn update_blueprint(
 ) -> Result<Json<BlueprintPumpResponse>, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let (saved, pumped) =
+    // The dropped templates cascade: every sourced instance they leave behind
+    // is detached, and its subtree's files are gone from the database and the
+    // disk is the only place left holding them. Unlink what the sweep reported.
+    let (saved, pumped, files) =
         class_blueprint::set_courses(&st.db, blueprint, courses, user.get_id()).await?;
+    for file in &files {
+        remove_blob(&st.files_path, file).await;
+    }
     Ok(Json(blueprint_body(&saved, &pumped, &st.db).await?))
 }
 
@@ -1358,7 +1445,13 @@ async fn delete_blueprint(
     Path(grade): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
-    class_blueprint::delete(&st.db, blueprint).await?;
+    // Deleting a blueprint detaches every sourced instance it started, subtree
+    // and all — the returned keys are the only record of the files those rows
+    // named, so they are unlinked here (the same contract the instance-detach
+    // and course-delete routes carry).
+    for file in &class_blueprint::delete(&st.db, blueprint).await? {
+        remove_blob(&st.files_path, file).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1441,7 +1534,7 @@ async fn blueprint_status(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found, or no blueprint covers its grade", body = ErrorResponse),
-        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The class's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn apply_blueprint(
@@ -1452,15 +1545,12 @@ async fn apply_blueprint(
     let class = class_or_404(&id, &st.db).await?;
     let grade = class.get_grade().ok_or(AppError::NotFound)?;
     let blueprint = blueprint_or_404(grade.as_str(), &st.db).await?;
-    // The pump writes both ends, so both are guarded — the class, and every
-    // course the template would attach. A course the template names that is
-    // already gone is the pump's own `skipped` business, not a term refusal.
+    // The pump writes both ends, so both are guarded — the class, whose year
+    // every instance it mints will belong to, and every course the template
+    // names. A course the template names that is already gone is the pump's own
+    // `skipped` business, not a refusal here; a catalog course carries no year
+    // of its own, so there is nothing else to gate on it.
     class_group::require_open(&st.db, &class).await?;
-    for id in blueprint.get_courses() {
-        if let Some(course) = crate::service::course::read(&st.db, id).await? {
-            crate::service::course::require_open(&st.db, &course).await?;
-        }
-    }
     let skipped = class_blueprint::apply_to(&st.db, &blueprint, &class, user.get_id()).await?;
     Ok(Json(ApplyResponse {
         skipped: skipped.iter().map(SkipResponse::new).collect(),

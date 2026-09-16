@@ -59,8 +59,9 @@ impl Config {
         Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into()),
             port: parse_port(env::var("PORT").ok()),
-            database_url: env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control".into()),
+            database_url: env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control".into()
+            }),
             files_path: env::var("FILES_PATH").unwrap_or_else(|_| "./data/files".into()),
             cookie_secure: parse_flag(env::var("COOKIE_SECURE").ok()),
             rate_limit: RateLimitConfig {

@@ -6,7 +6,7 @@
 //! [`crate::domain::homework_result`].
 
 use crate::database::{Database, tx_with_retry};
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_result::{HomeworkResult, HomeworkResultId, HomeworkStatus};
@@ -180,7 +180,7 @@ pub async fn list_for_homework(
 /// `ExamResult::list_for_user_in_course`.
 pub async fn list_for_user_in_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<HomeworkResult>, AppError> {
     Ok(sqlx::query_as!(
@@ -194,10 +194,10 @@ pub async fn list_for_user_in_course(
                   created_at AS "created_at: Timestamp"
            FROM homework_result
            WHERE app_user = $1
-             AND homework IN (SELECT id FROM homework WHERE course = $2)
+             AND homework IN (SELECT id FROM homework WHERE class_course = $2)
            ORDER BY id DESC"#,
         user.uuid(),
-        course.uuid()
+        class_course.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -304,7 +304,7 @@ mod tests {
         use crate::domain::homework::HomeworkTitle;
         use crate::domain::subject::{SubjectDescription, SubjectName};
 
-        let course = crate::db::course::a_test_course(db).await;
+        let (instance, course) = crate::db::course::a_test_instance(db).await;
         let subject = crate::db::subject::create(
             db,
             &course,
@@ -315,7 +315,7 @@ mod tests {
         .unwrap();
         homework::create(
             db,
-            &course,
+            &instance,
             subject.get_id(),
             HomeworkTitle::try_new("essay").unwrap(),
             None,

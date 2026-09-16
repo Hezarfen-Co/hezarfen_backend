@@ -165,8 +165,8 @@ mod tests {
         let got = latest_per_pair(vec![
             row(user, 1, 60),
             row(other, 1, 70),
-            row(user, 2, 85), // retake outranks the seq-1 mark
-            row(other, 3, 40),        // third sitting of the second pair
+            row(user, 2, 85),  // retake outranks the seq-1 mark
+            row(other, 3, 40), // third sitting of the second pair
         ]);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].get_user(), &user);

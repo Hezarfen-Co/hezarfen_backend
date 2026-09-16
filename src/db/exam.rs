@@ -2,12 +2,16 @@
 //! course that is gone, the compare-and-set every PATCH writes through, and
 //! the cascading delete. The PATCH re-derive lives in [`crate::service::exam`].
 
+use sqlx::PgConnection;
+
 use crate::database::{Database, foreign_key_violation, tx_with_retry};
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
     ExamSchedule, ExamTitle, redraft_error,
 };
+use crate::domain::term::TermId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -19,7 +23,8 @@ use crate::error::AppError;
 pub async fn create(
     db: &Database,
     creator: &UserId,
-    course: &CourseId,
+    class_course: &ClassCourseId,
+    term: &TermId,
     title: ExamTitle,
     description: ExamDescription,
     kind: ExamKind,
@@ -29,55 +34,163 @@ pub async fn create(
     allow_review: bool,
     draft: bool,
 ) -> Result<Exam, AppError> {
-    // A missing parent is refused by the real foreign keys: a course or a
-    // creator that is gone is `SQLSTATE 23503`, and this call site's
-    // parent-gone answer is the same `NotFound` the old existence-proof
-    // touch (`cap::touch_and_create`, deleted) answered with. The bump that
-    // touch made and unmade is gone with it — an exam was never counted
-    // anywhere.
-    let created = sqlx::query_as!(
+    // A missing parent is refused by the real foreign keys: an instance, a
+    // dönem or a creator that is gone is `SQLSTATE 23503`, and this call
+    // site's parent-gone answer is the same `NotFound` the old
+    // existence-proof touch answered with.
+    //
+    // The dönem is *claimed* in the same statement as the row (`exam_count`
+    // +1, a conditional write on the term row), the shape the old course
+    // create used against `term.course_count`: the count is what the term's
+    // own delete guard reads, and claim-and-insert in one CTE means no crash
+    // can leave one half without the other.
+    //
+    // The owner's `exam_audience` row is written in the same transaction,
+    // *always*: the audience is what every listing reads through, so an exam
+    // with no audience row would be invisible to its own instance. An ortak
+    // sınav is extra audience rows on this one exam (D2), never a second
+    // shape.
+    let id = ExamId::generate();
+    let creator = *creator;
+    let class_course = class_course.clone();
+    // `TermId` is `Copy`: one copy here, and the per-attempt closure below
+    // re-yields values rather than clones.
+    let term = *term;
+    // The binds are hoisted to owned values so the closure below only has to
+    // clone them per attempt: the write itself is a named future, for the
+    // reason [`insert_in`] gives.
+    let title_text = title.as_str().to_string();
+    let description_text = description.as_str().to_string();
+    let kind_text = kind.as_str().to_string();
+    let mode_text = schedule.mode.as_ref().map(|mode| mode.as_str().to_string());
+    let starts_at = schedule.starts_at.map(|at| at.as_millis());
+    let ends_at = schedule.ends_at.map(|at| at.as_millis());
+    let duration_ms = schedule.duration_ms.map(|duration| duration.as_millis());
+    let max_attempts = max_attempts.as_i64();
+    let created = tx_with_retry(db, false, async move |tx| {
+        insert_in(
+            tx,
+            id.clone(),
+            creator,
+            class_course.clone(),
+            term,
+            title_text.clone(),
+            description_text.clone(),
+            kind_text.clone(),
+            mode_text.clone(),
+            starts_at,
+            ends_at,
+            duration_ms,
+            max_attempts,
+            allow_rejoin,
+            allow_review,
+            draft,
+        )
+        .await
+    })
+    .await?;
+    Ok(created)
+}
+
+/// The claim, the row and its audience row, on one connection — [`create`]'s
+/// body as a *named* future.
+///
+/// Named, and taking owned values, because the anonymous `async move |tx|`
+/// closure does not work here: with this many binds, rustc cannot prove the
+/// closure's future is `Send` under [`tx_with_retry`]'s
+/// `AsyncFnMut(&mut PgConnection)` higher-ranked bound, so every axum handler
+/// that awaits [`create`] fails with "implementation of `Send` is not general
+/// enough" pointing at its `routes!` entry. A named `async fn` has a concrete
+/// future type rustc can check, exactly as
+/// [`crate::db::answer_image::upsert_in`] does for the same reason.
+///
+/// Everything it decides is the closure's own: a claim that matched no dönem
+/// row is [`crate::domain::term::gone_error`], any other foreign key is the
+/// parent-gone `NotFound`, and the audience row is written in the same
+/// transaction as the row it names.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the create's own field list, spelled once for the named future"
+)]
+pub(crate) async fn insert_in(
+    tx: &mut PgConnection,
+    id: ExamId,
+    creator: UserId,
+    class_course: ClassCourseId,
+    term: TermId,
+    title: String,
+    description: String,
+    kind: String,
+    mode: Option<String>,
+    starts_at: Option<i64>,
+    ends_at: Option<i64>,
+    duration_ms: Option<i64>,
+    max_attempts: i64,
+    allow_rejoin: bool,
+    allow_review: bool,
+    draft: bool,
+) -> Result<Exam, AppError> {
+    let written = sqlx::query_as!(
         Exam,
-        r#"INSERT INTO exam (id, creator, course, title, description, kind, mode,
-                             starts_at, ends_at, duration_ms, max_attempts,
-                             allow_rejoin, allow_review, draft)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-           RETURNING id AS "id: ExamId", creator AS "creator: UserId",
-                     course AS "course: CourseId", title AS "title: ExamTitle",
-                     description AS "description: ExamDescription",
-                     kind AS "kind: ExamKind", mode AS "mode: ExamMode",
-                     starts_at AS "starts_at: Timestamp",
-                     ends_at AS "ends_at: Timestamp",
-                     duration_ms AS "duration_ms: ExamDuration",
-                     max_attempts AS "max_attempts: ExamAttemptLimit",
-                     allow_rejoin, allow_review, draft"#,
-        ExamId::generate().uuid(),
+        r#"WITH room AS (
+                   UPDATE term SET exam_count = exam_count + 1
+                    WHERE id = $3
+                    RETURNING 1)
+               INSERT INTO exam (id, creator, class_course, term, title, description, kind, mode,
+                                 starts_at, ends_at, duration_ms, max_attempts,
+                                 allow_rejoin, allow_review, draft)
+               SELECT $1, $2, $4, $3, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+                WHERE EXISTS (SELECT 1 FROM room)
+               RETURNING id AS "id: ExamId", creator AS "creator: UserId",
+                         class_course AS "class_course: ClassCourseId",
+                         term AS "term: TermId", title AS "title: ExamTitle",
+                         description AS "description: ExamDescription",
+                         kind AS "kind: ExamKind", mode AS "mode: ExamMode",
+                         starts_at AS "starts_at: Timestamp",
+                         ends_at AS "ends_at: Timestamp",
+                         duration_ms AS "duration_ms: ExamDuration",
+                         max_attempts AS "max_attempts: ExamAttemptLimit",
+                         allow_rejoin, allow_review, draft"#,
+        id.uuid(),
         creator.uuid(),
-        course.uuid(),
+        term.uuid(),
+        class_course.uuid(),
         title.as_str(),
         description.as_str(),
         kind.as_str(),
-        schedule.mode.as_ref().map(ExamMode::as_str),
-        schedule.starts_at.map(|at| at.as_millis()),
-        schedule.ends_at.map(|at| at.as_millis()),
-        schedule.duration_ms.map(|duration| duration.as_millis()),
-        max_attempts.as_i64(),
+        mode.as_deref(),
+        starts_at,
+        ends_at,
+        duration_ms,
+        max_attempts,
         allow_rejoin,
         allow_review,
         draft,
     )
-    .fetch_one(db)
+    .fetch_optional(&mut *tx)
     .await;
-    match created {
-        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
-        Err(err) => Err(err.into()),
-        Ok(exam) => Ok(exam),
-    }
+    let exam = match written {
+        Ok(Some(exam)) => exam,
+        // The conditional claim matched no dönem row: the term is gone.
+        Ok(None) => return Err(crate::domain::term::gone_error()),
+        Err(err) if foreign_key_violation(&err) => return Err(AppError::NotFound),
+        Err(err) => return Err(err.into()),
+    };
+    sqlx::query!(
+        r#"INSERT INTO exam_audience (exam, class_course) VALUES ($1, $2)"#,
+        exam.id.uuid(),
+        exam.class_course.uuid(),
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(exam)
 }
 
 pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> {
     Ok(sqlx::query_as!(
         Exam,
-        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId",
+                  class_course AS "class_course: ClassCourseId", term AS "term: TermId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
                   kind AS "kind: ExamKind", mode AS "mode: ExamMode",
                   starts_at AS "starts_at: Timestamp",
@@ -97,7 +210,8 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
 pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
     Ok(sqlx::query_as!(
         Exam,
-        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
+        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId",
+                  class_course AS "class_course: ClassCourseId", term AS "term: TermId",
                   title AS "title: ExamTitle", description AS "description: ExamDescription",
                   kind AS "kind: ExamKind", mode AS "mode: ExamMode",
                   starts_at AS "starts_at: Timestamp",
@@ -111,26 +225,84 @@ pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
     .await?)
 }
 
-pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Exam>, AppError> {
+/// The exams of one instance, newest first.
+///
+/// It reads through `exam_audience` rather than off `exam.class_course`: the
+/// owner's row is always there (the create writes it), so the two agree for
+/// every exam this instance owns, and the join is what lets an ortak sınav be
+/// one exam addressed to several instances (D2) without a second read path.
+pub async fn list_for_class_course(
+    db: &Database,
+    class_course: &ClassCourseId,
+) -> Result<Vec<Exam>, AppError> {
     Ok(sqlx::query_as!(
         Exam,
-        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
-                  title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
-                  starts_at AS "starts_at: Timestamp",
-                  ends_at AS "ends_at: Timestamp",
-                  duration_ms AS "duration_ms: ExamDuration",
-                  max_attempts AS "max_attempts: ExamAttemptLimit",
-                  allow_rejoin, allow_review, draft
-           FROM exam WHERE course = $1 ORDER BY id DESC"#,
-        course.uuid(),
+        r#"SELECT DISTINCT ON (e.id)
+                  e.id AS "id: ExamId", e.creator AS "creator: UserId",
+                  e.class_course AS "class_course: ClassCourseId",
+                  e.term AS "term: TermId", e.title AS "title: ExamTitle",
+                  e.description AS "description: ExamDescription",
+                  e.kind AS "kind: ExamKind", e.mode AS "mode: ExamMode",
+                  e.starts_at AS "starts_at: Timestamp",
+                  e.ends_at AS "ends_at: Timestamp",
+                  e.duration_ms AS "duration_ms: ExamDuration",
+                  e.max_attempts AS "max_attempts: ExamAttemptLimit",
+                  e.allow_rejoin, e.allow_review, e.draft
+           FROM exam e
+           JOIN exam_audience a ON a.exam = e.id
+           WHERE a.class_course = $1
+           ORDER BY e.id DESC"#,
+        class_course.uuid(),
     )
     .fetch_all(db)
     .await?)
 }
 
-/// Every exam of every course in `courses` (one query) — the catalog as one
-/// user sees it.
+/// Every exam of every instance in `instances` (one query) — the karne and
+/// marks reports' cross-instance read, and the list behind a caller's visible
+/// courses.
+///
+/// `DISTINCT ON (e.id)` because an exam may be addressed to several instances
+/// at once (an ortak sınav): the filters ask "is this exam visible here", not
+/// "how many audiences does it have", so each exam is returned once with its
+/// own owner instance.
+pub async fn list_for_class_course_courses(
+    db: &Database,
+    instances: &[ClassCourseId],
+) -> Result<Vec<Exam>, AppError> {
+    if instances.is_empty() {
+        return Ok(Vec::new());
+    }
+    let instances = instances
+        .iter()
+        .map(ClassCourseId::uuid)
+        .collect::<Vec<_>>();
+    Ok(sqlx::query_as!(
+        Exam,
+        r#"SELECT DISTINCT ON (e.id)
+                  e.id AS "id: ExamId", e.creator AS "creator: UserId",
+                  e.class_course AS "class_course: ClassCourseId",
+                  e.term AS "term: TermId", e.title AS "title: ExamTitle",
+                  e.description AS "description: ExamDescription",
+                  e.kind AS "kind: ExamKind", e.mode AS "mode: ExamMode",
+                  e.starts_at AS "starts_at: Timestamp",
+                  e.ends_at AS "ends_at: Timestamp",
+                  e.duration_ms AS "duration_ms: ExamDuration",
+                  e.max_attempts AS "max_attempts: ExamAttemptLimit",
+                  e.allow_rejoin, e.allow_review, e.draft
+           FROM exam e
+           JOIN exam_audience a ON a.exam = e.id
+           WHERE a.class_course = ANY($1)
+           ORDER BY e.id DESC"#,
+        &instances,
+    )
+    .fetch_all(db)
+    .await?)
+}
+
+/// Every exam of every *catalog* course in `courses` (one query) — the
+/// catalog as one user sees it, across the instances those courses are taught
+/// in.
 pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec<Exam>, AppError> {
     if courses.is_empty() {
         return Ok(Vec::new());
@@ -138,15 +310,22 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
     let courses = courses.iter().map(CourseId::uuid).collect::<Vec<_>>();
     Ok(sqlx::query_as!(
         Exam,
-        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId", course AS "course: CourseId",
-                  title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
-                  starts_at AS "starts_at: Timestamp",
-                  ends_at AS "ends_at: Timestamp",
-                  duration_ms AS "duration_ms: ExamDuration",
-                  max_attempts AS "max_attempts: ExamAttemptLimit",
-                  allow_rejoin, allow_review, draft
-           FROM exam WHERE course = ANY($1) ORDER BY id DESC"#,
+        r#"SELECT DISTINCT ON (e.id)
+                  e.id AS "id: ExamId", e.creator AS "creator: UserId",
+                  e.class_course AS "class_course: ClassCourseId",
+                  e.term AS "term: TermId", e.title AS "title: ExamTitle",
+                  e.description AS "description: ExamDescription",
+                  e.kind AS "kind: ExamKind", e.mode AS "mode: ExamMode",
+                  e.starts_at AS "starts_at: Timestamp",
+                  e.ends_at AS "ends_at: Timestamp",
+                  e.duration_ms AS "duration_ms: ExamDuration",
+                  e.max_attempts AS "max_attempts: ExamAttemptLimit",
+                  e.allow_rejoin, e.allow_review, e.draft
+           FROM exam e
+           JOIN exam_audience a ON a.exam = e.id
+           JOIN class_course cc ON cc.id = a.class_course
+           WHERE cc.course = ANY($1)
+           ORDER BY e.id DESC"#,
         &courses,
     )
     .fetch_all(db)
@@ -272,7 +451,8 @@ pub async fn update_if_unchanged(
                  AND draft = $23
                  AND result_count = $24
                RETURNING id AS "id: ExamId", creator AS "creator: UserId",
-                         course AS "course: CourseId", title AS "title: ExamTitle",
+                         class_course AS "class_course: ClassCourseId",
+                         term AS "term: TermId", title AS "title: ExamTitle",
                          description AS "description: ExamDescription",
                          kind AS "kind: ExamKind", mode AS "mode: ExamMode",
                          starts_at AS "starts_at: Timestamp",
@@ -355,16 +535,19 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
         db,
         true,
         async move |conn| {
-            // The row lock every other exam-child writer contends on.
+            // The row lock every other exam-child writer contends on. The
+            // dönem rides out of the same read: the term's `exam_count` is
+            // given back in this transaction, and the row that names it is
+            // the one being deleted.
             let locked = sqlx::query!(
-                r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,
+                r#"SELECT term AS "term: TermId" FROM exam WHERE id = $1 FOR UPDATE"#,
                 target.id.uuid(),
             )
             .fetch_optional(&mut *conn)
             .await?;
-            if locked.is_none() {
+            let Some(locked) = locked else {
                 return Err(AppError::NotFound);
-            }
+            };
             // The blob names, collected *before* the rows go — inside the
             // lock, so an image row written after this snapshot cannot
             // strand its bytes on disk even though the row itself would be
@@ -441,11 +624,21 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             )
             .execute(&mut *conn)
             .await?;
+            // The sitting instances go with the exam: every read goes through
+            // the audience join, so a row pointing at a deleted exam would be
+            // both invisible and undeletable.
+            sqlx::query!(
+                r#"DELETE FROM exam_audience WHERE exam = $1"#,
+                target.id.uuid(),
+            )
+            .execute(&mut *conn)
+            .await?;
             let deleted = sqlx::query_as!(
                 Exam,
                 r#"DELETE FROM exam WHERE id = $1
                    RETURNING id AS "id: ExamId", creator AS "creator: UserId",
-                             course AS "course: CourseId", title AS "title: ExamTitle",
+                             class_course AS "class_course: ClassCourseId",
+                             term AS "term: TermId", title AS "title: ExamTitle",
                              description AS "description: ExamDescription",
                              kind AS "kind: ExamKind", mode AS "mode: ExamMode",
                              starts_at AS "starts_at: Timestamp",
@@ -460,6 +653,15 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             let Some(exam) = deleted else {
                 return Err(AppError::NotFound);
             };
+            // The dönem gets its exam reference back inside the same
+            // transaction — the other half of the claim `create` makes.
+            sqlx::query!(
+                r#"UPDATE term SET exam_count = GREATEST(exam_count - 1, 0)
+                   WHERE id = $1"#,
+                locked.term.uuid(),
+            )
+            .execute(&mut *conn)
+            .await?;
             Ok(Deleted {
                 exam,
                 question_image_files: image_files,
@@ -494,13 +696,20 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
     .execute(db)
     .await
     .unwrap();
+    // The exam hangs off the *instance* and carries the dönem it is graded in
+    // (both foreign keys): both are real rows, minted per call —
+    // [`crate::db::course::a_test_instance`] mints the class, the course and
+    // the link, [`crate::db::term::a_test_term`] the year under the term.
+    let (instance, _course) = crate::db::course::a_test_instance(db).await;
+    let term = crate::db::term::a_test_term(db).await;
     create(
         db,
         &creator,
-        &crate::db::course::a_test_course(db).await,
+        &instance,
+        &term,
         ExamTitle::try_new("midterm").unwrap(),
         ExamDescription::try_new("").unwrap(),
-        ExamKind::try_new("midterm", &allowed).unwrap(),
+        ExamKind::try_new("yazili", &allowed).unwrap(),
         ExamSchedule::try_new(None, None, None, None).unwrap(),
         ExamAttemptLimit::try_new(1).unwrap(),
         true,
@@ -524,7 +733,7 @@ mod tests {
 
     /// An exam must not outlive the course it belongs to. It is the worst of
     /// the three children `Course::delete` used to leave behind: every exam
-    /// route funnels through `course_of`, which answers
+    /// route funnels through `class_course_of`, which answers
     /// `Internal("exam references a missing course")`, so an orphan **500s
     /// forever** on `GET`/`PATCH`/`DELETE /exams/{id}` — undeletable — while
     /// [`crate::db::exam::list_all`] still hands it to every manager+ on `GET /exams`.
@@ -552,13 +761,34 @@ mod tests {
                 .execute(&db)
                 .await
                 .unwrap();
+                // The exam's parents: a dönem, and an instance of *this*
+                // course. Attaching it is the claim the racing delete
+                // contends on, so the round where the course is gone refuses
+                // here — which is the refusal this test wants to see answered.
+                let term = crate::db::term::a_test_term(&db).await;
+                let class = crate::db::class_group::create(
+                    &db,
+                    &creator,
+                    crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+                .get_id()
+                .clone();
+                let instance = crate::service::class_course::attach(&db, &class, &course, &creator)
+                    .await?
+                    .get_id()
+                    .clone();
                 create(
                     &db,
                     &creator,
-                    &course,
+                    &instance,
+                    &term,
                     ExamTitle::try_new("quiz").unwrap(),
                     ExamDescription::try_new("").unwrap(),
-                    ExamKind::try_new("quiz", &kinds).unwrap(),
+                    ExamKind::try_new("yazili", &kinds).unwrap(),
                     ExamSchedule::try_new(None, None, None, None).unwrap(),
                     ExamAttemptLimit::try_new(1).unwrap(),
                     true,
@@ -569,7 +799,13 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("exam", make).await;
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "exam",
+            "SELECT count(*) FROM exam e JOIN class_course cc ON cc.id = e.class_course
+              WHERE cc.course = $1",
+            make,
+        )
+        .await;
     }
 
     /// A real `app_user` row: students and graders are foreign keys now. The
@@ -705,10 +941,18 @@ mod tests {
         let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
-        for kind in ["homework", "quiz", "midterm", "final", "project", "oral"] {
+        // The K12 defaults, pinned by name: the acceptance set of a fresh
+        // school is exactly these three, and the pre-remodel vocabulary
+        // ("quiz", "midterm", …) is not in it.
+        for kind in ["yazili", "sozlu", "uygulama"] {
             assert_eq!(ExamKind::try_new(kind, &allowed).unwrap().as_str(), kind);
         }
-        assert!(ExamKind::try_new("essay", &allowed).is_err());
+        for stale in ["quiz", "midterm", "exam"] {
+            assert!(
+                ExamKind::try_new(stale, &allowed).is_err(),
+                "{stale} is not in the school's list"
+            );
+        }
         assert!(ExamKind::try_new("", &allowed).is_err());
         // A school-defined list swaps the acceptance set wholesale.
         let custom = vec![ExamKindDef::try_new("lab", 2).unwrap()];
@@ -1196,8 +1440,13 @@ mod tests {
                 })
             };
             let child = {
-                let (db, exam_id, on, student, gate) =
-                    (db.clone(), id.clone(), question.get_id().clone(), student, gate);
+                let (db, exam_id, on, student, gate) = (
+                    db.clone(),
+                    id.clone(),
+                    question.get_id().clone(),
+                    student,
+                    gate,
+                );
                 tokio::spawn(async move {
                     gate.wait().await;
                     let image = AnswerImage::new(
@@ -1264,7 +1513,8 @@ mod tests {
                 })
             };
             let child = {
-                let (db, exam_id, on, gate) = (db.clone(), id.clone(), question.get_id().clone(), gate);
+                let (db, exam_id, on, gate) =
+                    (db.clone(), id.clone(), question.get_id().clone(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     let image = QuestionImage::new(

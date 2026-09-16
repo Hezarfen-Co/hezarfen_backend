@@ -336,7 +336,14 @@ async fn run_with_refcount(
     // lifted from an async fn's *pattern parameter* poisons the higher-ranked
     // `AsyncFnMut`/`Send` evaluation of any closure that captures it
     // ("`Send` would have to be implemented for `&'0 str`, for any lifetime").
-    let Refcount { counter_table, counter_field, claim, release, refused, .. } = refcount;
+    let Refcount {
+        counter_table,
+        counter_field,
+        claim,
+        release,
+        refused,
+        ..
+    } = refcount;
     // Owned into the closure: a captured `&str` — even `'static` — drags the
     // async closure's arg lifetime off the higher-ranked one `tx_with_retry`
     // needs ("AsyncFnMut is not general enough" at the route registration).

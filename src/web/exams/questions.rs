@@ -12,8 +12,8 @@ use crate::service::exam_question;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateQuestion {
-    /// The subject this question belongs to — one of the exam's course's
-    /// subjects (`GET /courses/{id}/subjects`). Required.
+    /// The subject this question belongs to — one of the subjects of the exam
+    /// instance's catalog course (`GET /courses/{id}/subjects`). Required.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
     /// The question itself.
@@ -38,9 +38,9 @@ pub(crate) struct CreateQuestion {
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct UpdateQuestion {
-    /// Re-tag the question with another of the course's subjects. Omit to
-    /// keep the current one — a question always has a subject, so there is no
-    /// clearing it.
+    /// Re-tag the question with another subject of the instance's catalog
+    /// course. Omit to keep the current one — a question always has a subject,
+    /// so there is no clearing it.
     subject_id: Option<String>,
     #[schema(max_length = 2000)]
     text: Option<String>,
@@ -139,8 +139,9 @@ impl QuestionResponse {
 }
 
 /// Add a question to an exam. Requires teacher+ and management rights over the
-/// exam's course. `subject_id` must name one of the course's subjects
-/// (`GET /courses/{id}/subjects`) — every question belongs to a subject.
+/// exam's instance. `subject_id` must name one of the subjects of that
+/// instance's catalog course (`GET /courses/{id}/subjects`) — every question
+/// belongs to a subject.
 /// `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text`
 /// questions carry neither. Locked once attempts exist.
 #[utoipa::path(
@@ -154,9 +155,9 @@ impl QuestionResponse {
         (status = 201, description = "Question created", body = QuestionResponse),
         (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -169,20 +170,21 @@ pub(crate) async fn create_question(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can author questions",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can author questions",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lease: the subject check below is only a pre-flight for the message,
     // and the insert takes the subject's reference counter in the same breath —
     // a subject delete lands either wholly before it (400) or is refused. The
     // freeze gate rides inside the insert's own transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
 
-    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
+    let subject =
+        service::subject::in_course(&st.db, &req.subject_id, instance.get_course()).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
     // No stored choices to match against on create, so every option is new and
@@ -204,7 +206,7 @@ pub(crate) async fn create_question(
 
 /// The exam's question list, `correct` choice ids included — the answer key,
 /// paged via `?limit=&offset=` (omit `limit` for the whole list). Requires
-/// teacher+ and management rights over the exam's course. Students read
+/// teacher+ and management rights over the exam's instance. Students read
 /// questions through `GET /exams/{id}/attempt/questions`. Returns a
 /// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
@@ -217,7 +219,7 @@ pub(crate) async fn create_question(
         (status = 200, description = "A page of the exam's questions (all of them when unpaged)", body = Page<QuestionResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -231,10 +233,10 @@ pub(crate) async fn list_questions(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can read the question list",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can read the question list",
         ));
     }
     Ok(Json(
@@ -274,11 +276,11 @@ pub(crate) async fn question_page(
 }
 
 /// Edit a question. Requires teacher+ and management rights over the exam's
-/// course. Omitted fields keep their value; `kind`/`choices`/`correct` are
+/// instance. Omitted fields keep their value; `kind`/`choices`/`correct` are
 /// re-validated as a unit, so a kind switch must bring the matching fields
-/// along. `subject_id` re-tags within the course's subjects. Locked once
-/// attempts exist. An omitted `subject_id` is filled from the stored row, so
-/// any edit here — not just a re-tag — is refused with a `409` when someone
+/// along. `subject_id` re-tags within the instance's catalog course. Locked
+/// once attempts exist. An omitted `subject_id` is filled from the stored row,
+/// so any edit here — not just a re-tag — is refused with a `409` when someone
 /// else moved the question's subject after the caller read it.
 #[utoipa::path(
     patch,
@@ -294,9 +296,9 @@ pub(crate) async fn question_page(
         (status = 200, description = "Updated question", body = QuestionResponse),
         (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, the subject the question was read on changed since — nothing was written, re-read and retry — or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, the subject the question was read on changed since — nothing was written, re-read and retry — or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -309,13 +311,13 @@ pub(crate) async fn update_question(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit questions",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can edit questions",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lease — see `create_question`; a re-tag moves the subject's reference
     // counter, and the freeze gate rides in the update's transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -323,7 +325,7 @@ pub(crate) async fn update_question(
 
     let subject = match req.subject_id {
         Some(ref subject_id) => {
-            service::subject::in_course(&st.db, subject_id, course.get_id()).await?
+            service::subject::in_course(&st.db, subject_id, instance.get_course()).await?
         }
         None => *question.get_subject(),
     };
@@ -377,7 +379,7 @@ pub(crate) async fn update_question(
 }
 
 /// Remove a question (and every answer to it). Requires teacher+ and
-/// management rights over the exam's course. Locked once attempts exist.
+/// management rights over the exam's instance. Locked once attempts exist.
 #[utoipa::path(
     delete,
     path = "/{id}/questions/{qid}",
@@ -390,9 +392,9 @@ pub(crate) async fn update_question(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_question(
@@ -403,13 +405,13 @@ pub(crate) async fn delete_question(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete questions",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can delete questions",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lock: the freeze gate is part of the delete's own transaction, and
     // this path checks no subject. The pre-flight below is the fast 409.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -433,18 +435,19 @@ pub(crate) async fn delete_question(
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct InstantiateFromBank {
-    /// The subject to file the new question under — one of the exam's course's
-    /// subjects (the same-course rule the bank row itself is exempt from).
+    /// The subject to file the new question under — one of the subjects of the
+    /// exam instance's catalog course (the same-course rule the bank row itself
+    /// is exempt from).
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
 }
 
 /// Instantiate a bank template into this exam as a fresh question. Requires
-/// teacher+, management rights over the exam's course, and a template the
+/// teacher+, management rights over the exam's instance, and a template the
 /// caller may see (their own, or one published to the school) — anything else
 /// is a 404. `subject_id` must
-/// name one of the course's subjects — the template's own subject is origin
-/// metadata and does not carry over. The template (and its blobs) stay
+/// name one of the subjects of the instance's catalog course — the template's
+/// own subject is origin metadata and does not carry over. The template (and its blobs) stay
 /// untouched; a full copy — text, points, spec, illustration, and option
 /// pictures — lands under a new question id. Locked once attempts exist.
 #[utoipa::path(
@@ -461,9 +464,9 @@ pub(crate) struct InstantiateFromBank {
         (status = 201, description = "Question created from the template", body = QuestionResponse),
         (status = 400, description = "Unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no bank template the caller may see", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -476,17 +479,18 @@ pub(crate) async fn question_from_bank(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can author questions",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can author questions",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
+    let subject =
+        service::subject::in_course(&st.db, &req.subject_id, instance.get_course()).await?;
 
     let template = bank_question::read(&st.db, &BankQuestionId::from_key(&bid))
         .await?
@@ -559,14 +563,14 @@ pub(crate) async fn question_from_bank(
 /// instantiated from it — the escape hatch for the divergence a deep copy
 /// creates: fixing a typo in the template does not reach the copies, so this is
 /// how a copy is brought back in line, explicitly and per question. Requires
-/// teacher+, management rights over the exam's course, and a template the
+/// teacher+, management rights over the exam's instance, and a template the
 /// caller may still see.
 ///
 /// Replaces text, points, kind, choices, `correct`, the illustration, and the
 /// option pictures with the template's; the question keeps its own id, its
-/// exam, its `subject` (exam-course-scoped — the template's subject is
-/// unrelated metadata) and its provenance links. Anything edited on the exam
-/// copy since it was inserted is overwritten.
+/// exam, its `subject` (checked against the exam instance's catalog course —
+/// the template's subject is unrelated metadata) and its provenance links.
+/// Anything edited on the exam copy since it was inserted is overwritten.
 ///
 /// **Choice ids come from the template**, exactly as
 /// [`question_from_bank`] mints them — the copy adopts the template's ids, so
@@ -595,9 +599,9 @@ pub(crate) async fn question_from_bank(
         (status = 200, description = "Question refreshed from its template", body = QuestionResponse),
         (status = 400, description = "The question did not come from the bank", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, no such question in it, or no bank template the caller may see", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, the question's subject was re-tagged since the caller read it — nothing was written, re-read and retry — or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, the question's subject was re-tagged since the caller read it — nothing was written, re-read and retry — or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn question_refresh_from_bank(
@@ -608,13 +612,13 @@ pub(crate) async fn question_refresh_from_bank(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit questions",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can edit questions",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lock: the question keeps its own subject here, so there is nothing to
     // pair with a subject delete, and the freeze gate rides in the overwrite's
     // transaction.
@@ -653,8 +657,9 @@ pub(crate) async fn question_refresh_from_bank(
         incoming.push((source, bytes));
     }
 
-    // The question's own subject stays: it is checked against the exam's
-    // course, and the template's is origin metadata from anywhere in school.
+    // The question's own subject stays: it is checked against the exam
+    // instance's catalog course, and the template's is origin metadata from
+    // anywhere in school.
     let subject = *question.get_subject();
     // `spec()` hands over the template's stored choices *with their ids* rather
     // than re-minting any — the same funnel `question_from_bank` uses.
@@ -701,7 +706,7 @@ pub(crate) async fn question_refresh_from_bank(
 }
 
 /// Save one of this exam's questions into the school-wide bank as a reusable
-/// template. Requires teacher+ and management rights over the exam's course.
+/// template. Requires teacher+ and management rights over the exam's instance.
 /// The caller becomes the template's owner; the question's subject rides along
 /// as origin metadata. A full copy — text, points, spec, illustration, and
 /// option pictures — lands under a new bank id. Provenance rides both ways: the
@@ -722,9 +727,9 @@ pub(crate) async fn question_refresh_from_bank(
     responses(
         (status = 201, description = "Template saved to the bank", body = BankQuestionResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn question_to_bank(
@@ -735,13 +740,13 @@ pub(crate) async fn question_to_bank(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = service::exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can save questions to the bank",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can save questions to the bank",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    crate::service::class_course::require_open(&st.db, instance.get_id()).await?;
     // No lease: `BANK_LOCK` is gone with the subject delete's writer lease, and
     // a template left holding a deleted subject reads as an empty
     // `subject_name` either way (see [`crate::web::bank_questions`]).

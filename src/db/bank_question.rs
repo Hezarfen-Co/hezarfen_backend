@@ -589,11 +589,7 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let owner = a_person(&db, "owner").await;
         let other = a_person(&db, "other").await;
-        async fn mine(
-            db: &Database,
-            owner: &UserId,
-            text: &str,
-        ) -> Result<BankQuestion, AppError> {
+        async fn mine(db: &Database, owner: &UserId, text: &str) -> Result<BankQuestion, AppError> {
             create(
                 db,
                 *owner,

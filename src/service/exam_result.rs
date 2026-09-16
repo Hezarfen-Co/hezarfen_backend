@@ -1,16 +1,16 @@
 //! Exam-mark workflows: the grading gate chain, ungrading behind the
-//! archived-term gate, and the read doors the web layer takes. The mark's
+//! archived-year gate, and the read doors the web layer takes. The mark's
 //! own claim-riding transaction lives in [`crate::db::exam_result`].
 
 use crate::database::Database;
 use crate::db;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-use crate::service::exam_attempt::{course_of, read_latest_for_user};
+use crate::service::exam_attempt::{read_latest_for_user, require_open};
 
 /// Grade a student's current sitting: every wall the handler used to run
 /// (draft, retired kind, self-grade, target existence/role/enrollment), then
@@ -49,7 +49,7 @@ pub async fn grade(
     let exam = crate::service::exam::read(db, exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    crate::service::course::require_open(db, &course_of(&exam, db).await?).await?;
+    require_open(db, &exam).await?;
     // Pre-flight: `db::exam_result::grade` re-makes this check inside the
     // mark's own transaction, so a re-draft landing after this read cannot
     // leave a mark on a hidden exam.
@@ -91,8 +91,8 @@ pub async fn grade(
         }));
     }
 
-    // ... and be enrolled in the exam's course.
-    if crate::service::enrollment::read_for_user(db, exam.get_course(), target)
+    // ... and be enrolled in the instance the exam belongs to.
+    if crate::service::enrollment::read_for_user(db, exam.get_class_course(), target)
         .await?
         .is_none()
     {
@@ -124,7 +124,7 @@ pub async fn remove(
     exam: &Exam,
     target: &UserId,
 ) -> Result<Option<ExamResult>, AppError> {
-    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
+    require_open(db, exam).await?;
     db::exam_result::remove(db, exam.get_id(), target, exam.get_kind().as_str()).await
 }
 
@@ -151,12 +151,12 @@ pub async fn list_all_for_exam_user(
     db::exam_result::list_all_for_exam_user(db, exam, user).await
 }
 
-/// The user's graded results restricted to one course's exams — the raw
-/// rows behind the per-course block of the marks report.
+/// The user's graded results restricted to one instance's exams — the raw
+/// rows behind the per-instance block of the marks report.
 pub async fn list_for_user_in_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<ExamResult>, AppError> {
-    db::exam_result::list_for_user_in_course(db, course, user).await
+    db::exam_result::list_for_user_in_course(db, class_course, user).await
 }

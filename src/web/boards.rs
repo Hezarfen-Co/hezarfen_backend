@@ -589,10 +589,10 @@ enum InviteSource {
     /// Everyone currently in this class section (şube). The homeroom teacher is
     /// not implied — the field is a label and grants nothing.
     Class { class: String },
-    /// Everyone currently enrolled in this course. Clubs and study groups are
-    /// courses (`kind` `club` / `study`), so this is how a whole club is
-    /// invited. Staff running the course are not enrolled and so are not
-    /// included.
+    /// Everyone the course reaches: the union of every instance's roster and
+    /// the course's individual members. Clubs and study groups are courses
+    /// (`kind` `club` / `study`), so this is how a whole club is invited. Staff
+    /// running the course are not enrolled and so are not included.
     Course { course: String },
     /// The event's expected-attendee roster, exactly as `GET
     /// /events/{id}/roster` resolves it — the signup list for a registration
@@ -609,10 +609,12 @@ impl InviteSource {
     /// The gate is deliberately not a new permission: a board's roster is
     /// visible to everyone on the board, so a bulk invite *discloses* the source
     /// roster. Each arm therefore mirrors the gate on that roster's own listing
-    /// route — teacher+ for a class (`GET /classes/{id}/members`),
-    /// [`can_manage_course`] for a course (`GET /courses/{id}/enrollments`),
-    /// teacher+ for an event (`GET /events/{id}/roster`). A student can still
-    /// build a board one id at a time; they cannot dump a class roster into one.
+    /// route — teacher+ for a class (`GET /classes/{id}/members`), teacher+ for
+    /// an event (`GET /events/{id}/roster`); the course arm keeps
+    /// [`can_manage_course`], the gate over a catalog row, because a course's
+    /// audience (every instance's roster plus its individual members) has no
+    /// single listing route of its own. A student can still build a board one id
+    /// at a time; they cannot dump a class roster into one.
     ///
     /// A source that does not exist is a `400` naming the field, never a `404`:
     /// on these routes a 404 means "no such board, or not yours", and reusing it
@@ -653,17 +655,10 @@ impl InviteSource {
                     }))?;
                 if !can_manage_course(&course, user) {
                     return Err(AppError::Forbidden(
-                        "only the course creator, an assigned teacher, or a manager/admin can invite its roster",
+                        "only the course creator or a manager/admin can invite its roster",
                     ));
                 }
-                Ok(
-                    crate::service::enrollment::list_for_course(db, course.get_id(), None, 0)
-                        .await?
-                        .0
-                        .iter()
-                        .map(|enrollment| *enrollment.get_user())
-                        .collect(),
-                )
+                Ok(crate::db::enrollment::list_users_for_course(db, course.get_id()).await?)
             }
             InviteSource::Event { event } => {
                 if !user.get_role().at_least(Role::Teacher) {

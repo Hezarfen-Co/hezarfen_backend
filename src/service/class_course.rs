@@ -1,24 +1,28 @@
 //! Class-course workflows: the attach that maps the pump's refusals to this
-//! route's answers, and the detach that turns a zero-row sweep into a 404.
-//! The transactions live in [`crate::db::class_pump`] and
-//! [`crate::db::class_course`].
+//! route's answers, the detach that turns a zero-row sweep into a 404, and the
+//! instance-scoped gates every route under `/instances` pays — the archived
+//! year and the D10 "who may act on this instance" rule. The transactions live
+//! in [`crate::db::class_pump`] and [`crate::db::class_course`].
 
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::db::class_course;
 use crate::db::class_pump::{self, Axis};
-use crate::domain::class_course::ClassCourse;
+use crate::domain::academic_year::AcademicYearId;
+use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
-use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::domain::role::Role;
+use crate::domain::user::{User, UserId};
+use crate::error::{AppError, ValidationError};
 
 /// Attach `course` to `class` and enroll the class's whole roster into it,
 /// in one transaction.
 ///
-/// Students already in the course keep the rows they have — no seat
-/// charged, `source` untouched — and a roster that does not fit refuses the
-/// whole attach rather than filling the course to its cap and stopping.
+/// Students already in the course keep the rows they have — no second
+/// enrollment written, `source` untouched — and the attach is one
+/// `class_course` row per (class, course): the instance every exam, session,
+/// homework and enrollment under this class's course now keys on.
 pub async fn attach(
     db: &Database,
     class: &ClassGroupId,
@@ -54,10 +58,6 @@ pub async fn attach(
                  remove some before attaching a course"
             ),
         }),
-        class_pump::Attached::Full(full) => Err(AppError::ConflictCoded {
-            code,
-            message: format!("{full} cannot hold the whole class"),
-        }),
         // Unreachable on this axis, and kept because the match is
         // exhaustive: the pair loop enrolls the roster into `$pivot` and
         // nothing else, and the pivot claim already proved *that* course
@@ -82,18 +82,29 @@ pub async fn attach(
 /// into it. A course that was not attached is a [`AppError::NotFound`],
 /// raised here rather than left to each caller to re-derive from a boolean.
 ///
-/// to that class (see [`class_pump::detach_course`]).
+/// The instance is the anchor, so this takes everything the class taught under
+/// it — exams, sessions, homework, the roster and the teacher links (see
+/// [`class_pump::detach_course`]) — and answers the blob keys of the image and
+/// homework-file rows that cascade removed, so the route can unlink those files
+/// after the commit (the shape [`crate::service::course::delete`] already has).
+/// The rows are gone by the time this returns: a caller that drops the list
+/// leaves the bytes on disk with nothing pointing at them.
+///
+/// An empty list is *not* the refusal — an instance that carried no uploads
+/// detaches fine and simply has no files to unlink. Only a pair holding no
+/// instance at all is the 404.
 pub async fn detach(
     db: &Database,
     class: &ClassGroupId,
     course: &CourseId,
-) -> Result<(), AppError> {
-    let gone = class_pump::detach_course(db, class, course, None).await?;
-    (gone > 0).then_some(()).ok_or(AppError::NotFound)
+) -> Result<Vec<String>, AppError> {
+    class_pump::detach_course(db, class, course, None)
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 /// The courses a class is attached to, newest first, paged — the read behind
-/// `GET /classes/{id}/courses`.
+/// `GET /classes/{id}/instances`.
 pub async fn list_for_class(
     db: &Database,
     class: &ClassGroupId,
@@ -103,21 +114,183 @@ pub async fn list_for_class(
     class_course::list_for_class(db, class, limit, offset).await
 }
 
+/// One instance, or `None` when the id names no row — the read behind
+/// `GET /instances/{id}`.
+pub async fn read(db: &Database, id: &ClassCourseId) -> Result<Option<ClassCourse>, AppError> {
+    class_course::read(db, id).await
+}
+
+/// PATCH one instance's own policy: the weekly hours and whether it counts
+/// toward the karne. Both are non-clearable, so an omitted field keeps the
+/// stored value.
+pub async fn update(
+    db: &Database,
+    id: &ClassCourseId,
+    staff: Option<DersSaati>,
+    counts: Option<bool>,
+) -> Result<ClassCourse, AppError> {
+    class_course::update(db, id, staff, counts).await
+}
+
+/// The academic year this instance sits under, if any — the seam every
+/// instance-scoped write reads the archive gate off (instance → şube → year).
+pub async fn year_of(
+    db: &Database,
+    instance: &ClassCourseId,
+) -> Result<Option<AcademicYearId>, AppError> {
+    let Some(class) = class_course::class_of(db, instance).await? else {
+        return Ok(None);
+    };
+    Ok(crate::db::class_group::read(db, &class)
+        .await?
+        .and_then(|class| class.get_year().copied()))
+}
+
+/// Refuse the write when the instance's year is archived — past years are
+/// read-only. A pre-flight guard, accepted race (see README concurrency
+/// model): a year archived after this read still lets the write through.
+///
+/// A şube with no year, or one whose year row is gone, passes: a dangling
+/// link is not this guard's error, and the caller that cares answers it.
+pub async fn require_open(db: &Database, instance: &ClassCourseId) -> Result<(), AppError> {
+    if let Some(year) = year_of(db, instance).await? {
+        crate::service::academic_year::require_open(db, &year).await?;
+    }
+    Ok(())
+}
+
+/// Assign `target` to teach this instance, on `by`'s orders.
+///
+/// The target must already hold the `teacher` role or higher — assignment
+/// hands out the rights every instance-scoped gate re-checks against that bar,
+/// so assigning anyone below it would write a row that can never be used —
+/// and the caller `by` must hold `manager`+: staffing is the office's call,
+/// stated here so it holds for every caller of this workflow and not only for
+/// the route that remembers to extract it. Assignment is idempotent, and a
+/// past year is read-only: staffing an archived year's instance is refused
+/// like every other write against it.
+pub async fn assign_teacher(
+    db: &Database,
+    instance: &ClassCourseId,
+    target: &UserId,
+    by: &UserId,
+) -> Result<(), AppError> {
+    let Some(actor) = crate::db::user::read(db, by).await? else {
+        return Err(AppError::Unauthorized);
+    };
+    if !actor.get_role().at_least(Role::Manager) {
+        return Err(AppError::Forbidden(
+            "assigning a teacher is the office's call — manager role or higher",
+        ));
+    }
+    let Some(target_user) = crate::db::user::read(db, target).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user does not exist",
+        }));
+    };
+    if !target_user.get_role().at_least(Role::Teacher) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user must hold the teacher role or higher",
+        }));
+    }
+    require_open(db, instance).await?;
+    crate::db::class_course_teacher::assign(db, instance, target).await?;
+    Ok(())
+}
+
+/// Drop `target` from this instance's teachers: read-only in a past year, like
+/// every other write against archived structure. `false` when they were not
+/// assigned to it, so the web layer can answer 404 instead of pretending it
+/// removed someone.
+pub async fn unassign_teacher(
+    db: &Database,
+    instance: &ClassCourseId,
+    target: &UserId,
+) -> Result<bool, AppError> {
+    require_open(db, instance).await?;
+    crate::db::class_course_teacher::unassign(db, instance, target).await
+}
+
+/// A 403 unless `user` may act on this instance — D10, the one gate every
+/// instance-scoped route shares in place of a `class_course_teacher` lookup of
+/// its own. It passes when the user is `manager`+ (the office), when they are
+/// one of the instance's assigned teachers, or when they are the şube's
+/// homeroom teacher (sınıf öğretmeni) — the three ways a person legitimately
+/// runs a section's course.
+///
+/// A gone instance is a `404`, never a 403: the route the user asked about
+/// does not exist.
+pub async fn ensure_instance_teacher(
+    db: &Database,
+    user: &User,
+    instance: &ClassCourseId,
+) -> Result<(), AppError> {
+    if user.get_role().at_least(Role::Manager) {
+        return Ok(());
+    }
+    let Some(class) = class_course::class_of(db, instance).await? else {
+        return Err(AppError::NotFound);
+    };
+    // Both ways in below are an *assignment*, and an assignment is history:
+    // the caller's live role decides, exactly as it does on the catalog path
+    // ([`crate::web::courses::can_manage_course`]). The demotion cascade
+    // sweeps the assignment table and the homeroom column only when it runs
+    // with the role write, so a flip that skipped it would otherwise leave a
+    // student running the section they were stripped of.
+    if user.get_role().at_least(Role::Teacher)
+        && (crate::db::class_course_teacher::list_for_instance(db, instance)
+            .await?
+            .contains(user.get_id())
+            || crate::db::class_group::read(db, &class)
+                .await?
+                .and_then(|class| class.get_teacher().copied())
+                .as_ref()
+                == Some(user.get_id()))
+    {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "only this instance's teachers, its class's homeroom teacher, or a manager may act here",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::class_group;
     use crate::db::class_member::tests::{
         a_class, a_course, counter, course_exists, link_exists, rows, source_of,
     };
+    use crate::domain::user::Username;
     use crate::service::class_member;
 
-    /// Attaching seeds the course from the roster the class already holds.
+    /// The stored user row, for the gates that judge a live role.
+    async fn user_of(db: &Database, id: &UserId) -> User {
+        crate::db::user::read(db, id).await.unwrap().unwrap()
+    }
+
+    /// A real account at a role — the D10 gates judge the live row, so a
+    /// fixture id would not do.
+    async fn staff(db: &Database, username: &str, role: Role) -> UserId {
+        let account = crate::db::user::create(db, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap();
+        crate::service::user::set_role(db, account.get_id(), role)
+            .await
+            .unwrap();
+        *account.get_id()
+    }
+
+    /// Attaching mints the instance, seeds it from the roster the class already
+    /// holds, and refuses a second attach of the same pair.
     #[tokio::test]
-    async fn an_attach_enrolls_the_whole_roster() {
+    async fn an_attach_enrolls_the_whole_roster_into_the_new_instance() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         let class = a_class("9-A", &db).await;
-        let algebra = a_course("algebra", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
         let students = [
             crate::db::class_member::tests::fixture_user(&db, "a").await,
             crate::db::class_member::tests::fixture_user(&db, "b").await,
@@ -128,14 +301,17 @@ mod tests {
                 .unwrap();
         }
 
-        attach(&db, &class, &algebra, &manager).await.unwrap();
+        let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
         for student in &students {
             assert_eq!(
-                source_of(&algebra, student, &db).await,
+                source_of(instance.get_id(), student, &db).await,
                 Some(Some(class.clone()))
             );
         }
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 2);
+        assert_eq!(
+            counter("enrollment_count", instance.get_id().uuid(), &db).await,
+            2
+        );
         assert_eq!(counter("class_course_count", class.uuid(), &db).await, 1);
 
         let again = attach(&db, &class, &algebra, &manager).await;
@@ -145,71 +321,107 @@ mod tests {
         );
     }
 
-    /// A course with room for only part of the roster takes none of it: zero
-    /// enrollments, the counter unmoved, and no attachment row.
+    /// Two şubeler teaching one catalog course are two instances — that is the
+    /// whole remodel — and each keeps its own roster.
     #[tokio::test]
-    async fn a_roster_that_does_not_fit_attaches_nothing() {
+    async fn two_classes_teaching_one_course_keep_their_own_rosters() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let class = a_class("9-A", &db).await;
-        let tight = a_course("algebra", Some(2), &db).await;
-        for name in ["a", "b", "c"] {
-            let student = crate::db::class_member::tests::fixture_user(&db, name).await;
-            class_member::add(&db, &class, &student, &manager).await.unwrap();
-        }
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
+        let algebra = a_course("algebra", &db).await;
+        let fifth_a = a_class("5-A", &db).await;
+        let fifth_b = a_class("5-B", &db).await;
 
-        let refused = attach(&db, &class, &tight, &manager).await;
-        assert!(
-            matches!(refused, Err(AppError::ConflictCoded { code, ref message })
-                if code == "course_full" && message.contains(tight.key().as_str())),
-            "the refusal must be coded `course_full` and name the course: {refused:?}"
+        let first = attach(&db, &fifth_a, &algebra, &manager).await.unwrap();
+        let second = attach(&db, &fifth_b, &algebra, &manager).await.unwrap();
+        assert_ne!(
+            first.get_id(),
+            second.get_id(),
+            "one catalog course, one instance per şube"
+        );
+
+        class_member::add(&db, &fifth_a, &student, &manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            source_of(first.get_id(), &student, &db).await,
+            Some(Some(fifth_a.clone())),
+            "5-A's student lands in 5-A's instance"
         );
         assert_eq!(
-            rows("enrollment", &db).await,
-            0,
-            "the two seats that did fit must be given back with the third"
+            source_of(second.get_id(), &student, &db).await,
+            None,
+            "…and nowhere near 5-B's"
+        );
+
+        // Detaching one şube takes its instance and its roster; the other
+        // şube's instance and roster stand.
+        detach(&db, &fifth_a, &algebra).await.unwrap();
+        assert_eq!(source_of(first.get_id(), &student, &db).await, None);
+        assert_eq!(
+            source_of(second.get_id(), &student, &db).await,
+            None,
+            "5-B's instance was never enrolled either"
         );
         assert_eq!(
-            rows("class_course", &db).await,
-            0,
-            "…and no attachment row may survive"
+            counter("class_course_count", fifth_b.uuid(), &db).await,
+            1,
+            "the other şube keeps its instance"
         );
-        assert_eq!(counter("enrollment_count", tight.uuid(), &db).await, 0);
-        assert_eq!(counter("class_course_count", class.uuid(), &db).await, 0);
+        assert_eq!(
+            counter("class_member_count", fifth_a.uuid(), &db).await,
+            1,
+            "the two axes are independent: dropping the course keeps the roster"
+        );
     }
 
-    /// A hand-placed row is skipped on the way in and left standing on the way
-    /// out — the class never owned it.
+    /// A hand-placed row is never adopted: the pump skips it, and a member
+    /// exit leaves it standing because it carries no class `source`. The
+    /// detach is the other story: it takes the whole instance subtree, and a
+    /// hand row lives on that instance like any other.
     #[tokio::test]
-    async fn a_hand_placed_row_survives_the_detach() {
+    async fn a_hand_placed_row_is_never_adopted_by_the_class() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "student").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
-        let algebra = a_course("algebra", None, &db).await;
-        crate::db::enrollment::enroll(&db, &algebra, &student, &manager)
+        let algebra = a_course("algebra", &db).await;
+        let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
+        crate::db::enrollment::enroll(&db, instance.get_id(), &student, &manager, None)
             .await
             .unwrap();
         class_member::add(&db, &class, &student, &manager)
             .await
             .unwrap();
 
-        attach(&db, &class, &algebra, &manager).await.unwrap();
         assert_eq!(
-            source_of(&algebra, &student, &db).await,
+            source_of(instance.get_id(), &student, &db).await,
             Some(None),
-            "an attach may not adopt a hand-placed row"
+            "the pump may not adopt a hand-placed row"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.uuid(), &db).await,
+            counter("enrollment_count", instance.get_id().uuid(), &db).await,
             1,
-            "…nor charge a seat for it"
+            "…nor count it twice"
+        );
+
+        class_member::leave(&db, &class, &student).await.unwrap();
+        assert_eq!(
+            source_of(instance.get_id(), &student, &db).await,
+            Some(None),
+            "the member sweep may only take back the rows the class wrote"
+        );
+        assert_eq!(
+            counter("enrollment_count", instance.get_id().uuid(), &db).await,
+            1
         );
 
         detach(&db, &class, &algebra).await.unwrap();
-        assert_eq!(source_of(&algebra, &student, &db).await, Some(None));
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
+        assert_eq!(
+            source_of(instance.get_id(), &student, &db).await,
+            None,
+            "the detach takes the instance and every row on it"
+        );
         let again = detach(&db, &class, &algebra).await;
         assert!(
             matches!(again, Err(AppError::NotFound)),
@@ -217,24 +429,23 @@ mod tests {
         );
     }
 
-    /// Detaching with nobody else claiming the rows deletes them and gives the
-    /// seats back.
+    /// Detaching sweeps the rows the class pumped, and only those: the
+    /// membership row is a separate axis and stays.
     #[tokio::test]
     async fn a_detach_sweeps_the_rows_it_pumped() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "student").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
-        let algebra = a_course("algebra", None, &db).await;
+        let algebra = a_course("algebra", &db).await;
         class_member::add(&db, &class, &student, &manager)
             .await
             .unwrap();
-        attach(&db, &class, &algebra, &manager).await.unwrap();
+        let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
 
         detach(&db, &class, &algebra).await.unwrap();
-        assert_eq!(source_of(&algebra, &student, &db).await, None);
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
+        assert_eq!(source_of(instance.get_id(), &student, &db).await, None);
+        assert_eq!(rows("enrollment", &db).await, 0);
         assert_eq!(counter("class_course_count", class.uuid(), &db).await, 0);
         assert_eq!(
             rows("class_member", &db).await,
@@ -244,146 +455,137 @@ mod tests {
         );
     }
 
-    /// Two classes, one course, one student in both: the second attach skipped
-    /// the row the first wrote, so the row names only the first class — and
-    /// detaching *that* class must hand the row to the second rather than
-    /// unenroll a student the second is still responsible for. Detaching the
-    /// second then finds nobody left and takes the seat back.
+    /// The attach of an empty class leaves the new instance's counter at zero —
+    /// nothing to enroll, nothing charged.
     #[tokio::test]
-    async fn a_detach_hands_a_shared_row_to_the_class_that_still_claims_it() {
+    async fn the_attach_of_an_empty_roster_charges_no_seat() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "student").await;
-        let algebra = a_course("algebra", None, &db).await;
-        let first = a_class("9-A", &db).await;
-        let second = a_class("club", &db).await;
-        for class in [&first, &second] {
-            class_member::add(&db, class, &student, &manager)
-                .await
-                .unwrap();
-            attach(&db, class, &algebra, &manager).await.unwrap();
-        }
-        assert_eq!(
-            source_of(&algebra, &student, &db).await,
-            Some(Some(first.clone())),
-            "the second attach must skip the row the first wrote"
-        );
-        assert_eq!(
-            counter("enrollment_count", algebra.uuid(), &db).await,
-            1,
-            "…and pay no second seat for it"
-        );
-
-        detach(&db, &first, &algebra).await.unwrap();
-        assert_eq!(
-            source_of(&algebra, &student, &db).await,
-            Some(Some(second.clone())),
-            "the row must be handed to the class that still claims it"
-        );
-        assert_eq!(
-            counter("enrollment_count", algebra.uuid(), &db).await,
-            1,
-            "a repair is not a release"
-        );
-
-        detach(&db, &second, &algebra).await.unwrap();
-        assert_eq!(
-            source_of(&algebra, &student, &db).await,
-            None,
-            "the last claimant leaving takes the row with it"
-        );
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
-    }
-
-    /// The same repair along the member axis: removing the student from the
-    /// class that owns the row hands it to the other class they are in.
-    #[tokio::test]
-    async fn a_member_removal_hands_a_shared_row_over_too() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "student").await;
-        let algebra = a_course("algebra", None, &db).await;
-        let first = a_class("9-A", &db).await;
-        let second = a_class("club", &db).await;
-        for class in [&first, &second] {
-            attach(&db, class, &algebra, &manager).await.unwrap();
-            class_member::add(&db, class, &student, &manager)
-                .await
-                .unwrap();
-        }
-
-        class_member::remove(&db, &first, &student).await.unwrap();
-        assert_eq!(
-            source_of(&algebra, &student, &db).await,
-            Some(Some(second.clone())),
-            "the student is still in the second class, so the row stays"
-        );
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
-
-        class_member::remove(&db, &second, &student).await.unwrap();
-        assert_eq!(source_of(&algebra, &student, &db).await, None);
-        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 0);
-    }
-
-    /// The restore half of the pivot claim: it bumps the course's counter to
-    /// prove the row is there and must put it back *exactly* as it found it —
-    /// absent, which the boot backfill keys on (`WHERE enrollment_count =
-    /// NONE`). An empty roster is the case that has no seat write to hide a
-    /// leftover bump behind.
-    #[tokio::test]
-    async fn the_pivot_claim_gives_the_courses_counter_back_untouched() {
-        let (db, _leases) = crate::database::init_test_db().await;
         let class = a_class("9-A", &db).await;
-        let algebra = a_course("algebra", None, &db).await;
-        // The course's own counter: fresh means 0 (the Postgres column is
-        // NOT NULL DEFAULT 0), and the claim's bump must be restored, not
-        // left dangling at 1 with an empty roster behind it.
-        let count = || {
-            sqlx::query_scalar::<_, i64>("SELECT enrollment_count FROM course WHERE id = $1")
-                .bind(algebra.uuid())
-        };
+        let algebra = a_course("algebra", &db).await;
+        let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
         assert_eq!(
-            count().fetch_one(&db).await.unwrap(),
+            counter("enrollment_count", instance.get_id().uuid(), &db).await,
             0,
-            "a fresh course carries no count"
+            "a fresh instance's roster counter is zero"
+        );
+    }
+
+    /// PATCHing the instance writes only what the request carried.
+    #[tokio::test]
+    async fn an_update_writes_only_the_fields_it_carried() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let class = a_class("9-A", &db).await;
+        let algebra = a_course("algebra", &db).await;
+        let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
+
+        let updated = update(
+            &db,
+            instance.get_id(),
+            Some(DersSaati::try_new(5).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.get_ders_saati().as_i64(), 5);
+        assert!(
+            updated.counts_toward_karne(),
+            "the omitted field keeps its stored value"
         );
 
-        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        attach(&db, &class, &algebra, &manager).await.unwrap();
+        let again = update(&db, instance.get_id(), None, Some(false))
+            .await
+            .unwrap();
+        assert!(!again.counts_toward_karne());
         assert_eq!(
-            count().fetch_one(&db).await.unwrap(),
-            0,
-            "the claim's bump must be restored, not left dangling"
+            again.get_ders_saati().as_i64(),
+            5,
+            "…and the other direction holds too"
+        );
+    }
+
+    /// D10: the instance's own teacher, the şube's homeroom teacher and a
+    /// manager may act on it; another instance's teacher and a plain student
+    /// may not. Assignment itself is the office's call and the assignee must
+    /// hold the teacher bar.
+    #[tokio::test]
+    async fn the_instance_gate_admits_its_teachers_homeroom_and_managers() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "mudur", Role::Manager).await;
+        let assigned = staff(&db, "ayse", Role::Teacher).await;
+        let outsider = staff(&db, "mehmet", Role::Teacher).await;
+        let homeroom = staff(&db, "zeynep", Role::Teacher).await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "ogrenci").await;
+        let algebra = a_course("algebra", &db).await;
+        let class = class_group::create(
+            &db,
+            &manager,
+            crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
+            None,
+            None,
+            Some(homeroom),
+        )
+        .await
+        .unwrap();
+        let instance = attach(&db, &class.get_id().clone(), &algebra, &manager)
+            .await
+            .unwrap();
+
+        assign_teacher(&db, instance.get_id(), &assigned, &manager)
+            .await
+            .unwrap();
+        // Idempotent, like every other assignment.
+        assign_teacher(&db, instance.get_id(), &assigned, &manager)
+            .await
+            .unwrap();
+
+        assert!(
+            ensure_instance_teacher(&db, &user_of(&db, &manager).await, instance.get_id())
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_instance_teacher(&db, &user_of(&db, &assigned).await, instance.get_id())
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_instance_teacher(&db, &user_of(&db, &homeroom).await, instance.get_id())
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_instance_teacher(&db, &user_of(&db, &outsider).await, instance.get_id())
+                .await
+                .is_err(),
+            "a teacher of another instance is not this one's"
+        );
+        assert!(
+            ensure_instance_teacher(&db, &user_of(&db, &student).await, instance.get_id())
+                .await
+                .is_err()
+        );
+
+        // A student cannot be made an instance's teacher, and a non-manager
+        // cannot assign one.
+        let refused = assign_teacher(&db, instance.get_id(), &student, &manager).await;
+        assert!(
+            matches!(refused, Err(AppError::Validation(_))),
+            "a student is not a teacher: {refused:?}"
+        );
+        let refused = assign_teacher(&db, instance.get_id(), &assigned, &outsider).await;
+        assert!(
+            matches!(refused, Err(AppError::Forbidden(_))),
+            "staffing is the office's call: {refused:?}"
         );
     }
 
     /// The `Menu::delete` defect on the class layer: a `class_course` row must
     /// not outlive the course it names. The attach's proof that the course is
-    /// still there is a *write* on the course row
-    /// ([`crate::db::class_pump::Axis::pivot_claim`]), landing it on the
-    /// very key `Course::delete`'s guard writes — but only because that write
-    /// now *moves* the counter. The `count = count` this shipped with left the
-    /// document unchanged, which SurrealDB 3.2.3 elides: it entered no write
-    /// set, collided with nothing, and both callers were told OK while the link
-    /// stayed pointing at a deleted course.
-    ///
-    /// The roster is empty deliberately — that is the only shape where nothing
-    /// else in the transaction touches the course row, so the claim is the
-    /// whole guard. One child per round, for the reason the menu twin
-    /// documents: a second writer makes the delete lose and re-send, and the
-    /// re-sent sweep clears the evidence.
-    ///
-    /// The window is opened by the schema, not by a lucky interleaving: a
-    /// `DEFINE EVENT` on `course` fires inside the delete's own transaction the
-    /// instant the row goes, so the `SLEEP` lands between the delete and its
-    /// `DELETE class_course WHERE course = $course` sweep every time.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both and answers `Ok` to each, so this passes there on broken
-    /// code.
+    /// still there lands on the very row `Course::delete`'s guard locks, so
+    /// whatever the interleaving, a link row and a deleted course can never
+    /// both stand.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_class_course_link_never_outlives_the_course() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -391,16 +593,14 @@ mod tests {
         let (mut orphans, mut swept, mut miscounted) = (0, 0, 0);
         for round in 0..4 {
             let class = a_class(&format!("9-{round}"), &db).await;
-            let algebra = a_course(&format!("algebra{round}"), None, &db).await;
+            let algebra = a_course(&format!("algebra{round}"), &db).await;
             let course = crate::db::course::read(&db, &algebra)
                 .await
                 .unwrap()
                 .unwrap();
 
-            // The old engine needed a schema event to hold the delete's
-            // window open; Postgres puts the racing delete and attach on the
-            // same rows, so a barrier start covers every interleaving — the
-            // link row may never outlive the course in any of them.
+            // A barrier start covers every interleaving — the link row may
+            // never outlive the course in any of them.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
                 let (db, gate, course) = (db.clone(), gate.clone(), course.clone());
@@ -414,6 +614,14 @@ mod tests {
                     (db.clone(), class.clone(), algebra.clone(), manager, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
+                    // Every other round the attach is held back a clear 2ms so
+                    // the delete wins outright (`swept > 0` below is a coin
+                    // toss without it): with the course counter claim live both
+                    // sides write the very row the guard reads, so whichever is
+                    // marginally faster otherwise takes every round under load.
+                    if round % 2 == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
                     attach(&db, &class, &algebra, &manager).await
                 })
             };

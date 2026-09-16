@@ -167,14 +167,17 @@ pub async fn delete_choices_not_in(
 }
 
 /// The blob names behind every image of every exam of `course` — collected
-/// *before* the course-delete cascade wipes the rows.
+/// *before* the course-delete cascade wipes the rows. The exams belong to the
+/// course's instances since D1, so the join goes through `class_course`.
 pub async fn file_keys_for_course(
     db: &Database,
     course: &CourseId,
 ) -> Result<Vec<String>, AppError> {
     let rows = sqlx::query!(
         r#"SELECT qi.file FROM question_image qi
-           JOIN exam e ON e.id = qi.exam WHERE e.course = $1"#,
+           JOIN exam e ON e.id = qi.exam
+           JOIN class_course cc ON cc.id = e.class_course
+           WHERE cc.course = $1"#,
         course.uuid(),
     )
     .fetch_all(db)

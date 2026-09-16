@@ -147,10 +147,13 @@ pub async fn list_for_user(
     // A window that can hide rows needs the count over the same WHERE;
     // an unpaged read from row zero already holds every row.
     let total = if limit.is_some() || offset > 0 {
-        sqlx::query_scalar!("SELECT count(*) FROM work_entry WHERE app_user = $1", user.uuid())
-            .fetch_one(db)
-            .await?
-            .unwrap_or(0)
+        sqlx::query_scalar!(
+            "SELECT count(*) FROM work_entry WHERE app_user = $1",
+            user.uuid()
+        )
+        .fetch_one(db)
+        .await?
+        .unwrap_or(0)
     } else {
         rows.len() as i64
     };

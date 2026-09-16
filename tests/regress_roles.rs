@@ -425,8 +425,8 @@ async fn a_student_holding_every_grant(
     let veli = login(app, "veli").await;
     let ali_id = me_id(app, &ali).await;
 
-    let course = common::create_course(app, &teacher, "Fizik").await;
-    common::enroll(app, &teacher, &course, &ali_id).await;
+    let t = common::taught_under(app, &admin, &teacher, "Fizik").await;
+    common::enroll(app, &teacher, &t.instance, &ali_id).await;
     let res = send(
         app,
         "POST",
@@ -511,7 +511,7 @@ async fn nothing_was_swept(ali_id: &str, db: &Database) {
     );
     assert_eq!(
         counter(
-            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course",
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course",
             db
         )
         .await,
@@ -579,7 +579,7 @@ async fn the_retry_takes_everything(
     assert_eq!(boards_listing(ali_id, db).await, 0);
     assert_eq!(
         counter(
-            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course",
+            "SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM class_course",
             db
         )
         .await,
@@ -777,13 +777,13 @@ async fn demoted_creator_loses_course_management_over_http() {
     let teacher_id = me_id(&app, &teacher).await;
     let student_id = me_id(&app, &student).await;
 
-    let course = common::create_course(&app, &teacher, "Fizik").await;
-    let subject = common::create_subject(&app, &teacher, &course, "Kuvvet").await;
+    let t = common::taught_under(&app, &admin, &teacher, "Fizik").await;
+    let subject = common::create_subject(&app, &teacher, &t.course, "Kuvvet").await;
     let res = common::create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "Ara", "kind": "quiz", "draft": true }),
+        &t.instance,
+        json!({ "title": "Ara", "kind": "yazili", "term": t.term.clone(), "draft": true }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -791,16 +791,28 @@ async fn demoted_creator_loses_course_management_over_http() {
     // Assigned to the other student only, so seeing it is a *management* right
     // and never the audience right a course member has.
     let due = Timestamp::now().as_millis() + 86_400_000;
-    common::enroll(&app, &teacher, &course, &student_id).await;
+    common::enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = common::create_homework_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({ "title": "Odev", "subject_id": subject, "due_at": due, "assigned": [student_id] }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let homework = id_of(&res.body);
+
+    // The teacher runs the instance — the assignment the list endpoints'
+    // `visible_instances` reads for a staff caller.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/instances/{}/teachers", t.instance),
+        Some(&admin),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // Before the demotion: the creator manages the course.
     let res = send(
@@ -828,7 +840,7 @@ async fn demoted_creator_loses_course_management_over_http() {
     // course-view gate still passes, so what answers below is the management
     // gate alone.
     common::set_role(&db, "ogretmen", "student").await;
-    common::enroll(&app, &admin, &course, &teacher_id).await;
+    common::enroll(&app, &admin, &t.instance, &teacher_id).await;
 
     let res = send(
         &app,
@@ -868,7 +880,7 @@ async fn demoted_creator_loses_course_management_over_http() {
     let res = send(
         &app,
         "PATCH",
-        &format!("/courses/{course}"),
+        &format!("/courses/{}", t.course),
         Some(&teacher),
         Some(json!({ "title": "Kimya" })),
     )
@@ -877,7 +889,7 @@ async fn demoted_creator_loses_course_management_over_http() {
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
+        &format!("/courses/{}", t.course),
         Some(&teacher),
         None,
     )
@@ -886,20 +898,25 @@ async fn demoted_creator_loses_course_management_over_http() {
 }
 
 /// The no-orphan half: the role floor must never leave a course nobody can
-/// manage, and it must not touch a teacher who is still teacher+.
+/// manage, and it must not touch a teacher who is still teacher+. Staffing is
+/// per instance now (D6), so the still-teacher assignee keeps the *instance*
+/// while the manager keeps the *catalog* row.
 #[tokio::test]
-async fn manager_and_assigned_teacher_keep_a_demoted_creators_course() {
+async fn manager_keeps_a_demoted_creators_course_and_the_instance_teacher_keeps_the_instance() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
     let helper = login_as(&app, &db, "yardimci", "teacher").await;
     let helper_id = me_id(&app, &helper).await;
 
-    let course = common::create_course(&app, &teacher, "Fizik").await;
+    // The creator runs the şube that teaches the course; the manager stocks it.
+    let t = common::taught_under(&app, &manager, &teacher, "Fizik").await;
+    // A second still-teacher staffs the instance — assignment is per instance
+    // never over the catalog, so this is what an assignee holds now.
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/teachers"),
+        &format!("/instances/{}/teachers", t.instance),
         Some(&manager),
         Some(json!({ "user_id": helper_id })),
     )
@@ -908,24 +925,34 @@ async fn manager_and_assigned_teacher_keep_a_demoted_creators_course() {
 
     common::set_role(&db, "ogretmen", "student").await;
 
-    // The course keeps two managers: the manager, and the still-teacher
-    // assignee — a course the floor orphaned would be the worse bug.
-    for cookie in [&manager, &helper] {
-        let res = send(
-            &app,
-            "PATCH",
-            &format!("/courses/{course}"),
-            Some(cookie),
-            Some(json!({ "title": "Kimya" })),
-        )
-        .await;
-        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    }
-    // Deleting still needs ownership, which an assignee never had.
+    // Nobody is orphaned: the manager keeps the catalog course (the demoted
+    // creator owns nothing), and the still-teacher assignee keeps running the
+    // instance.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{}", t.course),
+        Some(&manager),
+        Some(json!({ "title": "Kimya" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/instances/{}", t.instance),
+        Some(&helper),
+        Some(json!({ "ders_saati": 3 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Deleting still needs catalog ownership, which an instance assignee never
+    // had — and the catalog is only deletable once no instance teaches it.
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
+        &format!("/courses/{}", t.course),
         Some(&helper),
         None,
     )
@@ -934,7 +961,16 @@ async fn manager_and_assigned_teacher_keep_a_demoted_creators_course() {
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
+        &format!("/classes/{}/instances/{}", t.class, t.instance),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{}", t.course),
         Some(&manager),
         None,
     )
@@ -948,16 +984,30 @@ async fn manager_and_assigned_teacher_keep_a_demoted_creators_course() {
 #[tokio::test]
 async fn demoted_creator_drops_out_of_the_catalogs() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
 
-    let course = common::create_course(&app, &teacher, "Fizik").await;
-    let subject = common::create_subject(&app, &teacher, &course, "Kuvvet").await;
-    let exam = common::create_exam(&app, &teacher, &course, "Ara", "quiz").await;
+    let t = common::taught_under(&app, &mudur, &teacher, "Fizik").await;
+    // The teacher runs the instance — the assignment `visible_courses` reads
+    // for a teacher's catalog half.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/instances/{}/teachers", t.instance),
+        Some(&mudur),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let subject = common::create_subject(&app, &teacher, &t.course, "Kuvvet").await;
+    let exam = common::create_exam(&app, &teacher, &t.instance, &t.term, "Ara", "yazili").await;
     let due = Timestamp::now().as_millis() + 86_400_000;
-    let homework = common::create_homework(&app, &teacher, &course, &subject, "Odev", due).await;
+    let homework =
+        common::create_homework(&app, &teacher, &t.instance, &subject, "Odev", due).await;
 
     for (path, wanted) in [
-        ("/courses", &course),
+        ("/courses", &t.course),
         ("/exams", &exam),
         ("/homework", &homework),
     ] {
@@ -969,7 +1019,7 @@ async fn demoted_creator_drops_out_of_the_catalogs() {
     common::set_role(&db, "ogretmen", "student").await;
 
     for (path, gone) in [
-        ("/courses", &course),
+        ("/courses", &t.course),
         ("/exams", &exam),
         ("/homework", &homework),
     ] {
@@ -993,23 +1043,23 @@ async fn demoted_session_teacher_loses_the_session() {
 
     // Owned by the manager, so losing the session is not just a side effect of
     // losing the course: the demoted account was only ever its *teacher*.
-    let course = common::create_course(&app, &manager, "Fizik").await;
+    let t = common::taught_under(&app, &manager, &manager, "Fizik").await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/teachers"),
+        &format!("/instances/{}/teachers", t.instance),
         Some(&manager),
         Some(json!({ "user_id": teacher_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let starts_at = Timestamp::now().as_millis() + 86_400_000;
-    let session = common::create_session(&app, &teacher, &course, starts_at).await;
+    let session = common::create_session(&app, &teacher, &t.instance, starts_at).await;
     // Drop the assignment: only the session's own teacher column is left.
     let res = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}/teachers/{teacher_id}"),
+        &format!("/instances/{}/teachers/{teacher_id}", t.instance),
         Some(&manager),
         None,
     )

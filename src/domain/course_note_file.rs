@@ -43,7 +43,6 @@ impl CourseNoteFileId {
     }
 }
 
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CourseNoteFile {
     pub(crate) id: CourseNoteFileId,

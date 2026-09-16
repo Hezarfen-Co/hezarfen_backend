@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT app_user AS \"app_user: uuid::Uuid\" FROM class_member\n               WHERE class = $1 AND left_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "app_user: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_member",
+            "name": "app_user"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7ef15b73d204f84bbf71ddef3381b2cb2b8d818bb1aaf58197b8ab1e9afc425d"
+}

@@ -4,6 +4,7 @@
 //! newtypes derive `sqlx::Type` so a column reads straight into the validated
 //! wrapper.
 
+pub mod academic_year;
 pub mod answer_image;
 pub mod appointment;
 pub mod appointment_slot;
@@ -21,6 +22,7 @@ pub mod class_course;
 pub mod class_group;
 pub mod class_member;
 pub mod course;
+pub mod course_membership;
 pub mod course_note;
 pub mod course_note_file;
 pub mod course_session;
@@ -50,6 +52,7 @@ pub mod note;
 pub mod note_file;
 pub mod parent_link;
 pub mod payment_ledger;
+pub mod person;
 pub mod pomodoro;
 pub mod pool_question;
 pub mod pool_question_image;
@@ -58,7 +61,6 @@ pub mod profile;
 pub mod question_image;
 pub mod rag_output;
 pub mod registration;
-pub mod person;
 pub mod role;
 pub mod session;
 pub mod session_attendance;

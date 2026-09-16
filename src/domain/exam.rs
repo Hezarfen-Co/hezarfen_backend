@@ -1,7 +1,8 @@
 use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::settings::ExamKindDef;
+use crate::domain::term::TermId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -286,7 +287,8 @@ impl ExamSchedule {
 pub struct Exam {
     pub(crate) id: ExamId,
     pub(crate) creator: UserId,
-    pub(crate) course: CourseId,
+    pub(crate) class_course: ClassCourseId,
+    pub(crate) term: TermId,
     pub(crate) title: ExamTitle,
     pub(crate) description: ExamDescription,
     pub(crate) kind: ExamKind,
@@ -311,8 +313,12 @@ impl Exam {
         &self.creator
     }
 
-    pub fn get_course(&self) -> &CourseId {
-        &self.course
+    pub fn get_class_course(&self) -> &ClassCourseId {
+        &self.class_course
+    }
+
+    pub fn get_term(&self) -> &TermId {
+        &self.term
     }
 
     pub fn get_title(&self) -> &ExamTitle {

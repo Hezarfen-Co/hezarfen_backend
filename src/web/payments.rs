@@ -936,7 +936,8 @@ async fn statement_response(
             StatementEntry {
                 charge_id: charge.get_id().key().to_string(),
                 plan: plan.map(|plan| plan.key().to_string()),
-                plan_name: plan.and_then(|plan| plan_names.get(plan.key().as_str()).cloned().flatten()),
+                plan_name: plan
+                    .and_then(|plan| plan_names.get(plan.key().as_str()).cloned().flatten()),
                 amount_minor: charge.get_amount_minor().as_minor(),
                 due_at,
                 credited_minor: credited,
@@ -1087,10 +1088,8 @@ mod tests {
     #[tokio::test]
     async fn the_statement_rolls_each_charge_up_from_its_own_lines() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let manager =
-            crate::db::class_member::tests::fixture_user(&db, "stmt-manager").await;
-        let student =
-            crate::db::class_member::tests::fixture_user(&db, "stmt-student").await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "stmt-manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "stmt-student").await;
         let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;
         let plan = service::fee_plan::create(
             &db,

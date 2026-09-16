@@ -4,19 +4,21 @@
 //! counted on this row — a class may only be deleted at zero on both, the same
 //! stored guard shape courses and terms use.
 //!
-//! A class links a term exactly like a course does, and claims a reference on it
-//! before the link is written. The reference is its *own* column
-//! ([`crate::constant::TERM_CLASS_COUNT_FIELD`]) rather than the courses' `course_count`, because
-//! boot seeds that one from the course rows alone and would wipe a class's share
-//! of it on the next migration.
+//! A class belongs to an academic year ([`crate::domain::academic_year`]), not
+//! to a term: the şube keeps the same roster all year and the dönem is a
+//! grading slice inside it. It claims a reference on its year before the link
+//! is written; the reference is its *own* column
+//! ([`crate::constant::ACADEMIC_YEAR_CLASS_COUNT_FIELD`]) rather than the
+//! courses' own count, so a class's share is never confused with another
+//! roster's.
 //!
-//! The queries live in [`crate::db::class_group`]; the archived-term guard and
+//! The queries live in [`crate::db::class_group`]; the archived-year guard and
 //! the route-facing wrappers in [`crate::service::class_group`] — this file is
 //! the row shape, its newtypes and getters.
 
 use crate::constant::{MAX_CLASS_GRADE_LEN, MAX_CLASS_NAME_LEN};
+use crate::domain::academic_year::AcademicYearId;
 use crate::domain::monotonic_id::next_uuid;
-use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
@@ -94,7 +96,7 @@ pub struct ClassGroup {
     pub(crate) creator: UserId,
     pub(crate) name: ClassName,
     pub(crate) grade: Option<ClassGrade>,
-    pub(crate) term: Option<TermId>,
+    pub(crate) year: Option<AcademicYearId>,
     pub(crate) teacher: Option<UserId>,
 }
 
@@ -115,8 +117,8 @@ impl ClassGroup {
         self.grade.as_ref()
     }
 
-    pub fn get_term(&self) -> Option<&TermId> {
-        self.term.as_ref()
+    pub fn get_year(&self) -> Option<&AcademicYearId> {
+        self.year.as_ref()
     }
 
     /// The homeroom teacher (sınıf öğretmeni), if one is assigned.

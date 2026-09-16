@@ -137,6 +137,30 @@ const EXCLUDED: &[(&str, &str)] = &[
         "settings seed; the live list is on GET /settings",
     ),
     (
+        "DEFAULT_GRADE_BANDS",
+        "settings seed; the school's own bands are on GET /settings",
+    ),
+    // The school's zone is a settings *value*, not a bound: `GET /settings`
+    // serves what this school runs on, and a client renders that, never a
+    // default or the allow-list behind it. (`MAX_ABSENCE_DAYS` below is the
+    // one settings bound this list still owes /limits.)
+    (
+        "DEFAULT_TIMEZONE",
+        "settings fallback; the school's live zone is on GET /settings",
+    ),
+    (
+        "TIMEZONES",
+        "settings allow-list; the school's live zone is on GET /settings",
+    ),
+    // A settings field's own range (the office types an absence ceiling as a
+    // number). It belongs beside `max_grade_bands` in the /limits settings
+    // group — excluded here rather than silently, so the day a frontend needs
+    // the range the decision is already written down.
+    (
+        "MAX_ABSENCE_DAYS",
+        "settings field bound; /limits should carry it beside max_grade_bands",
+    ),
+    (
         "DECOY_PASSWORD",
         "login-decoy input, never a real credential",
     ),

@@ -8,7 +8,7 @@
 use crate::database::Database;
 use crate::db::homework;
 use crate::db::homework_result;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
@@ -62,8 +62,8 @@ pub async fn grade(
         }));
     }
 
-    // ... enrolled in the homework's course ...
-    if crate::service::enrollment::read_for_user(db, homework.get_course(), target)
+    // ... enrolled in the instance the homework belongs to ...
+    if crate::service::enrollment::read_for_user(db, homework.get_class_course(), target)
         .await?
         .is_none()
     {
@@ -119,11 +119,11 @@ pub async fn list_for_homework(
     homework_result::list_for_homework(db, homework_id).await
 }
 
-/// `user`'s homework grades across one course.
-pub async fn list_for_user_in_course(
+/// `user`'s homework grades across one instance.
+pub async fn list_for_user_in_class_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<HomeworkResult>, AppError> {
-    homework_result::list_for_user_in_course(db, course, user).await
+    homework_result::list_for_user_in_course(db, class_course, user).await
 }

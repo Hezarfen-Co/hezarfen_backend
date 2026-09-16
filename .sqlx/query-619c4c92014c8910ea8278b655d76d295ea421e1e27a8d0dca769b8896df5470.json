@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT term AS \"term: TermId\" FROM exam WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "term: TermId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "term"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "619c4c92014c8910ea8278b655d76d295ea421e1e27a8d0dca769b8896df5470"
+}

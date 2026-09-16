@@ -218,7 +218,12 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("subject", make).await;
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "subject",
+            "SELECT count(*) FROM subject WHERE course = $1",
+            make,
+        )
+        .await;
     }
 
     /// GUARD, not a retry measurement — read the last paragraph before

@@ -12,6 +12,9 @@ use serde_json::json;
 async fn concurrent_partial_patches_keep_both_fields() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "term_race_manager", "manager").await;
+    // A dönem is a slice of an academic year since the K12 remodel, so every
+    // create in this file names one.
+    let year = create_year(&app, &manager, "2026-2027").await;
 
     for round in 0..20 {
         let created = send(
@@ -21,6 +24,7 @@ async fn concurrent_partial_patches_keep_both_fields() {
             Some(&manager),
             Some(json!({
                 "name": "before",
+                "year": year,
                 "starts_at": 1_780_000_000_000_i64,
                 "ends_at": 1_790_000_000_000_i64,
             })),
@@ -55,6 +59,7 @@ async fn concurrent_partial_patches_keep_both_fields() {
 async fn concurrent_range_patches_never_invert_the_term() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "term_range_manager", "manager").await;
+    let year = create_year(&app, &manager, "2026-2027").await;
 
     for round in 0..20 {
         let created = send(
@@ -64,6 +69,7 @@ async fn concurrent_range_patches_never_invert_the_term() {
             Some(&manager),
             Some(json!({
                 "name": "range",
+                "year": year,
                 "starts_at": 1_000_000_000_000_i64,
                 "ends_at": 2_000_000_000_000_i64,
             })),
@@ -111,9 +117,15 @@ async fn concurrent_range_patches_never_invert_the_term() {
     }
 }
 
-/// Archiving a term freezes it: the term itself takes no PATCH or DELETE, and
-/// no new course or class may link it. Reads stay open — a past year is
-/// read-only, not hidden.
+/// Archiving a dönem freezes it: its own row takes no PATCH or DELETE, and the
+/// karne it issued on the way in is the snapshot `GET /marks/karne` serves from
+/// then on. Reads stay open — a past dönem is read-only, not hidden.
+///
+/// What a closed dönem no longer freezes is the structure around it, and this
+/// pins that too: a şube hangs off the academic *year* and the catalog off
+/// nothing at all, so neither create is refused by a past dönem — the bar moved
+/// up to the year when the class became the academic anchor. A test that still
+/// expected `term_archived` here would be pinning the old world.
 #[tokio::test]
 async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
     let (app, db) = app_and_db().await;
@@ -121,6 +133,7 @@ async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
     let teacher = login_as(&app, &db, "archive_teacher", "teacher").await;
     let student = login_as(&app, &db, "archive_student", "student").await;
 
+    let year = create_year(&app, &manager, "2024-2025").await;
     let created = send(
         &app,
         "POST",
@@ -128,6 +141,7 @@ async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
         Some(&manager),
         Some(json!({
             "name": "2024",
+            "year": year,
             "starts_at": 1_700_000_000_000_i64,
             "ends_at": 1_710_000_000_000_i64,
         })),
@@ -172,27 +186,38 @@ async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
         assert_eq!(res.body["code"], "term_archived", "{method} code");
     }
 
-    // No new structure may be hung on a past year — one refusal per link site.
+    // The structure around a past dönem is *not* frozen by it any more: a şube
+    // is written against the year, and the catalog against nothing, so both go
+    // through — the refusal the old shape answered here lives on the year now
+    // (`regress_classes` drives it).
     let new_course = send(
         &app,
         "POST",
         "/courses",
         Some(&manager),
-        Some(json!({ "title": "algebra", "term_id": id })),
+        Some(json!({ "title": "algebra" })),
     )
     .await;
-    assert_eq!(new_course.status, StatusCode::CONFLICT, "course link");
-    assert_eq!(new_course.body["code"], "term_archived");
+    assert_eq!(
+        new_course.status,
+        StatusCode::CREATED,
+        "the catalog has no dönem to be frozen by: {}",
+        new_course.body
+    );
     let new_class = send(
         &app,
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "term_id": id })),
+        Some(json!({ "name": "9-A", "year": year })),
     )
     .await;
-    assert_eq!(new_class.status, StatusCode::CONFLICT, "class link");
-    assert_eq!(new_class.body["code"], "term_archived");
+    assert_eq!(
+        new_class.status,
+        StatusCode::CREATED,
+        "a şube is frozen by its academic year, never by a dönem: {}",
+        new_class.body
+    );
 
     // Reads keep working and carry the stamp, single and listed.
     let one = send(&app, "GET", &uri, Some(&student), None).await;
@@ -240,12 +265,19 @@ async fn a_pre_migration_term_row_still_decodes_as_open() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "archive_legacy_manager", "manager").await;
 
+    let year = create_year(&app, &manager, "2026-2027").await;
     let legacy = hezarfen_backend::domain::term::TermId::generate();
-    sqlx::query("INSERT INTO term (id, name, starts_at, ends_at) VALUES ($1, 'old', 100, 200)")
-        .bind(legacy)
-        .execute(&db)
-        .await
-        .expect("legacy term query");
+    // The row a pre-`year` database arrives with: its year came from the
+    // backfill (`migrations/school/20260916000001_k12_remodel.sql`), which is
+    // why `year` is NOT NULL and this insert names one.
+    sqlx::query(
+        "INSERT INTO term (id, name, year, starts_at, ends_at) VALUES ($1, 'old', $2, 100, 200)",
+    )
+    .bind(legacy)
+    .bind(uuid::Uuid::parse_str(&year).unwrap())
+    .execute(&db)
+    .await
+    .expect("legacy term query");
 
     let res = send(
         &app,

@@ -11,6 +11,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use common::{id_of, items, login_as, send, total};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 
 async fn create_class(app: &Router, cookie: &str, name: &str) -> String {
@@ -74,6 +75,39 @@ async fn add_member(app: &Router, cookie: &str, class: &str, user: &str) -> Stat
     )
     .await
     .status
+}
+
+/// Mark `user` present on a class-audience event; returns the status alone,
+/// which is all the point check's answer is read for here.
+async fn mark(app: &Router, cookie: &str, event: &str, user: &str) -> StatusCode {
+    send(
+        app,
+        "POST",
+        &format!("/events/{event}/attendance"),
+        Some(cookie),
+        Some(json!({"status": "present", "user_id": user})),
+    )
+    .await
+    .status
+}
+
+/// The class's membership rows for `user`: `(stints, live)` straight out of the
+/// store, so a leave can be told from a delete.
+async fn stints(db: &Database, user: &str) -> (i64, i64) {
+    let user = UserId::from_key(user);
+    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM class_member WHERE app_user = $1")
+        .bind(user)
+        .fetch_one(db)
+        .await
+        .unwrap();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM class_member WHERE app_user = $1 AND left_at IS NULL",
+    )
+    .bind(user)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    (all, live)
 }
 
 /// (a) the roster is exactly the class's current members, and (b) a student
@@ -265,4 +299,71 @@ async fn the_audience_dto_round_trips() {
     )
     .await;
     assert_eq!(seat.status, StatusCode::BAD_REQUEST, "{:?}", seat.body);
+}
+
+/// The K12 soft leave is a *history* row, so every reader that asks "is this
+/// student in this section" must ask for the live stint. The class-audience
+/// point check is one of them — and the one that shipped broken: a student who
+/// left was still markable on the section's event, so a roll call could record
+/// an absence against a şube they had left. A rejoined student is back.
+#[tokio::test]
+async fn a_soft_left_member_leaves_the_class_audience() {
+    let (app, db) = common::app_and_db().await;
+    let boss = login_as(&app, &db, "mudur", "manager").await;
+    let (_, ayse) = student(&app, &db, "ayse").await;
+
+    let class = create_class(&app, &boss, "9-A").await;
+    assert_eq!(
+        add_member(&app, &boss, &class, &ayse).await,
+        StatusCode::CREATED
+    );
+    let event = class_event(&app, &boss, &class).await;
+    assert_eq!(roster(&app, &boss, &event).await, vec![ayse.clone()]);
+    assert_eq!(mark(&app, &boss, &event, &ayse).await, StatusCode::OK);
+
+    let left = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/members/{ayse}"),
+        Some(&boss),
+        None,
+    )
+    .await;
+    assert_eq!(left.status, StatusCode::NO_CONTENT, "{:?}", left.body);
+
+    assert_eq!(
+        roster(&app, &boss, &event).await,
+        Vec::<String>::new(),
+        "a student who left the section is off its live roster"
+    );
+    assert_eq!(
+        mark(&app, &boss, &event, &ayse).await,
+        StatusCode::BAD_REQUEST,
+        "…and out of its audience: the point check must read the live stint"
+    );
+
+    // The row is still there — that is what a leave *is* — so the refusal had
+    // to come from the live filter, not from a row that was deleted.
+    assert_eq!(
+        stints(&db, &ayse).await,
+        (1, 0),
+        "one stint, none of it live: the section kept the record"
+    );
+
+    // Rejoining opens a second stint, and the audience follows it back.
+    assert_eq!(
+        add_member(&app, &boss, &class, &ayse).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        stints(&db, &ayse).await,
+        (2, 1),
+        "the rejoin is a fresh row beside the history"
+    );
+    assert_eq!(roster(&app, &boss, &event).await, vec![ayse.clone()]);
+    assert_eq!(
+        mark(&app, &boss, &event, &ayse).await,
+        StatusCode::OK,
+        "a rejoined student is audience again"
+    );
 }

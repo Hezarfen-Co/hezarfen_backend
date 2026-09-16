@@ -1,9 +1,10 @@
 //! Course notes: a teacher-authored note attached to a course, with file
 //! attachments. Mirrors [`super::notes`] (personal notes) handler for
 //! handler, with authorization swapped for the course-management wall:
-//! writes need [`super::courses::can_manage_course`] (creator, an assigned
-//! teacher, or manager+), reads need [`super::courses::can_view_course`]
-//! (management rights, or enrollment).
+//! writes need [`super::courses::can_manage_course`] (its creator or a
+//! manager/admin, while teacher+), reads need
+//! [`super::courses::can_view_course`] (the above, or anyone the course
+//! reaches).
 
 use crate::web::tenant_state::{ResolvedTenant, State};
 use axum::Json;
@@ -107,8 +108,8 @@ impl CourseNoteResponse {
     }
 }
 
-/// Create a note on a course. Requires teacher+ and management rights over
-/// the course (its creator, an assigned teacher, or a manager/admin).
+/// Create a note on a course. Requires teacher+ and catalog rights over the
+/// course (its creator or a manager/admin).
 #[utoipa::path(
     post,
     path = "/",
@@ -119,9 +120,8 @@ impl CourseNoteResponse {
         (status = 201, description = "Note created", body = CourseNoteResponse),
         (status = 400, description = "Invalid title or content", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -136,10 +136,9 @@ async fn create(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add a course note",
+            "only the course creator or a manager/admin can add a course note",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     let title = CourseNoteTitle::try_new(&req.title)?;
     let content = CourseNoteContent::try_new(&req.content.unwrap_or_default())?;
     let note = service::course_note::create(&st.db, course.get_id(), user.get_id(), title, content)
@@ -159,8 +158,8 @@ struct CourseFilter {
 }
 
 /// List a course's notes, newest first. Visible to whoever can view the
-/// course (its enrolled users, creator, assigned teachers, and
-/// managers/admins). Paged via `?limit=&offset=`.
+/// course (its creator, a manager/admin, or anyone the course reaches).
+/// Paged via `?limit=&offset=`.
 #[utoipa::path(
     get,
     path = "/",
@@ -171,7 +170,7 @@ struct CourseFilter {
         (status = 200, description = "A page of the course's notes (all of them when unpaged)", body = Page<CourseNoteResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -186,7 +185,7 @@ async fn list(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course's notes",
+            "only a user this course reaches, its creator, or a manager/admin can view this course's notes",
         ));
     }
     let (limit, offset) = page.resolve()?;
@@ -206,7 +205,7 @@ async fn list(
     responses(
         (status = 200, description = "The note", body = CourseNoteResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -218,7 +217,7 @@ async fn get_one(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note",
+            "only a user this course reaches, its creator, or a manager/admin can view this course note",
         ));
     }
     Ok(Json(CourseNoteResponse::new(&note)))
@@ -237,9 +236,8 @@ async fn get_one(
         (status = 200, description = "Updated note", body = CourseNoteResponse),
         (status = 400, description = "Invalid title or content", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -253,10 +251,9 @@ async fn update(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this course note",
+            "only the course creator or a manager/admin can edit this course note",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
 
     let title = req
         .title
@@ -286,9 +283,8 @@ async fn update(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_one(
@@ -299,10 +295,9 @@ async fn delete_one(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
+            "only the course creator or a manager/admin can delete this course note",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     // Derived rows first, outside the note's own cascade transaction: they are
     // disposable, so failing here leaves the note intact and the 500 truthful,
     // whereas dropping them after the note would strand every blob on an error
@@ -361,9 +356,9 @@ impl CourseNoteFileResponse {
         (status = 201, description = "File stored", body = CourseNoteFileResponse),
         (status = 400, description = "Missing file field, invalid filename or content type, or empty file", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
-        (status = 409, description = "The note already holds the maximum number of files, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The note already holds the maximum number of files", body = ErrorResponse),
         (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -377,10 +372,9 @@ async fn upload_file(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can add a file to this course note",
+            "only the course creator or a manager/admin can add a file to this course note",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     // The 10-file cap is enforced inside `service::course_note_file::insert`
     // (count and create in one conditional write) — checking it here too would
     // just race.
@@ -426,7 +420,7 @@ async fn upload_file(
         (status = 200, description = "A page of the note's files", body = Page<CourseNoteFileResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
     ),
 )]
@@ -440,7 +434,7 @@ async fn list_files(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's files",
+            "only a user this course reaches, its creator, or a manager/admin can view this course note's files",
         ));
     }
     let (files, total) =
@@ -463,7 +457,7 @@ async fn list_files(
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Note or file not found", body = ErrorResponse),
     ),
 )]
@@ -475,7 +469,7 @@ async fn download_file(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can download this course note's files",
+            "only a user this course reaches, its creator, or a manager/admin can download this course note's files",
         ));
     }
     let file = service::course_note_file::read_for(
@@ -523,9 +517,8 @@ async fn download_file(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Note or file not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_file(
@@ -537,10 +530,9 @@ async fn delete_file(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this course note's files",
+            "only the course creator or a manager/admin can delete this course note's files",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     let file = service::course_note_file::read_for(
         &st.db,
         &CourseNoteFileId::from_key(&file_id),
@@ -605,7 +597,7 @@ impl RagOutputResponse {
         (status = 200, description = "A page of the note's stored AI outputs", body = Page<RagOutputResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
     ),
 )]
@@ -619,7 +611,7 @@ async fn list_rag(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's AI outputs",
+            "only a user this course reaches, its creator, or a manager/admin can view this course note's AI outputs",
         ));
     }
     let (outputs, total) =
@@ -643,8 +635,7 @@ async fn list_rag(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Note or output not found", body = ErrorResponse),
     ),
 )]
@@ -656,10 +647,9 @@ async fn delete_rag(
     let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this course note's AI outputs",
+            "only the course creator or a manager/admin can delete this course note's AI outputs",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     // Scoped to the note in the path, like `service::course_note_file::read_for`: an
     // output of another note is a 404 here, never a cross-note delete.
     let output = service::rag_output::read(&st.db, &RagOutputId::from_key(&output_id))

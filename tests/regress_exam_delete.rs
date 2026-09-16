@@ -18,28 +18,31 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{app_and_db, create_exam_with, enroll, id_of, login_as, me_id, send};
+use common::{
+    app_and_db, create_exam_with, enroll, id_of, login_as, me_id, send, taught, taught_under,
+};
 use hezarfen_backend::db::exam_attempt::list_for_exam;
 use hezarfen_backend::domain::exam::ExamId;
 use serde_json::json;
 
 /// The delete is held open for a second *after* the exam row is gone but
-/// before its cascade runs — a `DEFINE EVENT` on the table fires inside the
-/// delete's own transaction, so the window is opened by the database rather
-/// than by a lucky interleaving. A start firing into that window used to read
-/// an exam that was still there (deleted, uncommitted), create its sitting, and
-/// commit past a sweep that had already run on a snapshot without it. That row
-/// was unreachable afterwards — every route to an attempt goes through its exam
-/// — while the student's lifetime sitting counter stayed up for good, and a
-/// badge minted off it is never revoked.
+/// before its cascade runs — an `AFTER DELETE` trigger on the table sleeps
+/// inside the delete's own transaction, so the window is opened by the database
+/// rather than by a lucky interleaving. A start firing into that window used to
+/// read an exam that was still there (deleted, uncommitted), create its
+/// sitting, and commit past a sweep that had already run on a snapshot without
+/// it. That row was unreachable afterwards — every route to an attempt goes
+/// through its exam — while the student's lifetime sitting counter stayed up
+/// for good, and a badge minted off it is never revoked.
 ///
-/// The in-memory engine is enough here, unusually: this asserts a *lock*, not
-/// the store's conflict detection, and a mutex behaves the same on either
-/// engine. Mutation-tested — dropping the lease from `delete_exam` turns it
+/// The window needs no second writer to be real: the exam row lock is what the
+/// start and the sweep contend on, and it behaves the same whoever wins. The
+/// pairing is mutation-tested — dropping the row lock from `delete_exam` turns
 /// red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_sil", "manager").await;
     let teacher = login_as(&app, &db, "ogretmen_sil", "teacher").await;
     let student = login_as(&app, &db, "ogrenci_sil", "student").await;
     let student_id = me_id(&app, &student).await;
@@ -61,16 +64,19 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
 
     let mut sittings = 0;
     for round in 0..3 {
-        let course = common::create_course(&app, &teacher, &format!("Fizik {round}")).await;
-        enroll(&app, &teacher, &course, &student_id).await;
+        // The exam's parents are the instance and its dönem now, so the round
+        // mints the whole stack; the plain teacher stays the şube's homeroom
+        // one, which is what lets their cookie act on the instance.
+        let t = taught_under(&app, &mudur, &teacher, &format!("Fizik {round}")).await;
+        enroll(&app, &teacher, &t.instance, &student_id).await;
         // `open` mode, so the exam is actually sittable: an unscheduled one
         // answers the start with a 409 before it ever writes, which would make
         // this test pass on a missing lease.
         let res = create_exam_with(
             &app,
             &teacher,
-            &course,
-            json!({ "title": "quiz", "kind": "midterm", "mode": "open" }),
+            &t.instance,
+            json!({ "title": "Vize", "kind": "yazili", "mode": "open", "term": t.term }),
         )
         .await;
         assert_eq!(
@@ -132,10 +138,11 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
     assert_eq!(sittings, 0, "a sitting outlived its exam");
 }
 
-/// An archived term freezes the exams hanging off its courses: all nineteen
-/// write routes under `/exams/{id}` answer `409 term_archived` — authoring,
-/// grading, the images on both sides, and the sitting itself — while every
-/// read stays open. Past years are a read-only archive, not a hidden one.
+/// An archived academic year freezes the exams hanging off its şubeler'
+/// instances: all nineteen write routes under `/exams/{id}` answer
+/// `409 academic_year_archived` — authoring, grading, the images on both sides,
+/// and the sitting itself — while every read stays open. Past years are a
+/// read-only archive, not a hidden one.
 ///
 /// The sitting is deliberately *live* when the archive lands: a student mid-exam
 /// is the case where a freeze can do real damage, and every one of their write
@@ -151,47 +158,26 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
 /// `POST /exams/{id}/attempt/answers` below does cover the shared
 /// `save_answer_in` funnel that every WS `answer` frame also goes through.
 #[tokio::test]
-async fn an_archived_terms_exams_take_no_writes_but_still_read() {
+async fn an_archived_years_exams_take_no_writes_but_still_read() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "arsiv_sinav_mudur", "manager").await;
     let student = login_as(&app, &db, "arsiv_sinav_ogrenci", "student").await;
     let student_id = me_id(&app, &student).await;
 
-    let res = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2018 bahar",
-            "starts_at": 1_780_000_000_000_i64,
-            "ends_at": 1_790_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let term = id_of(&res.body);
-
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&manager),
-        Some(json!({ "title": "Tarih", "term_id": term })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    enroll(&app, &manager, &course, &student_id).await;
-    let subject = common::create_subject(&app, &manager, &course, "Kronoloji").await;
+    // The freeze is the *year's*: every exam write reads its instance's year
+    // (`class_course::require_open` → şube → year), so the fixture's şube has to
+    // sit in the year that gets archived.
+    let t = taught(&app, &manager, "Tarih").await;
+    enroll(&app, &manager, &t.instance, &student_id).await;
+    let subject = common::create_subject(&app, &manager, &t.course, "Kronoloji").await;
 
     // `open` mode so the sitting is real: the attempt below has to be running
     // when the archive lands.
     let res = create_exam_with(
         &app,
         &manager,
-        &course,
-        json!({ "title": "Vize", "kind": "midterm", "mode": "open" }),
+        &t.instance,
+        json!({ "title": "Vize", "kind": "yazili", "mode": "open", "term": t.term.clone() }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -225,15 +211,20 @@ async fn an_archived_terms_exams_take_no_writes_but_still_read() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
 
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // The year goes past. No route archives one — a year is frozen when the
+    // office declares it done — so the stored state is written straight into
+    // the store, the way the role bootstrap and the sibling suites do it.
+    let year = uuid::Uuid::parse_str(&t.year).unwrap();
+    let archived = sqlx::query("UPDATE academic_year SET archived_at = 1 WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        archived.rows_affected(),
+        1,
+        "the fixture's year is archived"
+    );
 
     // The thirteen JSON write routes: exam, results, and the question authoring
     // set. `from-bank` takes an id that need not exist — the freeze is judged
@@ -300,7 +291,7 @@ async fn an_archived_terms_exams_take_no_writes_but_still_read() {
         let res = send(&app, method, uri, Some(&manager), body.clone()).await;
         assert_eq!(
             (res.status, res.body["code"].clone()),
-            (StatusCode::CONFLICT, json!("term_archived")),
+            (StatusCode::CONFLICT, json!("academic_year_archived")),
             "{method} {uri} must be frozen by the archive: {}",
             res.body
         );
@@ -326,7 +317,7 @@ async fn an_archived_terms_exams_take_no_writes_but_still_read() {
         let res = send(&app, method, uri, Some(&student), body.clone()).await;
         assert_eq!(
             (res.status, res.body["code"].clone()),
-            (StatusCode::CONFLICT, json!("term_archived")),
+            (StatusCode::CONFLICT, json!("academic_year_archived")),
             "{method} {uri} must be frozen by the archive: {}",
             res.body
         );
@@ -352,7 +343,7 @@ async fn an_archived_terms_exams_take_no_writes_but_still_read() {
         let res = common::upload_file_at(&app, cookie, uri, "a.png", "image/png", b"png").await;
         assert_eq!(
             (res.status, res.body["code"].clone()),
-            (StatusCode::CONFLICT, json!("term_archived")),
+            (StatusCode::CONFLICT, json!("academic_year_archived")),
             "POST {uri} must be frozen by the archive: {}",
             res.body
         );
@@ -391,16 +382,13 @@ async fn an_archived_terms_exams_take_no_writes_but_still_read() {
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 
-    // Unarchiving thaws them again.
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // Re-opening the year thaws them again.
+    let reopened = sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(reopened.rows_affected(), 1, "the year is open again");
     let res = send(
         &app,
         "PATCH",

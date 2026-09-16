@@ -573,8 +573,7 @@ async fn profile_response(
 ) -> Result<Json<DietaryProfileResponse>, AppError> {
     let profile = service::dietary_profile::read(db, student).await?;
     let people = person_map(
-        std::iter::once(*student)
-            .chain(profile.as_ref().map(|row| *row.get_updated_by())),
+        std::iter::once(*student).chain(profile.as_ref().map(|row| *row.get_updated_by())),
         db,
     )
     .await?;
@@ -743,12 +742,9 @@ async fn booking_responses(
     db: &Database,
 ) -> Result<Vec<BookingResponse>, AppError> {
     let people = person_map(
-        bookings.iter().flat_map(|booking| {
-            [
-                *booking.get_student(),
-                *booking.get_booked_by(),
-            ]
-        }),
+        bookings
+            .iter()
+            .flat_map(|booking| [*booking.get_student(), *booking.get_booked_by()]),
         db,
     )
     .await?;

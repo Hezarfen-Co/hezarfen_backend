@@ -5,7 +5,7 @@
 //! delete.
 
 use crate::database::{Database, tx_with_retry};
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
@@ -36,7 +36,7 @@ const STALE_MOVE: &str = "the link this update moves changed since it was read; 
 )]
 pub async fn create(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     subject: &SubjectId,
     title: HomeworkTitle,
     description: Option<HomeworkDescription>,
@@ -56,7 +56,7 @@ pub async fn create(
     // whole-course, not even for the instant of its create.
     let homework = Homework {
         id: HomeworkId::generate(),
-        course: course.clone(),
+        class_course: class_course.clone(),
         subject: *subject,
         title,
         description,
@@ -82,13 +82,13 @@ pub async fn create(
     // comes back "not general enough" over the higher-ranked connection
     // lease — every tx_with_retry site captures only owned values.
     let subject = *subject;
-    let course = course.clone();
+    let class_course = class_course.clone();
     tx_with_retry(db, false, async move |tx| {
         // And every bind is a precomputed value of this coroutine's own: a
         // bind expression reading a capture inside the macro keeps that
         // borrow alive across the await to the same `Send` end.
         let subject_uuid = subject.uuid();
-        let course_uuid = course.uuid();
+        let class_course_uuid = class_course.uuid();
         let homework_uuid = homework.id.uuid();
         let title = homework.title.clone();
         let description = homework.description.clone();
@@ -103,10 +103,10 @@ pub async fn create(
                    WHERE id = $1
                    RETURNING 1
                )
-               INSERT INTO homework (id, course, subject, title, description, due_at, created_by, created_at)
+               INSERT INTO homework (id, class_course, subject, title, description, due_at, created_by, created_at)
                SELECT $2, $3, $1, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING id AS "id: HomeworkId",
-                         course AS "course: CourseId",
+                         class_course AS "class_course: ClassCourseId",
                          subject AS "subject: SubjectId",
                          title AS "title: HomeworkTitle",
                          description AS "description: HomeworkDescription",
@@ -116,7 +116,7 @@ pub async fn create(
                          created_at AS "created_at: Timestamp""#,
             subject_uuid,
             homework_uuid,
-            course_uuid,
+            class_course_uuid,
             title.as_str(),
             description.as_ref().map(HomeworkDescription::as_str),
             due_at_millis,
@@ -158,7 +158,7 @@ pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, Ap
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
-                  course AS "course: CourseId",
+                  class_course AS "class_course: ClassCourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
@@ -174,13 +174,16 @@ pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, Ap
     .await?)
 }
 
-/// The course's homework, newest first (v7 ids sort by creation). The web
+/// The instance's homework, newest first (v7 ids sort by creation). The web
 /// layer retains only the rows a given student `student_sees`.
-pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Homework>, AppError> {
+pub async fn list_for_class_course(
+    db: &Database,
+    class_course: &ClassCourseId,
+) -> Result<Vec<Homework>, AppError> {
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
-                  course AS "course: CourseId",
+                  class_course AS "class_course: ClassCourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
@@ -189,8 +192,8 @@ pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Hom
                     WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
-           FROM homework WHERE course = $1 ORDER BY id DESC"#,
-        course.uuid()
+           FROM homework WHERE class_course = $1 ORDER BY id DESC"#,
+        class_course.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -202,7 +205,7 @@ pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
-                  course AS "course: CourseId",
+                  class_course AS "class_course: ClassCourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
@@ -217,22 +220,22 @@ pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
     .await?)
 }
 
-/// Every homework of every course in `courses`, newest first (one query) —
-/// the cross-course list over a caller's visible courses. The web layer
-/// still trims each course's rows to what the caller may see (a student to
-/// the ones they `student_sees`).
-pub async fn list_for_courses(
+/// Every homework of every instance in `instances`, newest first (one
+/// query) — the cross-instance list over a caller's visible courses. The web
+/// layer still trims each instance's rows to what the caller may see (a
+/// student to the ones they `student_sees`).
+pub async fn list_for_class_courses(
     db: &Database,
-    courses: &[CourseId],
+    instances: &[ClassCourseId],
 ) -> Result<Vec<Homework>, AppError> {
-    if courses.is_empty() {
+    if instances.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<uuid::Uuid> = courses.iter().map(CourseId::uuid).collect();
+    let ids: Vec<uuid::Uuid> = instances.iter().map(ClassCourseId::uuid).collect();
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
-                  course AS "course: CourseId",
+                  class_course AS "class_course: ClassCourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
@@ -241,27 +244,27 @@ pub async fn list_for_courses(
                     WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
-           FROM homework WHERE course = ANY($1) ORDER BY id DESC"#,
+           FROM homework WHERE class_course = ANY($1) ORDER BY id DESC"#,
         &ids
     )
     .fetch_all(db)
     .await?)
 }
 
-/// The homework of `course` that `user` is meant to see — whole-course ones
-/// plus any subset that names them — newest first. Backs a student's (or an
-/// observer's) per-course homework report; mirrors
+/// The homework of one instance that `user` is meant to see — whole-class
+/// ones plus any subset that names them — newest first. Backs a student's (or
+/// an observer's) per-instance homework report; mirrors
 /// [`Homework::student_sees`](crate::domain::homework::Homework::student_sees)
 /// in SQL so the filter runs in the database.
 pub async fn list_for_user_in_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     user: &UserId,
 ) -> Result<Vec<Homework>, AppError> {
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
-                  course AS "course: CourseId",
+                  class_course AS "class_course: ClassCourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
                   description AS "description: HomeworkDescription",
@@ -271,13 +274,13 @@ pub async fn list_for_user_in_course(
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework
-           WHERE course = $1
+           WHERE class_course = $1
              AND (NOT EXISTS (SELECT 1 FROM homework_assignment a
                                WHERE a.homework = homework.id)
                   OR EXISTS (SELECT 1 FROM homework_assignment a
                               WHERE a.homework = homework.id AND a.student = $2))
            ORDER BY id DESC"#,
-        course.uuid(),
+        class_course.uuid(),
         user.uuid()
     )
     .fetch_all(db)
@@ -318,7 +321,7 @@ pub async fn update(
         let current = sqlx::query_as!(
             Homework,
             r#"SELECT id AS "id: HomeworkId",
-                      course AS "course: CourseId",
+                      class_course AS "class_course: ClassCourseId",
                       subject AS "subject: SubjectId",
                       title AS "title: HomeworkTitle",
                       description AS "description: HomeworkDescription",
@@ -420,7 +423,7 @@ pub async fn update(
                    due_at = $5
                WHERE id = $1
                RETURNING id AS "id: HomeworkId",
-                         course AS "course: CourseId",
+                         class_course AS "class_course: ClassCourseId",
                          subject AS "subject: SubjectId",
                          title AS "title: HomeworkTitle",
                          description AS "description: HomeworkDescription",
@@ -552,7 +555,7 @@ pub async fn delete(
             Homework,
             r#"DELETE FROM homework WHERE id = $1
                RETURNING id AS "id: HomeworkId",
-                         course AS "course: CourseId",
+                         class_course AS "class_course: ClassCourseId",
                          subject AS "subject: SubjectId",
                          title AS "title: HomeworkTitle",
                          description AS "description: HomeworkDescription",
@@ -596,8 +599,9 @@ mod tests {
     }
 
     async fn homework_on(subject: &SubjectId, db: &Database) -> Homework {
-        // The course and the teacher are foreign keys now: a real course row
-        // (the subject's own fixture path mints one) and a real teacher.
+        // The instance and the teacher are foreign keys now: a real instance
+        // row (the class, the course and their link, minted by the fixture)
+        // and a real teacher.
         let teacher = UserId::generate();
         sqlx::query(
             "INSERT INTO app_user (id, username, created_at, role) \
@@ -610,7 +614,7 @@ mod tests {
         .unwrap();
         create(
             db,
-            &crate::db::course::a_test_course(db).await,
+            &crate::db::course::a_test_instance(db).await.0,
             subject,
             HomeworkTitle::try_new("essay").unwrap(),
             None,
@@ -655,7 +659,7 @@ mod tests {
 
         let error = create(
             &db,
-            &CourseId::from_key("course"),
+            &crate::domain::class_course::ClassCourseId::from_key("course"),
             &id,
             HomeworkTitle::try_new("essay").unwrap(),
             None,
@@ -688,17 +692,9 @@ mod tests {
         let homework = homework_on(from.get_id(), &db).await;
         assert_eq!(count_on(from.get_id(), &db).await, 1);
 
-        let moved = update(
-            &db,
-            homework,
-            Some(*to.get_id()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let moved = update(&db, homework, Some(*to.get_id()), None, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(moved.get_subject(), to.get_id());
         assert_eq!(
             count_on(from.get_id(), &db).await,
@@ -728,17 +724,9 @@ mod tests {
         crate::db::subject::delete(&db, dead).await.unwrap();
         let homework = homework_on(from.get_id(), &db).await;
 
-        let error = update(
-            &db,
-            homework.clone(),
-            Some(gone),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("a subject that is gone must not be taggable");
+        let error = update(&db, homework.clone(), Some(gone), None, None, None, None)
+            .await
+            .expect_err("a subject that is gone must not be taggable");
         assert!(error.to_string().contains("subject does not exist"));
         let stored = read(&db, homework.get_id()).await.unwrap().unwrap();
         assert_eq!(stored.get_subject(), from.get_id(), "the tag never moved");
@@ -770,17 +758,9 @@ mod tests {
         let other = a_subject("calculus", &db).await;
         let homework = homework_on(from.get_id(), &db).await;
         let stale = homework.clone();
-        update(
-            &db,
-            homework,
-            Some(*to.get_id()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        update(&db, homework, Some(*to.get_id()), None, None, None, None)
+            .await
+            .unwrap();
 
         let error = update(
             &db,
@@ -823,17 +803,9 @@ mod tests {
         let to = a_subject("geometry", &db).await;
         let homework = homework_on(from.get_id(), &db).await;
         let stale = homework.clone();
-        update(
-            &db,
-            homework,
-            Some(*to.get_id()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        update(&db, homework, Some(*to.get_id()), None, None, None, None)
+            .await
+            .unwrap();
 
         let error = update(
             &db,
@@ -866,17 +838,9 @@ mod tests {
         // A *genuine* no-op re-state — nobody moved underneath it — still lands,
         // and still moves no counter: the CAS passes trivially.
         let fresh = read(&db, stale.get_id()).await.unwrap().unwrap();
-        let same = update(
-            &db,
-            fresh,
-            Some(*to.get_id()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("re-stating the tag actually held is not a race");
+        let same = update(&db, fresh, Some(*to.get_id()), None, None, None, None)
+            .await
+            .expect("re-stating the tag actually held is not a race");
         assert_eq!(same.get_subject(), to.get_id());
         assert_eq!(
             count_on(from.get_id(), &db).await,
@@ -924,10 +888,10 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let course = crate::db::course::a_test_course(&db).await;
+        let instance = crate::db::course::a_test_instance(&db).await.0;
         let homework = create(
             &db,
-            &course,
+            &instance,
             subject.get_id(),
             HomeworkTitle::try_new("essay").unwrap(),
             None,
@@ -939,27 +903,33 @@ mod tests {
         .unwrap();
         assert_eq!(homework.get_assigned(), Some(&[ali][..]));
         assert_eq!(
-            list_for_user_in_course(&db, &course, &ali).await.unwrap().len(),
+            list_for_user_in_course(&db, &instance, &ali)
+                .await
+                .unwrap()
+                .len(),
             1,
             "the named student sees the subset"
         );
         assert!(
-            list_for_user_in_course(&db, &course, &veli)
+            list_for_user_in_course(&db, &instance, &veli)
                 .await
                 .unwrap()
                 .is_empty(),
             "an unnamed student sees nothing"
         );
-        // Widening back to the whole course (`Some(None)`) empties the
+        // Widening back to the whole instance (`Some(None)`) empties the
         // junction: everyone — including the never-named student — is covered.
         let widened = update(&db, homework, None, None, None, None, Some(None))
             .await
             .unwrap();
         assert_eq!(widened.get_assigned(), None);
         assert_eq!(
-            list_for_user_in_course(&db, &course, &veli).await.unwrap().len(),
+            list_for_user_in_course(&db, &instance, &veli)
+                .await
+                .unwrap()
+                .len(),
             1,
-            "whole-course reaches the never-named student"
+            "whole-instance reaches the never-named student"
         );
     }
 }

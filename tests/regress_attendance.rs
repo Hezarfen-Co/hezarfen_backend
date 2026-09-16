@@ -11,7 +11,9 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{app_and_db, create_course, create_session, enroll, login, login_as, me_id, send};
+use common::{
+    app_and_db, create_session, enroll, login, login_as, me_id, send, taught, taught_under,
+};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::db::attendance;
 use hezarfen_backend::db::course_session;
@@ -85,12 +87,12 @@ async fn reassigning_the_teacher_does_not_unlock_the_old_teachers_staff_row() {
     let t2_id = me_id(&app, &t2).await;
     let ali_id = me_id(&app, &ali).await;
 
-    let course = create_course(&app, &boss, "algebra").await;
-    enroll(&app, &boss, &course, &ali_id).await;
+    let t = taught(&app, &boss, "algebra").await;
+    enroll(&app, &boss, &t.instance, &ali_id).await;
     let res = send(
         &app,
         "POST",
-        &format!("/courses/{course}/sessions"),
+        &format!("/instances/{}/sessions", t.instance),
         Some(&boss),
         Some(json!({ "starts_at": soon(), "teacher_id": t1_id })),
     )
@@ -183,15 +185,16 @@ async fn reassigning_the_teacher_does_not_unlock_the_old_teachers_staff_row() {
 #[tokio::test]
 async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let hoca = login_as(&app, &db, "hoca", "teacher").await;
     let ali = login(&app, "ali").await;
     let ali_id = me_id(&app, &ali).await;
     let hoca_id = me_id(&app, &hoca).await;
     let ali_ref = UserId::from_key(&ali_id);
 
-    let course = create_course(&app, &hoca, "algebra").await;
-    enroll(&app, &hoca, &course, &ali_id).await;
-    let session = create_session(&app, &hoca, &course, soon()).await;
+    let t = taught_under(&app, &mudur, &hoca, "algebra").await;
+    enroll(&app, &hoca, &t.instance, &ali_id).await;
+    let session = create_session(&app, &hoca, &t.instance, soon()).await;
     let res = send(
         &app,
         "POST",
@@ -264,16 +267,17 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
 #[tokio::test]
 async fn a_mark_writes_its_session_row_even_when_it_credits_nothing() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let hoca = login_as(&app, &db, "hoca", "teacher").await;
     let ali = login(&app, "ali").await;
     let ali_id = me_id(&app, &ali).await;
     let veli = login(&app, "veli").await;
     let veli_id = me_id(&app, &veli).await;
 
-    let course = create_course(&app, &hoca, "algebra").await;
-    enroll(&app, &hoca, &course, &ali_id).await;
-    enroll(&app, &hoca, &course, &veli_id).await;
-    let session = create_session(&app, &hoca, &course, soon()).await;
+    let t = taught_under(&app, &mudur, &hoca, "algebra").await;
+    enroll(&app, &hoca, &t.instance, &ali_id).await;
+    enroll(&app, &hoca, &t.instance, &veli_id).await;
+    let session = create_session(&app, &hoca, &t.instance, soon()).await;
     let mark_uri = format!("/sessions/{session}/attendance");
 
     // (The write-probe below is `queues_on_parent_lock` now.)
@@ -454,45 +458,21 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
     );
 }
 
-/// #22, session half: a course sitting in an archived term is a past year —
-/// its sessions and their roll call are read-only. The guard runs *after* the
-/// authorization check (403 before 409, so a stranger never learns a term's
-/// state) and off the `course` the shared session loader already returns, not
-/// inside that loader — reads go through it too, and reads stay open.
+/// #22, session half: a şube sitting in an archived academic year is a past
+/// year — its sessions and their roll call are read-only. The guard runs
+/// *after* the authorization check (403 before 409, so a stranger never learns
+/// a year's state) and off the instance's year, not inside the shared session
+/// loader — reads go through that loader too, and reads stay open.
 #[tokio::test]
-async fn an_archived_term_freezes_its_sessions_and_roll_call() {
+async fn an_archived_year_freezes_its_sessions_and_roll_call() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "arch_sess_manager", "manager").await;
     let ali = login(&app, "arch_sess_ali").await;
     let ali_id = me_id(&app, &ali).await;
 
-    let term = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2023",
-            "starts_at": 1_600_000_000_000_i64,
-            "ends_at": 1_610_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(term.status, StatusCode::CREATED, "{}", term.body);
-    let term_id = common::id_of(&term.body);
-
-    let course = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&manager),
-        Some(json!({ "title": "Tarih", "term_id": term_id })),
-    )
-    .await;
-    assert_eq!(course.status, StatusCode::CREATED, "{}", course.body);
-    let course_id = common::id_of(&course.body);
-    enroll(&app, &manager, &course_id, &ali_id).await;
-    let session = create_session(&app, &manager, &course_id, soon()).await;
+    let t = taught(&app, &manager, "Tarih").await;
+    enroll(&app, &manager, &t.instance, &ali_id).await;
+    let session = create_session(&app, &manager, &t.instance, soon()).await;
     // A roll-call row exists before the freeze, so the delete route reaches the
     // guard rather than a 404 for a missing row.
     let marked = send(
@@ -505,15 +485,16 @@ async fn an_archived_term_freezes_its_sessions_and_roll_call() {
     .await;
     assert_eq!(marked.status, StatusCode::OK, "{}", marked.body);
 
-    let archived = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(archived.status, StatusCode::OK, "{}", archived.body);
+    // The şube's year goes to the archive. No route does this — a year freezes
+    // when the office declares it done — so the stored state is written
+    // straight into the store, the same trick the `starts_at` rewrites above
+    // use.
+    let year = uuid::Uuid::parse_str(&t.year).unwrap();
+    sqlx::query("UPDATE academic_year SET archived_at = 1 WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
 
     // Every write on the session and its roll call refuses with the coded 409.
     let writes: [(&str, String, Option<serde_json::Value>); 4] = [
@@ -542,7 +523,7 @@ async fn an_archived_term_freezes_its_sessions_and_roll_call() {
             "{method} {uri}: {}",
             res.body
         );
-        assert_eq!(res.body["code"], "term_archived", "{method} {uri}");
+        assert_eq!(res.body["code"], "academic_year_archived", "{method} {uri}");
     }
 
     // Reads stay open — a past year is read-only, not hidden.
@@ -555,15 +536,11 @@ async fn an_archived_term_freezes_its_sessions_and_roll_call() {
     }
 
     // Re-opening the year thaws the writes again.
-    let reopened = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(reopened.status, StatusCode::OK, "{}", reopened.body);
+    sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(year)
+        .execute(&db)
+        .await
+        .unwrap();
     let res = send(
         &app,
         "PATCH",

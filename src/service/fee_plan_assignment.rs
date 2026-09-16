@@ -359,8 +359,7 @@ mod tests {
                 })
             };
             let assign = {
-                let (db, plan, manager, student) =
-                    (db.clone(), plan.clone(), manager, student);
+                let (db, plan, manager, student) = (db.clone(), plan.clone(), manager, student);
                 tokio::spawn(async move { assign(&db, &plan, &student, &manager).await })
             };
             let (edit, assign) = (edit.await.unwrap(), assign.await.unwrap());
@@ -461,8 +460,7 @@ mod tests {
                 })
             };
             let assign = {
-                let (db, plan, manager, student) =
-                    (db.clone(), plan.clone(), manager, student);
+                let (db, plan, manager, student) = (db.clone(), plan.clone(), manager, student);
                 tokio::spawn(async move {
                     if hold_back_the_assign {
                         tokio::time::sleep(head_start).await;

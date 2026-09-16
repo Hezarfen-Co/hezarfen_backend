@@ -145,4 +145,3 @@ impl PoolQuestion {
         self.approved_by.as_ref()
     }
 }
-

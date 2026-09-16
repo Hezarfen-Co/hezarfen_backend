@@ -20,8 +20,8 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_exam_with, create_subject, enroll, id_of, login, login_as,
-    me_id, send, ABSENT_ID,
+    app_and_db, create_exam_with, create_subject, enroll, id_of, login, login_as, me_id, send,
+    taught_under, ABSENT_ID,
 };
 use serde_json::json;
 
@@ -31,13 +31,14 @@ use serde_json::json;
 #[tokio::test]
 async fn review_hides_the_key_of_a_bank_question_live_under_another_sitting() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "rev_bank_m", "manager").await;
     let teacher = login_as(&app, &db, "rev_bank_t", "teacher").await;
     let student = login(&app, "rev_bank_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "maths").await;
-    let subject = create_subject(&app, &teacher, &course, "arithmetic").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "maths").await;
+    let subject = create_subject(&app, &teacher, &t.course, "arithmetic").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // One template, instantiated into both exams below.
     let res = send(
@@ -57,9 +58,9 @@ async fn review_hides_the_key_of_a_bank_question_live_under_another_sitting() {
         create_exam_with(
             &app,
             &teacher,
-            &course,
-            json!({ "title": title, "kind": "quiz", "mode": "open",
-                    "max_attempts": 1, "allow_review": review }),
+            &t.instance,
+            json!({ "title": title, "kind": "yazili", "term": t.term.clone(),
+                    "mode": "open", "max_attempts": 1, "allow_review": review }),
         )
     };
     let res = exam("graded quiz", true).await;
@@ -218,21 +219,22 @@ async fn review_hides_the_key_of_a_bank_question_live_under_another_sitting() {
 #[tokio::test]
 async fn review_hides_a_question_banked_out_of_it_and_live_elsewhere() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "rev_bank2_m", "manager").await;
     let teacher = login_as(&app, &db, "rev_bank2_t", "teacher").await;
     let student = login(&app, "rev_bank2_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "physics").await;
-    let subject = create_subject(&app, &teacher, &course, "optics").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "physics").await;
+    let subject = create_subject(&app, &teacher, &t.course, "optics").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     let exam = async |title: &str, review: bool| {
         let res = create_exam_with(
             &app,
             &teacher,
-            &course,
-            json!({ "title": title, "kind": "quiz", "mode": "open",
-                    "max_attempts": 1, "allow_review": review }),
+            &t.instance,
+            json!({ "title": title, "kind": "yazili", "term": t.term.clone(),
+                    "mode": "open", "max_attempts": 1, "allow_review": review }),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -388,20 +390,21 @@ async fn review_hides_a_question_banked_out_of_it_and_live_elsewhere() {
 #[tokio::test]
 async fn a_retake_in_progress_closes_the_students_own_review_reads() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "rev_race_m", "manager").await;
     let teacher = login_as(&app, &db, "rev_race_t", "teacher").await;
     let student = login(&app, "rev_race_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "biology").await;
-    let subject = create_subject(&app, &teacher, &course, "cells").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "cell quiz", "kind": "quiz", "mode": "open",
-            "max_attempts": 2, "allow_review": true,
+            "title": "cell quiz", "kind": "yazili", "term": t.term.clone(),
+            "mode": "open", "max_attempts": 2, "allow_review": true,
         }),
     )
     .await;
@@ -484,21 +487,22 @@ async fn a_retake_in_progress_closes_the_students_own_review_reads() {
 #[tokio::test]
 async fn review_stays_shut_while_another_sitting_is_still_available() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "rev_left_m", "manager").await;
     let teacher = login_as(&app, &db, "rev_left_t", "teacher").await;
     let student = login(&app, "rev_left_s").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "chemistry").await;
-    let subject = create_subject(&app, &teacher, &course, "bonds").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "chemistry").await;
+    let subject = create_subject(&app, &teacher, &t.course, "bonds").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     // Unlimited sittings: no amount of finishing exhausts them.
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
+        &t.instance,
         json!({
-            "title": "bond quiz", "kind": "quiz", "mode": "open",
-            "max_attempts": 0, "allow_review": true,
+            "title": "bond quiz", "kind": "yazili", "term": t.term.clone(),
+            "mode": "open", "max_attempts": 0, "allow_review": true,
         }),
     )
     .await;
@@ -603,14 +607,15 @@ async fn review_stays_shut_while_another_sitting_is_still_available() {
 #[tokio::test]
 async fn the_review_gate_does_not_leak_allow_review_to_outsiders() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "rev_flag_m", "manager").await;
     let teacher = login_as(&app, &db, "rev_flag_t", "teacher").await;
     let student = login(&app, "rev_flag_s").await;
     let student_id = me_id(&app, &student).await;
     let outsider = login(&app, "rev_flag_out").await;
     let parent = login_as(&app, &db, "rev_flag_p", "parent").await;
 
-    let course = create_course(&app, &teacher, "physics").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "physics").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // Two published exams, identical but for the flag under test. The student
     // uses up their one sitting at each and is marked, so their read reaches the
@@ -619,9 +624,9 @@ async fn the_review_gate_does_not_leak_allow_review_to_outsiders() {
         let res = create_exam_with(
             &app,
             &teacher,
-            &course,
-            json!({ "title": title, "kind": "quiz", "mode": "open",
-                    "max_attempts": 1, "allow_review": review }),
+            &t.instance,
+            json!({ "title": title, "kind": "yazili", "term": t.term.clone(),
+                    "mode": "open", "max_attempts": 1, "allow_review": review }),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

@@ -356,9 +356,12 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
 /// longer exists.
 pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
     tx_with_retry(db, true, async move |conn| {
-        sqlx::query!("DELETE FROM board_participant WHERE board = $1", board.id.uuid())
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query!(
+            "DELETE FROM board_participant WHERE board = $1",
+            board.id.uuid()
+        )
+        .execute(&mut *conn)
+        .await?;
         sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id.uuid())
             .execute(&mut *conn)
             .await?;
@@ -407,8 +410,7 @@ mod tests {
     #[tokio::test]
     async fn field_scoped_writes_return_the_row_and_a_gone_board_refuses() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator =
-            crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
+        let creator = crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
         let board = create(
             &db,
             &creator,
@@ -425,8 +427,7 @@ mod tests {
 
         let locked = set_locked(&db, &board, true, &creator).await.unwrap();
         assert!(locked.is_locked());
-        let member =
-            crate::db::class_member::tests::fixture_user(&db, "board-member").await;
+        let member = crate::db::class_member::tests::fixture_user(&db, "board-member").await;
         let roster = vec![member];
         let re_rostered = set_participants(&db, &board, roster).await.unwrap();
         assert_eq!(re_rostered.get_participants().len(), 1);
@@ -440,8 +441,7 @@ mod tests {
     #[tokio::test]
     async fn the_cap_refuses_and_delete_releases_the_seat() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let creator =
-            crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
+        let creator = crate::db::class_member::tests::fixture_user(&db, "board-creator").await;
         for index in 0..MAX_BOARDS_PER_CREATOR {
             create(
                 &db,

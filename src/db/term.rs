@@ -8,44 +8,64 @@ use crate::constant::TERM_TABLE;
 use crate::database::Database;
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
+use crate::domain::academic_year::AcademicYearId;
 use crate::domain::term::{Term, TermId, TermName};
 use crate::domain::timestamp::{Timestamp, range_error};
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
 pub async fn create(
     db: &Database,
     name: TermName,
+    year: AcademicYearId,
     starts_at: Timestamp,
     ends_at: Timestamp,
 ) -> Result<Term, AppError> {
     let term = Term {
         id: TermId::generate(),
+        year,
         name,
         starts_at,
         ends_at,
         archived_at: None,
     };
+    // The year is claimed in the same statement as the row: `academic_year.
+    // term_count` + 1 is what the year's own delete guard reads, and
+    // claim-and-insert in one CTE means no crash can strand one half without
+    // the other. A year that is gone matches nothing — the `gone_error` the
+    // web layer's own read answers one instant earlier.
     let created = sqlx::query_as!(
         Term,
-        r#"INSERT INTO term (id, name, starts_at, ends_at, archived_at)
-           VALUES ($1, $2, $3, $4, NULL)
-           RETURNING id AS "id: TermId", name AS "name: TermName",
+        r#"WITH room AS (
+               UPDATE academic_year SET term_count = term_count + 1
+                WHERE id = $5
+                RETURNING 1)
+           INSERT INTO term (id, name, year, starts_at, ends_at, archived_at)
+           SELECT $1, $2, $5, $3, $4, NULL WHERE EXISTS (SELECT 1 FROM room)
+           RETURNING id AS "id: TermId", year AS "year: AcademicYearId",
+                     name AS "name: TermName",
                      starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
                      archived_at AS "archived_at: Timestamp""#,
         term.id.uuid(),
         term.name.as_str(),
         term.starts_at.as_millis(),
         term.ends_at.as_millis(),
+        term.year.uuid(),
     )
-    .fetch_one(db)
+    .fetch_optional(db)
     .await?;
-    Ok(created)
+    created.ok_or_else(|| {
+        AppError::Validation(ValidationError::Invalid {
+            field: "year",
+            reason: "academic year does not exist",
+        })
+    })
 }
 
 pub async fn read(db: &Database, id: &TermId) -> Result<Option<Term>, AppError> {
     let term = sqlx::query_as!(
         Term,
-        r#"SELECT id AS "id: TermId", name AS "name: TermName",
+        r#"SELECT id AS "id: TermId", year AS "year: AcademicYearId",
+                  name AS "name: TermName",
                   starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
                   archived_at AS "archived_at: Timestamp" FROM term WHERE id = $1"#,
         id.uuid(),
@@ -86,25 +106,42 @@ pub async fn update(
         .await
 }
 
-/// Delete the term, but only while no course *and no class* links it —
-/// nothing here unlinks or cascades. `false` = refused, nothing was written.
+/// Delete the term, but only while nothing links it — nothing here unlinks or
+/// cascades. `false` = refused, nothing was written.
 ///
-/// The roster of linking courses is the term's own `course_count`
-/// refcount, claimed by [`crate::db::course::create`] and
-/// `update` *before* they write a link, so the check and the delete are one
-/// conditional write on one record: a course write racing this either
-/// claims first (and the delete is refused) or finds the row gone (and is
-/// refused itself, with the same 400 the lookup gives). `Err(NotFound)`
+/// Two children refuse it. Exams are counted by the term's own `exam_count`
+/// refcount, claimed by [`crate::db::exam::create`] *before* it writes the
+/// link, so the check and the delete are one conditional write on one record:
+/// an exam write racing this either claims first (and the delete is refused)
+/// or finds the row gone (and is refused itself). A frozen karne
+/// ([`crate::db::karne`]) has no counter — it is written once per archived
+/// dönem — so its existence is the `NOT EXISTS` half of the same guard: a
+/// dönem a family holds a karne for is history, not a calendar entry.
+///
+/// The referencing foreign keys (`exam.term`, `karne_snapshot.term`, both
+/// `NO ACTION`) are the backstop behind the guard, not a second one: while
+/// the count is honest the `WHERE` decides every race on its own, because the
+/// claim path locks this very row before it writes a link. `Err(NotFound)`
 /// keeps the answer a concurrent *delete* used to get.
 ///
-/// The referencing foreign keys (`course.term`, `class_group.term`, both
-/// `NO ACTION`) are the backstop behind the counters, not a second guard:
-/// while the counts are honest the `WHERE` decides every race on its own,
-/// because both claim paths lock this very row before they write a link.
+/// The year is handed its reference back in the *same statement* — a
+/// `DELETE … RETURNING year` feeding the decrement, the shape
+/// [`crate::db::course::delete`] uses for its classes — so a year whose last
+/// dönem was just deleted is deletable the moment this lands. The counter
+/// lives on the year row and only this statement may release it: without the
+/// release the year's own `term_count = 0` delete guard could never pass
+/// again, and a year nobody links would be undeletable forever.
 pub async fn delete(db: &Database, term: Term) -> Result<bool, AppError> {
     let gone = sqlx::query!(
-        r#"DELETE FROM term
-           WHERE id = $1 AND course_count = 0 AND class_count = 0"#,
+        r#"WITH gone AS (
+               DELETE FROM term
+                WHERE id = $1 AND exam_count = 0
+                  AND NOT EXISTS (SELECT 1 FROM karne_snapshot WHERE term = $1)
+               RETURNING year)
+           UPDATE academic_year
+              SET term_count = GREATEST(term_count - 1, 0)
+             FROM gone
+            WHERE academic_year.id = gone.year"#,
         term.id.uuid(),
     )
     .execute(db)
@@ -128,7 +165,8 @@ pub async fn archive(db: &Database, term: Term) -> Result<Term, AppError> {
         Term,
         r#"UPDATE term SET archived_at = $2
            WHERE id = $1 AND archived_at IS NULL
-           RETURNING id AS "id: TermId", name AS "name: TermName",
+           RETURNING id AS "id: TermId", year AS "year: AcademicYearId",
+                     name AS "name: TermName",
                      starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
                      archived_at AS "archived_at: Timestamp""#,
         term.id.uuid(),
@@ -150,7 +188,8 @@ pub async fn unarchive(db: &Database, term: Term) -> Result<Term, AppError> {
         Term,
         r#"UPDATE term SET archived_at = NULL
            WHERE id = $1 AND archived_at IS NOT NULL
-           RETURNING id AS "id: TermId", name AS "name: TermName",
+           RETURNING id AS "id: TermId", year AS "year: AcademicYearId",
+                     name AS "name: TermName",
                      starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
                      archived_at AS "archived_at: Timestamp""#,
         term.id.uuid(),
@@ -161,6 +200,23 @@ pub async fn unarchive(db: &Database, term: Term) -> Result<Term, AppError> {
         Some(written) => Ok(written),
         None => read(db, &term.id).await?.ok_or(AppError::NotFound),
     }
+}
+
+/// A real dönem behind a real academic year — the parent every exam names and
+/// the grading slice every term-keyed read scopes to. Minted per call.
+#[cfg(test)]
+pub(crate) async fn a_test_term(db: &Database) -> TermId {
+    let year = crate::db::academic_year::a_test_year(db).await;
+    let term = create(
+        db,
+        TermName::try_new("1. Dönem").unwrap(),
+        year,
+        Timestamp::from_millis(0),
+        Timestamp::from_millis(1),
+    )
+    .await
+    .unwrap();
+    *term.get_id()
 }
 
 #[cfg(test)]
@@ -175,9 +231,15 @@ mod tests {
     async fn a_moved_end_is_refused_against_the_stored_other_end() {
         let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
-        let term = create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
+        let term = create(
+            &db,
+            TermName::try_new("2026").unwrap(),
+            crate::db::academic_year::a_test_year(&db).await,
+            at(100),
+            at(200),
+        )
+        .await
+        .unwrap();
 
         let refused = update(&db, term.clone(), None, None, Some(at(50)))
             .await
@@ -204,11 +266,13 @@ mod tests {
     async fn identical_starts_at_still_pages_each_term_exactly_once() {
         let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
+        let year = crate::db::academic_year::a_test_year(&db).await;
         let mut minted = Vec::new();
         for i in 0..12 {
             let term = create(
                 &db,
                 TermName::try_new(&format!("t{i}")).unwrap(),
+                year,
                 at(100),
                 at(200),
             )
@@ -248,8 +312,8 @@ mod tests {
     /// through. A store answering "conflict, retry" therefore comes out as a
     /// 500 instead of the 404 or 409 the request owes.
     ///
-    /// The racer is [`crate::db::course::create`] against this
-    /// term: it claims `course_count` on the term row before it writes the
+    /// The racer is [`crate::db::exam::create`] against this
+    /// dönem: it claims `exam_count` on the term row before it writes the
     /// link, which is the same record and the same column the guard reads. Both
     /// sides are swept across each other sub-millisecond, exactly as in
     /// [`crate::db::subject::delete`]'s race test — a whole
@@ -263,15 +327,19 @@ mod tests {
     /// [`write_with_retry`] is a single round trip wide — measured at 0
     /// conflicts in 100 raced rounds, green with the retry loop cut to a single
     /// attempt. A status-code guard, then: a raced delete answers 409 or 404 and
-    /// never 500, and a course that got linked survives it. The retry is
+    /// never 500, and an exam that got linked survives it. The retry is
     /// measured on [`crate::db::course::delete`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_delete_racing_a_course_create_never_answers_500() {
-        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
+    async fn a_delete_racing_an_exam_create_never_answers_500() {
+        use crate::domain::exam::{
+            ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
+        };
         use crate::domain::user::UserId;
         let (db, _leases) = crate::database::init_test_db().await;
-        // The course's teacher is a foreign key now: one real row, reused by
-        // every create in every round.
+        // The exam's parents are foreign keys now: one real instance — with
+        // its class and course — reused by every create in every round, and
+        // one real creator.
+        let (instance, _course) = crate::db::course::a_test_instance(&db).await;
         let teacher = UserId::generate();
         sqlx::query(
             "INSERT INTO app_user (id, username, created_at, role) \
@@ -282,14 +350,24 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        let kinds = crate::domain::settings::Settings::defaults()
+            .get_exam_kinds()
+            .to_vec();
+        let year = crate::db::academic_year::a_test_year(&db).await;
         let (mut delete_500, mut create_500) = (0, 0);
         let (mut linked, mut wiped) = (0, 0);
         let (mut last_delete, mut last_create) = (String::new(), String::new());
         let at = Timestamp::from_millis;
         for round in 0..20 {
-            let term = create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
-                .await
-                .unwrap();
+            let term = create(
+                &db,
+                TermName::try_new("2026").unwrap(),
+                year,
+                at(100),
+                at(200),
+            )
+            .await
+            .unwrap();
 
             let separated = round % 4 == 0;
             let drop_it = {
@@ -312,7 +390,9 @@ mod tests {
             };
             let makes: Vec<_> = (0..6)
                 .map(|_| {
-                    let (id, db, teacher) = (*term.get_id(), db.clone(), teacher);
+                    let (instance, db, teacher, kinds) =
+                        (instance.clone(), db.clone(), teacher, kinds.clone());
+                    let term = *term.get_id();
                     let head_start = if separated {
                         std::time::Duration::from_millis(2)
                     } else {
@@ -320,14 +400,19 @@ mod tests {
                     };
                     tokio::spawn(async move {
                         tokio::time::sleep(head_start).await;
-                        crate::db::course::create(
+                        crate::db::exam::create(
                             &db,
                             &teacher,
-                            CourseTitle::try_new("algebra").unwrap(),
-                            CourseDescription::try_new("").unwrap(),
-                            CourseKind::course(),
-                            Some(id),
-                            None,
+                            &instance,
+                            &term,
+                            ExamTitle::try_new("algebra").unwrap(),
+                            ExamDescription::try_new("").unwrap(),
+                            ExamKind::try_new("yazili", &kinds).unwrap(),
+                            ExamSchedule::try_new(None, None, None, None).unwrap(),
+                            ExamAttemptLimit::try_new(1).unwrap(),
+                            true,
+                            false,
+                            false,
                         )
                         .await
                     })
@@ -338,7 +423,7 @@ mod tests {
                 delete_500 += 1;
                 last_delete = format!("{drop_it:?}");
             }
-            // Stored state, both sides: a linked course means the claim beat the
+            // Stored state, both sides: a linked exam means the claim beat the
             // guard, a gone term means the delete did.
             let mut landed = false;
             for make in makes {
@@ -347,8 +432,8 @@ mod tests {
                     create_500 += 1;
                     last_create = format!("{make:?}");
                 }
-                if let Ok(course) = &make
-                    && crate::db::course::read(&db, course.get_id())
+                if let Ok(exam) = &make
+                    && crate::db::exam::read(&db, exam.get_id())
                         .await
                         .unwrap()
                         .is_some()
@@ -363,7 +448,7 @@ mod tests {
         }
         eprintln!(
             "Term::delete raced: {delete_500}/20 delete 500s, {create_500} create 500s, \
-             {linked} rounds with a course linked / {wiped} wiped"
+             {linked} rounds with an exam linked / {wiped} wiped"
         );
         assert!(
             linked > 0 && wiped > 0,
@@ -375,7 +460,7 @@ mod tests {
         );
         assert_eq!(
             create_500, 0,
-            "a raced course create must retry, not 500: {create_500}/20 rounds, last {last_create}"
+            "a raced exam create must retry, not 500: {create_500}/20 rounds, last {last_create}"
         );
     }
 }

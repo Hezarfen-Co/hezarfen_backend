@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT class_course_count, course_membership_count FROM course\n               WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class_course_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "class_course_count"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course_membership_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course",
+            "name": "course_membership_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c9e8539ffc001f4fea89e28319703294b33a9312693ff2f9e795227ee1bb50db"
+}

@@ -9,7 +9,7 @@ use utoipa_axum::routes;
 
 use crate::domain::term::{Term, TermId, TermName};
 use crate::domain::timestamp::Timestamp;
-use crate::error::{AppError, ErrorResponse};
+use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
 use crate::state::AppState;
 
@@ -25,8 +25,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateTerm {
-    #[schema(example = "2026 Fall", max_length = 100)]
+    #[schema(example = "1. Dönem", max_length = 100)]
     name: String,
+    /// The academic year this dönem is a slice of (`GET /academic-years`).
+    /// Required — a dönem outside a year has no karne to be counted into.
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
+    year: String,
     /// Term start, UTC unix-milliseconds. May lie in the past — a school
     /// adopting the app mid-year backfills its calendar legitimately.
     #[schema(example = 1_780_000_000_000_i64)]
@@ -47,8 +51,10 @@ struct UpdateTerm {
 #[derive(Serialize, ToSchema)]
 struct TermResponse {
     id: String,
-    #[schema(example = "2026 Fall")]
+    #[schema(example = "1. Dönem")]
     name: String,
+    /// The academic year this dönem belongs to (`GET /academic-years/{id}`).
+    year: String,
     /// Term start, UTC unix-milliseconds.
     starts_at: i64,
     /// Term end, UTC unix-milliseconds.
@@ -62,6 +68,7 @@ impl TermResponse {
         Self {
             id: term.get_id().key().to_string(),
             name: term.get_name().as_str().to_string(),
+            year: term.get_year().key().to_string(),
             starts_at: term.get_starts_at().as_millis(),
             ends_at: term.get_ends_at().as_millis(),
             archived_at: term.get_archived_at().map(|at| at.as_millis()),
@@ -69,8 +76,9 @@ impl TermResponse {
     }
 }
 
-/// Create an academic term. Requires manager+. Past dates are allowed —
-/// terms are calendar structure, not schedules.
+/// Create a dönem inside an academic year. Requires manager+. Past dates are
+/// allowed — dönemler are calendar structure, not schedules; an *archived* year
+/// refuses the new dönem (`409`), because past years take no new structure.
 #[utoipa::path(
     post,
     path = "/",
@@ -79,9 +87,10 @@ impl TermResponse {
     request_body = CreateTerm,
     responses(
         (status = 201, description = "Term created", body = TermResponse),
-        (status = 400, description = "Invalid name or range", body = ErrorResponse),
+        (status = 400, description = "Invalid name or range, or an unknown year", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "The named academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -91,10 +100,18 @@ async fn create_term(
     Json(req): Json<CreateTerm>,
 ) -> Result<(StatusCode, Json<TermResponse>), AppError> {
     let name = TermName::try_new(&req.name)?;
+    // The single spot a request-supplied year passes through: an unknown id is
+    // a 400 naming the field, an archived one the year's own 409.
+    let Some(year) = service::academic_year::resolve(&st.db, Some(&req.year)).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "year",
+            reason: "academic year is required",
+        }));
+    };
     let starts_at = Timestamp::from_millis(req.starts_at);
     let ends_at = Timestamp::from_millis(req.ends_at);
     check_time_range(Some(starts_at), Some(ends_at))?;
-    let term = service::term::create(&st.db, name, starts_at, ends_at).await?;
+    let term = service::term::create(&st.db, name, year, starts_at, ends_at).await?;
     Ok((StatusCode::CREATED, Json(TermResponse::new(&term))))
 }
 
@@ -164,7 +181,7 @@ async fn get_term(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "The term is archived, or its academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -182,6 +199,10 @@ async fn update_term(
         .await?
         .ok_or(AppError::NotFound)?;
     service::term::require_writable(&term)?;
+    // The year above the dönem is the other half of the read-only rule, and
+    // the half a closed dönem no longer covers: a dönem still open inside an
+    // archived year takes no edit either.
+    service::academic_year::require_open(&st.db, term.get_year()).await?;
     // Pre-flight only: the range check is re-made inside the UPDATE's own
     // `WHERE` (the term update in the db layer), so a concurrent move of the
     // end this PATCH omits cannot slip an inverted range past this snapshot.
@@ -194,10 +215,11 @@ async fn update_term(
     Ok(Json(TermResponse::new(&updated)))
 }
 
-/// Delete a term. Requires manager+. Refused with a 409 while any course still
-/// links to it — unlink those courses (`PATCH /courses/{id}` with
-/// `"term_id": null`) or delete them first, so a term is never dropped out from
-/// under the calendar its courses hang on.
+/// Delete a dönem. Requires manager+. Refused with a 409 while anything still
+/// hangs off it — an exam filed in it, or a karne frozen for it — so a dönem is
+/// never dropped out from under marks that name it; move or delete those
+/// first. The dönem's own academic year is untouched (that is `DELETE
+/// /academic-years/{id}`, which refuses while a dönem still links it).
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -209,7 +231,7 @@ async fn update_term(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Courses are still linked to this term, or the term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Exams or frozen karnes still belong to this term, the term is archived, or its academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_term(
@@ -221,13 +243,19 @@ async fn delete_term(
         .await?
         .ok_or(AppError::NotFound)?;
     service::term::require_writable(&term)?;
+    service::academic_year::require_open(&st.db, term.get_year()).await?;
     service::term::delete(&st.db, term).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Archive a term. Requires manager+. An archived term is frozen: it takes no
-/// edits, no delete, and no new course or class link. Idempotent — archiving an
-/// already-archived term answers `200` with the stamp it already had.
+/// Archive a dönem. Requires manager+. Archiving **freezes the karnes**: every
+/// student with a roster row under the dönem's year gets a snapshot of their
+/// report, and from then on `GET /marks/karne` serves that record instead of
+/// recomputing — a mark corrected after the fact no longer rewrites what a
+/// family holds. An archived dönem takes no edits and no delete; exams may
+/// still be created in it while its *year* is open (the archive is a record,
+/// not a wall). Idempotent — archiving an already-archived dönem answers `200`
+/// with the stamp it already had and never re-freezes.
 #[utoipa::path(
     post,
     path = "/{id}/archive",

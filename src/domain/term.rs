@@ -2,6 +2,7 @@ use sqlx::Type;
 use uuid::Uuid;
 
 use crate::constant::MAX_TERM_NAME_LEN;
+use crate::domain::academic_year::AcademicYearId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
@@ -92,6 +93,8 @@ impl TermName {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Term {
     pub(crate) id: TermId,
+    /// The academic year this dönem is a grading slice of.
+    pub(crate) year: AcademicYearId,
     pub(crate) name: TermName,
     pub(crate) starts_at: Timestamp,
     pub(crate) ends_at: Timestamp,
@@ -104,6 +107,10 @@ pub struct Term {
 impl Term {
     pub fn get_id(&self) -> &TermId {
         &self.id
+    }
+
+    pub fn get_year(&self) -> &AcademicYearId {
+        &self.year
     }
 
     pub fn get_name(&self) -> &TermName {

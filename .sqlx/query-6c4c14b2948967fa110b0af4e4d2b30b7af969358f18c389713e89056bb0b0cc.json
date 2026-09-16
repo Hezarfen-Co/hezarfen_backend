@@ -1,0 +1,120 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: HomeworkId\",\n                  class_course AS \"class_course: ClassCourseId\",\n                  subject AS \"subject: SubjectId\",\n                  title AS \"title: HomeworkTitle\",\n                  description AS \"description: HomeworkDescription\",\n                  due_at AS \"due_at: Timestamp\",\n                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a\n                    WHERE a.homework = homework.id) AS \"assigned: Vec<UserId>\",\n                  created_by AS \"created_by: UserId\",\n                  created_at AS \"created_at: Timestamp\"\n           FROM homework\n           WHERE class_course = $1\n             AND (NOT EXISTS (SELECT 1 FROM homework_assignment a\n                               WHERE a.homework = homework.id)\n                  OR EXISTS (SELECT 1 FROM homework_assignment a\n                              WHERE a.homework = homework.id AND a.student = $2))\n           ORDER BY id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HomeworkId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "title: HomeworkTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "description: HomeworkDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "due_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "due_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "assigned: Vec<UserId>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "6c4c14b2948967fa110b0af4e4d2b30b7af969358f18c389713e89056bb0b0cc"
+}

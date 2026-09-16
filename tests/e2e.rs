@@ -535,13 +535,41 @@ struct ExamRoom {
     student: Client,
     student_id: String,
     cookie: String,
-    course_id: String,
     subject_id: String,
+    /// The instance the şube teaches the course as — the academic anchor every
+    /// roster, exam and karne keys on since the K12 remodel.
+    instance_id: String,
+    /// The dönem the exams written here are filed under.
+    term: String,
     exam_id: String,
     question_id: String,
     /// The fixture question's minted choice ids, in list order — what the
     /// tests below used to write as the indexes 0 and 1.
     choice_ids: Vec<String>,
+}
+
+impl ExamRoom {
+    /// Write one more exam into the fixture's instance as the teacher, through
+    /// the shipped shape: it hangs off `/instances/{id}/exams` and must carry
+    /// the dönem it counts into. `extra` overlays the scheduling fields.
+    async fn an_exam(&self, title: &str, extra: Value) -> Value {
+        let mut body = json!({ "title": title, "kind": "yazili", "term": self.term });
+        if let Some(map) = body.as_object_mut() {
+            map.extend(extra.as_object().cloned().unwrap_or_default());
+        }
+        self.teacher
+            .post(format!(
+                "{}/instances/{}/exams",
+                self.base, self.instance_id
+            ))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
 }
 
 async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
@@ -550,6 +578,22 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
     register(&teacher, &base, "hoca").await;
     promote(&db, "hoca", "teacher").await;
     login(&teacher, &base, "hoca").await;
+    let teacher_id: Value = teacher
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let teacher_id = teacher_id["id"].as_str().unwrap().to_string();
+
+    // A şube is school structure, so a manager mints the calendar, the section
+    // and the instance every exam in this fixture hangs off.
+    let manager = client();
+    register(&manager, &base, "mudur").await;
+    promote(&db, "mudur", "manager").await;
+    login(&manager, &base, "mudur").await;
 
     let student = client();
     register(&student, &base, "veli").await;
@@ -573,6 +617,37 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .await
         .unwrap();
     let now = now["now"].as_i64().unwrap();
+
+    let year: Value = manager
+        .post(format!("{base}/academic-years"))
+        .json(&json!({
+            "name": "2026-2027",
+            "starts_at": 1_750_000_000_000_i64,
+            "ends_at": 1_800_000_000_000_i64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let year = year["id"].as_str().unwrap().to_string();
+    let term: Value = manager
+        .post(format!("{base}/terms"))
+        .json(&json!({
+            "name": "1. Dönem",
+            "year": year,
+            "starts_at": 1_750_000_000_000_i64,
+            "ends_at": 1_800_000_000_000_i64,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let term = term["id"].as_str().unwrap().to_string();
+
     let course: Value = teacher
         .post(format!("{base}/courses"))
         .json(&json!({ "title": "algebra" }))
@@ -593,17 +668,41 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .await
         .unwrap();
     let subject_id = subject["id"].as_str().unwrap().to_string();
+
+    // 9-A teaches it, with `hoca` as its homeroom teacher — which is what lets
+    // a plain teacher run the instance's roster and write its exams.
+    let class: Value = manager
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "9-A", "year": year, "teacher_id": teacher_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let class_id = class["class"]["id"].as_str().unwrap().to_string();
+    let instance: Value = manager
+        .post(format!("{base}/classes/{class_id}/instances"))
+        .json(&json!({ "course_id": course_id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let instance_id = instance["id"].as_str().unwrap().to_string();
+
     let res = teacher
-        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .post(format!("{base}/instances/{instance_id}/enrollments"))
         .json(&json!({ "user_id": student_id }))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let exam: Value = teacher
-        .post(format!("{base}/courses/{course_id}/exams"))
+        .post(format!("{base}/instances/{instance_id}/exams"))
         .json(&json!({
-            "title": "final", "kind": "final",
+            "title": "final", "kind": "yazili", "term": term,
             "mode": "sync", "starts_at": now - 1_000, "ends_at": now + window_ms,
         }))
         .send()
@@ -635,8 +734,9 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         student,
         student_id,
         cookie,
-        course_id,
         subject_id,
+        instance_id,
+        term,
         exam_id,
         question_id,
         choice_ids,
@@ -896,16 +996,7 @@ async fn exam_room_rejects_bad_handshakes() {
     );
 
     // An unscheduled exam has no room to join: 409.
-    let unscheduled: Value = room
-        .teacher
-        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
-        .json(&json!({ "title": "homework", "kind": "homework" }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let unscheduled = room.an_exam("homework", json!({})).await;
     let unscheduled_id = unscheduled["id"].as_str().unwrap();
     assert_eq!(
         ws_open(&room.base, unscheduled_id, Some(&room.cookie))
@@ -1337,19 +1428,12 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
     let room = exam_room_fixture(600_000).await;
 
     // An open exam with two sittings and the rejoin door closed.
-    let exam: Value = room
-        .teacher
-        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
-        .json(&json!({
-            "title": "practice", "kind": "quiz",
-            "mode": "open", "max_attempts": 2, "allow_rejoin": false,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let exam = room
+        .an_exam(
+            "practice",
+            json!({ "mode": "open", "max_attempts": 2, "allow_rejoin": false }),
+        )
+        .await;
     let exam_id = exam["id"].as_str().unwrap().to_string();
     let question: Value = room
         .teacher
@@ -1448,19 +1532,9 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
     let room = exam_room_fixture(600_000).await;
 
     // An open exam with two sittings and one choice question.
-    let exam: Value = room
-        .teacher
-        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
-        .json(&json!({
-            "title": "practice", "kind": "quiz",
-            "mode": "open", "max_attempts": 2,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let exam = room
+        .an_exam("practice", json!({ "mode": "open", "max_attempts": 2 }))
+        .await;
     let exam_id = exam["id"].as_str().unwrap().to_string();
     let question: Value = room
         .teacher
@@ -1639,19 +1713,9 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
     let room = exam_room_fixture(600_000).await;
 
     // A second, open exam in the same course: two sittings, no window.
-    let exam: Value = room
-        .teacher
-        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
-        .json(&json!({
-            "title": "practice", "kind": "quiz",
-            "mode": "open", "max_attempts": 2,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let exam = room
+        .an_exam("practice", json!({ "mode": "open", "max_attempts": 2 }))
+        .await;
     let exam_id = exam["id"].as_str().unwrap().to_string();
     let question: Value = room
         .teacher
@@ -3148,7 +3212,7 @@ async fn clearing_a_blank_canvas_never_tells_the_room_the_board_is_closed() {
 
 /// The class layer over real HTTP with three cookie jars: the office builds the
 /// class, the teacher hands over their own course, and the student — who was
-/// never enrolled by anyone — finds it on `GET /courses/me`. Taking them out of
+/// never enrolled by anyone — finds it on `GET /instances/me`. Taking them out of
 /// the class takes the seat back with them.
 #[tokio::test]
 async fn a_class_seats_its_roster_and_gives_the_seat_back() {
@@ -3178,10 +3242,22 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
             .unwrap(),
     );
 
-    // The office opens the class and puts the student in it.
+    // The office opens the class — with `tch` as its homeroom teacher, so the
+    // teacher who brings the course can act on the instance it makes — and puts
+    // the student in it.
+    let teacher_id = id_of(
+        &teacher
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+    );
     let res = manager
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "9-A", "grade": "9" }))
+        .json(&json!({ "name": "9-A", "grade": "9", "teacher_id": teacher_id }))
         .send()
         .await
         .unwrap();
@@ -3207,16 +3283,18 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
     assert_eq!(res.status(), StatusCode::CREATED);
     let course = id_of(&res.json::<Value>().await.unwrap());
     let res = teacher
-        .post(format!("{base}/classes/{class}/courses"))
+        .post(format!("{base}/classes/{class}/instances"))
         .json(&json!({ "course_id": course }))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
+    let instance = id_of(&res.json::<Value>().await.unwrap());
 
-    // … and the student, whom nobody ever enrolled, is in it.
+    // … and the student, whom nobody ever enrolled, is in it: the şube teaching
+    // the course is what seats them.
     let mine: Value = student
-        .get(format!("{base}/courses/me"))
+        .get(format!("{base}/instances/me"))
         .send()
         .await
         .unwrap()
@@ -3224,10 +3302,19 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .await
         .unwrap();
     assert_eq!(mine["total"], 1, "the class seated them: {mine}");
-    assert_eq!(mine["items"][0]["id"], course);
-    assert_eq!(mine["items"][0]["title"], "Cebir");
+    assert_eq!(mine["items"][0]["course"], json!(course));
+    assert_eq!(mine["items"][0]["id"], json!(instance));
+    let catalog: Value = student
+        .get(format!("{base}/courses/{course}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog["title"], "Cebir");
 
-    // Out of the class, out of the course — the seat comes back.
+    // Out of the class, out of the instance — the seat comes back.
     let res = manager
         .delete(format!("{base}/classes/{class}/members/{student_id}"))
         .send()
@@ -3235,7 +3322,7 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     let mine: Value = student
-        .get(format!("{base}/courses/me"))
+        .get(format!("{base}/instances/me"))
         .send()
         .await
         .unwrap()
@@ -3244,7 +3331,7 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .unwrap();
     assert_eq!(mine["total"], 0, "the seat went with them: {mine}");
     let roster: Value = teacher
-        .get(format!("{base}/courses/{course}/enrollments"))
+        .get(format!("{base}/instances/{instance}/enrollments"))
         .send()
         .await
         .unwrap()
@@ -3252,6 +3339,15 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .await
         .unwrap();
     assert_eq!(roster["total"], 0, "and off the teacher's roster: {roster}");
+    let read: Value = teacher
+        .get(format!("{base}/instances/{instance}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["enrollment_count"], json!(0), "and off the counter");
 }
 
 /// The role bar has to close READS, not only writes. `forward` used to hand the
@@ -3313,12 +3409,18 @@ async fn a_demoted_participant_stops_reading_the_canvas_at_once() {
     board_draw(&mut ali, "{\"p\":[5,6]}").await;
 }
 
-/// A manager archives an academic year and the whole year turns read-only from
-/// the user's seat: every write into its structure answers `409 term_archived`,
+/// The past is read-only: with its academic year archived, every write into the
+/// year's structure answers `409 academic_year_archived` — the dönem, the
+/// instances, their rosters, exams, homework, roll call and the class itself —
 /// every read still answers, the live exam room's door refuses the upgrade with
-/// a real HTTP 409 (before the WebSocket handshake completes), and unarchiving
-/// reopens all of it. The two archive routes are discoverable in the served
-/// OpenAPI document Swagger renders.
+/// a real HTTP 409 (before the WebSocket handshake completes), and re-opening
+/// the year thaws all of it.
+///
+/// Since the K12 remodel a şube hangs off a *year*, not a dönem (a dönem is a
+/// grading slice inside it), so that is the unit the freeze had to move to. No
+/// route archives a year yet — the archive half of the API is still the dönem's
+/// — so the past is minted through the column, and the dönem's own archive route
+/// is exercised beside it at the end.
 #[tokio::test]
 async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     let (base, db) = spawn_server().await;
@@ -3347,24 +3449,44 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         .as_i64()
         .unwrap();
 
-    // --- a year's worth of structure, all hanging off one term -------------
+    // --- a year's worth of structure, all hanging off one year ------------
+    let res = mudur
+        .post(format!("{base}/academic-years"))
+        .json(&json!({
+            "name": "2026-2027",
+            "starts_at": now - 86_400_000,
+            "ends_at": now + 86_400_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let year: Value = res.json().await.unwrap();
+    let year_id = year["id"].as_str().unwrap().to_string();
+    assert!(
+        year["archived_at"].is_null(),
+        "a fresh year is open: {year}"
+    );
+
     let res = mudur
         .post(format!("{base}/terms"))
-        .json(&json!({ "name": "2026 Fall", "starts_at": now - 86_400_000, "ends_at": now + 86_400_000 }))
+        .json(&json!({
+            "name": "2026 Fall",
+            "year": year_id,
+            "starts_at": now - 86_400_000,
+            "ends_at": now + 86_400_000,
+        }))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     let term: Value = res.json().await.unwrap();
     let term_id = term["id"].as_str().unwrap().to_string();
-    assert!(
-        term["archived_at"].is_null(),
-        "a fresh term is open: {term}"
-    );
+    assert_eq!(term["year"], json!(year_id), "the dönem names its year");
 
     let res = mudur
         .post(format!("{base}/courses"))
-        .json(&json!({ "title": "algebra", "term_id": term_id }))
+        .json(&json!({ "title": "algebra" }))
         .send()
         .await
         .unwrap();
@@ -3384,10 +3506,36 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         .unwrap()
         .to_string();
 
+    // 9-A teaches it: the class is the structure the year closes over, and the
+    // instance is what every one of the writes below hangs off.
+    let res = mudur
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "9-A", "grade": "9", "year": year_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let class_id = json_of(res).await["class"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = mudur
+        .post(format!("{base}/classes/{class_id}/instances"))
+        .json(&json!({ "course_id": course_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let instance_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
     let exam: Value = json_of(
         mudur
-            .post(format!("{base}/courses/{course_id}/exams"))
-            .json(&json!({ "title": "midterm", "kind": "quiz", "mode": "open", "max_attempts": 2 }))
+            .post(format!("{base}/instances/{instance_id}/exams"))
+            .json(&json!({
+                "title": "midterm", "kind": "yazili", "term": term_id,
+                "mode": "open", "max_attempts": 2,
+            }))
             .send()
             .await
             .unwrap(),
@@ -3412,7 +3560,7 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     let opts = choice_ids(&question);
 
     let res = mudur
-        .post(format!("{base}/courses/{course_id}/sessions"))
+        .post(format!("{base}/instances/{instance_id}/sessions"))
         .json(&json!({ "starts_at": now + 3_600_000 }))
         .send()
         .await
@@ -3421,7 +3569,7 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     let session_id = json_of(res).await["id"].as_str().unwrap().to_string();
 
     let res = mudur
-        .post(format!("{base}/courses/{course_id}/homework"))
+        .post(format!("{base}/instances/{instance_id}/homework"))
         .json(
             &json!({ "title": "read ch3", "subject_id": subject_id, "due_at": now + 604_800_000 }),
         )
@@ -3441,19 +3589,7 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     let note_id = json_of(res).await["id"].as_str().unwrap().to_string();
 
     let res = mudur
-        .post(format!("{base}/classes"))
-        .json(&json!({ "name": "9-A", "grade": "9", "term_id": term_id }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::CREATED);
-    let class_id = json_of(res).await["class"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let res = mudur
-        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .post(format!("{base}/instances/{instance_id}/enrollments"))
         .json(&json!({ "user_id": student_id }))
         .send()
         .await
@@ -3470,30 +3606,28 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     assert_eq!(res.status(), StatusCode::CREATED, "start the live sitting");
     let student_cookie = raw_session_cookie(&base, "ogrenci").await;
 
-    // --- archive ----------------------------------------------------------
-    let res = mudur
-        .post(format!("{base}/terms/{term_id}/archive"))
-        .send()
+    // --- the year goes past -------------------------------------------------
+    // No route archives one yet (the year's own PATCH refuses an archived row
+    // and offers no archive), so the column is written the way an operator
+    // would; every gate below reads it.
+    let archived = sqlx::query("UPDATE academic_year SET archived_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(Uuid::parse_str(&year_id).unwrap())
+        .execute(&db)
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let archived: Value = res.json().await.unwrap();
-    let stamp = archived["archived_at"].as_i64().expect("archived_at stamp");
+    assert_eq!(archived.rows_affected(), 1, "the year went past");
+    let read: Value = json_of(
+        mudur
+            .get(format!("{base}/academic-years/{year_id}"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(read["archived_at"], json!(now), "the read shows it: {read}");
 
-    // Idempotent: a second archive answers 200 with the stamp it already had.
-    let res = mudur
-        .post(format!("{base}/terms/{term_id}/archive"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        json_of(res).await["archived_at"].as_i64(),
-        Some(stamp),
-        "re-archiving must not move the stamp"
-    );
-
-    // --- every write into the closed year is a 409 `term_archived` ---------
+    // --- every write into the closed year is a 409 --------------------------
     let refusals: Vec<(&str, reqwest::Response)> = vec![
         (
             "PATCH /terms/{id}",
@@ -3505,18 +3639,18 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
                 .unwrap(),
         ),
         (
-            "PATCH /courses/{id}",
+            "PATCH /instances/{id}",
             mudur
-                .patch(format!("{base}/courses/{course_id}"))
-                .json(&json!({ "title": "renamed" }))
+                .patch(format!("{base}/instances/{instance_id}"))
+                .json(&json!({ "ders_saati": 4 }))
                 .send()
                 .await
                 .unwrap(),
         ),
         (
-            "POST /courses/{id}/enrollments",
+            "POST /instances/{id}/enrollments",
             mudur
-                .post(format!("{base}/courses/{course_id}/enrollments"))
+                .post(format!("{base}/instances/{instance_id}/enrollments"))
                 .json(&json!({ "user_id": kaan_id }))
                 .send()
                 .await
@@ -3559,15 +3693,6 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
                 .unwrap(),
         ),
         (
-            "PATCH /course-notes/{id}",
-            mudur
-                .patch(format!("{base}/course-notes/{note_id}"))
-                .json(&json!({ "title": "renamed" }))
-                .send()
-                .await
-                .unwrap(),
-        ),
-        (
             "POST /classes/{id}/members",
             mudur
                 .post(format!("{base}/classes/{class_id}/members"))
@@ -3581,12 +3706,17 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         let status = res.status();
         let body: Value = res.json().await.unwrap();
         assert_eq!(status, StatusCode::CONFLICT, "{what} status: {body}");
-        assert_eq!(body["code"], "term_archived", "{what} code: {body}");
+        assert_eq!(
+            body["code"], "academic_year_archived",
+            "{what} code: {body}"
+        );
     }
 
     // --- every read still answers -----------------------------------------
     for url in [
         format!("{base}/terms/{term_id}"),
+        format!("{base}/academic-years/{year_id}"),
+        format!("{base}/instances/{instance_id}"),
         format!("{base}/courses/{course_id}"),
         format!("{base}/exams/{exam_id}"),
         format!("{base}/sessions/{session_id}"),
@@ -3604,23 +3734,17 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         .expect_err("an archived year's room must refuse the handshake");
     assert_eq!(refused, 409, "the room door answers a real HTTP 409");
 
-    // --- unarchive reopens the year ---------------------------------------
-    let res = mudur
-        .post(format!("{base}/terms/{term_id}/unarchive"))
-        .send()
+    // --- re-opening the year thaws the whole set ---------------------------
+    sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&year_id).unwrap())
+        .execute(&db)
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let reopened: Value = res.json().await.unwrap();
-    assert!(
-        reopened["archived_at"].is_null(),
-        "unarchive clears the stamp: {reopened}"
-    );
 
     // A write that was refused a moment ago now lands.
     let res = mudur
-        .patch(format!("{base}/courses/{course_id}"))
-        .json(&json!({ "title": "algebra II" }))
+        .patch(format!("{base}/instances/{instance_id}"))
+        .json(&json!({ "ders_saati": 4 }))
         .send()
         .await
         .unwrap();
@@ -3629,6 +3753,7 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         StatusCode::OK,
         "the reopened year takes writes"
     );
+    assert_eq!(json_of(res).await["ders_saati"], json!(4));
 
     // The room door opens again, and the live sitting is still there.
     let mut ws = ws_open(&base, &exam_id, Some(&student_cookie))
@@ -3639,12 +3764,12 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
 
     // Archive under the open socket: `finish` comes back as an error frame
     // carrying the archived refusal instead of submitting the sheet.
-    let res = mudur
-        .post(format!("{base}/terms/{term_id}/archive"))
-        .send()
+    sqlx::query("UPDATE academic_year SET archived_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(Uuid::parse_str(&year_id).unwrap())
+        .execute(&db)
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
     ws_send(&mut ws, json!({ "type": "finish" })).await;
     let error = ws_frame_of_type(&mut ws, "error").await;
     assert!(
@@ -3653,15 +3778,47 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     );
 
     // Reopen once more and the same frame submits the sitting.
+    sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&year_id).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    let finished = ws_frame_of_type(&mut ws, "finished").await;
+    assert!(finished["finished_at"].as_i64().is_some(), "{finished}");
+
+    // --- the dönem's own archive: idempotent, and discoverable --------------
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let archived: Value = res.json().await.unwrap();
+    let stamp = archived["archived_at"].as_i64().expect("archived_at stamp");
+
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(res).await["archived_at"].as_i64(),
+        Some(stamp),
+        "re-archiving must not move the stamp"
+    );
+
     let res = mudur
         .post(format!("{base}/terms/{term_id}/unarchive"))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    ws_send(&mut ws, json!({ "type": "finish" })).await;
-    let finished = ws_frame_of_type(&mut ws, "finished").await;
-    assert!(finished["finished_at"].as_i64().is_some(), "{finished}");
+    assert!(
+        json_of(res).await["archived_at"].is_null(),
+        "unarchive clears the stamp"
+    );
 
     // --- discoverable in the document Swagger renders ----------------------
     let spec: Value = json_of(
@@ -3861,4 +4018,254 @@ async fn probe_a_suspended_school_refuses_websocket_upgrades() {
         board_ws_open(&base, &board, Some(&cookie)).await.is_ok(),
         "the board socket after a resume"
     );
+}
+
+/// The K12 remodel's whole academic spine, over real TCP and a browser's cookie
+/// jar: one term, two şubeler teaching one catalog course, and the instances
+/// that make them two — each with its own roster, its own exam, and its own
+/// weight in the karne. It is the plan's end-to-end scenario, and what the old
+/// school-wide singleton could not have produced: 5-A's exam is invisible to
+/// 5-B, and a student of 5-A is on 5-A's roster alone.
+#[tokio::test]
+async fn a_course_taught_by_two_subeler_is_two_instances_end_to_end() {
+    let (base, db) = spawn_server().await;
+    let mudur = client();
+    let hoca = client();
+    let veli = client();
+    register(&mudur, &base, "mudur").await;
+    register(&hoca, &base, "hoca").await;
+    register(&veli, &base, "veli").await;
+    promote(&db, "mudur", "manager").await;
+    promote(&db, "hoca", "teacher").await;
+    for (c, name) in [(&mudur, "mudur"), (&hoca, "hoca"), (&veli, "veli")] {
+        login(c, &base, name).await;
+    }
+
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let hoca_id = id_of(
+        &hoca
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+    );
+    let veli_id = id_of(
+        &veli
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+    );
+
+    // --- the calendar: one year, one dönem inside it ------------------------
+    let res = mudur
+        .post(format!("{base}/academic-years"))
+        .json(&json!({
+            "name": "2026-2027",
+            "starts_at": 1_750_000_000_000_i64,
+            "ends_at": 1_800_000_000_000_i64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let year = id_of(&res.json::<Value>().await.unwrap());
+
+    let res = mudur
+        .post(format!("{base}/terms"))
+        .json(&json!({
+            "name": "1. Dönem",
+            "year": year,
+            "starts_at": 1_750_000_000_000_i64,
+            "ends_at": 1_800_000_000_000_i64,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "{}", res.status());
+    let term = id_of(&res.json::<Value>().await.unwrap());
+
+    // --- two şubeler, one catalog course ------------------------------------
+    let res = mudur
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "5-A", "grade": "5", "year": year, "teacher_id": hoca_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let five_a = id_of(&res.json::<Value>().await.unwrap()["class"]);
+    let res = mudur
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "5-B", "grade": "5", "year": year }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let five_b = id_of(&res.json::<Value>().await.unwrap()["class"]);
+
+    let res = mudur
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "Matematik", "kind": "course" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let course = id_of(&res.json::<Value>().await.unwrap());
+
+    let res = mudur
+        .post(format!("{base}/classes/{five_a}/instances"))
+        .json(&json!({ "course_id": course }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let instance_a = id_of(&res.json::<Value>().await.unwrap());
+    let res = mudur
+        .post(format!("{base}/classes/{five_b}/instances"))
+        .json(&json!({ "course_id": course }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let instance_b = id_of(&res.json::<Value>().await.unwrap());
+    assert_ne!(
+        instance_a, instance_b,
+        "one course taught by two şubeler is two instances"
+    );
+
+    // --- 5-A's roster is its own -------------------------------------------
+    let res = mudur
+        .post(format!("{base}/classes/{five_a}/members"))
+        .json(&json!({ "user_id": veli_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "{:?}", res.status());
+    let roster_a: Value = mudur
+        .get(format!("{base}/instances/{instance_a}/enrollments"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(roster_a["total"], 1, "{roster_a}");
+    assert_eq!(roster_a["items"][0]["user"]["id"], json!(veli_id));
+    let roster_b: Value = mudur
+        .get(format!("{base}/instances/{instance_b}/enrollments"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(roster_b["total"], 0, "5-B seated nobody: {roster_b}");
+
+    // --- 5-A's exam is its own ---------------------------------------------
+    let res = hoca
+        .post(format!("{base}/instances/{instance_a}/exams"))
+        .json(&json!({ "title": "1. Yazılı", "kind": "yazili", "term": term }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "{:?}", res.status());
+    let exam = id_of(&res.json::<Value>().await.unwrap());
+    let blind: Value = mudur
+        .get(format!("{base}/instances/{instance_b}/exams"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        blind["total"], 0,
+        "5-B must not see the exam 5-A sat: {blind}"
+    );
+
+    // --- the mark becomes a karne line, weighted by the instance -----------
+    let res = hoca
+        .post(format!("{base}/exams/{exam}/results"))
+        .json(&json!({ "mark": 85, "user_id": veli_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "{:?}", res.status());
+
+    let res = veli
+        .get(format!("{base}/marks/karne?term={term}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let karne: Value = res.json().await.unwrap();
+    assert_eq!(karne["instances"][0]["course"], json!("Matematik"));
+    assert_eq!(karne["instances"][0]["average"], json!(85.0));
+    assert_eq!(
+        karne["instances"][0]["band"],
+        json!("5"),
+        "85 is a 5 on the default bands: {karne}"
+    );
+    assert_eq!(karne["instances"][0]["ders_saati"], json!(1));
+    assert_eq!(karne["year_average"], json!(85.0));
+    assert_eq!(karne["verdict"], json!("gecti"));
+
+    // The şube raises the course's weekly hours: the same mark now weighs
+    // differently in the year's average, and the line says so.
+    let res = mudur
+        .patch(format!("{base}/instances/{instance_a}"))
+        .json(&json!({ "ders_saati": 5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.json::<Value>().await.unwrap()["ders_saati"], json!(5));
+    let karne: Value = veli
+        .get(format!("{base}/marks/karne?term={term}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(karne["instances"][0]["ders_saati"], json!(5));
+    assert_eq!(karne["year_average"], json!(85.0));
+
+    // --- leaving a şube is a stint, and rejoining opens a second ------------
+    let res = mudur
+        .delete(format!("{base}/classes/{five_a}/members/{veli_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = mudur
+        .post(format!("{base}/classes/{five_a}/members"))
+        .json(&json!({ "user_id": veli_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "{:?}", res.status());
+    let members: Value = mudur
+        .get(format!("{base}/classes/{five_a}/members"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["total"], 1, "one live stint reads back: {members}");
+    let stints: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM class_member WHERE class = $1 AND app_user = $2")
+            .bind(Uuid::parse_str(&five_a).unwrap())
+            .bind(Uuid::parse_str(&veli_id).unwrap())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(stints, 2, "the leave and the rejoin are two rows");
 }

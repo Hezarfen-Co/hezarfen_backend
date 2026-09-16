@@ -66,16 +66,12 @@ pub async fn list_folder(
     let home_arm = folder == Folder::Inbox;
     let mut from = match folder {
         Folder::Sent => "message WHERE sender = $1 AND sender_folder = 'sent'".to_string(),
-        Folder::Archive => {
-            "message WHERE (recipient = $1 AND recipient_folder = 'archive') \
+        Folder::Archive => "message WHERE (recipient = $1 AND recipient_folder = 'archive') \
              OR (sender = $1 AND sender_folder = 'archive')"
-                .to_string()
-        }
-        Folder::Trash => {
-            "message WHERE (recipient = $1 AND recipient_folder = 'trash') \
+            .to_string(),
+        Folder::Trash => "message WHERE (recipient = $1 AND recipient_folder = 'trash') \
              OR (sender = $1 AND sender_folder = 'trash')"
-                .to_string()
-        }
+            .to_string(),
         _ => "message WHERE recipient = $1 AND recipient_folder = $2".to_string(),
     };
     // The `read` filter binds after whichever placeholders the folder shape

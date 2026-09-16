@@ -29,7 +29,18 @@ pub(crate) fn range_error() -> AppError {
 /// A unix-millisecond instant (UTC by construction). Stored as a `BIGINT`.
 /// Also serializes as its bare number: the fee plan's installments ride the
 /// row as JSON, and a due date must stay a plain millisecond count there too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, sqlx::Type, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    sqlx::Type,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[sqlx(transparent)]
 pub struct Timestamp(i64);
 
@@ -172,7 +183,8 @@ mod tests {
             serde_json::to_value(Timestamp::from_millis(1_700_000_000_000)).unwrap(),
             serde_json::json!(1_700_000_000_000i64)
         );
-        let back: Timestamp = serde_json::from_value(serde_json::json!(1_700_000_000_000i64)).unwrap();
+        let back: Timestamp =
+            serde_json::from_value(serde_json::json!(1_700_000_000_000i64)).unwrap();
         assert_eq!(back.as_millis(), 1_700_000_000_000);
     }
 }

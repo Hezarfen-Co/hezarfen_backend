@@ -1,8 +1,9 @@
-//! Exam workflows: the PATCH re-derive — the merge (set / clear / keep per
-//! field) re-judged against a fresh read every retry round, and the
-//! mode-freeze, re-draft, and kind gates that guard it — and the delete that
-//! collects the image blob keys inside the cascade's own transaction. The
-//! queries live in [`crate::db::exam`]; the sitting workflows next door in
+//! Exam workflows: the create that resolves the exam's instance and dönem,
+//! the PATCH re-derive — the merge (set / clear / keep per field) re-judged
+//! against a fresh read every retry round, and the mode-freeze, re-draft, and
+//! kind gates that guard it — and the delete that collects the image blob keys
+//! inside the cascade's own transaction. The queries live in
+//! [`crate::db::exam`]; the sitting workflows next door in
 //! [`crate::service::exam_attempt`].
 
 use crate::constant::CAS_UPDATE_RETRIES;
@@ -10,17 +11,34 @@ use crate::database::Database;
 use crate::db::exam;
 use crate::db::exam_attempt::any_for_exam;
 use crate::db::exam_result;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
     ExamSchedule, ExamTitle, redraft_error,
 };
+use crate::domain::term::TermId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::AppError;
-use crate::service::course::require_open;
-use crate::service::exam_attempt::course_of;
+use crate::error::{AppError, ValidationError};
+use crate::service::exam_attempt::require_open;
 
+/// Publish (or draft) an exam on one class×course instance, inside one dönem.
+///
+/// Two refusals stand in front of the write. The instance's catalog course
+/// must be class-delivered (`kind = course`): a kulüp or etüt has no exams —
+/// D9 keeps the two membership tiers apart, and an exam on a club would be a
+/// roster nothing enrolls into. And the instance's *year* must still be open
+/// (D8: the dönem is a grading slice inside the year, so the year is what the
+/// exam's structure belongs to; a dönem archived inside an open year does not
+/// close exam creation — the archive is a record, not a wall).
+///
+/// The `term` is the dönem the exam is sat in, and it is required; the store's
+/// create claims it in the same transaction as the row. It must be one of the
+/// *instance's own year's* dönems: a dönem is a grading slice inside a year, so
+/// a term from another year is refused here with a `400` on the field rather
+/// than filed — the write would succeed in the store and misfile the exam in
+/// the karne of a year it is not taught in.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the sibling entities' create(field, field, ..) shape"
@@ -28,7 +46,8 @@ use crate::service::exam_attempt::course_of;
 pub async fn create(
     db: &Database,
     creator: &UserId,
-    course: &CourseId,
+    class_course: &ClassCourseId,
+    term: &TermId,
     title: ExamTitle,
     description: ExamDescription,
     kind: ExamKind,
@@ -38,10 +57,42 @@ pub async fn create(
     allow_review: bool,
     draft: bool,
 ) -> Result<Exam, AppError> {
+    let Some(instance) = crate::db::class_course::read(db, class_course).await? else {
+        return Err(AppError::NotFound);
+    };
+    let Some(course) = crate::db::course::read(db, instance.get_course()).await? else {
+        return Err(AppError::Internal(
+            "the instance references a missing course".into(),
+        ));
+    };
+    if !course.get_kind().is_class_delivered() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "course",
+            reason: "only a ders can carry exams — a club or etüt is joined, not sat",
+        }));
+    }
+    // The dönem must be one of the instance's own year's: the year is the
+    // scope a karne is computed over (and a dönem is a grading slice *inside*
+    // it), so an exam filed under another year's dönem would be counted into a
+    // report whose terms it does not belong to — invisible to the year it is
+    // actually taught in and foreign to the one it names. The instance's year
+    // is its şube's, read through the one seam that resolves it.
+    let Some(term_row) = crate::db::term::read(db, term).await? else {
+        return Err(crate::domain::term::gone_error());
+    };
+    let instance_year = crate::service::class_course::year_of(db, class_course).await?;
+    if instance_year != Some(*term_row.get_year()) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "term",
+            reason: "the term belongs to another academic year than this class",
+        }));
+    }
+    crate::service::class_course::require_open(db, class_course).await?;
     exam::create(
         db,
         creator,
-        course,
+        class_course,
+        term,
         title,
         description,
         kind,
@@ -64,12 +115,27 @@ pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
     exam::list_all(db).await
 }
 
-pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Exam>, AppError> {
-    exam::list_for_course(db, course).await
+/// One instance's exams, newest first — the read behind
+/// `GET /instances/{id}/exams`.
+pub async fn list_for_class_course(
+    db: &Database,
+    class_course: &ClassCourseId,
+) -> Result<Vec<Exam>, AppError> {
+    exam::list_for_class_course(db, class_course).await
 }
 
-/// Every exam of every course in `courses` (one query) — the catalog as one
-/// user sees it.
+/// Every exam of every instance in `instances` (one query) — the karne and
+/// marks reports' cross-instance read, and the list behind a caller's visible
+/// instances.
+pub async fn list_for_class_course_courses(
+    db: &Database,
+    instances: &[ClassCourseId],
+) -> Result<Vec<Exam>, AppError> {
+    exam::list_for_class_course_courses(db, instances).await
+}
+
+/// Every exam of every catalog course in `courses` (one query) — the catalog
+/// as one user sees it, across the instances those courses are taught in.
 pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec<Exam>, AppError> {
     exam::list_for_courses(db, courses).await
 }
@@ -118,8 +184,7 @@ pub async fn update(db: &Database, id: &ExamId, patch: &ExamPatch) -> Result<Exa
     let mut left = CAS_UPDATE_RETRIES;
     loop {
         let current = exam::read(db, id).await?.ok_or(AppError::NotFound)?;
-        let course = course_of(&current, db).await?;
-        require_open(db, &course).await?;
+        require_open(db, &current).await?;
 
         let title = patch
             .title
@@ -264,7 +329,7 @@ pub struct DeleteOutcome {
 /// out-of-transaction snapshot cannot strand its bytes on disk even though
 /// the row itself is now refused.
 pub async fn delete(db: &Database, target: &Exam) -> Result<DeleteOutcome, AppError> {
-    require_open(db, &course_of(target, db).await?).await?;
+    require_open(db, target).await?;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
     let deleted = exam::delete(db, target.clone()).await?;

@@ -17,6 +17,7 @@ use common::{GHOST_ID, Res, app_and_db, create_course, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
 use hezarfen_backend::domain::course::CourseId;
+use hezarfen_backend::domain::monotonic_id::next_uuid;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -148,18 +149,24 @@ async fn student_in(
     id
 }
 
-/// A course with a seat `capacity`, which `create_course` cannot express.
-async fn create_capped_course(app: &axum::Router, cookie: &str, title: &str, cap: i64) -> String {
-    let res = send(
-        app,
-        "POST",
-        "/courses",
-        Some(cookie),
-        Some(json!({ "title": title, "capacity": cap })),
+/// The instance id of that (class, course) pair, as text — the anchor every
+/// `enrollment` row and every per-instance counter keys on. A pair the store
+/// does not carry is a bug in the test's own setup, so it panics.
+async fn instance_of(class: &str, course: &str, db: &Database) -> String {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM class_course WHERE class = $1 AND course = $2",
     )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "create course {title}");
-    res.body["id"].as_str().expect("course id").to_string()
+    .bind(uuid_of(class))
+    .bind(CourseId::from_key(course))
+    .fetch_one(db)
+    .await
+    .unwrap()
+    .to_string()
+}
+
+/// A row id as the uuid every query here binds.
+fn uuid_of(id: &str) -> uuid::Uuid {
+    uuid::Uuid::parse_str(id).expect("a uuid row id")
 }
 
 fn skips(res: &Res) -> &Vec<Value> {
@@ -317,11 +324,12 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
             Some(blueprint_id("9", &db).await),
             "the blueprint must own what it attached"
         );
+        let instance = instance_of(&class, course, &db).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM enrollment WHERE course = $1 AND app_user = $2",
+                "SELECT count(*) FROM enrollment WHERE class_course = $1 AND app_user = $2",
             )
-            .bind(CourseId::from_key(course))
+            .bind(uuid_of(&instance))
             .bind(UserId::from_key(&student))
             .fetch_one(&db)
             .await
@@ -421,11 +429,12 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
     // both courses, in real rows.
     let student = student_in(&app, &db, &class, &manager, "ali").await;
     for course in [&algebra, &physics] {
+        let instance = instance_of(&class, course, &db).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM enrollment WHERE course = $1 AND app_user = $2",
+                "SELECT count(*) FROM enrollment WHERE class_course = $1 AND app_user = $2",
             )
-            .bind(CourseId::from_key(course))
+            .bind(uuid_of(&instance))
             .bind(UserId::from_key(&student))
             .fetch_one(&db)
             .await
@@ -620,10 +629,11 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
         count_on("class_course_count", "class_group", &ten, &db).await,
         0
     );
+    let instance = instance_of(&a, &algebra, &db).await;
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db).await,
+        count_on("enrollment_count", "class_course", &instance, &db).await,
         1,
-        "one student at the grade, one seat"
+        "one student in the şube that carries the course, one seat on its instance"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM enrollment WHERE app_user = $1")
@@ -635,138 +645,48 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
     );
 }
 
-/// Best-effort, the ruling that accepts a partial state: a section that cannot
-/// take a course is skipped and *reported*, the others are still stocked, and
-/// the skipped one has not moved a single counter.
+/// A duplicate is a refusal by hand and deliberately not a skip for the pump:
+/// the second `POST /classes/{id}/instances` for a pair the class already
+/// carries answers the machine code a client branches on, beside the sentence
+/// it always sent.
 #[tokio::test]
-async fn a_class_that_does_not_fit_is_reported_not_aborted() {
+async fn a_duplicate_attach_answers_its_machine_code() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
-    // One seat, and a section with two students — the attach cannot hold the
-    // whole class, so the pump's own transaction refuses it whole.
-    let tight = create_capped_course(&app, &manager, "seminar", 1).await;
-    let full = create_class(&app, &manager, "9-A", "9").await;
-    let fits = create_class(&app, &manager, "9-B", "9").await;
-    student_in(&app, &db, &full, &manager, "ali").await;
-    student_in(&app, &db, &full, &manager, "veli").await;
-
-    let made = send(
-        &app,
-        "POST",
-        "/classes/blueprints",
-        Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [tight.clone()] })),
-    )
-    .await;
-    assert_eq!(
-        made.status,
-        StatusCode::CREATED,
-        "one class that does not fit may not fail the whole edit: {:?}",
-        made.body
-    );
-    let skipped = skips(&made);
-    assert_eq!(skipped.len(), 1, "{skipped:?}");
-    assert_eq!(skipped[0]["class"], full.as_str());
-    assert_eq!(skipped[0]["class_name"], "9-A", "name the section");
-    assert_eq!(skipped[0]["course"], tight.as_str());
-    assert_eq!(
-        skipped[0]["reason"], "course_full",
-        "the reason must be the exact machine code a client branches on"
-    );
-
-    assert!(
-        attached(&fits, &tight, &db).await,
-        "the class that fits is still stocked"
-    );
-    assert!(!attached(&full, &tight, &db).await);
-    // Nothing moved on the skipped class: not its attachment counter, and not
-    // one of the seats the refused attach touched on its way to the refusal.
-    assert_eq!(
-        count_on("class_course_count", "class_group", &full, &db).await,
-        0
-    );
-    assert_eq!(
-        count_on("enrollment_count", "course", &tight, &db).await,
-        0,
-        "the empty class took no seat, and the refused one gave every seat back"
-    );
-    assert_eq!(rows("SELECT count(*) FROM enrollment", &db).await, 0);
-}
-
-/// One cause, one code, whichever door it came through: the `409` a manager's
-/// own `POST /classes/{id}/courses` answers carries the *same* machine code the
-/// pump reports as a skip for the state that class is in. The two used to be a
-/// code and an English sentence, and a bilingual client cannot translate the
-/// sentence — so this pins them equal, over HTTP, on one shared state.
-#[tokio::test]
-async fn a_manual_attach_answers_the_code_the_pump_reports() {
-    let (app, db) = app_and_db().await;
-    let manager = login_as(&app, &db, "mgr", "manager").await;
-    // One seat, two students: neither door can put this course on this class.
-    let tight = create_capped_course(&app, &manager, "seminar", 1).await;
+    let roomy = create_course(&app, &manager, "algebra").await;
     let class = create_class(&app, &manager, "9-A", "9").await;
     student_in(&app, &db, &class, &manager, "ali").await;
-    student_in(&app, &db, &class, &manager, "veli").await;
 
-    let by_hand = send(
-        &app,
-        "POST",
-        &format!("/classes/{class}/courses"),
-        Some(&manager),
-        Some(json!({ "course_id": tight.clone() })),
-    )
-    .await;
-    assert_eq!(by_hand.status, StatusCode::CONFLICT, "{:?}", by_hand.body);
-    assert_eq!(
-        by_hand.body["code"], "course_full",
-        "the manual 409 must carry the machine code, not prose alone: {:?}",
-        by_hand.body
-    );
-    assert!(
-        by_hand.body["error"].as_str().unwrap_or_default().len() > 10,
-        "…beside the sentence it always sent — the code is additive: {:?}",
-        by_hand.body
-    );
-
-    // The same refusal through the pump, on the very same class and course.
-    let pumped = send(
-        &app,
-        "POST",
-        "/classes/blueprints",
-        Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [tight.clone()] })),
-    )
-    .await;
-    assert_eq!(pumped.status, StatusCode::CREATED, "{:?}", pumped.body);
-    let skipped = skips(&pumped);
-    assert_eq!(skipped.len(), 1, "{skipped:?}");
-    assert_eq!(
-        skipped[0]["reason"], by_hand.body["code"],
-        "one cause must read the same in a skip list and on a manual 409"
-    );
-
-    // And the other end of the vocabulary: a duplicate, which *is* a refusal by
-    // hand and deliberately not a skip for the pump.
-    let roomy = create_course(&app, &manager, "algebra").await;
     let attached = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": roomy.clone() })),
     )
     .await;
     assert_eq!(attached.status, StatusCode::CREATED, "{:?}", attached.body);
+
     let again = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": roomy })),
     )
     .await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{:?}", again.body);
     assert_eq!(again.body["code"], "duplicate", "{:?}", again.body);
+    assert!(
+        again.body["error"].as_str().unwrap_or_default().len() > 10,
+        "…beside the sentence it always sent — the code is additive: {:?}",
+        again.body
+    );
+    // The refused door spent nothing: one instance, one attachment.
+    assert_eq!(
+        count_on("class_course_count", "class_group", &class, &db).await,
+        1
+    );
 }
 
 /// The provenance rule, both halves: dropping a course from the template
@@ -786,7 +706,7 @@ async fn a_removal_spares_a_hand_attached_course() {
     let attached_by_hand = send(
         &app,
         "POST",
-        &format!("/classes/{byhand}/courses"),
+        &format!("/classes/{byhand}/instances"),
         Some(&manager),
         Some(json!({ "course_id": algebra.clone() })),
     )
@@ -855,8 +775,9 @@ async fn a_removal_spares_a_hand_attached_course() {
         0,
         "the enrollments the blueprint pumped go with it"
     );
+    let instance = instance_of(&byhand, &algebra, &db).await;
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db).await,
+        count_on("enrollment_count", "class_course", &instance, &db).await,
         1,
         "the hand-attached class keeps its student's seat"
     );
@@ -879,7 +800,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
     let attached_by_hand = send(
         &app,
         "POST",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         Some(json!({ "course_id": algebra.clone() })),
     )
@@ -897,7 +818,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
     let listed = send(
         &app,
         "GET",
-        &format!("/classes/{class}/courses"),
+        &format!("/classes/{class}/instances"),
         Some(&manager),
         None,
     )
@@ -937,8 +858,9 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
         attached(&class, &algebra, &db).await,
         "a pre-migration row is hand-attached and unreachable by any blueprint sweep"
     );
+    let instance = instance_of(&class, &algebra, &db).await;
     assert_eq!(
-        count_on("enrollment_count", "course", &algebra, &db).await,
+        count_on("enrollment_count", "class_course", &instance, &db).await,
         1
     );
 }
@@ -1008,9 +930,10 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO class_course (class, course, attached_by, attached_at, source) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO class_course (id, class, course, attached_by, attached_at, source) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
+    .bind(next_uuid())
     .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
     .bind(CourseId::from_key(&algebra))
     .bind(manager_id)
@@ -1040,10 +963,11 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
 
     // The documented recovery: a human detaches it one course at a time, and
     // the counters come back exact.
+    let instance = instance_of(&class, &algebra, &db).await;
     let detached = send(
         &app,
         "DELETE",
-        &format!("/classes/{class}/courses/{algebra}"),
+        &format!("/classes/{class}/instances/{instance}"),
         Some(&manager),
         None,
     )
@@ -1132,6 +1056,10 @@ async fn a_grade_label_nothing_carries_reports_matched_zero() {
 /// every section in sync reports them all with nothing missing, `matched`
 /// counting the sections rather than the courses.
 ///
+/// The section that is short gets there the one way no pump repairs: a grade
+/// change is deliberately a blueprint no-op, so a section renamed onto the
+/// grade after the template exists carries none of what it holds.
+///
 /// The store is asserted alongside the body — the in-memory engine forges wins,
 /// and a status read agreeing with a `class_course` table that says otherwise
 /// would be worse than no read at all.
@@ -1140,13 +1068,9 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
-    // One seat, and a section with two students: the attach cannot hold the
-    // whole class, so that (section, course) pair is skipped.
-    let tight = create_capped_course(&app, &manager, "seminar", 1).await;
-    let short = create_class(&app, &manager, "9-A", "9").await;
-    let full = create_class(&app, &manager, "9-B", "9").await;
-    let ali = student_in(&app, &db, &short, &manager, "ali").await;
-    student_in(&app, &db, &short, &manager, "veli").await;
+    // The section starts at grade 10, where nothing stocks it, so the template
+    // below is never what attached anything to it.
+    let short = create_class(&app, &manager, "9-A", "10").await;
 
     // No template covers the grade yet, and that is a 404 rather than an empty
     // report — there is nothing to be out of sync with.
@@ -1165,11 +1089,29 @@ async fn a_status_read_names_the_course_a_section_is_short() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), tight.clone()] })),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
-    assert_eq!(skips(&made).len(), 1, "{:?}", made.body);
+    assert!(skips(&made).is_empty(), "{:?}", made.body);
+    assert_eq!(made.body["matched"], 0, "no section carries the label yet");
+
+    // A section created at the grade is stocked by its own create, in sync.
+    let full = create_class(&app, &manager, "9-B", "9").await;
+    assert!(attached(&full, &algebra, &db).await);
+
+    // The other section reaches the grade by a rename, which is deliberately
+    // not a pump: it stands at the grade carrying none of the template.
+    let moved = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{short}"),
+        Some(&manager),
+        Some(json!({ "grade": "9" })),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
+    assert!(!attached(&short, &algebra, &db).await);
 
     let drifted = send(
         &app,
@@ -1184,42 +1126,33 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     assert_eq!(drifted.body["matched"], 2, "both sections carry the label");
     assert_eq!(
         missing(&drifted, &short),
-        vec![tight.clone()],
-        "exactly the pair the pump refused — not the course it did place: {:?}",
+        vec![algebra.clone()],
+        "exactly the course that section is short: {:?}",
         drifted.body
     );
     assert_eq!(section(&drifted, &short)["class_name"], "9-A");
     assert!(
         missing(&drifted, &full).is_empty(),
-        "the section that took the whole list is in sync: {:?}",
+        "the section the pump stocked is in sync: {:?}",
         drifted.body
     );
     // …and the report agrees with the store on both halves.
-    assert!(attached(&short, &algebra, &db).await);
-    assert!(!attached(&short, &tight, &db).await);
+    assert!(attached(&full, &algebra, &db).await);
+    assert!(!attached(&short, &algebra, &db).await);
 
-    // Now a human fixes it: one student out (so the seat fits) and the course
-    // attached by hand, carrying no blueprint tag at all.
-    let removed = send(
-        &app,
-        "DELETE",
-        &format!("/classes/{short}/members/{ali}"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(removed.status, StatusCode::NO_CONTENT);
+    // Now a human fixes it: the course attached by hand, carrying no blueprint
+    // tag at all.
     let byhand = send(
         &app,
         "POST",
-        &format!("/classes/{short}/courses"),
+        &format!("/classes/{short}/instances"),
         Some(&manager),
-        Some(json!({ "course_id": tight.clone() })),
+        Some(json!({ "course_id": algebra.clone() })),
     )
     .await;
     assert_eq!(byhand.status, StatusCode::CREATED, "{:?}", byhand.body);
     assert_eq!(
-        source_of(&short, &tight, &db).await,
+        source_of(&short, &algebra, &db).await,
         None,
         "a hand attach carries no blueprint key — which is the point of the next \
          assertion"
@@ -1254,15 +1187,18 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     }
 }
 
-/// Deleting a course takes its id out of every template holding it, in the
-/// cascade that detaches it from the sections.
+/// Deleting a course takes its id out of every template holding it.
 ///
-/// Without that sweep the id stayed in the list forever and every doc surface
-/// lied: `PATCH`ing the template back **as it stands** is the documented
-/// self-heal, and it answered `400` ("one of these courses does not exist"),
-/// because the handler resolves the ids the *request* names — the very ones it
-/// had just read back. So the assertion that matters is not only that the store
-/// is clean but that the round trip a manager is told to make succeeds.
+/// A template outlives the links it stocked — a section may let an instance go
+/// long before the catalog row itself is deletable (the delete's guard reads
+/// the course's instance counter) — so the id a template names can point at a
+/// row that is gone. Without that sweep the id stayed in the list forever and
+/// every doc surface lied: `PATCH`ing the template back **as it stands** is
+/// the documented self-heal, and it answered `400` ("one of these courses does
+/// not exist"), because the handler resolves the ids the *request* names — the
+/// very ones it had just read back. So the assertion that matters is not only
+/// that the store is clean but that the round trip a manager is told to make
+/// succeeds.
 #[tokio::test]
 async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     let (app, db) = app_and_db().await;
@@ -1270,8 +1206,9 @@ async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     let algebra = create_course(&app, &manager, "algebra").await;
     let history = create_course(&app, &manager, "history").await;
     // No students: the section is here so the pump has something to walk, and
-    // an empty roster is what lets the course be deleted at all (one with a
-    // student on it is a 409).
+    // a section that lets its link go is what lets the course be deleted at
+    // all (the guard reads the course's own instance counter, so one still
+    // teaching it is a 409).
     let class = create_class(&app, &manager, "9-A", "9").await;
 
     let made = send(
@@ -1284,6 +1221,37 @@ async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
     assert!(attached(&class, &history, &db).await);
+
+    // The link goes the way an operator's does — through the instance's own
+    // detach — while the *template* goes on naming the course. That is the
+    // state the sweep below is about: the id outliving every live link.
+    let instances = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}/instances"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(instances.status, StatusCode::OK, "{:?}", instances.body);
+    let link = common::items(&instances.body)
+        .iter()
+        .find(|row| row["course"] == json!(history.as_str()))
+        .expect("the pump attached history to the section");
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/instances/{}", common::id_of(link)),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        detached.body
+    );
 
     let deleted = send(
         &app,
@@ -1305,7 +1273,11 @@ async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     );
     assert!(
         !attached(&class, &history, &db).await,
-        "the section's link goes in the same cascade"
+        "the section's link was already gone — the delete's guard demands it"
+    );
+    assert!(
+        attached(&class, &algebra, &db).await,
+        "…and the detach named one instance: the other link stands"
     );
 
     // The self-heal, made exactly as documented: read the list, send it back.
@@ -1446,6 +1418,11 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
     .await
     .unwrap();
 
+    // The instance rows the heal will sweep — captured while they stand,
+    // because the detach takes the history one with it.
+    let history_instance = instance_of(&class, &history, &db).await;
+    let algebra_instance = instance_of(&class, &algebra, &db).await;
+
     let courses = held(&app, &manager, "9").await;
     assert_eq!(
         courses.len(),
@@ -1468,10 +1445,10 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND course = $2",
+            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND class_course = $2",
         )
         .bind(UserId::from_key(&ali))
-        .bind(CourseId::from_key(&history))
+        .bind(uuid_of(&history_instance))
         .fetch_one(&db)
         .await
         .unwrap(),
@@ -1479,9 +1456,13 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
         "…enrollments and all"
     );
     assert_eq!(
-        count_on("enrollment_count", "course", &history, &db).await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM class_course WHERE id = $1")
+            .bind(uuid_of(&history_instance))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         0,
-        "…with the seat given back"
+        "…the detached instance gone with it, seat counter and all"
     );
     assert!(
         attached(&class, &algebra, &db).await,
@@ -1489,14 +1470,19 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND course = $2",
+            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND class_course = $2",
         )
         .bind(UserId::from_key(&ali))
-        .bind(CourseId::from_key(&algebra))
+        .bind(uuid_of(&algebra_instance))
         .fetch_one(&db)
         .await
         .unwrap(),
         1
+    );
+    assert_eq!(
+        count_on("enrollment_count", "class_course", &algebra_instance, &db).await,
+        1,
+        "the instance the template still holds keeps its seat"
     );
 }
 

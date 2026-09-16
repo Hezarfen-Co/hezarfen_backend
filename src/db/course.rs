@@ -1,25 +1,25 @@
-//! The `course` table: the unit exams, sessions, subjects and enrollments
-//! hang off. Listed newest first; deleted with its whole subtree in one
-//! guarded cascade.
+//! The `course` table: the school-level catalog exams, sessions, subjects and
+//! enrollments hang off *through their instances* ([`crate::db::class_course`]).
+//! Listed newest first; deleted with its whole subtree in one guarded cascade.
+//!
+//! The catalog is a template since the K12 remodel (D1): the academic work —
+//! roster, exams, timetable, teachers — lives on the instances a şube attaches,
+//! so this row carries only what every instance shares (title, description,
+//! kind) and two counters. The catalog is Manager+-owned (D6): there is no
+//! per-teacher ownership list, and the two counters are the delete guard.
 
 use crate::constant::COURSE_TABLE;
 use crate::database::{Database, tx_with_retry, unique_violation};
-use crate::db::cap;
-use crate::db::field_update::{FieldUpdate, Refcount};
 use crate::db::page::PagedList;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::PgConnection;
 
-use std::collections::HashMap;
-
-/// The stored columns of a `course` row. The assigned teachers live across
-/// the `course_teacher` junction, not on this row, so every read joins them
-/// on in one batch afterwards ([`into_courses`]) — the two generic readers
-/// below (the paged list and the field-scoped PATCH) both read whole rows
-/// (`SELECT *` / `RETURNING *`), which is a shape no aggregate column can
-/// ride.
+/// The stored columns of a `course` row — the whole row. The assigned-teacher
+/// list this struct used to join on moved to the instances
+/// ([`crate::db::class_course_teacher`]), so a course read is one statement
+/// again.
 #[derive(Debug, sqlx::FromRow)]
 struct CourseRow {
     id: CourseId,
@@ -27,131 +27,56 @@ struct CourseRow {
     title: CourseTitle,
     description: CourseDescription,
     kind: CourseKind,
-    term: Option<TermId>,
-    capacity: Option<i64>,
+    class_course_count: i64,
+    course_membership_count: i64,
 }
 
 impl CourseRow {
-    fn into_course(self, teachers: Vec<UserId>) -> Course {
+    fn into_course(self) -> Course {
         Course {
             id: self.id,
             creator: self.creator,
-            teachers,
             title: self.title,
             description: self.description,
             kind: self.kind,
-            term: self.term,
-            capacity: self.capacity,
+            class_course_count: self.class_course_count,
+            course_membership_count: self.course_membership_count,
         }
     }
 }
 
-/// Assemble [`Course`]s (their assigned teachers included) out of row reads:
-/// one `course_teacher` query for the whole batch, a course nobody is
-/// assigned to reading an empty list.
-async fn into_courses(db: &Database, rows: Vec<CourseRow>) -> Result<Vec<Course>, AppError> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id.uuid()).collect();
-    let links = sqlx::query!(
-        r#"SELECT course AS "course: CourseId", teacher AS "teacher: UserId"
-           FROM course_teacher WHERE course = ANY($1)"#,
-        &ids,
-    )
-    .fetch_all(db)
-    .await?;
-    let mut by_course: HashMap<uuid::Uuid, Vec<UserId>> = HashMap::new();
-    for link in links {
-        by_course
-            .entry(link.course.uuid())
-            .or_default()
-            .push(link.teacher);
-    }
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let teachers = by_course.remove(&row.id.uuid()).unwrap_or_default();
-            row.into_course(teachers)
-        })
-        .collect())
-}
-
-/// [`into_courses`] for a single row.
-async fn one_course(db: &Database, row: CourseRow) -> Result<Course, AppError> {
-    let course = into_courses(db, vec![row])
-        .await?
-        .pop()
-        .expect("one row in, one course out");
-    Ok(course)
-}
-
+/// Mint a catalog course. No term is claimed any more: the catalog is not
+/// bound to a dönem (exams are, through their instance), and no capacity is
+/// stored — the roster counter lives on the instance and gates nothing.
 pub async fn create(
     db: &Database,
     creator: &UserId,
     title: CourseTitle,
     description: CourseDescription,
     kind: CourseKind,
-    term: Option<TermId>,
-    capacity: Option<i64>,
 ) -> Result<Course, AppError> {
     let id = CourseId::generate();
-    let Some(term) = term else {
-        let created = sqlx::query_as!(
-            CourseRow,
-            r#"INSERT INTO course (id, creator, title, description, kind, term, capacity)
-               VALUES ($1, $2, $3, $4, $5, NULL, $6)
-               RETURNING id AS "id: CourseId", creator AS "creator: UserId",
-                     title AS "title: CourseTitle",
-                     description AS "description: CourseDescription",
-                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
-            id.uuid(),
-            creator.uuid(),
-            title.as_str(),
-            description.as_str(),
-            kind.as_str(),
-            capacity,
-        )
-        .fetch_one(db)
-        .await?;
-        // A new course has no assigned teachers; the join reads an empty list.
-        return one_course(db, created).await;
-    };
-    // Claim a reference on the term in the *same statement* as the row: the
-    // claim is a conditional write on the term row, so it fails when the
-    // term is already gone and it makes the term undeletable the instant
-    // this link exists — and a crash can never leave one without the other,
-    // which a claim sent as its own query could (the count would strand and
-    // the term be undeletable forever).
     let created = sqlx::query_as!(
         CourseRow,
-        r#"WITH seat AS (
-             UPDATE term
-                SET course_count = course_count + 1
-              WHERE id = $7 AND course_count < $8
-              RETURNING 1)
-           INSERT INTO course (id, creator, title, description, kind, term, capacity)
-           SELECT $1, $2, $3, $4, $5, $7, $6 WHERE EXISTS (SELECT 1 FROM seat)
+        r#"INSERT INTO course (id, creator, title, description, kind)
+           VALUES ($1, $2, $3, $4, $5)
            RETURNING id AS "id: CourseId", creator AS "creator: UserId",
-                     title AS "title: CourseTitle",
-                     description AS "description: CourseDescription",
-                     kind AS "kind: CourseKind", term AS "term: TermId", capacity"#,
+                 title AS "title: CourseTitle",
+                 description AS "description: CourseDescription",
+                 kind AS "kind: CourseKind", class_course_count, course_membership_count"#,
         id.uuid(),
         creator.uuid(),
         title.as_str(),
         description.as_str(),
         kind.as_str(),
-        capacity,
-        term.uuid(),
-        cap::UNLIMITED,
     )
     .fetch_one(db)
     .await;
     match created {
-        Ok(created) => one_course(db, created).await,
-        // Uncapped, so "full" can only mean the conditional write matched no
-        // term row at all — the existence check the pre-flight lookup makes.
-        Err(sqlx::Error::RowNotFound) => Err(term::gone_error()),
+        Ok(created) => Ok(created.into_course()),
+        // The creator is a foreign key: a gone account is the same `NotFound`
+        // the web layer's own read answers with, never an orphan row.
+        Err(err) if crate::database::foreign_key_violation(&err) => Err(AppError::NotFound),
         // Unreachable: the id was minted above.
         Err(err) if unique_violation(&err).is_some() => {
             Err(AppError::Internal("failed to create course".into()))
@@ -166,7 +91,7 @@ async fn read_row(db: &Database, id: &CourseId) -> Result<Option<CourseRow>, App
         r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
                   title AS "title: CourseTitle",
                   description AS "description: CourseDescription",
-                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
+                  kind AS "kind: CourseKind", class_course_count, course_membership_count
            FROM course WHERE id = $1"#,
         id.uuid(),
     )
@@ -176,10 +101,7 @@ async fn read_row(db: &Database, id: &CourseId) -> Result<Option<CourseRow>, App
 }
 
 pub async fn read(db: &Database, id: &CourseId) -> Result<Option<Course>, AppError> {
-    match read_row(db, id).await? {
-        Some(row) => Ok(Some(one_course(db, row).await?)),
-        None => Ok(None),
-    }
+    Ok(read_row(db, id).await?.map(CourseRow::into_course))
 }
 
 pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
@@ -188,16 +110,17 @@ pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
         r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
                   title AS "title: CourseTitle",
                   description AS "description: CourseDescription",
-                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
+                  kind AS "kind: CourseKind", class_course_count, course_membership_count
            FROM course ORDER BY id DESC"#,
     )
     .fetch_all(db)
     .await?;
-    into_courses(db, rows).await
+    Ok(rows.into_iter().map(CourseRow::into_course).collect())
 }
 
-/// The courses `user` is enrolled in — the spine of `/courses/me` and the
-/// marks report.
+/// The courses `user` is enrolled in — read through the *instances* their
+/// enrollments name, since an enrollment keys on the class×course instance.
+/// The spine of `/courses/me` and the marks report.
 pub async fn list_enrolled(
     db: &Database,
     user: &UserId,
@@ -205,42 +128,49 @@ pub async fn list_enrolled(
     offset: i64,
 ) -> Result<(Vec<Course>, i64), AppError> {
     let (rows, total) = PagedList::new(
-        "course WHERE id IN (SELECT course FROM enrollment WHERE app_user = $1)",
+        "course WHERE id IN (
+             SELECT cc.course FROM enrollment e
+             JOIN class_course cc ON cc.id = e.class_course
+             WHERE e.app_user = $1)",
         "ORDER BY id DESC",
     )
     .bind(user.uuid())
     .run::<CourseRow>(limit, offset, db)
     .await?;
-    Ok((into_courses(db, rows).await?, total))
+    Ok((
+        rows.into_iter().map(CourseRow::into_course).collect(),
+        total,
+    ))
 }
 
-/// The courses `user` runs — the ones they created plus the ones a manager
-/// assigned them to. A teacher's slice of the catalog.
+/// The courses `user` teaches somewhere — the ones a manager assigned them to
+/// on some instance. A teacher's slice of the catalog.
 ///
-/// The assigned half reads `course_teacher` by its `teacher` index (the
-/// shape `enrollment` already has) instead of an array membership test —
-/// that test was the corner-cut here once, and the junction is exactly the
-/// upgrade path the old comment called structural.
+/// It reads `class_course_teacher` by its `teacher` index and follows each
+/// assignment to the catalog course its instance teaches: a teacher who runs
+/// 5-A's Matematik sees Matematik. The old creator-membership half is gone
+/// with D6 — the catalog is Manager+ owned.
 pub async fn list_for_teacher(db: &Database, user: &UserId) -> Result<Vec<Course>, AppError> {
     let rows = sqlx::query_as!(
         CourseRow,
         r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
                   title AS "title: CourseTitle",
                   description AS "description: CourseDescription",
-                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
-           FROM course WHERE creator = $1 OR id IN (
-               SELECT course FROM course_teacher WHERE teacher = $2)
+                  kind AS "kind: CourseKind", class_course_count, course_membership_count
+           FROM course WHERE id IN (
+               SELECT cc.course FROM class_course_teacher t
+               JOIN class_course cc ON cc.id = t.class_course
+               WHERE t.teacher = $1)
            ORDER BY id DESC"#,
-        user.uuid(),
         user.uuid(),
     )
     .fetch_all(db)
     .await?;
-    into_courses(db, rows).await
+    Ok(rows.into_iter().map(CourseRow::into_course).collect())
 }
 
 /// Load every course behind `ids` (one query) — the join half of the
-/// attendance report's per-course blocks.
+/// attendance and marks reports' per-course blocks.
 pub async fn list_by_ids(db: &Database, ids: &[CourseId]) -> Result<Vec<Course>, AppError> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -251,144 +181,58 @@ pub async fn list_by_ids(db: &Database, ids: &[CourseId]) -> Result<Vec<Course>,
         r#"SELECT id AS "id: CourseId", creator AS "creator: UserId",
                   title AS "title: CourseTitle",
                   description AS "description: CourseDescription",
-                  kind AS "kind: CourseKind", term AS "term: TermId", capacity
+                  kind AS "kind: CourseKind", class_course_count, course_membership_count
            FROM course WHERE id = ANY($1)"#,
         &keys,
     )
     .fetch_all(db)
     .await?;
-    into_courses(db, rows).await
+    Ok(rows.into_iter().map(CourseRow::into_course).collect())
 }
 
-/// Field-scoped: nothing guards the course row across the handler's read
-/// and this write (the term it links is guarded by its own refcount write,
-/// and the assign path takes no lock at all) — so a field the request omitted
-/// (`None`) is not written at all. Sending the snapshot's value back
-/// instead would revert a concurrent edit of that field; scoping the `SET`
-/// alone does not stop that, the values have to come from the request.
-/// `term` and `capacity` are nullable, so they take the outer/inner
-/// `Option<Option<_>>`: `None` = omitted (keep), `Some(None)` = clear.
+/// Field-scoped: a field the request omitted (`None`) is not written at all.
+/// Sending the snapshot's value back instead would revert a concurrent edit of
+/// that field; scoping the `SET` alone does not stop that, the values have to
+/// come from the request.
 ///
-/// The assigned teachers are not fields of this row — they are
-/// `course_teacher` rows, written only by [`assign_teacher`],
-/// [`unassign_teacher`] and the demotion sweep — so a PATCH can neither
-/// carry nor clobber them.
+/// The two counters and `creator` are not editable: the counters are what the
+/// delete guard reads (a PATCH is not a roster change), and the creator is the
+/// catalog's of record.
 pub async fn update(
     db: &Database,
     course: Course,
     title: Option<CourseTitle>,
     description: Option<CourseDescription>,
     kind: Option<CourseKind>,
-    term: Option<Option<TermId>>,
-    capacity: Option<Option<i64>>,
 ) -> Result<Course, AppError> {
-    // A term move claims the new term and releases the old one inside the
-    // very transaction that moves the link, so no crash can leave a count
-    // without its link (the term would be undeletable forever) or a link
-    // without its count. A PATCH that carried no `term_id`, or re-stated the
-    // link it already had, moves neither counter.
-    let (claim, release) = term::ref_move(course.term.as_ref(), &term);
-    let row = FieldUpdate::new(COURSE_TABLE, course.id.uuid())
+    let row = crate::db::field_update::FieldUpdate::new(COURSE_TABLE, course.id.uuid())
         .set("title", title.map(|title| title.as_str().to_owned()))
         .set(
             "description",
             description.map(|description| description.as_str().to_owned()),
         )
         .set("kind", kind.map(|kind| kind.as_str().to_owned()))
-        .set(
-            "term",
-            term.map(|term| crate::db::page::Param::OptUuid(term.map(|term| term.uuid()))),
-        )
-        .set("capacity", capacity.map(crate::db::page::Param::OptI64))
-        .refcount(Refcount {
-            counter_table: "term",
-            counter_field: "course_count",
-            link: "term",
-            expected: course.term.as_ref().map(|term| term.uuid()),
-            claim: claim.map(|term| term.uuid()),
-            release: release.map(|term| term.uuid()),
-            refused: term::gone_error(),
-        })
         .run::<CourseRow>(db)
         .await?;
-    // The teachers are joined on after the write, off the junction.
-    one_course(db, row).await
+    Ok(row.into_course())
 }
 
-/// Assign `teacher` to run this course, or return the course untouched if
-/// they already run it — assignment is idempotent, like enrollment: the
-/// link is an `INSERT` whose `(course, teacher)` key answers a duplicate
-/// with `DO NOTHING`, so two requests naming the same teacher at once land
-/// one row (the early return only sees a stale snapshot).
-pub async fn assign_teacher(
-    db: &Database,
-    course: Course,
-    teacher: &UserId,
-) -> Result<Course, AppError> {
-    if course.is_assigned(teacher) {
-        return Ok(course);
-    }
-    // `WHERE EXISTS` keeps the insert a no-op when the course went between
-    // the caller's read and this write — the answer is the `NotFound` the
-    // fresh read below gives, not a foreign-key 500.
-    sqlx::query!(
-        r#"INSERT INTO course_teacher (course, teacher)
-           SELECT $1, $2 WHERE EXISTS (SELECT 1 FROM course WHERE id = $1)
-           ON CONFLICT DO NOTHING"#,
-        course.id.uuid(),
-        teacher.uuid(),
-    )
-    .execute(db)
-    .await?;
-    // Fresh read, like the `RETURNING` this replaced: the snapshot's
-    // teacher list can be stale (a concurrent assign).
-    let row = read_row(db, &course.id).await?.ok_or(AppError::NotFound)?;
-    one_course(db, row).await
-}
-
-/// Drop `teacher` from this course. `None` when they weren't assigned, so
-/// the web layer can answer 404 instead of pretending it removed someone.
-pub async fn unassign_teacher(
-    db: &Database,
-    course: Course,
-    teacher: &UserId,
-) -> Result<Option<Course>, AppError> {
-    if !course.is_assigned(teacher) {
-        return Ok(None);
-    }
-    let deleted = sqlx::query!(
-        r#"DELETE FROM course_teacher WHERE course = $1 AND teacher = $2"#,
-        course.id.uuid(),
-        teacher.uuid(),
-    )
-    .execute(db)
-    .await?;
-    if deleted.rows_affected() == 0 {
-        // Unassigned under the caller's feet — nothing was removed.
-        return Ok(None);
-    }
-    read(db, &course.id).await
-}
-
-/// Strip `user` from every course they were assigned to — the sweep for a
-/// user demoted below `teacher`, who may no longer run anything.
-pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), AppError> {
-    sqlx::query!(r#"DELETE FROM course_teacher WHERE teacher = $1"#, user.uuid(),)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-/// Delete the course and cascade-remove everything inside it: results,
-/// attempts, answers, and question/answer images of its exams, its
-/// homework with their submissions, submission files, and grades, its
-/// enrollments, the class attachments that pumped some of them (each class
-/// gets its count back, or it would be undeletable over rows pointing at
-/// nothing), its sessions with their roll call, its subjects, and the
-/// exams themselves. The children go in one transaction so a crash can't
-/// leave an exam pointing at a deleted course. The image and
-/// homework-file *blobs* are the web layer's to remove — it collects
-/// their names before calling this.
+/// Delete the course and cascade-remove everything inside it *through its
+/// instances*: results, attempts, answers, and question/answer images of
+/// their exams, their homework with submissions, submission files, and
+/// grades, their enrollments, their sessions with their roll call, their
+/// teachers, and — last — the `class_course` rows themselves (each class
+/// getting its attachment counter back, or it would be undeletable over rows
+/// pointing at nothing). The children go in one transaction so a crash can't
+/// leave an exam pointing at a deleted course. The image and homework-file
+/// *blobs* are the web layer's to remove — it collects their names before
+/// calling this.
+///
+/// The guard is the two counters on the locked row (D5/D6): an instance still
+/// teaching this course refuses the delete, and so does an individual club
+/// membership, because nothing here unlinks either. Detach the instances and
+/// empty the memberships first — a catalog course whose last instance goes is
+/// then deletable, which is the whole point of the catalog being a template.
 ///
 /// **Bank templates** survive it — they are a separate, reusable library
 /// spanning every course — so their `source_exam` and `subject` links are
@@ -405,46 +249,48 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// here like any other link, so a template stops naming a course the
 /// instant that course goes (the old `teachers`-style array made the id a
 /// permanent dangling value only the pump's [`crate::db::class_blueprint::
-/// prune`] could chase). The same transaction takes the course's
-/// `course_teacher` assignment rows: an assigned teacher loses the course
-/// with it.
+/// prune`] could chase). The same transaction takes the instances'
+/// `class_course_teacher` assignment rows: an assigned teacher loses the
+/// instance with it.
 ///
 /// The **derived AI rows** (`rag_output` carries a denormalized `course`
 /// besides its note link) and the event **audience links** are FK children
 /// the old store let dangle: `rag_output` is disposable and dies here, and
 /// an event whose audience was "this course's students" keeps standing with
 /// `audience_course` cleared — an empty roster, exactly the documented
-/// outcome of the class twin (`Course::delete` never touched `event`; it
-/// still doesn't delete one).
+/// outcome of the class twin (`ClassGroup::delete` never touched `event`;
+/// it still doesn't delete one).
 ///
 /// The marks going with it give their exam kinds' references back, counted
 /// per kind inside this same transaction — the mirror of `Exam::delete`.
 /// Skipping it would leave every kind the course graded under counted
 /// forever, and a counted kind can never leave the school's settings.
 ///
-/// **Order is the foreign-key graph, children first** (the old store had
-/// no FKs, so its order was free): exam results/attempts/answers/images
-/// and question images before `exam_question`; `exam_question` before
-/// `exam`; homework files before submissions before results before
-/// `homework`; roll-call rows before `course_session`; note files and
-/// rag rows before `course_note`; `blueprint_course` and `course_teacher`
-/// before the `course` row itself, whose `NO ACTION` FKs are checked the
-/// moment the final `DELETE` runs.
+/// **Order is the foreign-key graph, children first**: exam results/attempts/
+/// answers/audiences/images and question images before `exam_question`;
+/// `exam_question` before `exam`; homework files before submissions before
+/// results before `homework`; roll-call rows before `course_session`;
+/// enrollment / teacher / audience rows before `class_course`; note files and
+/// rag rows before `course_note`; `blueprint_course`, `course_membership` and
+/// `class_course` before the `course` row itself, whose `NO ACTION` FKs are
+/// checked the moment the final `DELETE` runs.
 ///
-/// `false` = refused, nothing was written: someone is still enrolled. The
-/// guard locks the course row (`FOR UPDATE`) and reads its own
-/// `enrollment_count`, so an enroll racing this either takes its seat
-/// first (and the delete is refused) or finds the row gone (and is refused
-/// itself). `Err(NotFound)` keeps the answer a concurrent *delete* used
-/// to get — and unlike the old one-statement guard, this one tells the two
-/// apart without a second read.
+/// `false` = refused, nothing was written: a class still teaches it, or
+/// someone still holds a membership. The guard locks the course row
+/// (`FOR UPDATE`) and reads its own counters, so an attach or a join racing
+/// this either claims first (and the delete is refused) or finds the row gone
+/// (and is refused itself). `Err(NotFound)` keeps the answer a concurrent
+/// *delete* used to get — and unlike the old one-statement guard, this one
+/// tells the two apart without a second read.
 pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
     tx_with_retry(db, true, async move |tx| {
-        // The guard and the lock: the row (and its roster count) cannot
-        // change under this transaction, and every enroll claim contends on
-        // this very row, so check and cascade are one decision.
+        // The guard and the lock: the row (and its two counters) cannot
+        // change under this transaction, and every attach or membership
+        // claim contends on this very row, so check and cascade are one
+        // decision.
         let guard = sqlx::query!(
-            r#"SELECT enrollment_count, term FROM course WHERE id = $1 FOR UPDATE"#,
+            r#"SELECT class_course_count, course_membership_count FROM course
+               WHERE id = $1 FOR UPDATE"#,
             course.id.uuid(),
         )
         .fetch_optional(&mut *tx)
@@ -452,42 +298,8 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         let Some(guard) = guard else {
             return Err(AppError::NotFound);
         };
-        if guard.enrollment_count != 0 {
+        if guard.class_course_count != 0 || guard.course_membership_count != 0 {
             return Ok(false);
-        }
-        // The exam ids are needed twice — the kind_ref refund and the bank's
-        // source_exam clear — and must be collected before the sweeps take
-        // the rows they name.
-        let exams: Vec<uuid::Uuid> =
-            sqlx::query!(r#"SELECT id FROM exam WHERE course = $1"#, course.id.uuid(),)
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .map(|row| row.id)
-                .collect();
-        // Every mark the course ever gave gives its exam kind's reference
-        // back, counted per kind (mirrors `Exam::delete`). The kind rides
-        // the exam row — `exam_result` names its exam, not its kind.
-        sqlx::query!(
-            r#"UPDATE kind_ref k
-                 SET count = GREATEST(k.count - s.n, 0)
-                 FROM (SELECT e.kind, count(*) AS n FROM exam_result r
-                        JOIN exam e ON r.exam = e.id
-                        WHERE r.exam = ANY($1) GROUP BY e.kind) s
-                WHERE k.name = s.kind"#,
-            &exams,
-        )
-        .execute(&mut *tx)
-        .await?;
-        // The term gets its reference back inside the same transaction.
-        if let Some(term) = guard.term {
-            sqlx::query!(
-                r#"UPDATE term SET course_count = GREATEST(course_count - 1, 0)
-                   WHERE id = $1"#,
-                term,
-            )
-            .execute(&mut *tx)
-            .await?;
         }
         // Events aimed at this course keep standing, audience cleared.
         sqlx::query!(
@@ -496,49 +308,21 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         )
         .execute(&mut *tx)
         .await?;
-        // The exam subtree, deepest children first.
-        sqlx::query!(r#"DELETE FROM exam_result WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM answer_image WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM question_image WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(r#"DELETE FROM exam_question WHERE exam = ANY($1)"#, &exams)
-            .execute(&mut *tx)
-            .await?;
-        // The homework subtree: files, then submissions (whose graded_by
-        // link names a result deleted after them), then results.
-        sqlx::query!(
-            r#"DELETE FROM homework_file WHERE submission IN (
-                 SELECT id FROM homework_submission
-                  WHERE homework IN (SELECT id FROM homework WHERE course = $1))"#,
+        // The instances and everything under them. The guard above refuses a
+        // course that still carries one, so this sweep is defensive: a counter
+        // is the guard's *input*, and a guard reading a stale number is
+        // exactly the shape this exists to survive. The blob keys it returns
+        // are already collected by the caller (`file_keys_for_course`), which
+        // reads them before the rows go, so they are dropped here.
+        let instances: Vec<uuid::Uuid> = sqlx::query_scalar!(
+            r#"SELECT id AS "id: uuid::Uuid" FROM class_course WHERE course = $1"#,
             course.id.uuid(),
         )
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        sqlx::query!(
-            r#"DELETE FROM homework_submission WHERE homework IN (
-                 SELECT id FROM homework WHERE course = $1)"#,
-            course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"DELETE FROM homework_result WHERE homework IN (
-                 SELECT id FROM homework WHERE course = $1)"#,
-            course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
+        for instance in &instances {
+            let _blobs = sweep_instance_subtree(&mut *tx, *instance).await?;
+        }
         // Derived AI rows for this course's notes — links before the rows
         // (`ON DELETE NO ACTION`).
         sqlx::query!(
@@ -568,8 +352,8 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         )
         .execute(&mut *tx)
         .await?;
-        // Class attachments: detach and hand each class its count back in
-        // one statement, then strike the course out of every blueprint.
+        // The instances, each class handed its attachment counter back in
+        // the same statement.
         sqlx::query!(
             r#"WITH detached AS (
                  DELETE FROM class_course WHERE course = $1 RETURNING class)
@@ -581,67 +365,24 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
+            r#"DELETE FROM course_membership WHERE course = $1"#,
+            course.id.uuid(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
             r#"DELETE FROM blueprint_course WHERE course = $1"#,
             course.id.uuid(),
         )
         .execute(&mut *tx)
         .await?;
-        // The assignment links die with the course, before the row itself.
-        sqlx::query!(
-            r#"DELETE FROM course_teacher WHERE course = $1"#,
-            course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        // Sessions with their roll call, then the roster itself.
-        sqlx::query!(
-            r#"DELETE FROM session_attendance WHERE course = $1"#,
-            course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"DELETE FROM course_session WHERE course = $1"#,
-            course.id.uuid()
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"DELETE FROM enrollment WHERE course = $1"#,
-            course.id.uuid()
-        )
-        .execute(&mut *tx)
-        .await?;
         // The bank keeps its templates; their links to this course's
-        // content go first, so the subject/exam deletes below cannot trip
-        // a foreign key behind them.
+        // content go first, so the subject delete below cannot trip a
+        // foreign key behind them.
         sqlx::query!(
             r#"UPDATE bank_question SET subject = NULL
                WHERE subject IN (SELECT id FROM subject WHERE course = $1)"#,
             course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"UPDATE bank_question SET source_exam = NULL WHERE source_exam = ANY($1)"#,
-            &exams,
-        )
-        .execute(&mut *tx)
-        .await?;
-        // Subjects before exams would trip `exam.subject` — exams go first.
-        sqlx::query!(r#"DELETE FROM exam WHERE course = $1"#, course.id.uuid())
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query!(
-            r#"DELETE FROM homework_assignment WHERE homework IN (
-                 SELECT id FROM homework WHERE course = $1)"#,
-            course.id.uuid(),
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"DELETE FROM homework WHERE course = $1"#,
-            course.id.uuid()
         )
         .execute(&mut *tx)
         .await?;
@@ -657,10 +398,237 @@ pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
     .await
 }
 
+/// Everything hanging off one instance, deleted children-first with the
+/// counters it holds refunded — the sweep both [`crate::db::class_pump::
+/// detach_course`] and [`delete`] run, and the only place the instance's
+/// foreign-key graph is spelled.
+///
+/// The order is the graph: exam results/attempts/answers/audiences and
+/// question/answer images before `exam_question`; the question rows give their
+/// subjects' `exam_question_count` back and the results their kinds'
+/// `kind_ref` count; bank templates keep standing with `source_exam` cleared;
+/// homework files before submissions (whose `grad_by_result` stamp points at a
+/// result row) before results before assignments before `homework`; roll-call
+/// rows before `course_session`; then the roster, the teacher links and the
+/// audience rows, and the caller takes the instance row itself last.
+///
+/// Returns the blob keys of the image and homework-file rows it removed, so a
+/// caller whose web route unlinks bytes can do it after the commit; a caller
+/// that collected them beforehand ([`crate::service::course::delete`]) drops
+/// them.
+///
+/// **Every reference counter it gives back is driven by the rows a
+/// `DELETE … RETURNING` actually removed** — `exam`→`term.exam_count`,
+/// `exam_result`→`kind_ref.count`, `exam_question`→`subject.exam_question_count`,
+/// `homework`→`subject.homework_count` — never by a count taken off a
+/// statement-start snapshot. The difference is a race: `Exam::delete` and
+/// `remove_result` release some of these counters themselves, so a
+/// count-then-subtract pair would hand one row's reference back twice (a
+/// counter one low, permanently — `GREATEST` only floors at zero), and a kind
+/// still carrying marks could then be retired from settings. Fused this way an
+/// interleaving is exact from either side: the loser's `DELETE` simply does
+/// not return the row the winner took.
+///
+/// The row locks it takes are the ones the children's own writers take (the
+/// instance row `FOR UPDATE` is the caller's, before this runs), so a grade or
+/// an upload racing the sweep either lands before it (and is swept) or finds
+/// its parent gone and is refused.
+pub(crate) async fn sweep_instance_subtree(
+    tx: &mut PgConnection,
+    instance: uuid::Uuid,
+) -> Result<Vec<String>, AppError> {
+    let exams: Vec<uuid::Uuid> = sqlx::query_scalar!(
+        r#"SELECT id AS "id: uuid::Uuid" FROM exam WHERE class_course = $1"#,
+        instance,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // Every release below is driven by the rows a `DELETE … RETURNING`
+    // actually removed, in the shape [`crate::db::exam_result::remove`] uses,
+    // and never by a count taken off a statement-start snapshot: a concurrent
+    // `Exam::delete` or `remove_result` releases the same counters itself, so
+    // a count-then-subtract pair would release its row twice — a `kind_ref`
+    // one low permanently (GREATEST only floors at zero), which then lets a
+    // kind still carrying marks be retired from settings.
+    let image_files: Vec<String> = sqlx::query_scalar!(
+        r#"SELECT file FROM question_image WHERE exam = ANY($1)"#,
+        &exams,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let answer_image_files: Vec<String> = sqlx::query_scalar!(
+        r#"SELECT file FROM answer_image WHERE exam = ANY($1)"#,
+        &exams,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM exam_audience WHERE class_course = $1"#,
+        instance
+    )
+    .execute(&mut *tx)
+    .await?;
+    // Every mark this sweep takes gives its exam kind's reference back, per
+    // kind, off the rows this statement removed. The kind rides the exam row —
+    // `exam_result` names its exam, not its kind — so the deleted rows are
+    // joined back to the exam they named *before* it goes (the exam row is
+    // still there: this runs ahead of the `DELETE FROM exam` at the end).
+    sqlx::query!(
+        r#"WITH gone AS (
+               DELETE FROM exam_result WHERE exam = ANY($1)
+               RETURNING exam),
+           kinds AS (
+               SELECT e.kind AS kind, count(*) AS n
+               FROM gone g JOIN exam e ON e.id = g.exam
+               GROUP BY e.kind)
+           UPDATE kind_ref k SET count = GREATEST(k.count - c.n, 0)
+           FROM kinds c WHERE k.name = c.kind"#,
+        &exams,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(r#"DELETE FROM exam_attempt WHERE exam = ANY($1)"#, &exams)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query!(r#"DELETE FROM exam_answer WHERE exam = ANY($1)"#, &exams)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query!(r#"DELETE FROM answer_image WHERE exam = ANY($1)"#, &exams)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query!(r#"DELETE FROM question_image WHERE exam = ANY($1)"#, &exams)
+        .execute(&mut *tx)
+        .await?;
+    // The cascaded questions give their subject references back off the rows
+    // this statement removed, per subject — released with the delete, never
+    // counted ahead of it.
+    sqlx::query!(
+        r#"WITH gone AS (
+               DELETE FROM exam_question WHERE exam = ANY($1)
+               RETURNING subject),
+           subs AS (
+               SELECT subject, count(*) AS n FROM gone GROUP BY subject)
+           UPDATE subject s SET exam_question_count = GREATEST(s.exam_question_count - c.n, 0)
+           FROM subs c WHERE s.id = c.subject"#,
+        &exams,
+    )
+    .execute(&mut *tx)
+    .await?;
+    // Bank templates survive the exam they were saved from — only the
+    // provenance link is cleared.
+    sqlx::query!(
+        r#"UPDATE bank_question SET source_exam = NULL WHERE source_exam = ANY($1)"#,
+        &exams,
+    )
+    .execute(&mut *tx)
+    .await?;
+    // The swept exams give their dönem's reference back off the rows this
+    // statement removed, per term (the mirror of `Exam::delete`'s
+    // single-exam release): `db::exam::create` claimed `term.exam_count` for
+    // each of them, and a claim nothing releases leaves the dönem's
+    // `exam_count = 0` delete guard permanently failing — which takes the
+    // term, and the academic year whose own guard counts its dönems, down
+    // with it. Fused with the delete for the same reason the two releases
+    // above are: a concurrent single-exam delete releases its own claim, so a
+    // count taken before this statement could give one back twice.
+    sqlx::query!(
+        r#"WITH gone AS (
+               DELETE FROM exam WHERE class_course = $1
+               RETURNING term),
+           terms AS (
+               SELECT term, count(*) AS n FROM gone GROUP BY term)
+           UPDATE term t SET exam_count = GREATEST(t.exam_count - c.n, 0)
+           FROM terms c WHERE t.id = c.term"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let homework_files: Vec<String> = sqlx::query_scalar!(
+        r#"SELECT file FROM homework_file
+           WHERE submission IN (SELECT id FROM homework_submission WHERE homework IN (
+               SELECT id FROM homework WHERE class_course = $1))"#,
+        instance,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM homework_file
+           WHERE submission IN (SELECT id FROM homework_submission WHERE homework IN (
+               SELECT id FROM homework WHERE class_course = $1))"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM homework_submission WHERE homework IN (
+             SELECT id FROM homework WHERE class_course = $1)"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM homework_result WHERE homework IN (
+             SELECT id FROM homework WHERE class_course = $1)"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM homework_assignment WHERE homework IN (
+             SELECT id FROM homework WHERE class_course = $1)"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    // The homework rows give their subjects' counters back off the rows this
+    // statement removed, per subject — the same fused shape as the two above.
+    sqlx::query!(
+        r#"WITH gone AS (
+               DELETE FROM homework WHERE class_course = $1
+               RETURNING subject),
+           subs AS (
+               SELECT subject, count(*) AS n FROM gone GROUP BY subject)
+           UPDATE subject s SET homework_count = GREATEST(s.homework_count - c.n, 0)
+           FROM subs c WHERE s.id = c.subject"#,
+        instance,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM session_attendance WHERE class_course = $1"#,
+        instance
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM course_session WHERE class_course = $1"#,
+        instance
+    )
+    .execute(&mut *tx)
+    .await?;
+    // The roster: every enrollment row of the instance, hand-placed included —
+    // the instance is the row's own parent key, so none can outlive it.
+    sqlx::query!(
+        r#"DELETE FROM enrollment WHERE class_course = $1"#,
+        instance
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM class_course_teacher WHERE class_course = $1"#,
+        instance
+    )
+    .execute(&mut *tx)
+    .await?;
+    let mut blobs = image_files;
+    blobs.extend(answer_image_files);
+    blobs.extend(homework_files);
+    Ok(blobs)
+}
+
 /// A real course row, for the tests of every child that must now prove its
-/// parent exists (`Exam`, `CourseSession`, `Subject` — see
-/// [`cap::touch_and_create`]). A minted id nothing wrote is a 404 there, the
-/// way a minted subject id already is for an exam question.
+/// parent exists. A minted id nothing wrote is a 404 there, the way a minted
+/// subject id already is for an exam question.
 #[cfg(test)]
 pub(crate) async fn a_test_course(db: &Database) -> CourseId {
     // The creator is a foreign key now: a real row, minted per call so
@@ -681,17 +649,55 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
         CourseTitle::try_new("test course").unwrap(),
         CourseDescription::try_new("").unwrap(),
         CourseKind::course(),
-        None,
-        None,
     )
     .await
     .unwrap()
     .id
 }
 
+/// A real *instance* of that course, attached to a fresh class — the parent
+/// every re-keyed child (exam, session, homework, enrollment) now hangs off,
+/// for the tests of those children.
+///
+/// Returned as a pair because a child write that names the instance usually
+/// also wants the catalog course (a subject's `course`, a marks read's
+/// course grouping); both are real rows, minted per call.
+#[cfg(test)]
+pub(crate) async fn a_test_instance(
+    db: &Database,
+) -> (crate::domain::class_course::ClassCourseId, CourseId) {
+    use crate::domain::class_group::ClassName;
+
+    let manager = UserId::generate();
+    sqlx::query(
+        "INSERT INTO app_user (id, username, created_at, role) \
+         VALUES ($1, $2, 0, 'manager')",
+    )
+    .bind(manager.uuid())
+    .bind(format!("instance-fixture-{}", &manager.key()[30..]))
+    .execute(db)
+    .await
+    .unwrap();
+    let class = crate::db::class_group::create(
+        db,
+        &manager,
+        ClassName::try_new("9-A").unwrap(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let course = a_test_course(db).await;
+    let attached = crate::service::class_course::attach(db, class.get_id(), &course, &manager)
+        .await
+        .unwrap();
+    (attached.get_id().clone(), course)
+}
+
 /// The race half of "a child of a course must not survive its deletion", run
 /// for one child table: [`delete`] is held open by the schema and
-/// `make` fires its create inside that window, four rounds.
+/// `make` fires its create inside that window, eight rounds.
 ///
 /// The harness lives here, beside the cascade being raced, and each child names
 /// its own pin in its own module (`exam`, `course_session`, `subject`) — the
@@ -700,12 +706,15 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
 /// things. The sequential half — a create against a course that is already gone
 /// — is `tests/regress_course_child_orphans.rs`, which needs no server.
 ///
-/// The window is opened by the database rather than by a lucky interleaving: a
-/// `DEFINE EVENT` on `course` fires *inside* the delete's own transaction the
-/// instant the row goes, so the `SLEEP` lands between the delete and its
-/// `DELETE <child> WHERE course = $course` sweep every time — and a create
-/// fired into it reads a course that is still there (removed, uncommitted)
-/// while the sweep already ran on a snapshot without its row.
+/// The orphan query is the caller's, because the child's key to the course is
+/// not: `subject` still names the course directly, while an exam or a session
+/// hangs off an *instance* ([`crate::db::class_course`]) and reaches the course
+/// through it. Either way it takes the course uuid as `$1`.
+///
+/// The window is opened by the database rather than by a lucky interleaving:
+/// Postgres puts the racing create and delete on the same rows (the FK claims
+/// and the cascade), so a barrier start covers every interleaving — and the
+/// child may never outlive the course in any of them.
 ///
 /// One child per round, for the reason the menu and `class_course` twins
 /// document: a second writer makes the delete lose and re-send, and the re-sent
@@ -718,6 +727,7 @@ pub(crate) async fn a_test_course(db: &Database) -> CourseId {
 #[cfg(test)]
 pub(crate) async fn assert_no_child_outlives_a_course_delete(
     table: &str,
+    orphan_count_sql: &str,
     make: fn(CourseId, Database) -> tokio::task::JoinHandle<Result<(), AppError>>,
 ) {
     use sqlx::Row as _;
@@ -774,15 +784,13 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
         // Stored state is the whole verdict; a return value is not evidence.
         if read(&db, &course).await.unwrap().is_none() {
             swept += 1;
-            orphans += sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT count(*) FROM {table} WHERE course = $1"
-            )))
-            .bind(course.uuid())
-            .fetch_one(&db)
-            .await
-            .unwrap()
-            .try_get::<i64, _>(0)
-            .unwrap() as usize;
+            orphans += sqlx::query(sqlx::AssertSqlSafe(orphan_count_sql.to_string()))
+                .bind(course.uuid())
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                .try_get::<i64, _>(0)
+                .unwrap() as usize;
         } else if matches!(dropped, Ok(true)) {
             panic!("{table} round {round}: the delete reported success, the course is still there");
         }
@@ -799,9 +807,8 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
 mod tests {
     use super::*;
     use sqlx::Row as _;
-    use crate::domain::term::{Term, TermName};
 
-    /// A real `app_user` row: creators, students and enrollers are foreign
+    /// A real `app_user` row: creators, attached-bys and managers are foreign
     /// keys now. The label names the row's username; the id is minted, so
     /// repeated calls are new people, not the same row.
     async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
@@ -819,129 +826,43 @@ mod tests {
         user
     }
 
-    async fn course_on(term: Option<TermId>, db: &Database) -> Course {
+    /// A catalog course, minted per call. The catalog is a school-wide
+    /// template since the remodel: no dönem to link, no capacity to store.
+    async fn a_course(db: &Database) -> Course {
         create(
             db,
             &a_person(db, "teacher", "teacher").await,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
-            term,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A şube, for the tests that need an instance attached to it.
+    async fn a_class(
+        on: &UserId,
+        name: &str,
+        db: &Database,
+    ) -> crate::domain::class_group::ClassGroup {
+        crate::db::class_group::create(
+            db,
+            on,
+            crate::domain::class_group::ClassName::try_new(name).unwrap(),
+            None,
+            None,
             None,
         )
         .await
         .unwrap()
     }
 
-    /// The bite test for the delete guard that replaced `ENROLL_LOCK`: the
-    /// roster check is now the `WHERE` on the delete itself, so only the guard
-    /// can refuse — and it must refuse having written nothing, cascade
-    /// included. A `>= 0` guard passes the roster branch and fails here.
-    #[tokio::test]
-    async fn a_course_with_a_roster_refuses_to_delete() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let teacher = a_person(&db, "teacher", "teacher").await;
-        let student = a_person(&db, "student", "student").await;
-        let course = course_on(None, &db).await;
-        crate::db::enrollment::enroll(&db, course.get_id(), &student, &teacher)
-            .await
-            .unwrap();
-
-        assert!(
-            !delete(&db, course.clone()).await.unwrap(),
-            "a non-empty roster must refuse the delete"
-        );
-        assert!(
-            read(&db, course.get_id()).await.unwrap().is_some(),
-            "a refused delete may write nothing"
-        );
-        assert!(
-            crate::db::enrollment::read_for_user(&db, course.get_id(), &student)
-                .await
-                .unwrap()
-                .is_some(),
-            "…the cascade least of all"
-        );
-
-        crate::db::enrollment::remove(&db, course.get_id(), &student)
-            .await
-            .unwrap();
-        assert!(delete(&db, course.clone()).await.unwrap());
-        assert!(read(&db, course.get_id()).await.unwrap().is_none());
-
-        // The other half of the same guard: once the course row is gone the
-        // seat claim matches nothing, so a late enroll is a 404 rather than a
-        // roster row that outlived its course.
-        let late = crate::db::enrollment::enroll(&db, course.get_id(), &student, &teacher)
-            .await
-            .expect_err("enrolling into a deleted course must fail");
-        assert!(matches!(late, AppError::NotFound), "got {late:?}");
-    }
-
-    /// The bite test for the refcount that replaced `TERM_LOCK`: a term is
-    /// undeletable exactly while a course links it, and every way a link can
-    /// end — PATCH away, and the course's own delete — gives the reference
-    /// back. Dropping the release in `delete` leaves the term deletable never.
-    #[tokio::test]
-    async fn a_term_is_deletable_only_once_no_course_links_it() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let at = crate::domain::timestamp::Timestamp::from_millis;
-        let term =
-            crate::db::term::create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
-                .await
-                .unwrap();
-
-        let linked = course_on(Some(*term.get_id()), &db).await;
-        let patched = course_on(Some(*term.get_id()), &db).await;
-        assert!(
-            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
-            "two linked courses must refuse the delete"
-        );
-
-        update(&db, patched, None, None, None, Some(None), None)
-            .await
-            .unwrap();
-        assert!(
-            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
-            "one link is still one link"
-        );
-
-        assert!(delete(&db, linked).await.unwrap());
-        assert!(
-            crate::db::term::delete(&db, term.clone()).await.unwrap(),
-            "the last link gone, the term may go"
-        );
-        let again = crate::db::term::delete(&db, term).await;
-        assert!(
-            matches!(again, Err(AppError::NotFound)),
-            "a second delete is a 404, not a refusal: {again:?}"
-        );
-    }
-
-    /// The claim doubles as the existence check the lock used to make safe:
-    /// a term that is already gone cannot be linked, with the same 400 the
-    /// web layer's pre-flight lookup gives.
-    #[tokio::test]
-    async fn a_course_cannot_link_a_term_that_is_gone() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let error = create(
-            &db,
-            &a_person(&db, "teacher", "teacher").await,
-            CourseTitle::try_new("algebra").unwrap(),
-            CourseDescription::try_new("").unwrap(),
-            CourseKind::course(),
-            Some(TermId::from_key("gone")),
-            None,
-        )
-        .await
-        .expect_err("a missing term must not be linkable");
-        assert!(error.to_string().contains("term does not exist"));
-    }
-
-    /// The stored `course_count` on one term, absent counting as zero.
-    async fn count_on(term: &TermId, db: &Database) -> i64 {
-        sqlx::query("SELECT COALESCE(course_count, 0) FROM term WHERE id = $1")
-            .bind(term.uuid())
+    /// The instances a course is attached through, re-read from storage —
+    /// never off a return value.
+    async fn instance_rows(course: &CourseId, db: &Database) -> i64 {
+        sqlx::query("SELECT count(*) FROM class_course WHERE course = $1")
+            .bind(course.uuid())
             .fetch_one(db)
             .await
             .unwrap()
@@ -959,352 +880,138 @@ mod tests {
             .unwrap() as usize
     }
 
-    async fn a_term(name: &str, db: &Database) -> Term {
-        let at = crate::domain::timestamp::Timestamp::from_millis;
-        crate::db::term::create(db, TermName::try_new(name).unwrap(), at(100), at(200))
-            .await
-            .unwrap()
-    }
-
-    /// The invariant, on the create path: a claim and the row it accounts for
-    /// commit together or not at all. A refused create must therefore leave
-    /// *neither* — no course row, and no count stranded on a term (which is
-    /// worse than it sounds: the term's delete guard reads that count, so a
-    /// stray one makes the term undeletable forever).
+    /// The bite test for the delete guard that replaced `ENROLL_LOCK`: the
+    /// guard is the two counters on the locked course row, so the anchor's
+    /// refusal is a live instance — and it must refuse having written
+    /// nothing, the instance least of all. A `>= 0` guard passes the guard
+    /// branch and fails here by deleting the course out from under its class.
     #[tokio::test]
-    async fn a_refused_create_writes_neither_row_nor_count() {
+    async fn a_course_an_instance_still_teaches_refuses_to_delete() {
         let (db, _leases) = crate::database::init_test_db().await;
-        let term = a_term("2026", &db).await;
-        let id = *term.get_id();
-        assert!(crate::db::term::delete(&db, term).await.unwrap());
+        let manager = a_person(&db, "manager", "manager").await;
+        let course = a_course(&db).await;
+        let class = a_class(&manager, "9-A", &db).await;
+        let instance =
+            crate::service::class_course::attach(&db, class.get_id(), course.get_id(), &manager)
+                .await
+                .unwrap();
 
-        let error = create(
-            &db,
-            &a_person(&db, "teacher", "teacher").await,
-            CourseTitle::try_new("algebra").unwrap(),
-            CourseDescription::try_new("").unwrap(),
-            CourseKind::course(),
-            Some(id),
-            None,
-        )
-        .await
-        .expect_err("a term that is gone must not be linkable");
-        assert!(error.to_string().contains("term does not exist"));
+        assert!(
+            !delete(&db, course.clone()).await.unwrap(),
+            "a course a class still teaches must refuse the delete"
+        );
+        assert!(
+            read(&db, course.get_id()).await.unwrap().is_some(),
+            "a refused delete may write nothing"
+        );
+        assert!(
+            crate::db::class_course::read(&db, instance.get_id())
+                .await
+                .unwrap()
+                .is_some(),
+            "…the instance least of all"
+        );
+
+        // Detaching the last instance frees the row: the catalog is a
+        // template, and the template whose last class let it go is deletable.
+        crate::service::class_course::detach(&db, class.get_id(), course.get_id())
+            .await
+            .unwrap();
+        assert!(delete(&db, course.clone()).await.unwrap());
+        assert!(read(&db, course.get_id()).await.unwrap().is_none());
+
+        // …and the counter the guard read is back to zero with it, not left
+        // stranded by the cascade.
+        assert_eq!(
+            instance_rows(course.get_id(), &db).await,
+            0,
+            "the instance rows must go with the course"
+        );
         assert_eq!(
             rows("course", &db).await,
             0,
-            "a refused create may write no row"
-        );
-        assert_eq!(
-            rows("term", &db).await,
-            0,
-            "…and least of all a count on a term it just brought back"
+            "no row may outlive the delete"
         );
     }
 
-    /// The invariant on the PATCH path, both directions: a move carries the new
-    /// term's claim and the old term's release with the link itself.
-    #[tokio::test]
-    async fn a_term_move_moves_the_count() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let from = a_term("2026", &db).await;
-        let to = a_term("2027", &db).await;
-        let course = course_on(Some(*from.get_id()), &db).await;
-        assert_eq!(count_on(from.get_id(), &db).await, 1);
-
-        let moved = update(
-            &db,
-            course,
-            None,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(moved.get_term(), Some(to.get_id()));
-        assert_eq!(
-            count_on(from.get_id(), &db).await,
-            0,
-            "the old term is free"
-        );
-        assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
-        assert!(crate::db::term::delete(&db, from.clone()).await.unwrap());
-        assert!(!crate::db::term::delete(&db, to.clone()).await.unwrap());
-    }
-
-    /// The double-claim guard. Both movers compute their claim and release from
-    /// the row as *they* read it, so two PATCHes moving the same course off the
-    /// same term both release it and both claim their target — two counts for
-    /// one link, and the loser's target is undeletable forever. The second call
-    /// here runs on the struct read before the first one landed, which is that
-    /// race with the interleaving pinned: it must be refused outright, and the
-    /// counts must read as if it never ran.
-    #[tokio::test]
-    async fn a_stale_mover_is_refused_and_claims_nothing() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let from = a_term("2026", &db).await;
-        let to = a_term("2027", &db).await;
-        let other = a_term("2028", &db).await;
-        let course = course_on(Some(*from.get_id()), &db).await;
-        let stale = course.clone();
-        update(
-            &db,
-            course,
-            None,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let error = update(
-            &db,
-            stale.clone(),
-            None,
-            None,
-            None,
-            Some(Some(*other.get_id())),
-            None,
-        )
-        .await
-        .expect_err("a mover that read a link it no longer holds must be refused");
-        assert!(
-            matches!(error, AppError::Conflict(_)),
-            "a lost CAS is a conflict, not a 404 or a 500: {error:?}"
-        );
-        let stored = read(&db, stale.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
-        assert_eq!(
-            count_on(from.get_id(), &db).await,
-            0,
-            "released once, not twice"
-        );
-        assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once");
-        assert_eq!(count_on(other.get_id(), &db).await, 0, "never claimed");
-
-        // Same race from the other end: the snapshot says *no* link, so the CAS
-        // is against an absent column — the shape a bound `NONE` has to match.
-        let unlinked = course_on(None, &db).await;
-        let stale = unlinked.clone();
-        update(
-            &db,
-            unlinked,
-            None,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
-        let error = update(
-            &db,
-            stale.clone(),
-            None,
-            None,
-            None,
-            Some(Some(*other.get_id())),
-            None,
-        )
-        .await
-        .expect_err("a mover that read an absent link someone else filled must be refused");
-        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
-        assert_eq!(count_on(to.get_id(), &db).await, 2, "one claim per link");
-        assert_eq!(
-            count_on(other.get_id(), &db).await,
-            0,
-            "still never claimed"
-        );
-        // …and the unraced set still lands, so the CAS did not just break moves.
-        let stored = read(&db, stale.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(to.get_id()));
-    }
-
-    /// The same race with the counters taken out of it. A PATCH that re-states
-    /// the term its snapshot showed shifts *nothing* — [`term::ref_move`] hands
-    /// back no claim and no release — so if the guard were armed off the counter
-    /// move it would not be armed here at all, and the write would land: the
-    /// winner's link silently dragged back, its claim stranded on a term nothing
-    /// points at (undeletable forever) and the reverted-to term linked at a
-    /// count of zero (deletable while linked). The guard is armed by the request
-    /// *carrying* the column instead, which is why this is refused.
-    #[tokio::test]
-    async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let from = a_term("2026", &db).await;
-        let to = a_term("2027", &db).await;
-        let course = course_on(Some(*from.get_id()), &db).await;
-        let stale = course.clone();
-        update(
-            &db,
-            course,
-            None,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let error = update(
-            &db,
-            stale.clone(),
-            None,
-            None,
-            None,
-            Some(Some(*from.get_id())),
-            None,
-        )
-        .await
-        .expect_err("re-stating a link someone else moved must be refused");
-        assert!(
-            matches!(error, AppError::Conflict(_)),
-            "a lost CAS is a conflict, not a silent 200: {error:?}"
-        );
-        let stored = read(&db, stale.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
-        assert_eq!(
-            count_on(from.get_id(), &db).await,
-            0,
-            "the reverted-to term must not end up linked at zero"
-        );
-        assert_eq!(
-            count_on(to.get_id(), &db).await,
-            1,
-            "…nor the winner's term counted with nothing pointing at it"
-        );
-
-        // A *genuine* no-op re-state — nobody moved underneath it — still lands,
-        // and still moves no counter: the CAS passes trivially.
-        let fresh = read(&db, stale.get_id()).await.unwrap().unwrap();
-        let same = update(
-            &db,
-            fresh,
-            None,
-            None,
-            None,
-            Some(Some(*to.get_id())),
-            None,
-        )
-        .await
-        .expect("re-stating the link the row really holds is not a conflict");
-        assert_eq!(same.get_term(), Some(to.get_id()));
-        assert_eq!(count_on(from.get_id(), &db).await, 0, "nothing moved");
-        assert_eq!(count_on(to.get_id(), &db).await, 1, "…in either direction");
-    }
-
-    /// The rollback proof. The transaction releases the old term *before* it
-    /// claims the new one, so a move to a term that is gone has already
-    /// decremented when the claim throws — the old count still being 1 is the
-    /// abort undoing a write that really happened, not a branch that never ran.
-    /// The title moves in the same PATCH, and must not stick either.
-    #[tokio::test]
-    async fn a_term_move_to_a_dead_term_leaves_everything_untouched() {
-        let (db, _leases) = crate::database::init_test_db().await;
-        let from = a_term("2026", &db).await;
-        let dead = a_term("2027", &db).await;
-        let dead_id = *dead.get_id();
-        assert!(crate::db::term::delete(&db, dead).await.unwrap());
-        let course = course_on(Some(*from.get_id()), &db).await;
-
-        let error = update(
-            &db,
-            course.clone(),
-            Some(CourseTitle::try_new("moved").unwrap()),
-            None,
-            None,
-            Some(Some(dead_id)),
-            None,
-        )
-        .await
-        .expect_err("a term that is gone must not be linkable");
-        assert!(error.to_string().contains("term does not exist"));
-
-        let stored = read(&db, course.get_id()).await.unwrap().unwrap();
-        assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
-        assert_eq!(
-            stored.get_title().as_str(),
-            "algebra",
-            "…and so does the row"
-        );
-        assert_eq!(
-            count_on(from.get_id(), &db).await,
-            1,
-            "the release must roll back with the abort"
-        );
-        assert_eq!(
-            rows("term", &db).await,
-            1,
-            "the dead term must not be resurrected by the claim"
-        );
-    }
-
-    /// MEASUREMENT — the one race test that actually measures the retry, and
-    /// the only one of the four that does. The other three (subject, term,
-    /// exam) are status-code guards; each says so on itself.
+    /// MEASUREMENT — the one race test for `Course::delete`, and the only
+    /// test that measures `tx_with_retry` on this path at all.
     ///
-    /// [`delete`] is one `BEGIN…COMMIT` whose guard reads
-    /// `enrollment_count` off the very record a concurrent enroll increments,
-    /// so the two contend by design, and its cascade is long enough that a
+    /// [`delete`] is one `BEGIN…COMMIT` whose guard locks the course row the
+    /// very counter an attach claims, so the two contend by design: the
+    /// attach is several statements long (the early verdicts, the counter
+    /// claim, the roster pump) and the delete's cascade is longer, so a
     /// rival's write lands mid-transaction. Losing that round writes nothing,
     /// which is what makes re-sending it the recovery. Without
-    /// [`crate::database::transaction_with_retry`] a lost round comes out as a
-    /// 500: mutation-tested by cutting that retry loop to one attempt, which
+    /// [`crate::database::transaction_with_retry`] a lost round comes out as
+    /// a 500: mutation-tested by cutting that retry loop to one attempt, which
     /// turns this test red at 1-2 of 20 rounds (3 runs in 5 — the window is
-    /// real but narrow, so a single green run under the mutation means nothing).
+    /// real but narrow, so a single green run under the mutation means
+    /// nothing).
     ///
     /// A refusal (`Ok(false)`) or an `Err(NotFound)` is *correct* here and
-    /// must not fail this test: the only defect is `AppError::Db`.
+    /// must not fail this test: the only defect is `AppError::Db`. The stored
+    /// half of the verdict is the orphan check — an instance may never name a
+    /// course that is gone, whichever side of the race it was on.
     ///
     /// The rate is counted over the whole loop instead of asserted per round,
     /// because a per-round `assert!` aborts at the first hit and would report
     /// "1 of 1" for a bug the point of this test is to *quantify*.
     ///
-    /// Multi-threaded and on a real server for the reasons spelled out on
-    /// [`crate::domain::fee_plan_assignment`]'s pair of race tests: the
-    /// current-thread runtime never interleaves the two, and the embedded
-    /// engine does not conflict-check concurrent writes to one record at all.
+    /// Each side gets a clear head start on every other round — 2ms is a
+    /// separation the several-statement rival cannot cross (the same spacing
+    /// [`crate::db::term`]'s race test settled on). Without it the two sides
+    /// compete for the same course row and whichever one is marginally faster
+    /// takes every round, leaving one half of the verdict (`swept > 0`, or
+    /// `attached > 0`) a coin toss under load.
+    ///
+    /// Multi-threaded and on a real server: the current-thread runtime never
+    /// interleaves the two, and an embedded engine does not conflict-check
+    /// concurrent writes at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_delete_racing_an_enroll_never_answers_500() {
+    async fn a_delete_racing_an_attach_never_answers_500() {
         let (db, _leases) = crate::database::init_test_db().await;
-        // The roster rows are foreign keys now: the burst's six racers and
-        // their enroller are real people, reused every round (each round's
-        // delete cascade frees the seats back).
-        let mgr = a_person(&db, "mgr", "manager").await;
-        let mut students = Vec::new();
+        let manager = a_person(&db, "mgr", "manager").await;
+        // One şube per racer; each round attaches them all into one fresh
+        // catalog course, so the round's delete has six rival claims to meet.
+        let mut classes = Vec::new();
         for seat in 0..6 {
-            students.push(a_person(&db, &format!("stu{seat}"), "student").await);
+            classes.push(a_class(&manager, &format!("9-{seat}"), &db).await);
         }
-        let (mut delete_500, mut enroll_500, mut enrolled) = (0, 0, 0);
-        let (mut last_delete, mut last_enroll) = (String::new(), String::new());
+        let (mut delete_500, mut attach_500, mut attached, mut swept) = (0, 0, 0, 0);
+        let (mut last_delete, mut last_attach) = (String::new(), String::new());
         for round in 0..20 {
-            let course = course_on(None, &db).await;
+            let course = a_course(&db).await;
 
-            // A *burst* of enrolls, and a delete held back by a sweeping beat.
-            // Released together the delete is one statement while an enroll
-            // spends two round trips reading before it claims, so it wins every
-            // round and the guard is never contended at all (measured: 0/20
-            // seats placed). Six racers over a 0-3ms sweep put the single
-            // statement somewhere inside the counter writes instead.
+            // Every other round the attaches are held back so the delete wins
+            // outright (the course goes, and nothing may survive it); the rest
+            // release the attaches first, which is the round where the guard
+            // has to read their claim and refuse the delete.
+            let clear = std::time::Duration::from_millis(2);
+            let (delete_beat, attach_beat) = if round % 2 == 0 {
+                (std::time::Duration::ZERO, clear)
+            } else {
+                (clear, std::time::Duration::ZERO)
+            };
             let drop_it = {
                 let (course, db) = (course.clone(), db.clone());
-                let beat = std::time::Duration::from_millis(round % 4);
                 tokio::spawn(async move {
-                    tokio::time::sleep(beat).await;
+                    tokio::time::sleep(delete_beat).await;
                     delete(&db, course).await
                 })
             };
-            let joins: Vec<_> = (0..6)
-                .map(|seat| {
-                    let (id, db, mgr) = (course.get_id().clone(), db.clone(), mgr);
-                    let student = students[seat];
+            let joins: Vec<_> = classes
+                .iter()
+                .map(|class| {
+                    let (class, course, db, mgr) = (
+                        class.get_id().clone(),
+                        course.get_id().clone(),
+                        db.clone(),
+                        manager,
+                    );
                     tokio::spawn(async move {
-                        crate::db::enrollment::enroll(&db, &id, &student, &mgr).await
+                        tokio::time::sleep(attach_beat).await;
+                        crate::service::class_course::attach(&db, &class, &course, &mgr).await
                     })
                 })
                 .collect();
@@ -1316,36 +1023,41 @@ mod tests {
             for join in joins {
                 let join = join.await.unwrap();
                 if matches!(join, Err(AppError::Db(_))) {
-                    enroll_500 += 1;
-                    last_enroll = format!("{join:?}");
+                    attach_500 += 1;
+                    last_attach = format!("{join:?}");
                 }
             }
-            // Stored state, not the return values: a seat that landed is what
-            // the guard had to see.
-            if !crate::db::enrollment::list_for_course(&db, course.get_id(), None, 0)
-                .await
-                .unwrap()
-                .0
-                .is_empty()
-            {
-                enrolled += 1;
+            // Stored state, not the return values: an instance that landed is
+            // what the guard had to see, and one that outlived a deleted
+            // course is the defect this whole shape exists to catch.
+            let live = instance_rows(course.get_id(), &db).await;
+            if live > 0 {
+                attached += 1;
+            }
+            if read(&db, course.get_id()).await.unwrap().is_none() {
+                swept += 1;
+                assert_eq!(
+                    live, 0,
+                    "round {round}: an instance outlived the course it names"
+                );
             }
         }
         eprintln!(
-            "Course::delete raced: {delete_500}/20 delete 500s, {enroll_500} enroll 500s, \
-             {enrolled}/20 rounds with a seat placed"
+            "Course::delete raced: {delete_500}/20 delete 500s, {attach_500} attach 500s, \
+             {attached} rounds with an instance attached / {swept} rounds the course went"
         );
         assert!(
-            enrolled > 0,
-            "no round ever placed an enrollment, so the delete guard was never contended"
+            attached > 0 && swept > 0,
+            "the sweep never crossed the window ({attached} attached / {swept} swept), \
+             so at least one verdict was never exercised"
         );
         assert_eq!(
             delete_500, 0,
             "a raced delete must be refused, not 500: {delete_500}/20 rounds, last {last_delete}"
         );
         assert_eq!(
-            enroll_500, 0,
-            "a raced enroll must retry, not 500: {enroll_500}/20 rounds, last {last_enroll}"
+            attach_500, 0,
+            "a raced attach must be answered, not 500: {attach_500}/20 rounds, last {last_attach}"
         );
     }
 }

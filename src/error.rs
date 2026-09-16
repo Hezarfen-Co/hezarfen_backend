@@ -115,7 +115,6 @@ pub enum AppError {
     Internal(String),
 }
 
-
 impl From<sqlx::Error> for AppError {
     fn from(e: sqlx::Error) -> Self {
         match e {
@@ -289,7 +288,6 @@ impl AppError {
 mod tests {
     use super::*;
 
-
     /// The refusal a gated nest answers with. Both keys, and the `403` — a
     /// client switches on `module`, so neither may drift.
     #[tokio::test]
@@ -327,7 +325,9 @@ mod tests {
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "gone");
         assert!(matches!(AppError::from(Error::Io(io)), AppError::DbTimeout));
         // A query that found no row is the caller's 404, never a 500.
-        assert!(matches!(AppError::from(Error::RowNotFound), AppError::NotFound));
+        assert!(matches!(
+            AppError::from(Error::RowNotFound),
+            AppError::NotFound
+        ));
     }
-
 }

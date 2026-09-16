@@ -7,7 +7,9 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{app_and_db, create_course, enroll, items, login, login_as, me_id, send, total};
+use common::{
+    app_and_db, create_course, enroll, items, login, login_as, me_id, send, taught_under, total,
+};
 use serde_json::json;
 
 /// Register `user00..user{n-1}` as plain students.
@@ -106,15 +108,20 @@ async fn paged_roster_still_embeds_people_on_the_page() {
     // not the whole table — the page rows still carry their embedded people.
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
-    let course = create_course(&app, &teacher, "Algebra").await;
+    // The roster keys on the instance — one catalog course as one şube teaches
+    // it. A şube is school structure, so a manager mints it and names `teacher`
+    // the homeroom teacher, which is what keeps the teacher's rights over the
+    // instance (`ensure_instance_teacher`).
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let t = taught_under(&app, &mudur, &teacher, "Algebra").await;
 
     for i in 0..5 {
         let student = login(&app, &format!("stud{i}")).await;
         let sid = me_id(&app, &student).await;
-        enroll(&app, &teacher, &course, &sid).await;
+        enroll(&app, &teacher, &t.instance, &sid).await;
     }
 
-    let uri = format!("/courses/{course}/enrollments?limit=2&offset=0");
+    let uri = format!("/instances/{}/enrollments?limit=2&offset=0", t.instance);
     let res = send(&app, "GET", &uri, Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(total(&res.body), 5, "total counts the whole roster");
@@ -572,7 +579,7 @@ async fn board_lists_are_paged() {
 }
 
 /// The class layer's three lists speak the same envelope: the class index, one
-/// class's roster and the courses it carries. All three join people onto the
+/// class's roster and the instances it carries. All three join people onto the
 /// page, so the window is checked with the refs still riding on the rows.
 #[tokio::test]
 async fn class_lists_are_paged() {
@@ -599,7 +606,7 @@ async fn class_lists_are_paged() {
         let res = send(
             &app,
             "POST",
-            &format!("/classes/{class}/courses"),
+            &format!("/classes/{class}/instances"),
             Some(&manager),
             Some(json!({ "course_id": course })),
         )
@@ -622,7 +629,7 @@ async fn class_lists_are_paged() {
     for uri in [
         "/classes".to_string(),
         format!("/classes/{class}/members"),
-        format!("/classes/{class}/courses"),
+        format!("/classes/{class}/instances"),
     ] {
         // Unpaged: everything, `limit` echoes null.
         let res = send(&app, "GET", &uri, Some(&manager), None).await;
@@ -695,7 +702,7 @@ async fn class_lists_are_paged() {
     let row = &items(&res.body)[0];
     assert!(row["user"]["username"].is_string(), "member ref: {row}");
     assert_eq!(row["added_by"]["username"], "mgr");
-    let uri = format!("/classes/{class}/courses?limit=1&offset=0");
+    let uri = format!("/classes/{class}/instances?limit=1&offset=0");
     let res = send(&app, "GET", &uri, Some(&manager), None).await;
     assert_eq!(items(&res.body)[0]["attached_by"]["username"], "mgr");
 }

@@ -1,29 +1,24 @@
-//! A child of a course must not survive that course's deletion.
+//! A child must not survive the parent row it names.
 //!
-//! `Course::delete` cascades with `DELETE <child> WHERE course = $course`, and
-//! that statement's write set is a *snapshot* of the children that existed when
-//! it ran. SurrealDB 3.2.3 conflict-checks write sets, not read sets, so a
-//! create whose only tie to the course was *reading* it committed happily
-//! alongside the sweep — and the row it left is unreachable for good, because
-//! every route to it goes through the course:
+//! Since the K12 remodel a child names one of two parents: a `subject` and a
+//! `course_note` hang off the catalog `course`, while an `exam` and a
+//! `course_session` hang off the class×course **instance** a şube teaches. The
+//! tie is a real foreign key now, so a create whose parent is already gone is a
+//! refusal that writes nothing — but a create written as a bare insert that
+//! *reads* its parent first could still write the orphan, and every route to
+//! such a row goes through the parent it names:
 //!
-//! - an orphan `exam` 500s through `course_of` ("exam references a missing
-//!   course") on `GET`/`PATCH`/`DELETE /exams/{id}` while `GET /exams` still
-//!   lists it to every manager+ — undeletable,
-//! - an orphan `course_session` 404s forever through `session_with_course`,
-//! - an orphan `subject` 404s through `subject_with_course`, but
-//!   `must_exist` still accepts its id, so a bank template can be
-//!   tagged with a subject nobody can reach.
+//! - an orphan `exam` is unreachable through its instance, while the list still
+//!   hands it to every manager+ — undeletable,
+//! - an orphan `course_session` 404s forever through the instance it names,
+//! - an orphan `subject` 404s through its course, but its id still resolves as
+//!   a parent, so a bank template can be tagged with a subject nobody can
+//!   reach.
 //!
-//! All three creates now go through a claim that locks the course row inside
-//! the create's own transaction: the write lands on the very row the delete
-//! removes, so the store refuses one of the two.
-//!
-//! Two halves, and they are not interchangeable. **This file is the sequential
-//! one**: it pins the existence contract (a create against a course that is
-//! already gone must be a 404, not an orphan) plus the restore (the borrowed
-//! counter comes back exactly as it was, or the course is undeletable forever —
-//! a worse bug than the one being fixed).
+//! **This file is the sequential half**: it pins the existence contract — a
+//! create against a parent that is already gone must be a 404, not an orphan —
+//! and that such a create leaves the counters its parent's delete guard reads
+//! where they were.
 //!
 //! The **race** half drives the real interleaving and lives in-crate, one pin
 //! per child beside the create it pins —
@@ -35,11 +30,14 @@
 
 mod common;
 
-use axum::http::StatusCode;
-use common::{app_and_db, id_of, login_as, send, upload_course_note_file};
+use common::{FIXTURE_YEAR_ENDS_AT, FIXTURE_YEAR_STARTS_AT};
 use hezarfen_backend::database::{self, Database};
-use hezarfen_backend::db::course;
-use hezarfen_backend::db::course_session as db_course_session;
+use hezarfen_backend::db::{
+    academic_year, class_group, course, course_session as db_course_session, term,
+};
+use hezarfen_backend::domain::academic_year::AcademicYearName;
+use hezarfen_backend::domain::class_course::ClassCourseId;
+use hezarfen_backend::domain::class_group::{ClassGroupId, ClassName};
 use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
 use hezarfen_backend::domain::course_note::{CourseNoteContent, CourseNoteTitle};
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
@@ -49,10 +47,11 @@ use hezarfen_backend::domain::exam::{
 };
 use hezarfen_backend::domain::settings::Settings;
 use hezarfen_backend::domain::subject::{SubjectDescription, SubjectName};
+use hezarfen_backend::domain::term::{TermId, TermName};
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
-use serde_json::json;
+use hezarfen_backend::service;
 use sqlx::Row as _;
 use tokio::task::JoinHandle;
 
@@ -84,13 +83,106 @@ async fn a_course(db: &Database) -> CourseId {
         CourseTitle::try_new("Fizik").unwrap(),
         CourseDescription::try_new("").unwrap(),
         CourseKind::course(),
-        None,
-        None,
     )
     .await
     .unwrap()
     .get_id()
     .clone()
+}
+
+/// The two parents a child can name: the catalog `course` for a subject and a
+/// course note, the class×course **instance** for an exam and a lesson session.
+/// Which one a child names decides which row has to go before its create can be
+/// asked the question, and [`Fixture`] mints both so either half can be staged
+/// out of one fixture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    Course,
+    Instance,
+}
+
+impl Parent {
+    /// The column the child names its parent by.
+    fn column(self) -> &'static str {
+        match self {
+            Parent::Course => "course",
+            Parent::Instance => "class_course",
+        }
+    }
+}
+
+/// A catalog course taught by one şube: the course, the class, the instance the
+/// pair forms, and the dönem an exam is filed under — everything a child needs
+/// to exist, and everything that has to be gone before the child's create can
+/// be staged against a missing parent.
+#[derive(Clone)]
+struct Fixture {
+    course: CourseId,
+    class: ClassGroupId,
+    instance: ClassCourseId,
+    term: TermId,
+}
+
+/// Mint the whole stack: a year (so the class has a calendar), a dönem inside
+/// it, the catalog course, a şube, and the instance the pair forms.
+async fn fixture(db: &Database) -> Fixture {
+    let teacher = teacher(db).await;
+    let year = *academic_year::create(
+        db,
+        &teacher,
+        AcademicYearName::try_new("2025-2026").unwrap(),
+        Timestamp::from_millis(FIXTURE_YEAR_STARTS_AT),
+        Timestamp::from_millis(FIXTURE_YEAR_ENDS_AT),
+        Vec::new(),
+    )
+    .await
+    .unwrap()
+    .get_id();
+    let term = *term::create(
+        db,
+        TermName::try_new("1. Dönem").unwrap(),
+        year,
+        Timestamp::from_millis(FIXTURE_YEAR_STARTS_AT),
+        Timestamp::from_millis(FIXTURE_YEAR_ENDS_AT),
+    )
+    .await
+    .unwrap()
+    .get_id();
+    let course = a_course(db).await;
+    // The şube names the year it sits in — the link every instance-scoped
+    // archive gate reads (instance → şube → year).
+    let class = class_group::create(
+        db,
+        &teacher,
+        ClassName::try_new("9-A").unwrap(),
+        None,
+        Some(year),
+        None,
+    )
+    .await
+    .unwrap()
+    .get_id()
+    .clone();
+    let instance = service::class_course::attach(db, &class, &course, &teacher)
+        .await
+        .unwrap()
+        .get_id()
+        .clone();
+    Fixture {
+        course,
+        class,
+        instance,
+        term,
+    }
+}
+
+/// Detach the fixture's instance — the shipped way an instance (and everything
+/// taught under it) goes. A catalog course is refused while any instance still
+/// teaches it, so this is also the move that makes the course deletable.
+async fn detach(fixture: &Fixture, db: &Database) -> Vec<String> {
+    service::class_course::detach(db, &fixture.class, &fixture.course)
+        .await
+        .expect("the fixture's own instance detaches")
 }
 
 async fn drop_course(course: &CourseId, db: &Database) -> Result<bool, AppError> {
@@ -104,21 +196,24 @@ async fn drop_course(course: &CourseId, db: &Database) -> Result<bool, AppError>
     .await
 }
 
-// --- the three creates, each as one spawnable unit -------------------------
-// Fn pointers rather than a generic closure: the three take different argument
+// --- the four creates, each as one spawnable unit --------------------------
+// Fn pointers rather than a generic closure: the four take different argument
 // types and the race harness only ever needs "start it, tell me if it 500s".
+// Two of them name the catalog course (a subject, a note), two name the
+// instance (an exam, a lesson session) — the split the K12 remodel made.
 
-fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
+fn make_exam(fixture: Fixture, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
         let teacher = teacher(&db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         hezarfen_backend::db::exam::create(
             &db,
             &teacher,
-            &course,
-            ExamTitle::try_new("quiz").unwrap(),
+            &fixture.instance,
+            &fixture.term,
+            ExamTitle::try_new("Yazılı").unwrap(),
             ExamDescription::try_new("").unwrap(),
-            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamKind::try_new("yazili", &kinds).unwrap(),
             ExamSchedule::try_new(None, None, None, None).unwrap(),
             ExamAttemptLimit::try_new(1).unwrap(),
             true,
@@ -130,12 +225,12 @@ fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
     })
 }
 
-fn make_session(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
+fn make_session(fixture: Fixture, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
         let teacher = teacher(&db).await;
         db_course_session::create(
             &db,
-            &course,
+            &fixture.instance,
             &teacher,
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(1),
@@ -146,11 +241,11 @@ fn make_session(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
     })
 }
 
-fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
+fn make_subject(fixture: Fixture, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
         hezarfen_backend::db::subject::create(
             &db,
-            &course,
+            &fixture.course,
             SubjectName::try_new("Limits").unwrap(),
             SubjectDescription::try_new("").unwrap(),
         )
@@ -159,12 +254,12 @@ fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
     })
 }
 
-fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
+fn make_note(fixture: Fixture, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
         let teacher = teacher(&db).await;
         hezarfen_backend::db::course_note::create(
             &db,
-            &course,
+            &fixture.course,
             &teacher,
             CourseNoteTitle::try_new("plan").unwrap(),
             CourseNoteContent::try_new("").unwrap(),
@@ -174,90 +269,119 @@ fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
     })
 }
 
-/// How many rows of `table` name `course`. Stored state, never a return value:
-/// the whole point is what the store kept.
-async fn children(table: &str, course: &CourseId, db: &Database) -> usize {
+/// How many rows of `table` name `parent` in `column`. Stored state, never a
+/// return value: the whole point is what the store kept. The id is bound as a
+/// uuid — the column is one, and a text bind would not compare against it.
+async fn children(table: &str, column: &str, parent: uuid::Uuid, db: &Database) -> usize {
     sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM {table} WHERE course = $1"
+        "SELECT count(*) FROM {table} WHERE {column} = $1"
     )))
-    .bind(course.clone())
+    .bind(parent)
     .fetch_one(db)
     .await
     .unwrap() as usize
 }
 
+/// The pair of counters a catalog course's delete guard reads.
+async fn guard_counters(course: &CourseId, db: &Database) -> (i64, i64) {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT class_course_count, course_membership_count FROM course WHERE id = $1",
+    )
+    .bind(course.uuid())
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
 // --- the sequential half: the existence contract ---------------------------
 
-/// A create against a course that is *already* gone must refuse, having written
-/// nothing. This is the half of the fix a race cannot show: with the bare
-/// `db.create` these creates shipped with, every one of them happily wrote a
-/// row naming a course that does not exist.
-async fn a_create_against_a_deleted_course_refuses(
+/// A create against a parent that is *already* gone must refuse, having written
+/// nothing. This is the half of the fix a race cannot show: a create that reads
+/// its parent and then inserts would happily write a row naming a row that does
+/// not exist.
+///
+/// The staging is the shipped shape of "the parent is gone": the fixture's own
+/// instance is detached for both parents (a catalog course is refused while any
+/// instance still teaches it), and the course is deleted on top for the two
+/// children that name it.
+async fn a_create_against_a_deleted_parent_refuses(
     table: &str,
-    make: fn(CourseId, Database) -> JoinHandle<Result<(), AppError>>,
+    parent: Parent,
+    make: fn(Fixture, Database) -> JoinHandle<Result<(), AppError>>,
 ) {
     let (db, _dbs) = database::init_test_db().await;
-    let course = a_course(&db).await;
-    assert!(drop_course(&course, &db).await.unwrap(), "the course goes");
+    let fixture = fixture(&db).await;
+    detach(&fixture, &db).await;
+    let (gone, id) = match parent {
+        Parent::Course => ("course", {
+            assert!(
+                drop_course(&fixture.course, &db).await.unwrap(),
+                "the course goes"
+            );
+            fixture.course.uuid()
+        }),
+        Parent::Instance => ("instance", fixture.instance.uuid()),
+    };
 
-    let answer = make(course.clone(), db.clone()).await.unwrap();
+    let answer = make(fixture.clone(), db.clone()).await.unwrap();
     assert!(
         matches!(answer, Err(AppError::NotFound)),
-        "{table}: a create under a deleted course must be a 404, not {answer:?}"
+        "{table}: a create under a deleted {gone} must be a 404, not {answer:?}"
     );
     assert_eq!(
-        children(table, &course, &db).await,
+        children(table, parent.column(), id, &db).await,
         0,
-        "{table}: a refused create left a row naming a course that is gone"
+        "{table}: a refused create left a row naming a {gone} that is gone"
     );
 }
 
 #[tokio::test]
-async fn an_exam_under_a_deleted_course_is_refused() {
-    a_create_against_a_deleted_course_refuses("exam", make_exam).await;
+async fn an_exam_under_a_deleted_instance_is_refused() {
+    a_create_against_a_deleted_parent_refuses("exam", Parent::Instance, make_exam).await;
 }
 
 #[tokio::test]
-async fn a_session_under_a_deleted_course_is_refused() {
-    a_create_against_a_deleted_course_refuses("course_session", make_session).await;
+async fn a_session_under_a_deleted_instance_is_refused() {
+    a_create_against_a_deleted_parent_refuses("course_session", Parent::Instance, make_session)
+        .await;
 }
 
 #[tokio::test]
 async fn a_subject_under_a_deleted_course_is_refused() {
-    a_create_against_a_deleted_course_refuses("subject", make_subject).await;
+    a_create_against_a_deleted_parent_refuses("subject", Parent::Course, make_subject).await;
 }
 
 #[tokio::test]
 async fn a_course_note_under_a_deleted_course_is_refused() {
-    a_create_against_a_deleted_course_refuses("course_note", make_note).await;
+    a_create_against_a_deleted_parent_refuses("course_note", Parent::Course, make_note).await;
 }
 
-/// The counter the three creates borrow is *given back*. A bump left behind is
-/// not a smaller bug than the orphan it prevents: the course's delete guard
-/// reads `enrollment_count`, so a course that once had an exam created under it
-/// would be undeletable forever.
+/// A child create must leave the counters its parent's delete guard reads where
+/// they were, and the parent must stay deletable afterwards. The guard on a
+/// catalog course is the pair `class_course_count`/`course_membership_count`
+/// (and on an instance, the class's own counter) — a create that bumped one as
+/// a side effect and never gave it back would leave the parent undeletable for
+/// good, which is a worse bug than the orphan it prevents.
 #[tokio::test]
-async fn the_creates_give_the_courses_roster_counter_back_untouched() {
+async fn the_creates_leave_their_parents_delete_guards_untouched() {
     let (db, _dbs) = database::init_test_db().await;
-    let course = a_course(&db).await;
+    let fixture = fixture(&db).await;
+    let before = guard_counters(&fixture.course, &db).await;
 
     for make in [make_exam, make_session, make_subject, make_note] {
-        make(course.clone(), db.clone()).await.unwrap().unwrap();
+        make(fixture.clone(), db.clone()).await.unwrap().unwrap();
     }
-    let bumped = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM course WHERE enrollment_count <> 0",
-    )
-    .fetch_one(&db)
-    .await
-    .unwrap();
     assert_eq!(
-        bumped, 0,
-        "the borrowed counter must be restored to 0, not left bumped"
+        guard_counters(&fixture.course, &db).await,
+        before,
+        "a child create moved a counter the course's delete guard reads"
     );
-    // The proof that matters to a user: the course is still deletable.
+    // The proof that matters to a user: once the instance is detached, the
+    // course is still deletable.
+    detach(&fixture, &db).await;
     assert!(
-        drop_course(&course, &db).await.unwrap(),
-        "a course whose children moved its roster counter can never be deleted"
+        drop_course(&fixture.course, &db).await.unwrap(),
+        "a course whose children moved a guard counter can never be deleted"
     );
 }
 
@@ -293,7 +417,7 @@ async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
     assert!(drop_course(&course, &db).await.unwrap(), "the course goes");
 
     assert_eq!(
-        children("course_note", &course, &db).await,
+        children("course_note", "course", course.uuid(), &db).await,
         0,
         "a course_note survived its course's delete"
     );
@@ -312,10 +436,9 @@ async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
 }
 
 /// `CourseNoteFile::insert` already goes through `cap::claim_and_create` on
-/// the note row (unlike the bare `db.create` `CourseNote::create` shipped
-/// with) — this pins that a file upload against an already-deleted note is
-/// refused rather than left as an orphan, the same existence contract as the
-/// three creates above.
+/// the note row (unlike a bare `db.create` `CourseNote::create` would) — this
+/// pins that a file upload against an already-deleted note is refused rather
+/// than left as an orphan, the same existence contract as the creates above.
 #[tokio::test]
 async fn a_course_note_file_under_a_deleted_note_is_refused() {
     let (db, _dbs) = database::init_test_db().await;
@@ -363,167 +486,4 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
         0,
         "a refused upload left a row naming a note that is gone"
     );
-}
-#[tokio::test]
-async fn an_archived_term_freezes_a_course_s_subjects_and_notes() {
-    let (app, db) = app_and_db().await;
-    let manager = login_as(&app, &db, "arch_child_manager", "manager").await;
-
-    let term = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2022",
-            "starts_at": 1_500_000_000_000_i64,
-            "ends_at": 1_510_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(term.status, StatusCode::CREATED, "{}", term.body);
-    let term_id = id_of(&term.body);
-
-    let course = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&manager),
-        Some(json!({ "title": "Fizik", "term_id": term_id })),
-    )
-    .await;
-    assert_eq!(course.status, StatusCode::CREATED, "{}", course.body);
-    let course_id = id_of(&course.body);
-
-    let subject = send(
-        &app,
-        "POST",
-        &format!("/courses/{course_id}/subjects"),
-        Some(&manager),
-        Some(json!({ "name": "Optik" })),
-    )
-    .await;
-    assert_eq!(subject.status, StatusCode::CREATED, "{}", subject.body);
-    let subject_id = id_of(&subject.body);
-
-    let note = send(
-        &app,
-        "POST",
-        "/course-notes",
-        Some(&manager),
-        Some(json!({ "course": course_id, "title": "Ders 1" })),
-    )
-    .await;
-    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
-    let note_id = id_of(&note.body);
-
-    let file = upload_course_note_file(
-        &app,
-        &manager,
-        &note_id,
-        "plan.pdf",
-        "application/pdf",
-        b"pdf bytes",
-    )
-    .await;
-    assert_eq!(file.status, StatusCode::CREATED, "{}", file.body);
-    let file_id = id_of(&file.body);
-
-    let archived = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(archived.status, StatusCode::OK, "{}", archived.body);
-
-    let writes: [(&str, String, Option<serde_json::Value>); 5] = [
-        (
-            "PATCH",
-            format!("/subjects/{subject_id}"),
-            Some(json!({ "name": "Akustik" })),
-        ),
-        ("DELETE", format!("/subjects/{subject_id}"), None),
-        (
-            "POST",
-            "/course-notes".to_string(),
-            Some(json!({ "course": course_id, "title": "Ders 2" })),
-        ),
-        (
-            "PATCH",
-            format!("/course-notes/{note_id}"),
-            Some(json!({ "title": "Ders 1a" })),
-        ),
-        (
-            "DELETE",
-            format!("/course-notes/{note_id}/files/{file_id}"),
-            None,
-        ),
-    ];
-    for (method, uri, body) in writes {
-        let res = send(&app, method, &uri, Some(&manager), body).await;
-        assert_eq!(
-            res.status,
-            StatusCode::CONFLICT,
-            "{method} {uri}: {}",
-            res.body
-        );
-        assert_eq!(res.body["code"], "term_archived", "{method} {uri}");
-    }
-    // The multipart upload refuses too, and before its body is buffered.
-    let refused = upload_course_note_file(
-        &app,
-        &manager,
-        &note_id,
-        "more.pdf",
-        "application/pdf",
-        b"more bytes",
-    )
-    .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
-    assert_eq!(refused.body["code"], "term_archived");
-    // Deleting the note itself is a write as well (it cascades its files).
-    let res = send(
-        &app,
-        "DELETE",
-        &format!("/course-notes/{note_id}"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
-    assert_eq!(res.body["code"], "term_archived");
-
-    // Reads all stay open.
-    for uri in [
-        format!("/subjects/{subject_id}"),
-        format!("/course-notes/{note_id}"),
-        format!("/course-notes/{note_id}/files"),
-        format!("/course-notes/{note_id}/files/{file_id}"),
-    ] {
-        let res = send(&app, "GET", &uri, Some(&manager), None).await;
-        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
-    }
-
-    // Re-opening the year thaws them.
-    let reopened = send(
-        &app,
-        "POST",
-        &format!("/terms/{term_id}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(reopened.status, StatusCode::OK, "{}", reopened.body);
-    let res = send(
-        &app,
-        "PATCH",
-        &format!("/subjects/{subject_id}"),
-        Some(&manager),
-        Some(json!({ "name": "Akustik" })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }

@@ -1,0 +1,119 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cc.id AS \"id: ClassCourseId\", cc.class AS \"class: ClassGroupId\",\n                  cc.course AS \"course: CourseId\", cc.attached_by AS \"attached_by: UserId\",\n                  b.grade AS \"source?: ClassBlueprintId\",\n                  cc.ders_saati::bigint AS \"ders_saati!: DersSaati\",\n                  cc.counts_toward_karne, cc.enrollment_count,\n                  cc.attached_at AS \"attached_at: Timestamp\"\n           FROM class_course cc\n           LEFT JOIN class_blueprint b ON b.id = cc.source\n           WHERE cc.class = ANY($1)\n           ORDER BY cc.attached_at DESC, cc.id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "attached_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "attached_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "source?: ClassBlueprintId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_blueprint",
+            "name": "grade"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "ders_saati!: DersSaati",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "counts_toward_karne",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "counts_toward_karne"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "enrollment_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "enrollment_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "attached_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "attached_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "63bfd49bc95190d30571715c41de8dd2fe98a6a4ab2dfffc47c253c5e0cc6414"
+}

@@ -22,8 +22,8 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
-    login_as, me_id, send, set_role,
+    app_and_db, create_exam, create_exam_with, create_session, enroll, id_of, login, login_as, me_id,
+    send, set_role, taught_under,
 };
 use hezarfen_backend::constant::{
     BADGES, HIGH_MARK_MIN, MIN_COUNTED_POMODORO_MS, STUDY_STREAK_LAST_DAY_FIELD,
@@ -98,14 +98,25 @@ struct Marking {
 
 async fn marking(exams: usize) -> Marking {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "teach", "teacher").await;
     let student = login(&app, "stu").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "Algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
     let mut ids = Vec::with_capacity(exams);
     for n in 0..exams {
-        ids.push(create_exam(&app, &teacher, &course, &format!("Quiz {n}"), "quiz").await);
+        ids.push(
+            create_exam(
+                &app,
+                &teacher,
+                &t.instance,
+                &t.term,
+                &format!("Quiz {n}"),
+                "yazili",
+            )
+            .await,
+        );
     }
     Marking {
         app,
@@ -345,7 +356,7 @@ fn soon() -> i64 {
 ///
 /// This manipulates **stored state, never the clock**, the same trick
 /// `age_one_day` uses below and for the same reason: no route can do it. Both
-/// `POST /courses/{id}/sessions` and the session PATCH refuse a start time in
+/// `POST /instances/{id}/sessions` and the session PATCH refuse a start time in
 /// the past — which is what makes the counter's own gate worth having, since a
 /// client can only ever schedule *forward* into an unheld lesson.
 async fn ring_the_bell(db: &Database, session: &str) {
@@ -369,16 +380,16 @@ async fn the_first_roll_call_credits_the_lesson_once_and_only_students_attend() 
     let boss = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "teach", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
-    let course = create_course(&app, &teacher, "Algebra").await;
+    let t = taught_under(&app, &boss, &teacher, "Algebra").await;
 
     let mut students = Vec::new();
     for name in ["ali", "veli", "ayse"] {
         let cookie = login(&app, name).await;
         let id = me_id(&app, &cookie).await;
-        enroll(&app, &teacher, &course, &id).await;
+        enroll(&app, &teacher, &t.instance, &id).await;
         students.push((cookie, id));
     }
-    let session = create_session(&app, &teacher, &course, soon()).await;
+    let session = create_session(&app, &teacher, &t.instance, soon()).await;
 
     // The lesson is still an hour away. Opening the sheet early is allowed and
     // the mark stands, but it holds nothing — ungated, two hundred lessons
@@ -440,16 +451,17 @@ async fn the_first_roll_call_credits_the_lesson_once_and_only_students_attend() 
 #[tokio::test]
 async fn a_correction_lowers_the_counter_but_never_takes_the_badge_back() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "teach", "teacher").await;
     let student = login(&app, "stu").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Algebra").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught_under(&app, &mudur, &teacher, "Algebra").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
 
     let mut sessions = Vec::new();
     for lesson in 0..10 {
         let starts_at = soon() + lesson * 3_600_000;
-        let session = create_session(&app, &teacher, &course, starts_at).await;
+        let session = create_session(&app, &teacher, &t.instance, starts_at).await;
         ring_the_bell(&db, &session).await;
         roll_call(&app, &teacher, &session, &student_id, "present").await;
         sessions.push(session);
@@ -708,13 +720,14 @@ async fn sit_and_finish(app: &Router, cookie: &str, exam: &str, times: usize) {
 #[tokio::test]
 async fn a_retake_loop_on_one_exam_counts_one_exam_sat() {
     let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
     let teacher = login_as(&app, &db, "hoca", "teacher").await;
     let student = login(&app, "ogrenci").await;
     let student_id = me_id(&app, &student).await;
-    let course = create_course(&app, &teacher, "Biology").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let unlimited = json!({ "title": "Cells", "kind": "quiz", "mode": "open", "max_attempts": 0 });
-    let res = create_exam_with(&app, &teacher, &course, unlimited.clone()).await;
+    let t = taught_under(&app, &mudur, &teacher, "Biology").await;
+    enroll(&app, &teacher, &t.instance, &student_id).await;
+    let unlimited = json!({ "title": "Cells", "kind": "yazili", "mode": "open", "max_attempts": 0, "term": t.term });
+    let res = create_exam_with(&app, &teacher, &t.instance, unlimited.clone()).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let exam = id_of(&res.body);
 
@@ -737,8 +750,8 @@ async fn a_retake_loop_on_one_exam_counts_one_exam_sat() {
     let res = create_exam_with(
         &app,
         &teacher,
-        &course,
-        json!({ "title": "Genes", "kind": "quiz", "mode": "open", "max_attempts": 0 }),
+        &t.instance,
+        json!({ "title": "Genes", "kind": "yazili", "mode": "open", "max_attempts": 0, "term": t.term }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

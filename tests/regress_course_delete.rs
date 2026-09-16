@@ -1,23 +1,31 @@
-//! A course delete must take every attempt under it with it — the same hole
-//! `regress_exam_delete` pins one level down.
+//! A catalog course's delete must leave the bank where deleting its content by
+//! hand would have left it — and the sweep that takes that content is the
+//! instance's, not the course's.
 //!
-//! `delete_course` cascades the course's exams *and their attempts*, and an
-//! attempt is still the one exam child whose write cannot collide with that
-//! sweep on a key: its create rides `cap::claim_and_create` against the
-//! *student's* row, which this cascade never touches. The exam row lock
-//! (`FOR UPDATE` on start, `DELETE` waiting behind it) is what keeps the
-//! sweep and a start from both committing.
+//! The K12 remodel split this cascade in two, and the split decides the staging
+//! of every test below. The academic work — exams with their attempts,
+//! homework, lesson sessions, the roster, the assigned teachers — hangs off the
+//! class×course **instance**, and the sweep that takes it is the **detach**
+//! (`DELETE /classes/{class}/instances/{instance}`). A catalog course is
+//! refused while any instance still teaches it (`class_course_count`, beside
+//! `course_membership_count`, is the guard), so reaching [`course::delete`]
+//! means the instances went first; what is left for it to sweep is the
+//! catalog's own content — subjects, course notes with their files, the
+//! instance rows themselves, the memberships, the blueprint links, the derived
+//! AI rows, and the bank links its exams and subjects owed.
 //!
-//! The two cascade tests below fire the delete at [`Course::delete`] rather
-//! than at `DELETE /courses/{id}`: the defects they pin live in that
-//! transaction's SQL, and neither one needs a race to show.
+//! The attempt is the one child a sweep cannot collide with on a key: its
+//! create rides `cap::claim_and_create` against the *student's* row, which no
+//! cascade here touches. The exam row lock (`FOR UPDATE` on start, the sweep's
+//! delete waiting behind it) is what keeps a sweep and a start from both
+//! committing — the race test below fires the detach into that window.
 
 mod common;
 
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, create_subject, enroll, id_of, login,
-    login_as, me_id, send, unenroll,
+    Res, app_and_db, create_exam, create_exam_with, create_subject, enroll, id_of, login, login_as,
+    me_id, send, taught, unenroll,
 };
 use hezarfen_backend::db::course;
 use hezarfen_backend::db::exam_attempt::list_for_exam;
@@ -37,26 +45,45 @@ async fn drop_course(db: &hezarfen_backend::database::Database, course: &str) {
     );
 }
 
+/// Detach `t`'s instance: `DELETE /classes/{class}/instances/{instance}`, the
+/// shipped sweep that takes an instance and everything taught under it — and
+/// the move a catalog course's delete requires first. No assertion: each caller
+/// below checks the answer it means to.
+async fn detach_instance(app: &axum::Router, staff: &str, t: &common::Taught) -> Res {
+    send(
+        app,
+        "DELETE",
+        &format!("/classes/{}/instances/{}", t.class, t.instance),
+        Some(staff),
+        None,
+    )
+    .await
+}
+
 /// A bank template outlives the course it was saved out of — it is a separate,
-/// school-wide library — so the cascade owes it the same cleanup its children's
-/// own deletes perform: `Exam::delete` clears `source_exam`, `db::subject::delete`
-/// clears `subject`. The course cascade deleted both rows and neither link,
-/// leaving a template pointing at two ids that no longer exist — the
-/// `source_exam` one forever (nothing else ever visits that column) and the
-/// `subject` one until a `PATCH` omitting `subject_id` writes it back.
+/// school-wide library — so the sweeps owe it the same cleanup its children's
+/// own deletes perform: the exam sweep clears `source_exam`, the subject sweep
+/// clears `subject`. The cascade deleted both rows and neither link, leaving a
+/// template pointing at two ids that no longer exist — the `source_exam` one
+/// forever (nothing else ever visits that column) and the `subject` one until a
+/// `PATCH` omitting `subject_id` writes it back.
+///
+/// Two sweeps are in the flow since the remodel, and both owe their half: the
+/// exam goes with the instance's detach, the subject with the course's delete —
+/// which the detach is what makes reachable.
 #[tokio::test]
 async fn a_course_delete_clears_the_bank_links_its_exams_and_subjects_owed() {
     let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "banka_ders_sil", "teacher").await;
-    let course = create_course(&app, &teacher, "Fizik").await;
-    let subject = create_subject(&app, &teacher, &course, "Optik").await;
-    let exam = create_exam(&app, &teacher, &course, "quiz", "midterm").await;
+    let mudur = login_as(&app, &db, "banka_ders_sil", "manager").await;
+    let t = taught(&app, &mudur, "Fizik").await;
+    let subject = create_subject(&app, &mudur, &t.course, "Optik").await;
+    let exam = create_exam(&app, &mudur, &t.instance, &t.term, "Vize", "yazili").await;
 
     let res = send(
         &app,
         "POST",
         &format!("/exams/{exam}/questions"),
-        Some(&teacher),
+        Some(&mudur),
         Some(json!({
             "subject_id": subject, "text": "mercek", "kind": "text", "points": 5
         })),
@@ -69,7 +96,7 @@ async fn a_course_delete_clears_the_bank_links_its_exams_and_subjects_owed() {
         &app,
         "POST",
         &format!("/exams/{exam}/questions/{question}/to-bank"),
-        Some(&teacher),
+        Some(&mudur),
         None,
     )
     .await;
@@ -79,13 +106,22 @@ async fn a_course_delete_clears_the_bank_links_its_exams_and_subjects_owed() {
     assert_eq!(res.body["source_exam"], exam, "{}", res.body);
     assert_eq!(res.body["subject"], subject, "{}", res.body);
 
-    drop_course(&db, &course).await;
+    // The instance first: a catalog course is refused while one still teaches
+    // it, and this detach is what takes the exam.
+    let detached = detach_instance(&app, &mudur, &t).await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the instance detaches: {}",
+        detached.body
+    );
+    drop_course(&db, &t.course).await;
 
     let res = send(
         &app,
         "GET",
         &format!("/bank-questions/{template}"),
-        Some(&teacher),
+        Some(&mudur),
         None,
     )
     .await;
@@ -99,33 +135,37 @@ async fn a_course_delete_clears_the_bank_links_its_exams_and_subjects_owed() {
     );
 }
 
-/// The marks the cascade sweeps hold a reference on their exam *kind*, and that
+/// The marks a sweep takes hold a reference on their exam *kind*, and that
 /// counter is the only thing standing between a manager and removing a kind the
 /// school is already graded under. Nothing covered the release on this path —
 /// only on `Exam::delete`'s and `remove_result`'s — and the `GROUP BY` doing it
 /// is the shape this store has answered with no rows before.
+///
+/// The sweep is the instance's now: a catalog course is refused while it still
+/// carries an instance, so the detach is what takes the marks (and is the only
+/// path that can), after which the course delete follows.
 #[tokio::test]
-async fn a_course_delete_gives_back_the_kind_references_its_marks_held() {
+async fn the_sweep_that_takes_a_courses_marks_gives_their_kind_references_back() {
     let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "kind_ref_ders_sil", "teacher").await;
+    let mudur = login_as(&app, &db, "kind_ref_ders_sil", "manager").await;
     let student = login(&app, "kind_ref_ogrenci").await;
     let student_id = me_id(&app, &student).await;
 
-    let course = create_course(&app, &teacher, "Tarih").await;
-    enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Vize", "midterm").await;
+    let t = taught(&app, &mudur, "Tarih").await;
+    enroll(&app, &mudur, &t.instance, &student_id).await;
+    let exam = create_exam(&app, &mudur, &t.instance, &t.term, "Vize", "yazili").await;
     let res = send(
         &app,
         "POST",
         &format!("/exams/{exam}/results"),
-        Some(&teacher),
+        Some(&mudur),
         Some(json!({ "user_id": student_id, "mark": 70 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     let counted = |db: hezarfen_backend::database::Database| async move {
-        sqlx::query_as::<_, (i64,)>("SELECT count FROM kind_ref WHERE name = 'midterm'")
+        sqlx::query_as::<_, (i64,)>("SELECT count FROM kind_ref WHERE name = 'yazili'")
             .fetch_optional(&db)
             .await
             .expect("kind_ref read")
@@ -134,10 +174,17 @@ async fn a_course_delete_gives_back_the_kind_references_its_marks_held() {
     };
     assert_eq!(counted(db.clone()).await, 1, "the mark must be counted");
 
-    // The roster has to empty before the delete is admitted at all; the mark
-    // stays behind, which is precisely why the cascade owes the release.
-    unenroll(&app, &teacher, &course, &student_id).await;
-    drop_course(&db, &course).await;
+    // The detach is what takes the mark — the course delete cannot even be
+    // admitted while the instance stands — so it is the path that owes the
+    // release; the course delete follows it onto an empty catalog.
+    let detached = detach_instance(&app, &mudur, &t).await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the instance detaches: {}",
+        detached.body
+    );
+    drop_course(&db, &t.course).await;
 
     assert_eq!(
         counted(db.clone()).await,
@@ -147,38 +194,34 @@ async fn a_course_delete_gives_back_the_kind_references_its_marks_held() {
     );
 }
 
-/// Reaching the window takes one move `regress_exam_delete` does not need,
-/// because a course is refused while anyone is enrolled: the sitting has to
-/// pass its enrollment gate and then lose that enrollment while it is still
-/// being written.
+/// The sitting's own write is held open, every gate already cleared, and the
+/// sweep that takes its exam fires into that window: an `AFTER INSERT` trigger
+/// on `exam_attempt` sleeps *inside* the create's own transaction, after the
+/// enrollment gate has passed, and the detach that follows lands inside it.
 ///
-/// That also decides which side the window is opened on. It cannot be the
-/// delete's, the way the exam test does it — by the time a course delete is
-/// admitted the roster is empty, so a start fired into its window is answered
-/// `403` by the enrollment gate and the test would pass on a missing lease. So
-/// the *start* is held open instead: a `DEFINE EVENT` on `exam_attempt` fires
-/// inside the create's own transaction, after every gate has been cleared, and
-/// holds the start — and with it the writer lease — across the unenroll and the
-/// delete that follow. That is exactly the pairing the lease exists to
-/// serialize; without it the cascade sweeps attempts on a snapshot taken before
-/// this one commits, and the sitting outlives both its exam and its course,
-/// unreachable (every route to an attempt goes through its exam) with the
-/// student's lifetime sitting counter up for good.
+/// That is exactly the pairing the exam row lock exists to serialize. The
+/// sitting's transaction holds the exam row's write lock across the sleeping
+/// trigger (the start takes `FOR UPDATE` and keeps it through the insert), so
+/// the sweep cannot even reach its attempt delete until the sitting has
+/// committed — and the sitting finds its exam gone if it goes second. Without
+/// the lock the sweep runs on a snapshot taken before the start commits and the
+/// sitting outlives both its exam and its instance, unreachable (every route to
+/// an attempt goes through its exam) with the student's lifetime sitting
+/// counter up for good.
 ///
-/// Postgres hands out the same pairing the lease used to: the sitting's
-/// transaction holds the exam row's write lock across the sleeping trigger, so
-/// the delete cannot even reach its attempt sweep until the sitting has
-/// committed. Mutation-proven: dropping the lease from the cascade turns it
-/// red.
+/// The course's own delete needs one move more, and that move is the shipped
+/// shape of this test now: the instance has to go before the catalog row can
+/// (the guard reads `class_course_count`), so the detach is where the race is
+/// staged and the course delete closes the flow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
+async fn an_attempt_started_inside_a_detach_never_outlives_it() {
     let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "ogretmen_ders_sil", "teacher").await;
+    let mudur = login_as(&app, &db, "ogretmen_ders_sil", "manager").await;
     let student = login_as(&app, &db, "ogrenci_ders_sil", "student").await;
     let student_id = me_id(&app, &student).await;
 
     // Hold the sitting's own write open for a full second, gates already
-    // passed, so the unenroll and the delete both land inside it. An AFTER
+    // passed, so the roster change and the detach both land inside it. An AFTER
     // INSERT trigger sleeping inside the create's own transaction is the
     // Postgres shape of the old window event.
     let mut conn = db.acquire().await.expect("acquire for the trigger");
@@ -193,15 +236,15 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
     .await
     .expect("define the window trigger");
 
-    let course = common::create_course(&app, &teacher, "Kimya").await;
-    enroll(&app, &teacher, &course, &student_id).await;
+    let t = taught(&app, &mudur, "Kimya").await;
+    enroll(&app, &mudur, &t.instance, &student_id).await;
     // `open` mode, as next door: an unscheduled exam answers the start with a
     // 409 before it ever writes, and there would be no attempt to race.
     let res = create_exam_with(
         &app,
-        &teacher,
-        &course,
-        json!({ "title": "quiz", "kind": "midterm", "mode": "open" }),
+        &mudur,
+        &t.instance,
+        json!({ "title": "Vize", "kind": "yazili", "mode": "open", "term": t.term.clone() }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "create exam");
@@ -222,24 +265,31 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
     };
     // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    // The enrollment goes while the sitting is mid-write — the only staging in
-    // which the delete is admitted at all. Without it this is a 409 and the
-    // race never happens.
-    unenroll(&app, &teacher, &course, &student_id).await;
+    // The enrollment goes while the sitting is mid-write — the roster change
+    // the old staging needed to admit the delete, kept because a sitting that
+    // loses its enrollment mid-write is the state worth racing.
+    unenroll(&app, &mudur, &t.instance, &student_id).await;
+    let detached = detach_instance(&app, &mudur, &t).await;
     let dropped = send(
         &app,
         "DELETE",
-        &format!("/courses/{course}"),
-        Some(&teacher),
+        &format!("/courses/{}", t.course),
+        Some(&mudur),
         None,
     )
     .await;
     let sat = sit.await.unwrap();
 
     assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the detach must succeed: {:?}",
+        detached.body
+    );
+    assert_eq!(
         dropped.status,
         StatusCode::NO_CONTENT,
-        "the delete must succeed: {:?}",
+        "the course delete must succeed once the instance is gone: {:?}",
         dropped.body
     );
     // A 404 for the start is a correct answer too; the only defect is stored
@@ -257,182 +307,6 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
             .unwrap()
             .len(),
         0,
-        "a sitting outlived the course it was sat under"
-    );
-}
-
-/// An archived term freezes the courses hanging off it: every write route under
-/// `/courses/{id}` answers `409 term_archived`, while every read stays open —
-/// past years are a read-only archive, not a hidden one. The guard sits *after*
-/// each handler's authz check, so a caller who may not write still gets its
-/// `403` rather than being told about the term.
-#[tokio::test]
-async fn an_archived_terms_courses_take_no_writes_but_still_read() {
-    let (app, db) = app_and_db().await;
-    let manager = login_as(&app, &db, "arsiv_ders_mudur", "manager").await;
-    let student = login_as(&app, &db, "arsiv_ders_ogrenci", "student").await;
-    let student_id = me_id(&app, &student).await;
-    let teacher = login_as(&app, &db, "arsiv_ders_ogretmen", "teacher").await;
-    let teacher_id = me_id(&app, &teacher).await;
-
-    let res = send(
-        &app,
-        "POST",
-        "/terms",
-        Some(&manager),
-        Some(json!({
-            "name": "2019 güz",
-            "starts_at": 1_780_000_000_000_i64,
-            "ends_at": 1_790_000_000_000_i64,
-        })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let term = id_of(&res.body);
-
-    let res = send(
-        &app,
-        "POST",
-        "/courses",
-        Some(&manager),
-        Some(json!({ "title": "Coğrafya", "term_id": term })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let course = id_of(&res.body);
-    // Both the roster and an assigned teacher have to exist *before* the
-    // archive: the routes that remove them are themselves frozen.
-    enroll(&app, &manager, &course, &student_id).await;
-    let subject = create_subject(&app, &manager, &course, "Iklim").await;
-    let res = send(
-        &app,
-        "POST",
-        &format!("/courses/{course}/teachers"),
-        Some(&manager),
-        Some(json!({ "user_id": teacher_id })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/archive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-
-    let due = 1_900_000_000_000_i64;
-    let writes: Vec<(&str, String, Option<serde_json::Value>)> = vec![
-        (
-            "PATCH",
-            format!("/courses/{course}"),
-            Some(json!({ "title": "Yeni" })),
-        ),
-        ("DELETE", format!("/courses/{course}"), None),
-        (
-            "POST",
-            format!("/courses/{course}/teachers"),
-            Some(json!({ "user_id": teacher_id })),
-        ),
-        (
-            "DELETE",
-            format!("/courses/{course}/teachers/{teacher_id}"),
-            None,
-        ),
-        (
-            "POST",
-            format!("/courses/{course}/enrollments"),
-            Some(json!({ "user_id": student_id })),
-        ),
-        (
-            "DELETE",
-            format!("/courses/{course}/enrollments/{student_id}"),
-            None,
-        ),
-        (
-            "POST",
-            format!("/courses/{course}/exams"),
-            Some(json!({ "title": "Vize", "kind": "midterm" })),
-        ),
-        (
-            "POST",
-            format!("/courses/{course}/subjects"),
-            Some(json!({ "name": "Erozyon" })),
-        ),
-        (
-            "POST",
-            format!("/courses/{course}/homework"),
-            Some(json!({ "title": "Ödev", "subject_id": subject, "due_at": due })),
-        ),
-        (
-            "POST",
-            format!("/courses/{course}/sessions"),
-            Some(json!({ "starts_at": due })),
-        ),
-    ];
-    for (method, uri, body) in &writes {
-        let res = send(&app, method, uri, Some(&manager), body.clone()).await;
-        assert_eq!(
-            (res.status, res.body["code"].clone()),
-            (StatusCode::CONFLICT, json!("term_archived")),
-            "{method} {uri} must be frozen by the archive: {}",
-            res.body
-        );
-    }
-
-    for uri in [
-        format!("/courses/{course}"),
-        format!("/courses/{course}/enrollments"),
-        format!("/courses/{course}/exams"),
-        format!("/courses/{course}/subjects"),
-        format!("/courses/{course}/homework"),
-        format!("/courses/{course}/sessions"),
-    ] {
-        let res = send(&app, "GET", &uri, Some(&manager), None).await;
-        assert_eq!(
-            res.status,
-            StatusCode::OK,
-            "GET {uri} must stay readable: {}",
-            res.body
-        );
-    }
-
-    // A student who cannot write here is still told *that* first — the 403 has
-    // to precede the 409, or the archive leaks course structure to outsiders.
-    let res = send(
-        &app,
-        "POST",
-        &format!("/courses/{course}/subjects"),
-        Some(&student),
-        Some(json!({ "name": "Sızıntı" })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
-
-    let res = send(
-        &app,
-        "POST",
-        &format!("/terms/{term}/unarchive"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let res = send(
-        &app,
-        "POST",
-        &format!("/courses/{course}/subjects"),
-        Some(&manager),
-        Some(json!({ "name": "Erozyon" })),
-    )
-    .await;
-    assert_eq!(
-        res.status,
-        StatusCode::CREATED,
-        "the unarchive must give the writes back: {}",
-        res.body
+        "a sitting outlived the exam (and instance) it was sat under"
     );
 }

@@ -458,13 +458,18 @@ mod tests {
             .await
             .unwrap();
             let kinds = Settings::defaults().get_exam_kinds().to_vec();
+            // The instance and the dönem are foreign keys now: real rows the
+            // fixture mints, per call.
+            let (instance, _course) = crate::db::course::a_test_instance(db).await;
+            let term = crate::db::term::a_test_term(db).await;
             crate::db::exam::create(
                 db,
                 &creator,
-                &crate::db::course::a_test_course(db).await,
+                &instance,
+                &term,
                 ExamTitle::try_new("practice").unwrap(),
                 ExamDescription::try_new("").unwrap(),
-                ExamKind::try_new("quiz", &kinds).unwrap(),
+                ExamKind::try_new("yazili", &kinds).unwrap(),
                 ExamSchedule::try_new(Some(ExamMode::try_new("open").unwrap()), None, None, None)
                     .unwrap(),
                 ExamAttemptLimit::try_new(1).unwrap(),
@@ -514,13 +519,11 @@ mod tests {
 
         /// The stored `exam_question_count` on one subject, absent = zero.
         async fn count_on(subject: &SubjectId, db: &Database) -> i64 {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT exam_question_count FROM subject WHERE id = $1",
-            )
-            .bind(subject.uuid())
-            .fetch_one(db)
-            .await
-            .unwrap()
+            sqlx::query_scalar::<_, i64>("SELECT exam_question_count FROM subject WHERE id = $1")
+                .bind(subject.uuid())
+                .fetch_one(db)
+                .await
+                .unwrap()
         }
 
         async fn rows(sql: &str, db: &Database) -> usize {

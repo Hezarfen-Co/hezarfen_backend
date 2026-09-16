@@ -1,14 +1,15 @@
-//! The `course_session` table: reads, a course's timetable listing, the
+//! The `course_session` table: reads, an instance's timetable listing, the
 //! request-scoped field update, and the delete that sweeps roll-call rows in
-//! one transaction. Creation stands on the course foreign key, so a lesson
-//! can never outlive its course; the web-facing doors and the
-//! teacher-resolution rule live in [`crate::service::course_session`].
+//! one transaction. Creation stands on the instance foreign key, so a lesson
+//! can never outlive the class×course instance it is a lesson of; the
+//! web-facing doors and the teacher-resolution rule live in
+//! [`crate::service::course_session`].
 
 use crate::constant::COURSE_SESSION_TABLE;
 use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::UserId;
@@ -16,7 +17,7 @@ use crate::error::AppError;
 
 pub async fn create(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     teacher: &UserId,
     topic: SessionTopic,
     starts_at: Timestamp,
@@ -24,28 +25,29 @@ pub async fn create(
 ) -> Result<CourseSession, AppError> {
     let session = CourseSession {
         id: CourseSessionId::generate(),
-        course: course.clone(),
+        class_course: class_course.clone(),
         teacher: *teacher,
         topic,
         starts_at,
         ends_at,
     };
-    // The course foreign key is the existence proof the old bump-and-restore
-    // "touch" trick faked: a lesson whose course is already gone — or which
-    // is deleted while this insert is in flight — is refused here, so a
-    // lesson can never outlive its course and 404 through
-    // `session_with_course` forever — unreadable, unpatchable, undeletable.
-    // `23503` is the parent-gone refusal, the same answer the touch
-    // produced.
+    // The instance foreign key is the existence proof the old
+    // bump-and-restore "touch" trick faked: a lesson whose instance is
+    // already gone — or which is detached while this insert is in flight — is
+    // refused here, so a lesson can never outlive the instance and 404
+    // through the session reads forever — unreadable, unpatchable,
+    // undeletable. `23503` is the parent-gone refusal, the same answer the
+    // touch produced.
     let created = sqlx::query_as!(
         CourseSession,
-        r#"INSERT INTO course_session (id, course, teacher, topic, starts_at, ends_at)
+        r#"INSERT INTO course_session (id, class_course, teacher, topic, starts_at, ends_at)
            VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+           RETURNING id AS "id: CourseSessionId",
+                     class_course AS "class_course: ClassCourseId",
                      teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
                      starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
         session.id.uuid(),
-        session.course.uuid(),
+        session.class_course.uuid(),
         session.teacher.uuid(),
         session.topic.as_str(),
         session.starts_at.as_millis(),
@@ -63,7 +65,8 @@ pub async fn create(
 pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSession>, AppError> {
     let session = sqlx::query_as!(
         CourseSession,
-        r#"SELECT id AS "id: CourseSessionId", course AS "course: CourseId",
+        r#"SELECT id AS "id: CourseSessionId",
+                  class_course AS "class_course: ClassCourseId",
                   teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
                   starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp"
            FROM course_session WHERE id = $1"#,
@@ -74,20 +77,20 @@ pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSe
     Ok(session)
 }
 
-/// A course's sessions, most recent lesson first. Ordered by `starts_at`
+/// An instance's sessions, most recent lesson first. Ordered by `starts_at`
 /// (not id): a timetable is read by when the lesson happens, not by when
 /// the row was created.
-pub async fn list_for_course(
+pub async fn list_for_class_course(
     db: &Database,
-    course: &CourseId,
+    class_course: &ClassCourseId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<CourseSession>, i64), AppError> {
     PagedList::new(
-        "course_session WHERE course = $1",
+        "course_session WHERE class_course = $1",
         "ORDER BY starts_at DESC, id DESC",
     )
-    .bind(course.uuid())
+    .bind(class_course.uuid())
     .run::<CourseSession>(limit, offset, db)
     .await
 }
@@ -147,7 +150,8 @@ pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSessi
         let deleted = sqlx::query_as!(
             CourseSession,
             r#"DELETE FROM course_session WHERE id = $1
-               RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+               RETURNING id AS "id: CourseSessionId",
+                     class_course AS "class_course: ClassCourseId",
                      teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
                      starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
             session.id.uuid(),
@@ -175,6 +179,9 @@ mod tests {
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_never_outlives_its_course() {
+        use crate::domain::course::CourseId;
+        use crate::domain::user::UserId;
+
         fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
             tokio::spawn(async move {
                 // The creator is a foreign key now: a real `app_user` row.
@@ -188,9 +195,27 @@ mod tests {
                 .execute(&db)
                 .await
                 .unwrap();
+                // The lesson hangs off the instance now, so the round has to
+                // attach one — that claim is exactly what the racing delete
+                // contends on, and a course already gone refuses right here.
+                let class = crate::db::class_group::create(
+                    &db,
+                    &creator,
+                    crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
+                    None,
+                    None,
+                    None,
+                )
+                .await?
+                .get_id()
+                .clone();
+                let instance = crate::service::class_course::attach(&db, &class, &course, &creator)
+                    .await?
+                    .get_id()
+                    .clone();
                 create(
                     &db,
-                    &course,
+                    &instance,
                     &creator,
                     SessionTopic::try_new("limits").unwrap(),
                     Timestamp::from_millis(1),
@@ -200,6 +225,13 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("course_session", make).await;
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "course_session",
+            "SELECT count(*) FROM course_session s
+               JOIN class_course cc ON cc.id = s.class_course
+              WHERE cc.course = $1",
+            make,
+        )
+        .await;
     }
 }

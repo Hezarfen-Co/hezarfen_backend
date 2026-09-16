@@ -51,6 +51,17 @@ pub struct SettingsPatch {
     pub dietary_tags: Option<Vec<String>>,
     /// Absent keeps the knob; `Some(None)` clears it (no cutoff at all).
     pub meal_cancel_cutoff_minutes: Option<Option<i64>>,
+    /// The school's branş list, raw like `dietary_tags` (the workflow's own
+    /// validation step, holding the stored list, decides whether an empty
+    /// list means "keep" or "clear" — see `Settings::try_new`).
+    pub branches: Option<Vec<String>>,
+    /// The devamsızlık excuse kinds, raw like `branches`.
+    pub excuse_kinds: Option<Vec<String>>,
+    /// Absent keeps the limit; `Some(None)` clears it (no ceiling).
+    pub max_excused_absent_days: Option<Option<i64>>,
+    pub max_unexcused_absent_days: Option<Option<i64>>,
+    /// Absent keeps the zone; `Some(None)` restores the deployment default.
+    pub timezone: Option<Option<String>>,
 }
 
 /// One submitted exam kind, raw.
@@ -166,6 +177,31 @@ pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, App
         params.meal_cancel_cutoff_minutes = patch
             .meal_cancel_cutoff_minutes
             .unwrap_or(params.meal_cancel_cutoff_minutes);
+        // The year's shape: the branş and excuse-kind lists ride the same
+        // idiom as `dietary_tags` below — an *absent* field keeps the stored
+        // list, an explicitly submitted one replaces it whole (empty is a
+        // legal list: a school that never configured branş keeps none), and
+        // both are validated by `Settings::try_new` under the stored-list
+        // rules at the end of this merge.
+        params.branches = patch
+            .branches
+            .clone()
+            .unwrap_or_else(|| current.get_branches());
+        params.excuse_kinds = patch
+            .excuse_kinds
+            .clone()
+            .unwrap_or_else(|| current.get_excuse_kinds());
+        // Double option, exactly like `meal_cancel_cutoff_minutes`: absent
+        // keeps the ceiling, `null` clears it (no limit).
+        params.max_excused_absent_days = patch
+            .max_excused_absent_days
+            .unwrap_or(params.max_excused_absent_days);
+        params.max_unexcused_absent_days = patch
+            .max_unexcused_absent_days
+            .unwrap_or(params.max_unexcused_absent_days);
+        // …and the school's day-bucketing zone: absent keeps the stored one,
+        // `null` puts the deployment default back.
+        params.timezone = patch.timezone.clone().unwrap_or(params.timezone.clone());
 
         let settings = Settings::try_new(params)?;
 
@@ -410,19 +446,19 @@ mod tests {
         // fresh list, where the same PATCH is a no-op that flips nothing.
         // (The old engine needed a hand-rolled undo list for this; the
         // transaction's own rollback is the undo now.)
-        let without_midterm = SettingsPatch {
-            exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
+        let without_sozlu = SettingsPatch {
+            exam_kinds: Some(kinds(&["yazili", "uygulama"])),
             ..a_patch()
         };
-        apply(&db, &without_midterm).await.unwrap(); // the winner
-        apply(&db, &without_midterm).await.unwrap(); // the loser, retried
+        apply(&db, &without_sozlu).await.unwrap(); // the winner
+        apply(&db, &without_sozlu).await.unwrap(); // the loser, retried
 
         assert_eq!(
-            kind_bit(&db, "midterm").await,
+            kind_bit(&db, "sozlu").await,
             Some(true),
             "the winner's retirement must outlive the loser's rollback"
         );
-        assert!(!stored(&db).await.0.contains(&"midterm".to_string()));
+        assert!(!stored(&db).await.0.contains(&"sozlu".to_string()));
     }
 
     /// The mirror hole: a re-*added* name is put back in service before the
@@ -516,6 +552,11 @@ mod tests {
             meal_slots: None,
             dietary_tags: None,
             meal_cancel_cutoff_minutes: None,
+            branches: None,
+            excuse_kinds: None,
+            max_excused_absent_days: None,
+            max_unexcused_absent_days: None,
+            timezone: None,
         }
     }
 
@@ -566,7 +607,7 @@ mod tests {
     async fn two_edits_dropping_the_same_kind_leave_it_retired() {
         let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
-            exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
+            exam_kinds: Some(kinds(&["yazili", "uygulama"])),
             ..a_patch()
         };
 
@@ -576,11 +617,11 @@ mod tests {
 
         let (kinds, _) = stored(&db).await;
         assert!(
-            !kinds.contains(&"midterm".to_string()),
+            !kinds.contains(&"sozlu".to_string()),
             "dropped from the list"
         );
         assert_eq!(
-            kind_bit(&db, "midterm").await,
+            kind_bit(&db, "sozlu").await,
             Some(true),
             "a kind the stored list no longer offers must not grade"
         );
@@ -601,7 +642,7 @@ mod tests {
     async fn a_rival_edit_cannot_run_between_a_retirement_and_its_save() {
         let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
-            exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
+            exam_kinds: Some(kinds(&["yazili", "uygulama"])),
             ..a_patch()
         };
 
@@ -619,17 +660,17 @@ mod tests {
             // commit already landed, so the list read that follows cannot
             // predate it. The other order races the commit between the two
             // probes and "sees" a split that never existed.
-            let retired = kind_bit(&db, "midterm").await;
+            let retired = kind_bit(&db, "sozlu").await;
             let (kinds, _) = stored(&db).await;
             if retired == Some(true) {
                 assert!(
-                    !kinds.contains(&"midterm".to_string()),
+                    !kinds.contains(&"sozlu".to_string()),
                     "a retirement became visible before its list commit"
                 );
             }
             if retired == Some(false) {
                 assert!(
-                    kinds.contains(&"midterm".to_string()),
+                    kinds.contains(&"sozlu".to_string()),
                     "an un-retirement became visible before its list commit"
                 );
             }
@@ -637,8 +678,8 @@ mod tests {
         }
 
         rival.await.unwrap().unwrap();
-        assert_eq!(kind_bit(&db, "midterm").await, Some(true));
-        assert!(!stored(&db).await.0.contains(&"midterm".to_string()));
+        assert_eq!(kind_bit(&db, "sozlu").await, Some(true));
+        assert!(!stored(&db).await.0.contains(&"sozlu".to_string()));
     }
 
     /// The mirror: two managers put the same kind *back* at once. The attempt
@@ -648,14 +689,12 @@ mod tests {
     async fn two_edits_re_adding_the_same_kind_leave_it_in_service() {
         let (db, _leases) = init_test_db().await;
         let without = SettingsPatch {
-            exam_kinds: Some(kinds(&["homework", "quiz", "final", "project", "oral"])),
+            exam_kinds: Some(kinds(&["yazili", "uygulama"])),
             ..a_patch()
         };
         apply(&db, &without).await.unwrap();
         let with = SettingsPatch {
-            exam_kinds: Some(kinds(&[
-                "homework", "quiz", "midterm", "final", "project", "oral",
-            ])),
+            exam_kinds: Some(kinds(&["yazili", "sozlu", "uygulama"])),
             ..a_patch()
         };
 
@@ -664,9 +703,9 @@ mod tests {
         b.unwrap();
 
         let (kinds, _) = stored(&db).await;
-        assert!(kinds.contains(&"midterm".to_string()), "back on the list");
+        assert!(kinds.contains(&"sozlu".to_string()), "back on the list");
         assert_eq!(
-            kind_bit(&db, "midterm").await,
+            kind_bit(&db, "sozlu").await,
             Some(false),
             "a kind the stored list offers must grade"
         );

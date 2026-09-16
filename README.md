@@ -14,36 +14,43 @@ per-file size cap is school policy in settings (`max_file_bytes`, default
 body into the recipient's inbox, each side filing its own copy through
 archive/trash with a read flag the sender sees as a receipt (the only place a
 `parent` writes). Attendance is event + attendees: create an event with an **audience**
-(the whole school, one role, a course's enrollment, a **class section's**
-roster, or a **registration** signup list — omit for school-wide), then teachers mark the expected attendees
+(the whole school, one role, a course **instance's** enrollment, a **class
+section's** roster, or a **registration** signup list — omit for school-wide), then teachers mark the expected attendees
 present / absent / late / excused (students never self-mark), and a **roster
 report** shows who was expected and who missed. Registration lists fill seat
 by seat: teachers register students (never the other way round), staff
 register only themselves, an optional `capacity` caps the seats, and the list
 closes the moment the event starts (or, for an event with only an end time —
 a pure signup deadline — the moment that end passes). Every event stays visible to everyone —
-the audience is a roster, not a wall. Marks are course-shaped
-(Google Classroom style): a teacher creates a course — kind **`course`** (a
+the audience is a roster, not a wall. Marks are **instance-shaped**. A **course** in `/courses` is a
+school-wide catalog row — kind **`course`** (a
 regular taught course), **`study`** (a supervised study session — *etüt*), or
-**`club`** (a student club — *kulüp*; same behavior, different label),
-optionally capped by a `capacity` that refuses new enrolls once the roster is
-full — lays out its **subjects** (curriculum topics —
+**`club`** (a student club — *kulüp*; same behavior, different label) — and it
+owns its **subjects** (curriculum topics —
 every exam question must be tagged with one of its course's subjects, so
-results can later be read per topic), enrolls students, adds
-exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
-all student-only, staff never take part. A course is run by whoever created it
-plus any teachers a **manager assigns** to it (`POST /courses/{id}/teachers`):
-an assigned teacher manages everything inside the course — exams, sessions,
-subjects, roster, grading — but can't delete it or change who else teaches it,
-and a demotion below `teacher` sweeps their assignments away. Students are
+results can later be read per topic). Nobody is enrolled in a catalog course:
+teaching happens in the **instance** — one class section × one course, created
+when the course is attached to the section (`POST /classes/{id}/instances`) and
+living at `/instances/{id}` with its own `ders_saati` (weekly lesson hours, its
+weight in the karne average), `counts_toward_karne` flag, teachers, roster,
+exams, lesson sessions and homework. Two sections that attach Matematik get
+**two** instances and share nothing: adding a student to 5-A enrolls them in
+5-A's Matematik only, and an exam written on 5-A's Matematik is invisible to
+5-B. The catalog row is office-owned (creator or manager+; clubs and etüt are
+the exception — see "Courses (catalog)"), while an instance is run by the
+teachers a **manager assigns** to it (`POST /instances/{id}/teachers`) plus the
+section's homeroom teacher: an assigned teacher manages everything inside the
+instance — exams, sessions, subjects, roster, grading — and a demotion below
+`teacher` sweeps their assignments away. Students are
 grouped into a **class section** (*şube* — 9-A, 10-B) when a school teaches
-that way: it is bulk enrollment, not a second kind of membership — attaching a
-course to it enrolls the whole roster, adding a member enrolls them into every
-course already attached, and what lands are ordinary enrollment rows tagged
-with the section that pumped them (untagged = placed by hand, and hand-placed
-rows are never adopted and never swept). A course without room for everyone
-refuses the whole operation, naming it (see "Class sections (şube)"). A section
-may also
+that way; the şube belongs to an **academic year** (`/academic-years`), and a
+term is a grading slice inside that year. Membership is a live stint: leaving
+(`DELETE /classes/{id}/members/{user}`) stamps `left_at` and gives the seat
+back, and re-adding inserts a fresh row — the section's history is never
+erased. Attaching a course to a section enrolls the whole roster, adding a
+member enrolls them into every instance already attached, and what lands are
+ordinary enrollment rows tagged with the section that pumped them (untagged =
+placed by hand; a şube sweep never adopts or removes those). A section may also
 name a **homeroom teacher** (*sınıf öğretmeni*, `teacher_id` — any teacher+
 account, cleared automatically when that account is demoted), and while every
 other class read is teacher+, a student reads their own section at
@@ -58,10 +65,15 @@ label (matched exactly, `?grade=` alone the ones carrying none), and
 `GET /classes/blueprints/{grade}/status` names, per section, the template
 courses it is still missing — which is how a partial pump is chased down after
 the response that reported it is gone. Students read a
-per-course weighted average and
+per-instance weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
-(midterms can count double, orals once: weights are set per kind in settings,
-not per exam). Exams run **sync** (one
+(a yazılı can count double, a sözlü once: weights are set per kind in settings,
+not per exam) — and `GET /marks/karne` rolls the whole year up: per-instance
+averages mapped to the school's grade bands, a year-to-date average weighting
+each instance by its `ders_saati`, and a `gecti`/`kaldi` verdict read off the
+band labelled `"2"`. Once a term is archived the karne serves the **frozen
+snapshot** taken at archive time, so a past report never changes under a staff
+edit. Exams run **sync** (one
 fixed window), **async** (start anytime inside the window, with a personal
 time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
@@ -96,7 +108,8 @@ backend records the focus stints — every one of them, though only stints of at
 least 5 minutes and at most 16 a UTC day *count* towards the badges — and
 teachers can read any student's log),
 and every user has an
-**attendance report** (event + per-course lesson tallies with rates).
+**attendance report** (event + per-instance lesson tallies with rates, plus
+the per-dönem devamsızlık day counts).
 A school-wide **question pool** runs on moderation: a student asks a question
 (optionally attaching one photo of the problem — raster only, same
 `max_file_bytes` cap), a teacher+ **approves** it into the pool (or deletes
@@ -704,7 +717,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 204 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 219 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -1036,30 +1049,36 @@ bought answers `403 {"error": "module disabled", …}` instead — see "Modules"
 
 A course is a regular taught course (kind `course`, the default), an *etüt* (kind
 `study` — a supervised study session), or a *kulüp* (kind `club` — a student
-club). The three kinds behave identically everywhere — enrollment, exams,
-sessions, marks — the kind is a label the UI renders differently, settable at
-creation and editable later. A course may also carry a `capacity`: once the
-roster reaches it, new enrolls are refused with `409` (members already on the
-roster are unaffected, even if the cap is later lowered below them; `null`
-lifts the cap).
+club). The three kinds behave identically everywhere, and the kind is a label
+the UI renders differently, settable at creation and editable later. A course
+is a **catalog row**: it owns its **subjects** (curriculum topics) and carries
+counters — `class_course_count`, `course_membership_count` — never a roster of
+its own. There is no `capacity` anywhere: no route refuses an enroll for room,
+and a counter is a count, not a cap. Teaching happens in the **instance**
+(`/instances`): one class × course row, minted by attaching the course to a
+section, carrying its own teachers, hours, roster, exams, sessions and homework.
 
-**Who runs a course.** Its **creator** owns it for good — only they (or a
-manager+) may delete it. On top of that, a manager can **assign** any
-`teacher`+ to the course with `POST /courses/{id}/teachers` (`{user_id}`,
-idempotent) and drop them again with `DELETE /courses/{id}/teachers/{user}`.
-An assigned teacher gets full **course-management rights** — edit the course,
-enroll and unenroll students, add exams, sessions and subjects, grade, take
-roll call — but *not* the two owner powers: they cannot delete the course, and
-they cannot change who else teaches it. Staffing is deliberately the office's
-call, so a course's own creator cannot hand rights to their peers; only
-manager+ may touch the list. Every course response carries its `teachers`
-array alongside `creator`, and a user demoted below `teacher` is swept off
-every course they were assigned to (the mirror of promotion dropping
-enrollments). That sweep runs once, so an assignment landing in the same
-instant would survive it: the assign call therefore re-reads the account's live
-role **after** its write and answers `409` — dropping the assignment again — if
-it has since fallen below `teacher`. Same guard, same wording, as a class's
-homeroom teacher.
+A catalog course is **office-owned**: only its **creator** (or a manager+) may
+edit or delete it. The two kinds a section does not teach are the exception —
+a *kulüp* or an *etüt* is joined directly, with `POST /courses/{id}/members`
+(the school-scoped membership a student may join and leave on their own). A
+`course`-kind row refuses that join (`409`): a ders is taken through a şube's
+instance, never directly.
+
+**Who runs an instance.** Its **teachers** — each a `teacher`+ account a
+manager assigned with `POST /instances/{id}/teachers` (`{user_id}`, idempotent;
+drop them with `DELETE /instances/{id}/teachers/{user}`) — plus the **homeroom
+teacher of its class**. Instance teachers manage everything inside it: its
+`ders_saati` and karne weight, its roster, its exams, sessions and homework,
+grading and roll call. Staffing is deliberately the office's call; a manager+
+caller may always do the same, and nobody else may touch the teacher list.
+Every instance response carries its `teachers` array. A user demoted below
+`teacher` is swept off every instance they were assigned to (the mirror of
+promotion dropping enrollments) and off every homeroom they held. That sweep
+runs once, so an assignment landing in the same instant would survive it: the
+assign call therefore re-reads the account's live role **after** its write and
+answers `409` — dropping the assignment again — if it has since fallen below
+`teacher`. Same guard, same wording, as a class's homeroom teacher.
 
 Ownership is **not** a standing grant. `creator` is a historical column that no
 demotion sweeps (unlike the assignment list above), so every course-management
@@ -1070,23 +1089,28 @@ manager+, who can hand it to someone else. Nothing below is a right a caller
 holds while under `teacher`. The column is deliberately **not** swept the way
 the assignment list is: it answers "who made this", which stays true after a
 demotion — it is the *grant* that is role-gated, not the history. The same
-floor applies to the catalogs: a demoted creator's own course drops out of
-their `/courses`, `/exams` and `/homework` lists, and comes back only if they
-are enrolled in it, as any student would be. A session's `teacher` behaves
+floor applies to the catalogs: a demoted creator's own catalog row drops out
+of their `/courses` list, and comes back only if they are enrolled in one of
+its instances, as any student would be. A session's `teacher` behaves
 identically — teaching a session grants no roll call, and no view of it, once
 the account is below `teacher`.
 
-Course data is walled per course. A course, its exams, its sessions, and its
-subjects are
-**visible** only to its enrolled users, its creator, its assigned teachers,
-and manager+ — a student
-sees just the classes they were added to, and the `/courses` / `/exams`
-catalogs are filtered accordingly. Teacher-level reads *inside* a course
+Teaching data is walled **per instance**. An instance, its exams, its sessions,
+its homework and its rosters are
+**visible** only to its enrolled students, its assigned teachers, its class's
+homeroom teacher, and manager+ — a student
+sees just the instances their sections carry or they joined, and `/exams`,
+`/homework` and `/instances/me` are filtered accordingly. The catalog row, its
+subjects and its membership list are readable by that same audience (a student
+enrolled in any of its instances, a teacher assigned to one, a member of the
+catalog row itself, its creator, manager+). Teacher-level reads *inside* an
+instance
 (roster, results, statistics, the question list, answer sheets, the live
-monitor) additionally need **course-management rights** (creator, an assigned
-teacher, or manager+ — each of them still `teacher`+ today):
-one teacher cannot look into another teacher's course, and the per-user
-marks/attendance reports narrow to the courses the caller manages.
+monitor) additionally need **instance-management rights** (manager+, one of its
+assigned teachers, or its class's homeroom teacher — each of them still
+`teacher`+ today):
+one teacher cannot look into another teacher's instance, and the per-user
+marks/attendance reports narrow to the instances the caller manages.
 
 **Paging.** Every list endpoint below (the rows tagged **· paged**) accepts
 `?limit=&offset=` and returns a `{ items, total, limit, offset }` envelope
@@ -1119,6 +1143,12 @@ window filtering, before paging; negative values are a `400` naming the field.
 | Method | Path                                                             | Auth    | Description |
 |--------|------------------------------------------------------------------|---------|-------------|
 | GET    | `/`                                                              | no      | Same as `/health` |
+| GET    | `/academic-years`                                                | teacher | List every academic year, newest first. Requires teacher+. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/academic-years`                                                | manager | Create an academic year. Requires manager+. Past dates are allowed — years are calendar structure, not schedules. `grade_promotions` is the sınıf-geçme policy the rollover applies. |
+| GET    | `/academic-years/{id}`                                           | teacher | Fetch a single academic year by id. Requires teacher+. |
+| PATCH  | `/academic-years/{id}`                                           | manager | Update an academic year. Requires manager+. Omitted fields keep their value; `grade_promotions` is replaced as a whole when sent. An archived year is read-only. |
+| DELETE | `/academic-years/{id}`                                           | manager | Delete an academic year. Requires manager+. Refused with a 409 while any şube or dönem still links it — move or delete them first. An archived year must be re-opened (`PATCH` is not enough: there is no unarchive here, so the row is only deletable while open) like every other past-structure write. |
+| POST   | `/academic-years/{id}/rollover`                                  | manager | Carry another year's şubeler into this one. Requires manager+. Each şube of `from_year` whose grade the target year promotes is planted afresh here — same name, mapped grade, and copies of its instances (`ders_saati`, karne policy, teachers) and of every live member, who are also enrolled into the new instances. A grade with no promotion entry stays behind: that is graduation, and `graduated` names it. The target must be empty (a second rollover into it is a 409, which is what makes the command idempotent), open, and different from the source. |
 | GET    | `/ai/certificate`                                                | no      | The AI bridge's certificate (PEM + SHA-256 fingerprint) for a service to pin; `404` when the bridge is off. |
 | GET    | `/api-docs/openapi.json`                                         | no      | Raw OpenAPI 3 spec |
 | GET    | `/appointments`                                                  | student | List bookings, newest first. Students and parents see the ones they requested; teacher+ see the ones aimed at their own slots — their request inbox. Managers and admins read their own inbox too (they may still decide any booking by id). Paged via `?limit=&offset=` (omit `limit` for every booking); returns a `{items, total, limit, offset}` envelope. |
@@ -1133,8 +1163,8 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/appointments/{id}/reschedule`                                  | teacher | Counter-propose another time for a booking, on the same row (the reason and the history stay in one place). Requires teacher+ and ownership of the slot (or manager/admin). |
 | PATCH  | `/appointments/{id}/reschedule/accept`                           | student | Accept the teacher's counter-proposal. The requester's call alone — it is their commitment. Accepting *is* approval at the proposed time, so the double-booking guard runs again for both sides (`409` if the moved time now collides with something else, or has already started — agreeing to a window that began would mint a meeting nobody can cancel). |
 | PATCH  | `/appointments/{id}/reschedule/decline`                          | student | Refuse the teacher's counter-proposal. The requester's call alone, and it **cancels the booking**: the proposal replaced the time that was asked for, so there is nothing left to fall back to — book another slot instead. The slot frees up, and the original request stays readable as `cancelled` with the refused proposal still on it. Declining is a cancel, so it answers to the same deadline: `409` once the meeting's effective window has started. |
-| GET    | `/attendance/me`                                                 | student | The current user's attendance report: event tallies, lesson roll-call tallies, and a per-course breakdown with attendance rates. |
-| GET    | `/attendance/{user}`                                             | teacher | Any user's attendance report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every course; a teacher sees the event tallies plus only the roll-call blocks of the target's courses they manage. |
+| GET    | `/attendance/me`                                                 | student | The current user's attendance report: event tallies, lesson roll-call tallies, a per-instance breakdown with attendance rates, and the per-dönem devamsızlık. |
+| GET    | `/attendance/{user}`                                             | teacher | Any user's attendance report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every instance; a teacher sees the event tallies plus only the roll-call blocks — and the devamsızlık days — of the instances they run. |
 | POST   | `/auth/login`                                                    | no      | Log in with username + password — no school. Sets a `session` cookie on success: exactly one active membership enters that school right away (`<slug>.<token>` and the full [`UserResponse`], unchanged for single-school clients), several answer a [`SchoolChoiceResponse`] with a `person.<token>` cookie that `POST /auth/school` binds. |
 | POST   | `/auth/logout`                                                   | no      | Log out: revoke the current session (if any) and clear the cookie. Idempotent — no session required; answers `204` either way. |
 | GET    | `/auth/me`                                                       | student | Return the currently authenticated user. |
@@ -1175,7 +1205,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/chatbot/threads/{id}/messages/{mid}`                           | student | Poll one turn. The non-SSE fallback for `/stream`, reading the same row — including the projection that presents a long-stale `pending` as `failed`, so the two can never disagree about a turn's state. |
 | GET    | `/chatbot/threads/{id}/messages/{mid}/stream`                    | student | Watch one turn as Server-Sent Events: `delta` chunks of the answer, then a single `done` carrying the finished message, or one `error`. The stream closes after `done`/`error` — one stream per turn, not per thread. |
 | GET    | `/classes`                                                       | teacher | List every class, newest first. Requires teacher+. `?grade=` narrows to one grade label, matched exactly as written — the label a blueprint is keyed by, so this is the read that shows which sections a `POST /classes/blueprints` pump covered (and `?grade=` on its own lists the sections with no grade at all). An unknown label is an empty page, not a `404`. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope whose `total` counts every class under the same filter, not just this page. |
-| POST   | `/classes`                                                       | manager | Create a class. Requires manager+ — a class is school structure, not a teacher's own room. `grade` is a free-text label for the year ("9", "10-A"), `term_id` links the school calendar, `teacher_id` names the homeroom teacher (sınıf öğretmeni, a teacher+ account); all optional. |
+| POST   | `/classes`                                                       | manager | Create a class. Requires manager+ — a class is school structure, not a teacher's own room. `grade` is a free-text label for the year ("9", "10-A"), `year` links the academic year (which is what binds the şube to a karne and to the rollover), `teacher_id` names the homeroom teacher (sınıf öğretmeni, a teacher+ account); all optional. |
 | GET    | `/classes/blueprints`                                            | manager | List every grade blueprint, by grade label. Requires manager+. Paged via `?limit=&offset=` (omit `limit` for all of them). |
 | POST   | `/classes/blueprints`                                            | manager | Create a grade's course blueprint and stock every class section already at that grade with it. Requires manager+. |
 | GET    | `/classes/blueprints/{grade}`                                    | manager | Fetch one grade's blueprint. Requires manager+. |
@@ -1185,17 +1215,17 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/classes/me`                                                    | student | The classes the caller is a member of, newest membership first. Any authenticated role — this is the one class read a student (or a parent, for themselves) can make, since every other `/classes` route is teacher+. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. Staff, who are never class members, simply get an empty page. |
 | GET    | `/classes/user/{user}`                                           | teacher | Another user's classes. Requires teacher+, or a parent tied to the target student — the same bar the per-student reports hold, and the same 403 for everyone else (a student reads their own at `GET /classes/me`). |
 | GET    | `/classes/{id}`                                                  | teacher | Fetch a single class by id. Requires teacher+. |
-| PATCH  | `/classes/{id}`                                                  | manager | Update a class. Requires manager+. Omitted fields keep their value; `grade`, `term_id` and `teacher_id` are nullable, so an explicit `null` clears them. |
+| PATCH  | `/classes/{id}`                                                  | manager | Update a class. Requires manager+. Omitted fields keep their value; `grade`, `year` and `teacher_id` are nullable, so an explicit `null` clears them. |
 | DELETE | `/classes/{id}`                                                  | manager | Delete a class. Requires manager+. Refused with a 409 while it still holds students or courses — nothing cascades, because dropping the class silently would leave the enrollments it pumped with nothing left to sweep them. |
 | POST   | `/classes/{id}/blueprint`                                        | manager | Stock one class section from its grade's blueprint. Requires manager+ — this writes the roster of every course in the template, which is the office's call, not one course owner's. |
-| GET    | `/classes/{id}/courses`                                          | teacher | List the courses a class is attached to, newest first, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/classes/{id}/courses`                                          | teacher | Attach a course to a class. Requires teacher+ and management rights **on that course** — attaching writes its roster, so it takes exactly the right enrolling into it does. The class's whole roster is enrolled in one go: a course that cannot hold all of them takes none (409), and students already enrolled by hand keep their own rows. Attaching the same course twice is a 409. |
-| DELETE | `/classes/{id}/courses/{course}`                                 | teacher | Detach a course from a class. Requires teacher+ and management rights on that course, like attaching. The enrollments the class pumped into it are swept — except rows another attached class still claims (re-tagged to it) and rows placed by hand (left standing). A course that was not attached is a 404 — but a course row that is *gone* is not: the link a deleted course left behind detaches (the rights check has nothing left to read, and no roster left to protect), or the class holding it could never be deleted. |
+| GET    | `/classes/{id}/instances`                                        | teacher | List the instances a class carries — each a catalog course as this section teaches it, with its hours, karne policy and teachers — newest first, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+. Returns a `{items, total, limit, offset}` envelope. `POST /instances/{id}` edits one; this is the read that names them. |
+| POST   | `/classes/{id}/instances`                                        | teacher | Attach a course to a class: this is what **mints the instance** — the class×course row every exam, session, lesson and roster under this class's course now keys on. Requires teacher+ and catalog rights on that course (its creator, or a manager/admin): attaching writes that course's roster for this section, and the weekly hours and karne policy the instance starts with. The class's whole roster is enrolled in one go, and students already enrolled by hand keep their own rows. Attaching the same course twice is a 409. |
+| DELETE | `/classes/{id}/instances/{instance}`                             | teacher | Detach an instance from a class: the instance and everything the class taught under it — exams (with results, questions and images), homework (with submissions and grades), sessions and roll call, the roster it pumped and its teacher links — are swept, and the uploaded files those rows named are unlinked from disk. Requires teacher+ and catalog rights on the course the instance teaches (its creator, or a manager/admin): this is the inverse of attaching. |
 | GET    | `/classes/{id}/members`                                          | teacher | List a class's roster, newest first, paged via `?limit=&offset=` (omit `limit` for the whole roster). Requires teacher+. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/classes/{id}/members`                                          | manager | Put a student in a class. Requires manager+. They are enrolled into every course the class already carries, in one go: a course with no free seat refuses the whole join with a 409 naming it, and a student already enrolled by hand keeps the row they have (no second seat, and it survives their removal from the class). Adding the same student twice is a 409. |
-| DELETE | `/classes/{id}/members/{user}`                                   | manager | Take a student out of a class. Requires manager+. The enrollments the class pumped for them are swept with it — except rows another attached class still claims (re-tagged to it) and rows placed by hand (left standing). A student who was not in the class is a 404. |
-| GET    | `/course-notes`                                                  | student | List a course's notes, newest first. Visible to whoever can view the course (its enrolled users, creator, assigned teachers, and managers/admins). Paged via `?limit=&offset=`. |
-| POST   | `/course-notes`                                                  | teacher | Create a note on a course. Requires teacher+ and management rights over the course (its creator, an assigned teacher, or a manager/admin). |
+| POST   | `/classes/{id}/members`                                          | manager | Put a student in a class. Requires manager+. They are enrolled into every instance the class already carries, in one go, and a student already enrolled by hand keeps the row they have (and it survives their removal from the class). Adding the same student twice is a 409; a student who *left* is added afresh — the roster is a history, and the partial index only holds one live stint per pair. |
+| DELETE | `/classes/{id}/members/{user}`                                   | manager | Take a student out of a class. Requires manager+. The enrollments the class pumped for them are swept with it — except rows placed by hand, which are left standing. There is no heir to hand a swept row to: a second section teaching the same course holds its **own** instance, so its roster is its own row and this one is released. A student who was not in the class is a 404. |
+| GET    | `/course-notes`                                                  | student | List a course's notes, newest first. Visible to whoever can view the course (its creator, a manager/admin, or anyone the course reaches). Paged via `?limit=&offset=`. |
+| POST   | `/course-notes`                                                  | teacher | Create a note on a course. Requires teacher+ and catalog rights over the course (its creator or a manager/admin). |
 | GET    | `/course-notes/{id}`                                             | student | Fetch a single course note by id. Visible to whoever can view its course. |
 | PATCH  | `/course-notes/{id}`                                             | teacher | Update a course note's title and/or content. Omitted fields keep their value. Requires teacher+ and management rights over the course. |
 | DELETE | `/course-notes/{id}`                                             | teacher | Delete a course note, along with its files. Requires teacher+ and management rights over the course. |
@@ -1205,25 +1235,17 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/course-notes/{id}/files/{file_id}`                             | teacher | Delete a course note file (row first, then its blob). Requires teacher+ and management rights over the course. |
 | GET    | `/course-notes/{id}/rag`                                         | student | List a course note's AI outputs, newest first. Visible to whoever can view the course. Paged via `?limit=&offset=`. |
 | DELETE | `/course-notes/{id}/rag/{output_id}`                             | teacher | Delete one stored AI output. Requires teacher+ and management rights over the course. Dropping an output does not stop the next note or file change from regenerating one. |
-| GET    | `/courses`                                                       | student | List the courses visible to the caller: every course for manager+, otherwise the courses they created plus the ones they're enrolled in. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses`                                                       | teacher | Create a course owned by the current user. Requires the `teacher` role or higher. `kind` picks the flavor — `course` (a regular class, the default), `study` (a supervised study session — etüt), or `club` (a student club — kulüp); all behave identically. `capacity` caps the roster at enroll time (omit for unlimited). |
-| GET    | `/courses/me`                                                    | student | The courses the current user is enrolled in, paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. |
-| GET    | `/courses/{id}`                                                  | student | Fetch a single course by id. Visible to its enrolled users, and to its creator, its assigned teachers and managers/admins while those accounts are still `teacher`+ — a demoted creator sees it only if they are enrolled, like any other student (see [`can_manage_course`]). |
-| PATCH  | `/courses/{id}`                                                  | teacher | Update a course. Requires teacher+ and course management rights — its creator, a teacher assigned to it, or a manager/admin. Omitted fields keep their value. |
-| DELETE | `/courses/{id}`                                                  | teacher | Delete a course. Requires teacher+; only its creator or a manager/admin may delete it — an assigned teacher runs the course but does not own it. Refused with a 409 while anyone is still enrolled — empty the roster first, so a course that carries students is never dropped by accident. Once empty, it cascades the course's exams (with their results, questions, answers, and question images), its homework (with submissions, submission files, and grades), its sessions and roll call, and its subjects. It also detaches the course from every class that carried it and strikes its id out of every class blueprint that named it — a template holding a course nothing can resolve is a stocking run that skips it and a `PATCH` that refuses the very list the template already holds. |
-| GET    | `/courses/{id}/enrollments`                                      | teacher | List a course's roster, paged via `?limit=&offset=` (omit `limit` for the whole roster). Requires teacher+ and course management rights — students see their own courses via `GET /courses/me`. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses/{id}/enrollments`                                      | teacher | Enroll a user into a course (idempotent upsert). Requires teacher+ and course management rights. Only students can be enrolled — enrollment is student membership, and it gates sitting exams, being graded, and the class roster, all student-only. A course with a `capacity` refuses new members once the roster is full (someone already enrolled is returned as-is). Enrolling a student a class pumped in takes the row *off* that class — `source` comes back `null` — so a later class sweep can no longer undo a placement made by hand, the mirror of a manual unenroll winning permanently. |
-| DELETE | `/courses/{id}/enrollments/{user}`                               | teacher | Unenroll a user from a course. Requires teacher+ and course management rights. Existing exam results are kept (they disappear from the user's marks report until re-enrolled). |
-| GET    | `/courses/{id}/exams`                                            | student | List a course's exams, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to the course's enrolled users, its creator, and managers/admins — but drafts appear only to the course's managers. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses/{id}/exams`                                            | teacher | Create an exam inside a course. Requires teacher+ and course management rights; the exam's marks count into the course average with its kind's weight (`GET /settings`). Omit `mode` for an offline-graded exam nobody can sit; `sync`/`async` take a window (async also `duration_ms`), `open` is sittable anytime with an optional per-attempt `duration_ms`. `max_attempts` (default 1, `0` = unlimited) meters retakes and `allow_rejoin` (default `true`) is the exam-room door — both stay editable while the exam runs. Send `draft: true` to keep the exam private while it's still being written: only the course's managers see it, and sitting and grading are blocked until it's published (`PATCH` `draft: false`). |
-| GET    | `/courses/{id}/homework`                                         | student | List a course's homework, newest first, paged via `?limit=&offset=` (omit `limit` for all of it). Visible to the course's enrolled users, its creator, its assigned teachers, and managers/admins — but a student sees only the homework they are assigned (whole-course ones plus subsets that name them, each with its `assigned` narrowed to themselves). Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses/{id}/homework`                                         | teacher | Assign a homework inside a course. Requires teacher+ and course management rights. The homework is tagged with one of the course's subjects and given a future `due_at`; `assigned` optionally narrows it to a subset of the enrolled students (omit or empty = the whole course). |
-| GET    | `/courses/{id}/sessions`                                         | student | List a course's lesson sessions, most recent first, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to the course's enrolled users, its creator, and managers/admins. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses/{id}/sessions`                                         | teacher | Create a lesson session inside a course. Requires teacher+ and course management rights. The session's teacher defaults to the caller. |
-| GET    | `/courses/{id}/subjects`                                         | student | List a course's subjects in creation order, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to the course's enrolled users, its creator, and managers/admins. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/courses/{id}/subjects`                                         | teacher | Create a subject inside a course. Requires teacher+ and course management rights. Subjects are the course's curriculum topics — every exam question must be tagged with one of its course's subjects. |
-| POST   | `/courses/{id}/teachers`                                         | manager | Assign a teacher to a course (idempotent). Manager+ only — staffing is the office's call, so a course's own creator cannot hand management rights to their peers. The assignee must already hold the `teacher` role or higher; assigning gives them full management of the course (exams, sessions, subjects, roster, grading) but not the power to delete it or change this list. The course's assigned teachers are returned on every course response. |
-| DELETE | `/courses/{id}/teachers/{user}`                                  | manager | Unassign a teacher from a course. Manager+ only. The course itself, its exams, sessions, and roster are untouched — the teacher just loses their management rights over it. A user who was never assigned is a 404. |
+| GET    | `/courses`                                                       | student | List the catalog courses visible to the caller: every course for manager+, otherwise the courses they teach somewhere plus the ones they're enrolled in. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/courses`                                                       | teacher | Create a catalog course owned by the current user. Requires the `teacher` role or higher. `kind` picks the flavor — `course` (a regular class, the default), `study` (a supervised study session — etüt), or `club` (a student club — kulüp). A catalog row teaches nobody by itself: a şube attaches it into an instance (`POST /classes/{id}/instances`), and a `study`/`club` is joined school-wide (`POST /courses/{id}/members`). |
+| GET    | `/courses/me`                                                    | student | The catalog courses the current user is reached by, paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/courses/{id}`                                                  | student | Fetch a single catalog course by id. Visible to the people it reaches — students enrolled in any of its instances, members of the course itself — and to its creator and managers/admins while those accounts are still `teacher`+. |
+| PATCH  | `/courses/{id}`                                                  | teacher | Update a catalog course. Requires teacher+ and catalog rights — its creator, or a manager/admin. Omitted fields keep their value. |
+| DELETE | `/courses/{id}`                                                  | teacher | Delete a catalog course. Requires teacher+; only its creator or a manager/admin may delete it. Refused with a 409 while the course is still taught anywhere — detach it from every şube (`DELETE /classes/{id}/instances/{instance}`) and remove its individual members first, so a course that carries teaching is never dropped by accident. Once free, it cascades the instances' exams (with their results, questions, answers, and question images), homework (with submissions, submission files, and grades), sessions and roll call, its individual memberships, its subjects, and the teacher links. It also strikes its id out of every class blueprint that named it — a template holding a course nothing can resolve is a stocking run that skips it and a `PATCH` that refuses the very list the template already holds. |
+| GET    | `/courses/{id}/members`                                          | teacher | List a club/etüt's members, newest first, paged via `?limit=&offset=` (omit `limit` for the whole list). Requires teacher+ and catalog rights. Returns a `{items, total, limit, offset}` envelope. An instance's roster is `GET /instances/{id}/enrollments`. |
+| POST   | `/courses/{id}/members`                                          | teacher | Add a user to a club or etüt — the **school-scoped** membership tier. Requires teacher+ and catalog rights (its creator, or a manager/admin). Only students can be added, and only to a `study` (etüt) or `club` (kulüp): a regular ders (`kind` `course`) has no school-wide roster — its students come from the şubeler that teach it, and that join is `POST /instances/{id}/enrollments` (400 here). Idempotent: a pair that already holds a membership is returned as-is. |
+| DELETE | `/courses/{id}/members/{user}`                                   | teacher | Remove a user from a club or etüt. Requires teacher+ and catalog rights. Existing exam results and badges are untouched — the membership is a door, not a record of what happened inside. A pair holding no membership is a 404. |
+| GET    | `/courses/{id}/subjects`                                         | student | List a course's subjects in creation order, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to its creator, to managers/admins, and to anyone the course reaches (a student enrolled in one of its instances, or a member of it). Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/courses/{id}/subjects`                                         | teacher | Create a subject inside a course. Requires teacher+ and catalog rights (its creator, or a manager/admin). Subjects are the curriculum topics of the *catalog* row — every exam of every instance teaching it tags its questions with one of them. |
 | GET    | `/events`                                                        | student | List all events, newest first. Paged via `?limit=&offset=` (omit `limit` for every event); returns a `{items, total, limit, offset}` envelope. |
 | POST   | `/events`                                                        | teacher | Create an event owned by the current user. Requires the `teacher` role or higher. `audience` targets it at a role, a course's enrollment, a class section's roster, or a registration list (filled via `POST /events/{id}/register`); omitted it is school-wide. Everyone still sees every event — the audience is the expected-attendee roster, not a visibility wall. |
 | GET    | `/events/{id}`                                                   | student | Fetch a single event by id. |
@@ -1235,67 +1257,83 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/events/{id}/register`                                          | teacher | Put a user on a registration-audience event's signup list. Requires teacher+. `user_id` must name a student — students are placed by staff and never register themselves; omit it to take a seat yourself (staff self-serve, so registering another teacher/manager is refused). Registering the same person twice is a no-op returning the existing seat. The list closes when the event starts (or its ends_at-only deadline passes) and refuses to grow past `capacity`. |
 | DELETE | `/events/{id}/register/{user}`                                   | teacher | Take a user off the signup list — the register rules mirrored: teacher+, students' seats or your own (another *staff* member's seat only if their account no longer exists), and only while the list is open (the event hasn't started or, ends_at-only, passed). A seat held by a `parent` is freeable by any teacher+ as well: no route lets that account free it itself, so a stranded seat needs a door. Attendance already marked stays recorded. |
 | GET    | `/events/{id}/roster`                                            | teacher | The event's expected-attendee roster joined with its attendance marks — the who-came/who-missed report. Resolved live from the audience (today's role holders, current enrollment, the current class roster, the current signup list), so it always reflects the present roster; attendance rows for people no longer in the audience are omitted here (they remain in `GET /events/{id}/attendance`). Requires teacher+. Paged via `?limit=&offset=` (omit `limit` for the whole roster). |
-| GET    | `/exams`                                                         | student | List the exams visible to the caller: every exam for manager+, otherwise the exams of the courses they created or are enrolled in — minus other people's drafts (a draft shows only to its course's managers). Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
-| GET    | `/exams/{id}`                                                    | student | Fetch a single exam by id. Visible to its course's enrolled users, the course creator, and managers/admins — except drafts, which only the course's managers see (everyone else gets a `404`, as if the exam doesn't exist yet — because it doesn't, officially). |
-| PATCH  | `/exams/{id}`                                                    | teacher | Update an exam. Requires teacher+ and management rights over the exam's course (its creator, or manager/admin). Omitted fields keep their value; an explicit `null` clears a schedule field; the course itself is not updatable. The schedule must stay consistent as a whole (see the create endpoint), and `mode` is frozen once anyone has started an attempt — times, duration, `max_attempts`, and `allow_rejoin` stay editable so a running exam can be extended, granted retakes, or have its rejoin door opened live. `draft: false` publishes a draft; `draft: true` re-hides an exam, but only while it has no attempts and no results (`409` otherwise) — students never lose sight of an exam they've already sat or been graded on. |
-| DELETE | `/exams/{id}`                                                    | teacher | Delete an exam. Requires teacher+ and management rights over the exam's course (its creator, or manager/admin). Cascades the exam's results, attempts, questions, answers, and question + answer images (blobs included). |
+| GET    | `/exams`                                                         | student | List the exams visible to the caller: every exam for manager+, otherwise the exams of the instances they teach or are enrolled in — minus other people's drafts (a draft shows only to its instance's managers). Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/exams/{id}`                                                    | student | Fetch a single exam by id. Visible to its instance's enrolled students, its teachers (or its class's homeroom teacher), and managers/admins — except drafts, which only the instance's managers see (everyone else gets a `404`, as if the exam doesn't exist yet — because it doesn't, officially). |
+| PATCH  | `/exams/{id}`                                                    | teacher | Update an exam. Requires teacher+ and management rights over the exam's instance (an assigned teacher, its class's homeroom teacher, or a manager/admin). Omitted fields keep their value; an explicit `null` clears a schedule field; the instance an exam hangs off is not updatable here. The schedule must stay consistent as a whole (see the create endpoint), and `mode` is frozen once anyone has started an attempt — times, duration, `max_attempts`, and `allow_rejoin` stay editable so a running exam can be extended, granted retakes, or have its rejoin door opened live. `draft: false` publishes a draft; `draft: true` re-hides an exam, but only while it has no attempts and no results (`409` otherwise) — students never lose sight of an exam they've already sat or been graded on. |
+| DELETE | `/exams/{id}`                                                    | teacher | Delete an exam. Requires teacher+ and management rights over the exam's instance (an assigned teacher, its class's homeroom teacher, or a manager/admin). Cascades the exam's results, attempts, questions, answers, and question + answer images (blobs included). |
 | GET    | `/exams/{id}/attempt`                                            | student | The caller's own (latest) attempt: status, deadline, remaining time, and mark once graded — everything a student's live exam screen needs, judged by the server clock. `404` until an attempt is started. |
-| POST   | `/exams/{id}/attempt`                                            | student | Start, resume, or retake the caller's attempt. Requires the student role (staff run exams, they don't sit them), enrollment in the exam's course, a sittable exam (`sync`/`async`/`open` mode), and — when a window exists — the window to be open. A still-running attempt is returned as-is (`200` instead of `201`), so a reconnecting client gets its original clock back — re-starting never resets the time. Once the latest attempt is submitted or expired, re-posting starts the next sitting (`201`, blank answer sheet) while the exam's `max_attempts` (0 = unlimited) allows it. |
-| POST   | `/exams/{id}/attempt/answers`                                    | student | Save (or overwrite) one answer in the caller's in-progress attempt. `choice` questions take `selected`; `text` questions take `text`. Requires the student role and enrollment in the exam's course — an unenrollment (or a promotion out of `student`) mid-exam closes the sheet. Rejected once the attempt is submitted or its deadline has passed — the server clock, not the client's, is the judge — and rejected while the student has left the exam room with the rejoin door closed. |
+| POST   | `/exams/{id}/attempt`                                            | student | Start, resume, or retake the caller's attempt. Requires the student role (staff run exams, they don't sit them), enrollment in the exam's instance, a sittable exam (`sync`/`async`/`open` mode), and — when a window exists — the window to be open. A still-running attempt is returned as-is (`200` instead of `201`), so a reconnecting client gets its original clock back — re-starting never resets the time. Once the latest attempt is submitted or expired, re-posting starts the next sitting (`201`, blank answer sheet) while the exam's `max_attempts` (0 = unlimited) allows it. |
+| POST   | `/exams/{id}/attempt/answers`                                    | student | Save (or overwrite) one answer in the caller's in-progress attempt. `choice` questions take `selected`; `text` questions take `text`. Requires the student role and enrollment in the exam's instance — an unenrollment (or a promotion out of `student`) mid-exam closes the sheet. Rejected once the attempt is submitted or its deadline has passed — the server clock, not the client's, is the judge — and rejected while the student has left the exam room with the rejoin door closed. |
 | GET    | `/exams/{id}/attempt/answers/{qid}/image`                        | student | The caller's own drawn-answer bytes. Same visibility wall as the sitting question view — enrollment plus a started attempt (404 before that). |
 | POST   | `/exams/{id}/attempt/answers/{qid}/image`                        | student | Attach (or replace) the caller's drawn answer to a question inside their in-progress attempt. `multipart/form-data` with the drawing under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes`. Rides the exact `POST /exams/{id}/attempt/answers` gate chain: the student role, an in-progress attempt, current enrollment, and the rejoin door. |
 | DELETE | `/exams/{id}/attempt/answers/{qid}/image`                        | student | Clear the caller's drawn answer to a question. Same writable-attempt gate chain as the upload. |
 | POST   | `/exams/{id}/attempt/finish`                                     | student | Submit the caller's attempt. Allowed while the deadline hasn't passed; after it, the attempt is already `expired` (a valid terminal state — the student used their full time) and submitting is a `409`. |
-| GET    | `/exams/{id}/attempt/questions`                                  | student | The exam's questions as the sitting student sees them: `correct` stripped, their own saved answers embedded — the latest sitting's, since a retake starts from a blank sheet. Requires enrollment in the exam's course (the questions are course content — leaving the course closes them) and an attempt — start one with `POST /exams/{id}/attempt` first (404 until then). Readable in every attempt state, so a submitted student can still review what they wrote. |
+| GET    | `/exams/{id}/attempt/questions`                                  | student | The exam's questions as the sitting student sees them: `correct` stripped, their own saved answers embedded — the latest sitting's, since a retake starts from a blank sheet. Requires enrollment in the exam's instance (the questions are the instance's content — leaving it closes them) and an attempt — start one with `POST /exams/{id}/attempt` first (404 until then). Readable in every attempt state, so a submitted student can still review what they wrote. |
 | GET    | `/exams/{id}/attempt/ws`                                         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
-| GET    | `/exams/{id}/attempts/{user}/answers`                            | teacher | One student's answer sheet with correctness flags — always the *latest* sitting's answers (a retake starts from a blank sheet). Every row carries the saved answer plus `is_correct` (`null` for text questions — those are the grader's call), and the machine's `auto_score` over the choice questions is attached as a *suggestion*: the final mark stays human, via `POST /exams/{id}/results`. Requires teacher+ and management rights over the exam's course. |
-| GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image`                | teacher | One student's drawn-answer bytes, for the grader. Requires teacher+ and management rights over the exam's course — the `attempt_answers` gate. |
-| GET    | `/exams/{id}/live`                                               | teacher | A one-shot live snapshot of the exam: who's in, who's still writing (and on which sitting), who walked out of the room (`left_at`), who never showed at all (`absent`, once the window is over), time each student has left, and marks as they land. Requires teacher+ and management rights over the exam's course. Poll it to keep a monitor up to date. |
-| GET    | `/exams/{id}/questions`                                          | teacher | The exam's question list, `correct` choice ids included — the answer key, paged via `?limit=&offset=` (omit `limit` for the whole list). Requires teacher+ and management rights over the exam's course. Students read questions through `GET /exams/{id}/attempt/questions`. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/exams/{id}/questions`                                          | teacher | Add a question to an exam. Requires teacher+ and management rights over the exam's course. `subject_id` must name one of the course's subjects (`GET /courses/{id}/subjects`) — every question belongs to a subject. `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text` questions carry neither. Locked once attempts exist. |
-| POST   | `/exams/{id}/questions/from-bank/{bid}`                          | teacher | Instantiate a bank template into this exam as a fresh question. Requires teacher+, management rights over the exam's course, and a template the caller may see (their own, or one published to the school) — anything else is a 404. `subject_id` must name one of the course's subjects — the template's own subject is origin metadata and does not carry over. The template (and its blobs) stay untouched; a full copy — text, points, spec, illustration, and option pictures — lands under a new question id. Locked once attempts exist. |
-| PATCH  | `/exams/{id}/questions/{qid}`                                    | teacher | Edit a question. Requires teacher+ and management rights over the exam's course. Omitted fields keep their value; `kind`/`choices`/`correct` are re-validated as a unit, so a kind switch must bring the matching fields along. `subject_id` re-tags within the course's subjects. Locked once attempts exist. An omitted `subject_id` is filled from the stored row, so any edit here — not just a re-tag — is refused with a `409` when someone else moved the question's subject after the caller read it. |
-| DELETE | `/exams/{id}/questions/{qid}`                                    | teacher | Remove a question (and every answer to it). Requires teacher+ and management rights over the exam's course. Locked once attempts exist. |
+| GET    | `/exams/{id}/attempts/{user}/answers`                            | teacher | One student's answer sheet with correctness flags — always the *latest* sitting's answers (a retake starts from a blank sheet). Every row carries the saved answer plus `is_correct` (`null` for text questions — those are the grader's call), and the machine's `auto_score` over the choice questions is attached as a *suggestion*: the final mark stays human, via `POST /exams/{id}/results`. Requires teacher+ and management rights over the exam's instance. |
+| GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image`                | teacher | One student's drawn-answer bytes, for the grader. Requires teacher+ and management rights over the exam's instance — the `attempt_answers` gate. |
+| GET    | `/exams/{id}/live`                                               | teacher | A one-shot live snapshot of the exam: who's in, who's still writing (and on which sitting), who walked out of the room (`left_at`), who never showed at all (`absent`, once the window is over), time each student has left, and marks as they land. Requires teacher+ and management rights over the exam's instance. Poll it to keep a monitor up to date. |
+| GET    | `/exams/{id}/questions`                                          | teacher | The exam's question list, `correct` choice ids included — the answer key, paged via `?limit=&offset=` (omit `limit` for the whole list). Requires teacher+ and management rights over the exam's instance. Students read questions through `GET /exams/{id}/attempt/questions`. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/exams/{id}/questions`                                          | teacher | Add a question to an exam. Requires teacher+ and management rights over the exam's instance. `subject_id` must name one of the subjects of that instance's catalog course (`GET /courses/{id}/subjects`) — every question belongs to a subject. `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text` questions carry neither. Locked once attempts exist. |
+| POST   | `/exams/{id}/questions/from-bank/{bid}`                          | teacher | Instantiate a bank template into this exam as a fresh question. Requires teacher+, management rights over the exam's instance, and a template the caller may see (their own, or one published to the school) — anything else is a 404. `subject_id` must name one of the subjects of the instance's catalog course — the template's own subject is origin metadata and does not carry over. The template (and its blobs) stay untouched; a full copy — text, points, spec, illustration, and option pictures — lands under a new question id. Locked once attempts exist. |
+| PATCH  | `/exams/{id}/questions/{qid}`                                    | teacher | Edit a question. Requires teacher+ and management rights over the exam's instance. Omitted fields keep their value; `kind`/`choices`/`correct` are re-validated as a unit, so a kind switch must bring the matching fields along. `subject_id` re-tags within the instance's catalog course. Locked once attempts exist. An omitted `subject_id` is filled from the stored row, so any edit here — not just a re-tag — is refused with a `409` when someone else moved the question's subject after the caller read it. |
+| DELETE | `/exams/{id}/questions/{qid}`                                    | teacher | Remove a question (and every answer to it). Requires teacher+ and management rights over the exam's instance. Locked once attempts exist. |
 | GET    | `/exams/{id}/questions/{qid}/choices/{choice_id}/image`          | student | One option's picture bytes. Same access wall as the question-image read. |
 | POST   | `/exams/{id}/questions/{qid}/choices/{choice_id}/image`          | teacher | Attach (or replace) one option's picture on a `choice` question — so the options themselves can be images (four map crops, pick the right one). Same form, limits, and rights as the question-image upload; `choice_id` is the `id` carried on that choice, as returned in the question's `choices` (not a position — an unknown id is a `400`). Replacing the question's `choices` list drops all its option pictures — re-upload against the new list. |
-| DELETE | `/exams/{id}/questions/{qid}/choices/{choice_id}/image`          | teacher | Remove one option's picture. Requires teacher+ and management rights over the exam's course; frozen once attempts exist. |
-| GET    | `/exams/{id}/questions/{qid}/image`                              | student | The question's illustration bytes. Course managers read anytime; students through the same wall as the sitting view — enrollment plus a started attempt (404 before that, like the question list itself). |
-| POST   | `/exams/{id}/questions/{qid}/image`                              | teacher | Attach (or replace) a question's illustration — any question kind may carry one, e.g. the map the prompt asks about. `multipart/form-data` with the image under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes` (settings). Requires teacher+ and management rights over the exam's course; frozen once attempts exist, like every other question edit. |
-| DELETE | `/exams/{id}/questions/{qid}/image`                              | teacher | Remove a question's illustration. Requires teacher+ and management rights over the exam's course; frozen once attempts exist. |
-| POST   | `/exams/{id}/questions/{qid}/refresh-from-bank`                  | teacher | Re-copy a bank template's *current* content over the exam question that was instantiated from it — the escape hatch for the divergence a deep copy creates: fixing a typo in the template does not reach the copies, so this is how a copy is brought back in line, explicitly and per question. Requires teacher+, management rights over the exam's course, and a template the caller may still see. |
-| POST   | `/exams/{id}/questions/{qid}/to-bank`                            | teacher | Save one of this exam's questions into the school-wide bank as a reusable template. Requires teacher+ and management rights over the exam's course. The caller becomes the template's owner; the question's subject rides along as origin metadata. A full copy — text, points, spec, illustration, and option pictures — lands under a new bank id. Provenance rides both ways: the origin exam is recorded on the template as `source_exam`, and the exam question's `banked_as` is pointed at the new template (a repeat save is allowed and repoints it at the newest one). `from_bank` is left alone — it records the other direction and a save never changes where a question came from. |
+| DELETE | `/exams/{id}/questions/{qid}/choices/{choice_id}/image`          | teacher | Remove one option's picture. Requires teacher+ and management rights over the exam's instance; frozen once attempts exist. |
+| GET    | `/exams/{id}/questions/{qid}/image`                              | student | The question's illustration bytes. Instance managers read anytime; students through the same wall as the sitting view — enrollment plus a started attempt (404 before that, like the question list itself). |
+| POST   | `/exams/{id}/questions/{qid}/image`                              | teacher | Attach (or replace) a question's illustration — any question kind may carry one, e.g. the map the prompt asks about. `multipart/form-data` with the image under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes` (settings). Requires teacher+ and management rights over the exam's instance; frozen once attempts exist, like every other question edit. |
+| DELETE | `/exams/{id}/questions/{qid}/image`                              | teacher | Remove a question's illustration. Requires teacher+ and management rights over the exam's instance; frozen once attempts exist. |
+| POST   | `/exams/{id}/questions/{qid}/refresh-from-bank`                  | teacher | Re-copy a bank template's *current* content over the exam question that was instantiated from it — the escape hatch for the divergence a deep copy creates: fixing a typo in the template does not reach the copies, so this is how a copy is brought back in line, explicitly and per question. Requires teacher+, management rights over the exam's instance, and a template the caller may still see. |
+| POST   | `/exams/{id}/questions/{qid}/to-bank`                            | teacher | Save one of this exam's questions into the school-wide bank as a reusable template. Requires teacher+ and management rights over the exam's instance. The caller becomes the template's owner; the question's subject rides along as origin metadata. A full copy — text, points, spec, illustration, and option pictures — lands under a new bank id. Provenance rides both ways: the origin exam is recorded on the template as `source_exam`, and the exam question's `banked_as` is pointed at the new template (a repeat save is allowed and repoints it at the newest one). `from_bank` is left alone — it records the other direction and a save never changes where a question came from. |
 | GET    | `/exams/{id}/result`                                             | student | The current user's own result for an exam. Any authenticated user may read their own mark; `404` while ungraded (or when the exam doesn't exist). |
-| GET    | `/exams/{id}/results`                                            | teacher | List an exam's results, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+ and management rights over the exam's course — students read only their own via `GET /exams/{id}/result`. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/exams/{id}/results`                                            | teacher | Record (or overwrite) a student's mark for an exam. Requires teacher+ and management rights over the exam's course; the target must be a student and enrolled. Only students carry marks; students never grade — and nobody grades themselves. A draft can't be graded (`409`) — a mark would point at an exam its student can't see. |
-| DELETE | `/exams/{id}/results/{user}`                                     | teacher | Remove a student's result from an exam. Requires teacher+ and management rights over the exam's course. |
+| GET    | `/exams/{id}/results`                                            | teacher | List an exam's results, paged via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+ and management rights over the exam's instance — students read only their own via `GET /exams/{id}/result`. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/exams/{id}/results`                                            | teacher | Record (or overwrite) a student's mark for an exam. Requires teacher+ and management rights over the exam's instance; the target must be a student and enrolled. Only students carry marks; students never grade — and nobody grades themselves. A draft can't be graded (`409`) — a mark would point at an exam its student can't see. |
+| DELETE | `/exams/{id}/results/{user}`                                     | teacher | Remove a student's result from an exam. Requires teacher+ and management rights over the exam's instance. |
 | GET    | `/exams/{id}/review/attempts`                                    | student | The caller's own sitting numbers at an exam — every seq that carries answers or a mark, ascending. Own-scoped review view; opens once the teacher enables review and has marked the caller, and closes again (409) while the caller can still sit the exam. |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers`                      | student | One of the caller's own sittings, judged — the `seq`th attempt's answers, drawing refs, correctness flags, and auto-score suggestion. Own-scoped review view; 409 while the caller can still sit the exam, so a retake can't read its own correctness off an earlier seq. |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image`          | student | The caller's own drawn-answer bytes for one of their sittings — the seq-scoped, own-scoped mirror of the grader's drawing read. Same 409 while a sitting is still available. |
 | GET    | `/exams/{id}/review/questions`                                   | student | The exam's full question list, `correct` choice ids included — the answer key the caller reviews their own sheet against. Same review gate as the other self-review reads; revealing `correct` is the point (the gate already proves the caller was marked and can no longer sit the exam). Paged via `?limit=&offset=`. |
-| GET    | `/exams/{id}/statistics`                                         | teacher | Summary statistics for an exam's graded results. Requires teacher+ and management rights over the exam's course. |
-| GET    | `/exams/{id}/students/{user}/attempts`                           | teacher | The sitting numbers a student has left at an exam — every seq that carries answers or a mark, ascending. Requires teacher+ and management rights over the exam's course. Drives the FE's attempt-by-attempt picker. |
-| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers`             | teacher | One prior sitting's judged answer sheet — the `seq`th attempt's answers, drawing refs, correctness flags, and auto-score suggestion. Requires teacher+ and management rights over the exam's course. Serves an empty sheet for a seq the student never wrote in. |
-| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | A prior sitting's drawn-answer bytes. Requires teacher+ and management rights over the exam's course — the seq-scoped mirror of the grader's latest-sitting drawing read. |
-| GET    | `/exams/{id}/students/{user}/marks`                              | teacher | A student's full mark history at an exam — every sitting's mark, oldest first (the grade-of-record is the latest). Requires teacher+ and management rights over the exam's course. |
+| GET    | `/exams/{id}/statistics`                                         | teacher | Summary statistics for an exam's graded results. Requires teacher+ and management rights over the exam's instance. |
+| GET    | `/exams/{id}/students/{user}/attempts`                           | teacher | The sitting numbers a student has left at an exam — every seq that carries answers or a mark, ascending. Requires teacher+ and management rights over the exam's instance. Drives the FE's attempt-by-attempt picker. |
+| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers`             | teacher | One prior sitting's judged answer sheet — the `seq`th attempt's answers, drawing refs, correctness flags, and auto-score suggestion. Requires teacher+ and management rights over the exam's instance. Serves an empty sheet for a seq the student never wrote in. |
+| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | A prior sitting's drawn-answer bytes. Requires teacher+ and management rights over the exam's instance — the seq-scoped mirror of the grader's latest-sitting drawing read. |
+| GET    | `/exams/{id}/students/{user}/marks`                              | teacher | A student's full mark history at an exam — every sitting's mark, oldest first (the grade-of-record is the latest). Requires teacher+ and management rights over the exam's instance. |
 | GET    | `/health`                                                        | no      | Health probe: the database verdict and the AI bridge, `503` when degraded. |
-| GET    | `/homework`                                                      | student | List the homework across the caller's courses — their "my homework" view — paged via `?limit=&offset=` (omit `limit` for all of it). Manager+ see every course's homework; a teacher sees the homework of courses they run; a student sees only the homework they are assigned (whole-course ones plus any subset that names them, each with its `assigned` narrowed to themselves). Returns a `{items, total, limit, offset}` envelope. |
-| GET    | `/homework/report/{user}`                                        | teacher | A student's homework report across their enrolled courses, paged via `?limit=&offset=` (omit `limit` for all of it): one row per homework in their audience — submitted/late/missing state plus the grade once one exists. Statuses and marks, never the submitted files (observers get the report, not the bytes). Requires teacher+, or a parent linked to the target student. Managers, admins, and parents see every course; a teacher sees only the target's courses they manage. Returns a `{items, total, limit, offset}` envelope. |
-| GET    | `/homework/{id}`                                                 | student | Fetch a single homework by id. Visible to whoever can view its course (its enrolled users, creator, assigned teachers, and managers/admins). A student the homework is *not* assigned to gets a 404 — the same no-leak an unseen exam draft gets, so a subset assignment never reveals itself to the students left out of it. To a caller without course-management rights the `assigned` subset comes back narrowed to their own id: being named is theirs to know, the rest of the roster is not. |
-| PATCH  | `/homework/{id}`                                                 | teacher | Edit a homework's title, description, due date, subject, or assigned subset. Requires teacher+ and management rights over its course. Omitted fields keep their value; a newly set `due_at` is re-checked against now and a new `subject_id` re-checked against the course. Narrowing `assigned` is refused (409) while it would orphan an existing submission or result. |
-| DELETE | `/homework/{id}`                                                 | teacher | Delete a homework and everything under it — submissions, their files, and results — then unlink the file blobs from disk. Requires teacher+ and management rights over its course. The cascade is one transaction whose homework-row lock keeps a submission from landing under the homework mid-delete; the blob names are collected inside that transaction, before the rows are wiped, and removed after, so a crash in between strands at worst an unreachable file. |
+| GET    | `/homework`                                                      | student | List the homework across the caller's instances — their "my homework" view — paged via `?limit=&offset=` (omit `limit` for all of it). Manager+ see every instance's homework; a teacher sees the homework of instances they run; a student sees only the homework they are assigned (whole-roster ones plus any subset that names them, each with its `assigned` narrowed to themselves). Returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/homework/report/{user}`                                        | teacher | A student's homework report across the instances their şube carries, paged via `?limit=&offset=` (omit `limit` for all of it): one row per homework in their audience — submitted/late/missing state plus the grade once one exists. Statuses and marks, never the submitted files (observers get the report, not the bytes). Requires teacher+, or a parent linked to the target student. Managers, admins, and parents see every instance; a teacher sees only the target's instances they manage. Returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/homework/{id}`                                                 | student | Fetch a single homework by id. Visible to whoever can view its instance (its enrolled students, its teachers, its şube's homeroom teacher, and managers/admins). A student the homework is *not* assigned to gets a 404 — the same no-leak an unseen exam draft gets, so a subset assignment never reveals itself to the students left out of it. To a caller without instance-management rights the `assigned` subset comes back narrowed to their own id: being named is theirs to know, the rest of the roster is not. |
+| PATCH  | `/homework/{id}`                                                 | teacher | Edit a homework's title, description, due date, subject, or assigned subset. Requires teacher+ and management rights over its instance. Omitted fields keep their value; a newly set `due_at` is re-checked against now and a new `subject_id` re-checked against the instance's course. Narrowing `assigned` is refused (409) while it would orphan an existing submission or result. |
+| DELETE | `/homework/{id}`                                                 | teacher | Delete a homework and everything under it — submissions, their files, and results — then unlink the file blobs from disk. Requires teacher+ and management rights over its instance. The cascade is one transaction whose homework-row lock keeps a submission from landing under the homework mid-delete; the blob names are collected inside that transaction, before the rows are wiped, and removed after, so a crash in between strands at worst an unreachable file. |
 | GET    | `/homework/{id}/result`                                          | student | The caller's own grade for a homework. Any authenticated user may read their own; `404` while ungraded (or when the homework doesn't exist). This is the one read a student graded `missing` *without* ever submitting has — their submission endpoints 404 while nothing is submitted. |
-| POST   | `/homework/{id}/results`                                         | teacher | Record (or overwrite) a student's grade for a homework: a status (`done`/`incomplete`/`missing`) plus an optional 0–100 mark. Requires teacher+ and management rights over the homework's course; the target must be a live student, enrolled in the course, and in the homework's audience. Nobody grades themselves. Grading before the due date, or before any submission exists (`missing` for work never handed in), is allowed. A stored grade freezes the student's submission until it is removed. |
-| DELETE | `/homework/{id}/results/{user}`                                  | teacher | Remove a student's grade from a homework — un-grading, which unfreezes the student's submission and files for further edits. Requires teacher+ and management rights over the homework's course. |
+| POST   | `/homework/{id}/results`                                         | teacher | Record (or overwrite) a student's grade for a homework: a status (`done`/`incomplete`/`missing`) plus an optional 0–100 mark. Requires teacher+ and management rights over the homework's instance; the target must be a live student, enrolled in the instance, and in the homework's audience. Nobody grades themselves. Grading before the due date, or before any submission exists (`missing` for work never handed in), is allowed. A stored grade freezes the student's submission until it is removed. |
+| DELETE | `/homework/{id}/results/{user}`                                  | teacher | Remove a student's grade from a homework — un-grading, which unfreezes the student's submission and files for further edits. Requires teacher+ and management rights over the homework's instance. |
 | GET    | `/homework/{id}/submission`                                      | student | Read the caller's own submission to a homework: their text, files, the computed late flag, and the grade if one exists. Same visibility gates as submitting (student, enrolled, assigned). `404` until they have submitted. |
-| POST   | `/homework/{id}/submission`                                      | student | Submit (or re-submit) the caller's own work for a homework: optional text, files added separately. Requires the student role, enrollment in the course, and that the homework is assigned to the caller (a subset it doesn't name 404s, never leaking the assignment). Text replaces the previous text; the first-submit stamp is pinned once and `updated_at` moves to now. `201` on the first submit, `200` on a later edit. Refused (409) once the work is graded — ask the teacher to remove the grade to reopen it. |
+| POST   | `/homework/{id}/submission`                                      | student | Submit (or re-submit) the caller's own work for a homework: optional text, files added separately. Requires the student role, enrollment in the instance, and that the homework is assigned to the caller (a subset it doesn't name 404s, never leaking the assignment). Text replaces the previous text; the first-submit stamp is pinned once and `updated_at` moves to now. `201` on the first submit, `200` on a later edit. Refused (409) once the work is graded — ask the teacher to remove the grade to reopen it. |
 | DELETE | `/homework/{id}/submission`                                      | student | Withdraw the caller's own submission — its text, its file rows, and their blobs. Same visibility gates as submitting. Refused (409) once the work is graded. The file rows fall in one transaction with the submission (children first); their blob names are collected before the wipe and unlinked after. |
 | POST   | `/homework/{id}/submission/files`                                | student | Attach a file to the caller's own submission. `multipart/form-data` with the bytes under a `file` field (its `filename` required); any content type, at most the school's `max_file_bytes`, up to 10 files per submission. Same visibility gates as submitting. A submission need not exist first — a photo-only homework never types text, so this auto-creates an empty submission to hang the file off (an existing one's text is preserved). Adding a file re-stamps the submission's `updated_at`. Refused (409) once graded, or once the 10-file cap is reached. |
-| GET    | `/homework/{id}/submission/files/{fid}`                          | student | Download a submission file's bytes. Two callers, one handler: a student reads their own file (behind the submission gate), or a teacher who manages the homework's course reads any file under it. A parent never reaches here — observers get the report, never the bytes. The file is scoped to the homework in the path, so a managed homework's id can't be used to pull a file from another one. |
+| GET    | `/homework/{id}/submission/files/{fid}`                          | student | Download a submission file's bytes. Two callers, one handler: a student reads their own file (behind the submission gate), or a teacher who manages the homework's instance reads any file under it. A parent never reaches here — observers get the report, never the bytes. The file is scoped to the homework in the path, so a managed homework's id can't be used to pull a file from another one. |
 | DELETE | `/homework/{id}/submission/files/{fid}`                          | student | Remove a file from the caller's own submission — row first, then its blob. Same visibility gates as submitting. Refused (409) once graded. Removing a file re-stamps the submission's `updated_at`. |
-| GET    | `/homework/{id}/submissions`                                     | teacher | The teacher's roster for a homework, paged via `?limit=&offset=` (omit `limit` for all of it): one row per student in the audience — the assigned subset, or every currently enrolled student for a whole-course homework — plus any student outside it who still owns a submission or grade (an unenrollment or an audience change leaves work behind; it stays visible here, flagged). Each row carries the submission with its files and computed late flag, the grade, a computed `missing`, and a computed `unenrolled`. Requires teacher+ and management rights over the homework's course. Returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/homework/{id}/submissions`                                     | teacher | The teacher's roster for a homework, paged via `?limit=&offset=` (omit `limit` for all of it): one row per student in the audience — the assigned subset, or every student currently enrolled in the instance when the homework carries none — plus any student outside it who still owns a submission or grade (an unenrollment or an audience change leaves work behind; it stays visible here, flagged). Each row carries the submission with its files and computed late flag, the grade, a computed `missing`, and a computed `unenrolled`. Requires teacher+ and management rights over the homework's instance. Returns a `{items, total, limit, offset}` envelope. |
+| GET    | `/instances/me`                                                  | student | The instances the caller is a live member of, newest first, paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. The route a student reads to find the courses their section is being taught. |
+| GET    | `/instances/{id}`                                                | student | Fetch one instance by id. Visible to its enrolled students, its assigned teachers, its şube's homeroom teacher, and managers/admins. |
+| PATCH  | `/instances/{id}`                                                | teacher | Update one instance's own policy. Requires teacher+ and a right over this instance: manager+, one of its assigned teachers, or its şube's homeroom teacher. Omitted fields keep their value; both are non-clearable. |
+| GET    | `/instances/{id}/enrollments`                                    | teacher | List this instance's roster, paged via `?limit=&offset=` (omit `limit` for the whole roster). Requires teacher+ and a right over the instance — students see their own instances via `GET /instances/me`. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/instances/{id}/enrollments`                                    | teacher | Enroll a student into this instance (idempotent upsert). Requires teacher+ and a right over the instance. Only students can be enrolled — enrollment is student membership, and it gates sitting exams, being graded, and the roster. The row is hand-placed (`source` `null`), so no şube sweep can take it back. |
+| DELETE | `/instances/{id}/enrollments/{user}`                             | teacher | Unenroll a student from this instance. Requires teacher+ and a right over the instance. Existing exam results are kept (they disappear from the student's marks report until re-enrolled). |
+| GET    | `/instances/{id}/exams`                                          | student | List one instance's exams, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to the instance's enrolled students, its teachers, its şube's homeroom teacher, and managers/admins — but drafts appear only to the instance's managers. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/instances/{id}/exams`                                          | teacher | Create an exam inside one instance. Requires teacher+ and a right over the instance; the exam's marks count into the instance's average with its kind's weight (`GET /settings`) and into the dönem's karne named by `term`. Omit `mode` for an offline-graded exam nobody can sit; `sync`/`async` take a window (async also `duration_ms`), `open` is sittable anytime with an optional per-attempt `duration_ms`. `max_attempts` (default 1, `0` = unlimited) meters retakes and `allow_rejoin` (default `true`) is the exam-room door — both stay editable while the exam runs. Send `draft: true` to keep the exam private while it's still being written: only the instance's managers see it, and sitting and grading are blocked until it's published (`PATCH` `draft: false`). Only a class-delivered course (`kind` `course`) carries exams. |
+| GET    | `/instances/{id}/homework`                                       | student | List one instance's homework, newest first, paged via `?limit=&offset=` (omit `limit` for all of it). Visible to the instance's enrolled students, its teachers, and managers/admins — but a student sees only the homework they are assigned (whole-roster ones plus subsets that name them, each with its `assigned` narrowed to themselves). Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/instances/{id}/homework`                                       | teacher | Assign homework inside one instance. Requires teacher+ and a right over the instance. The homework is tagged with one of the catalog course's subjects and given a future `due_at`; `assigned` optionally narrows it to a subset of the enrolled students (omit or empty = the whole roster). |
+| GET    | `/instances/{id}/sessions`                                       | student | List one instance's lesson sessions, most recent first, paged via `?limit=&offset=` (omit `limit` for all of them). Visible to the instance's enrolled students, its teachers, and managers/admins. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/instances/{id}/sessions`                                       | teacher | Create a lesson session inside one instance. Requires teacher+ and a right over the instance. The session's teacher defaults to the caller. |
+| POST   | `/instances/{id}/teachers`                                       | manager | Assign a teacher to this instance (idempotent). Manager+ only — staffing is the office's call. The assignee must already hold the `teacher` role or higher; the assignment gives them full management of the instance (exams, sessions, homework, roster, grading) but they keep no catalog rights over the course itself. |
+| DELETE | `/instances/{id}/teachers/{user}`                                | manager | Unassign a teacher from this instance. Manager+ only. The instance, its exams, sessions, and roster are untouched — the teacher just loses their management rights over it. A user who was never assigned is a 404. |
 | GET    | `/limits`                                                        | no      | Every fixed validation bound the API enforces. Unauthenticated: the registration and login forms need the username and password bounds before a session exists, and none of these values are secrets — they are the same rules a 400 would spell out. |
-| GET    | `/marks/me`                                                      | student | The current user's mark report: every enrolled course with its graded exams, weighted course averages, and the overall average. |
-| GET    | `/marks/{user}`                                                  | teacher | Any user's mark report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every course; a teacher sees only the target's courses they manage — the rest of the report (other teachers' courses) stays out of reach. |
+| GET    | `/marks/karne`                                                   | student | The current user's karne for one dönem: every instance of their şubeler that counts toward the karne, the `ders_saati`-weighted average across them, and the verdict. An archived dönem serves the snapshot the school froze when it was closed; an open one computes live. |
+| GET    | `/marks/karne/{user}`                                            | teacher | Any user's karne for one dönem. Requires teacher+, or a parent tied to the target student. A linked parent and manager+ read the whole karne; an exactly-teacher caller sees only the lines of the instances they run, with the dönem average recomputed over those and no verdict (see [`narrow_karne`]). |
+| GET    | `/marks/me`                                                      | student | The current user's mark report: every instance they sit, with its graded exams, weighted instance averages, and the overall average. |
+| GET    | `/marks/{user}`                                                  | teacher | Any user's mark report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every instance; a teacher sees only the target's instances they run — the rest of the report (other sections) stays out of reach. |
 | GET    | `/meals/attendance/{user}`                                       | teacher | One student's meal-attendance history, newest mark first. Requires teacher+, or a parent linked to them — the caller's own id always passes, like the balance and ledger reads. Narrow to a date range with `?from=&to=` (inclusive `YYYY-MM-DD` bounds on the menu's day, each held to the same real-calendar-day rule the menu's own date is). Paged via `?limit=&offset=`. |
 | GET    | `/meals/balance/me`                                              | student | What the caller owes or has on account, in minor units (negative = owes). |
 | GET    | `/meals/balance/{user}`                                          | manager | One student's meal balance. Requires manager+, or a parent link to them — the caller's own id always passes. A teacher gets a `403`: canteen debt is family debt, gated exactly like `/payments`. |
@@ -1378,24 +1416,24 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/schools/{slug}/modules`                                        | builder | Re-sell a school's whole shelf in one call: any mix of modules and packages, in either direction. Every list is optional and an empty body is a no-op. |
 | POST   | `/schools/{slug}/modules/{module}`                               | builder | Sell a school one module. Idempotent: a module it already has is a `200` with the unchanged set. Refused while what the module structurally needs is off — enable those in the same `PATCH` instead. |
 | DELETE | `/schools/{slug}/modules/{module}`                               | builder | Take one module back. Idempotent, and refused while a module the school still has depends on it — the mirror of the enable direction. |
-| GET    | `/sessions/{id}`                                                 | student | Fetch a single session by id. Visible to its course's enrolled users, the session's teacher, the course's own teachers, and managers/admins. |
-| PATCH  | `/sessions/{id}`                                                 | teacher | Update a session. Requires teacher+ with course-management rights. Omitted fields keep their value; an explicit `null` clears `ends_at`. |
-| DELETE | `/sessions/{id}`                                                 | teacher | Delete a session and its roll-call rows. Requires teacher+ with course-management rights. |
-| GET    | `/sessions/{id}/attendance`                                      | teacher | List a session's roll call, paged via `?limit=&offset=` (omit `limit` for the whole roster). Same rights as taking it: the session's teacher or a course manager — students see their own tallies via `GET /attendance/me`. Returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/sessions/{id}/attendance`                                      | teacher | Record a user's roll-call state for a session. The session's teacher or a course manager marks **enrolled students** (only students attend classes); marking the **session's teacher** requires manager+ (staff presence is management's call, so a teacher can't mark themselves present). Students never self-mark a lesson. |
-| DELETE | `/sessions/{id}/attendance/{user}`                               | teacher | Remove a user's roll-call row from a session. Same rights as marking: session teacher or course manager for students, manager+ for a staff row (any target holding teacher or higher). |
+| GET    | `/sessions/{id}`                                                 | student | Fetch a single session by id. Visible to the instance's enrolled students, the session's own teacher, the instance's teachers, and managers/admins. |
+| PATCH  | `/sessions/{id}`                                                 | teacher | Update a session. Requires teacher+ with instance-management rights. Omitted fields keep their value; an explicit `null` clears `ends_at`. |
+| DELETE | `/sessions/{id}`                                                 | teacher | Delete a session and its roll-call rows. Requires teacher+ with instance-management rights. |
+| GET    | `/sessions/{id}/attendance`                                      | teacher | List a session's roll call, paged via `?limit=&offset=` (omit `limit` for the whole roster). Same rights as taking it: the session's teacher or a manager of its instance — students see their own tallies via `GET /attendance/me`. Returns a `{items, total, limit, offset}` envelope. |
+| POST   | `/sessions/{id}/attendance`                                      | teacher | Record a user's roll-call state for a session. The session's teacher or a manager of its instance marks **enrolled students** (only students attend classes); marking the **session's teacher** requires manager+ (staff presence is management's call, so a teacher can't mark themselves present). Students never self-mark a lesson. |
+| DELETE | `/sessions/{id}/attendance/{user}`                               | teacher | Remove a user's roll-call row from a session. Same rights as marking: the session's teacher or a manager of its instance for students, manager+ for a staff row (any target holding teacher or higher). |
 | GET    | `/settings`                                                      | student | The school's current policy. Any authenticated user — clients need it to render pickers and grades. Falls back to the built-in defaults until a manager edits it. |
 | PATCH  | `/settings`                                                      | manager | Update the school's policy. Requires manager+. Omitted fields keep their value; a present field replaces its list wholesale. Existing rows are untouched — a removed exam kind or status lives on in old records; only new writes are held to the new lists. Kind weights, though, apply live: mark reports read them at request time, so editing a weight re-weights every exam of that kind. For that reason a kind whose exams already carry marks cannot be dropped from the list (409) — those marks would silently re-weight to 1; an unmarked kind leaves freely, and an exam whose kind is gone counts with weight 1 but cannot be graded (409) until the kind returns — the other end of the same rule. `max_file_bytes` likewise applies at upload time only — already-stored files keep their size, and the chatbot knobs apply to the next chat request only. `meal_slots` follows the exam-kind rule: a slot a menu was already published for cannot be dropped (409), because the menu snapshotted its name. Slot names must not contain `/ \ ? # %` (400) — a menu's id carries the name into a URL — but a name already on the school's stored list is exempt, so a list written before that rule can still be edited around it. |
-| GET    | `/subjects/{id}`                                                 | student | Fetch a single subject by id. Visible to whoever can view its course: the course's enrolled users, its creator, its assigned teachers, and managers/admins. |
+| GET    | `/subjects/{id}`                                                 | student | Fetch a single subject by id. Visible to whoever can view its course: its creator, a manager/admin, or anyone the course reaches. |
 | PATCH  | `/subjects/{id}`                                                 | teacher | Update a subject's name or description. Requires teacher+ and management rights over its course. Omitted fields keep their value; the course link is fixed at creation. |
 | DELETE | `/subjects/{id}`                                                 | teacher | Delete a subject. Requires teacher+ and management rights over its course. Refused with a 409 while any exam question or homework still references it — re-tag or delete those first, so nothing is left pointing at a subject that no longer exists. |
 | GET    | `/swagger`                                                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/terms`                                                         | student | List every term, newest first. Any authenticated user — students need the calendar to make sense of their courses. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
-| POST   | `/terms`                                                         | manager | Create an academic term. Requires manager+. Past dates are allowed — terms are calendar structure, not schedules. |
+| POST   | `/terms`                                                         | manager | Create a dönem inside an academic year. Requires manager+. Past dates are allowed — dönemler are calendar structure, not schedules; an *archived* year refuses the new dönem (`409`), because past years take no new structure. |
 | GET    | `/terms/{id}`                                                    | student | Fetch a single term by id. |
 | PATCH  | `/terms/{id}`                                                    | manager | Update a term. Requires manager+. Omitted fields keep their value; the merged range must stay ordered. |
-| DELETE | `/terms/{id}`                                                    | manager | Delete a term. Requires manager+. Refused with a 409 while any course still links to it — unlink those courses (`PATCH /courses/{id}` with `"term_id": null`) or delete them first, so a term is never dropped out from under the calendar its courses hang on. |
-| POST   | `/terms/{id}/archive`                                            | manager | Archive a term. Requires manager+. An archived term is frozen: it takes no edits, no delete, and no new course or class link. Idempotent — archiving an already-archived term answers `200` with the stamp it already had. |
+| DELETE | `/terms/{id}`                                                    | manager | Delete a dönem. Requires manager+. Refused with a 409 while anything still hangs off it — an exam filed in it, or a karne frozen for it — so a dönem is never dropped out from under marks that name it; move or delete those first. The dönem's own academic year is untouched (that is `DELETE /academic-years/{id}`, which refuses while a dönem still links it). |
+| POST   | `/terms/{id}/archive`                                            | manager | Archive a dönem. Requires manager+. Archiving **freezes the karnes**: every student with a roster row under the dönem's year gets a snapshot of their report, and from then on `GET /marks/karne` serves that record instead of recomputing — a mark corrected after the fact no longer rewrites what a family holds. An archived dönem takes no edits and no delete; exams may still be created in it while its *year* is open (the archive is a record, not a wall). Idempotent — archiving an already-archived dönem answers `200` with the stamp it already had and never re-freezes. |
 | POST   | `/terms/{id}/unarchive`                                          | manager | Re-open an archived term. Requires manager+. Idempotent the same way as archiving: an already-open term answers `200`. |
 | GET    | `/time`                                                          | no      | Server clock: `{now}` UTC unix-millis, for a frontend to sync against. |
 | GET    | `/users`                                                         | admin   | List every user with their role, newest first. Admin only. Paged: pass `?limit=&offset=` to take a window (omit `limit` for the whole list); the response is a `{items, total, limit, offset}` envelope where `total` counts every user. |
@@ -1431,13 +1469,16 @@ window filtering, before paging; negative values are a `400` naming the field.
 the core four `present | absent | late | excused` always exist, plus whatever
 the school added.
 `kind` must be one of the school's exam kinds (`GET /settings`; defaults:
-`homework | quiz | midterm | final | project | oral`). The kind carries the
-exam's weight in the course average — an integer `1`–`100` set per **kind** in
+`yazili | sozlu | uygulama`). The kind carries the
+exam's weight in the instance average — an integer `1`–`100` set per **kind** in
 settings (defaults all `1`), resolved when a report is read; an exam whose
 kind was later removed from settings counts with weight `1`.
-A course may carry a `term_id` (`null` = unassigned); on `PATCH
-/courses/{id}`, an omitted `term_id` keeps the link and an explicit `null`
-clears it.
+A course carries **no** term — the calendar hangs off the class instead. The
+academic stack is three levels: an **academic year** (`/academic-years`) holds
+the terms (`/terms`), and a **class section** names the year it runs in
+(`year`), so every instance under it and every exam filed in one of that year's
+terms shares one calendar. On `PATCH /classes/{id}`, an omitted `year` keeps the
+link and an explicit `null` clears it.
 `role` ∈ `parent | student | teacher | manager | admin`. Ids in responses are
 hyphenated UUIDv7s. `parent` accounts are made by an admin (register as `student`, then
 `PATCH /users/{id}/role`) and observe only the students an admin tied to them
@@ -1503,8 +1544,9 @@ free their own, and a closed list is never rewritten. Pre-existing hand-picked (
 audiences convert on boot: each listed user becomes a signup row credited to
 the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
-`/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
-`/courses/{id}/sessions`, `/courses/{id}/subjects`, `/courses/{id}/homework`,
+`/exams/{id}/results`, `/instances/{id}/enrollments`, `/instances/{id}/exams`,
+`/instances/{id}/sessions`, `/instances/{id}/homework`,
+`/courses/{id}/subjects`, `/classes/{id}/members`, `/classes/{id}/instances`,
 `/homework/{id}/submissions`, `/sessions/{id}/attendance`) is a `404`, not an
 empty list.
 Personal info (`name`, `surname`, `email`, `phone`, `birth_date`) is the same
@@ -2149,13 +2191,17 @@ why grading an exam whose kind has left the list is refused).
 
 The kitchen is data too: a manager publishes a **menu** per calendar day and meal slot, with its dishes, their dietary tags, and prices in minor units; booking a seat charges that price as a snapshot and an admin records the cash that comes back in (see "Food program: menus, dishes, bookings & the ledger"). The one shape rule on a **meal slot's name** lives here: it may not contain `/`, `\`, `?`, `#` or `%` (`400`), because the name is copied verbatim into a menu's record id and that id is a URL path segment — a slot the settings accepted but no menu could be addressed under would be a slot the canteen cannot use. A name the stored list *already* carries is exempt, so a list written before the rule existed can still be edited around the offending name — otherwise one bad slot froze the whole list, since re-sending it is a `400` and dropping it is a `409` once a menu used it. The grandfathered name still cannot carry a new menu, and dropping it is still the only way to remove it.
 
-Academic structure is data too. **Terms** (`/terms`) model whatever calendar
-the school runs — semester, trimester, quarter systems are just rows with a
-name and a date range. Courses *and classes* may link to one via `term_id` (nullable),
-and deleting a term is refused with a `409` while any of them still links to
-it — unlink them (`PATCH /courses/{id}` or `PATCH /classes/{id}` with
-`"term_id": null`) or delete them first, so the calendar never disappears
-under them. Term dates may lie in the past,
+Academic structure is data too, in three levels. An **academic year**
+(`/academic-years`) carries the school's year — a name, a date range, the
+sınıf-geçme policy (`grade_promotions`) the next rollover applies, and, once
+you ask for one, `POST /academic-years/{id}/rollover` plants the previous
+year's şubeler into it. A **class section** names the year it runs in (`year`),
+and **terms** (`/terms`) hang off that year: semester, trimester and quarter
+systems are all just rows with a name, a date range and their `year`.
+A year refuses deletion with a `409` while any şube or dönem still belongs to
+it, and a term refuses it while any exam is filed in it — move or delete those
+first, so the calendar never disappears
+under the structure. Term dates may lie in the past,
 deliberately: a school adopting the app mid-year backfills its calendar —
 unlike exam/lesson/event times, which reject backdating.
 
@@ -2633,7 +2679,9 @@ a new plan instead.
 That freeze is a **counter on the plan row** (`assignment_count`), incremented
 in the *same transaction* as the assignment row it counts, and the edit and the
 delete are single-record conditional writes against it — the same shape as a
-term's `course_count`. It used to be a `SELECT` taken before the write, which a
+term's `exam_count` (the term's own delete is one `DELETE … WHERE
+exam_count = 0 AND NOT EXISTS (SELECT 1 FROM karne_snapshot WHERE term = $1)`,
+with the year's reference handed back in the same statement). It used to be a `SELECT` taken before the write, which a
 concurrent assign could land behind, leaving a plan edited *and* assigned, or
 deleted with a live assignment naming it. Now the two contend on one record: an
 assign either freezes the plan first (and the edit or delete is a `409`) or
@@ -3149,8 +3197,8 @@ half-applied refresh.
 
 ## Homework
 
-A course hands out **homework**: `POST /courses/{id}/homework` with a title,
-an optional description, a **required subject** (one of the course's own — and
+An **instance** hands out **homework**: `POST /instances/{id}/homework` with a title,
+an optional description, a **required subject** (one of the instance's course's subjects — and
 the same delete guard questions have: a subject with homework refuses deletion
 with a `409` until the homework is re-tagged via `PATCH /homework/{id}` or
 deleted), and a **required `due_at`** that must not lie in the past (same 60s
@@ -3222,7 +3270,7 @@ grades.
 
 ## Lesson sessions, roll call, the work log, pomodoro & attendance reports
 
-Events cover ad-hoc gatherings; **sessions** are a course's lessons. A session
+Events cover ad-hoc gatherings; **sessions** are an instance's lessons. A session
 belongs to a course and carries a `teacher` (defaults to whoever creates it;
 any explicit `teacher_id` must hold teacher+ — a student cannot teach), an
 optional `topic`, a required `starts_at`, and an optional `ends_at` (when both
@@ -3300,135 +3348,167 @@ as the longest run ever held (see "Badges").
 
 **Attendance reports** mirror the marks report: `GET /attendance/me` for any
 logged-in user, `GET /attendance/{user}` for teacher+ — narrowed to the
-courses the caller manages (manager+ sees every course; event tallies are
+instances the caller manages (manager+ sees every instance; event tallies are
 school-wide either way). The report tallies event attendance and lesson roll
-call separately, plus a per-course breakdown:
+call separately, plus a per-instance breakdown and the per-dönem devamsızlık
+counts:
 
 ```json
 {
   "user": "01J…",
   "events":   { "present": 4, "absent": 1, "late": 0, "excused": 1, "total": 6, "rate": 0.8 },
   "sessions": { "present": 9, "absent": 2, "late": 1, "excused": 0, "total": 12, "rate": 0.8333 },
-  "courses": [ { "course": { "id": "01J…", "title": "algebra", … }, "counts": { … } } ]
+  "courses": [ { "instance": "01J…", "course": { "id": "01J…", "title": "algebra", … }, "counts": { … } } ],
+  "devamsizlik": [
+    { "term": "01J…", "name": "1. Dönem", "absent_days": 3, "excused_days": 1,
+      "unexcused_days": 3,
+      "limits": { "max_excused_days": 10, "max_unexcused_days": 20 },
+      "over_limit": false }
+  ]
 }
 ```
 
 `rate = (present + late) / (present + absent + late)`: arriving late still
 counts as attending, and an excused absence counts against no one (`rate` is
-`null` when every row is excused, or there are none). Per-course blocks appear
-for every course the user has roll-call rows in — attendance is a historical
+`null` when every row is excused, or there are none). Per-instance blocks appear
+for every instance the user has roll-call rows in — attendance is a historical
 record, so unenrolling hides marks from the marks report but never hides an
 absence.
+
+**Devamsızlık (the legal absence tally).** The same report carries a
+`devamsizlik` block, one entry per **term**: `absent_days` (distinct calendar
+days the student has at least one `absent` roll-call row on), `excused_days`
+(idem for `excused`), `unexcused_days` (the `absent` count — the two are one
+bucket in the schema), the school's `limits`
+(`max_excused_absent_days`, `max_unexcused_absent_days`, each `null` when
+unset), and `over_limit`. Days are bucketed in the school's **timezone**
+(`GET /settings`, `timezone`, default `Europe/Istanbul`), so a 23:30 and a
+00:30 lesson are two days or one depending on where the school is — never on
+where the server runs. Two absences on one day count once, because veli
+excuses and the yönetmelik count days, not lessons. The limits are advisory
+here: nothing refuses a roll-call row that pushes a student past them.
 
 ## Class sections (şube)
 
 A **class section** is the group a school actually teaches in — 9-A, 10-B — and
-here it is a bulk-enrollment tool rather than a second kind of membership. Its
-row carries a name, an optional free-text `grade` label in the school's own
-vocabulary (`"9"`, `"Lise 2"`; `""` means no grade, exactly like omitting it)
-and an optional `term_id`; nothing else about a course changes because a class
-exists. Schools that run electives or a college-style timetable simply never
-create one — individual enrollment is untouched, and classes are a
-convenience.
+it is the **academic anchor**: a student's membership, the courses it carries,
+their exams and their homework all hang off it. Its row carries a name, an
+optional free-text `grade` label in the school's own vocabulary (`"9"`,
+`"Lise 2"`; `""` means no grade, exactly like omitting it) and the **academic
+year** it runs in (`year`, nullable while a section is being prepared). A
+section does not teach a course directly: attaching one mints an **instance**
+(`/instances`) — its own row, with its own teachers, `ders_saati`, karne weight,
+roster, exams, sessions and homework — and two sections that attach the same
+course share nothing at all. Schools that run electives or a college-style
+timetable simply never create one — individual enrollment and the school-scoped
+course membership are untouched, and classes are a convenience.
 
 **The homeroom teacher.** A class may also name one — the *sınıf öğretmeni* —
 with `teacher_id` on create or `PATCH`, and it rides back out as a `teacher`
 person block (`null` when there is none, exactly like `grade`; both `null` and
 `""` clear it). The account must exist and hold **teacher, manager or admin**
 (anything else is a `400` naming `teacher_id`, the same shape a non-student
-member gets). It is a label and nothing more: it grants no rights over the
-class, is not counted, and is not a second teacher assignment — courses keep
-their own `teachers` list. A role change that takes the account below `teacher`
+member gets). It is a **teaching right**, not a label: the homeroom teacher
+manages every **instance** their section carries — its hours and karne weight,
+its roster, its exams, sessions, homework and grading — under the same rule an
+assigned instance teacher gets (manager+, one of the instance's assigned
+teachers, or the section's homeroom teacher). It is not counted as a teacher
+assignment of its own and grants nothing on the catalog: instances keep their
+own `teachers` list, and editing a section is still manager+. A role change
+that takes the account below `teacher`
 clears the column on **every** class it held, in the same sweep that drops
-their course assignments, so no section ever lists a demoted account.
+their instance assignments, so no section ever lists a demoted account.
 
 That sweep runs once, over the rows that exist when it runs — so a demotion
 that lands *between* a request's role check and its write would sweep nothing
 and leave the assignment standing forever. Both writers close it from the other
-end: `POST /classes`, `PATCH /classes/{id}` and `POST /courses/{id}/teachers`
+end: `POST /classes`, `PATCH /classes/{id}` and `POST /instances/{id}/teachers`
 re-read the account's live role **after** their write and answer `409` if it
 has since dropped below `teacher`, taking the assignment back (a create is
 rolled back whole — no half-made class is left behind). Whichever side is
 second catches it; the ordinary path costs one extra read and no extra write.
 
-**The pump.** A class holds **members** (students) and **attached courses**,
-and owes the product of the two: every member enrolled in every attached
-course. So both writes push the same way — attaching a course
-(`POST /classes/{id}/courses`) enrolls the whole roster into it, adding a
-member (`POST /classes/{id}/members`) enrolls them into every course the class
+**The pump.** A class holds **members** (students) and **instances** (the
+courses it teaches), and owes the product of the two: every member enrolled in
+every instance. So both writes push the same way — attaching a course
+(`POST /classes/{id}/instances`, body `{"course_id": …}`) enrolls the whole
+roster into the new instance, adding a
+member (`POST /classes/{id}/members`) enrolls them into every instance the class
 already carries — and what gets written is an ordinary `enrollment` row, the
-same one `POST /courses/{id}/enrollments` writes, counted against the same
+same one `POST /instances/{id}/enrollments` writes, counted against the same
 `enrollment_count`. Each row a class writes is tagged with it as the row's
 `source`; **no `source` means placed by hand**, and that one bit is what makes
 the sweeps below safe. It rides back out on every enrollment response
-(`GET /courses/{id}/enrollments`) as the class's id, or `null` for a
+(`GET /instances/{id}/enrollments`) as the class's id, or `null` for a
 hand-placed row — without it no client could tell which of the roster rows it
 is showing a class change is about to remove.
 
-**Already enrolled is skipped.** A pair that already has an enrollment row is
-left exactly as it stands — no second seat charged, no `source` rewritten. A
+**Already enrolled is skipped.** An (instance, student) pair that already has
+an enrollment row is
+left exactly as it stands — no second row, no `source` rewritten. A
 student a teacher enrolled by hand *stays* hand-placed when the class later
 attaches that course, so the class never quietly adopts someone else's roster
 decision.
 
-**Capacity is all-or-nothing.** Attaching a course, or adding a member, claims
-one seat per pair that needs a new row, each against its own course's
-`capacity` — and if any single course has no room the whole call is a `409`
-naming it (`course:<key> is full, so the class cannot take this student`,
-`course:<key> cannot hold the whole class`). Nothing lands, not even the seats
-claimed earlier in the same run: a half-enrolled class is worse than a refused
-one, and the refusal names the course whose capacity to raise.
+**A link to a course that no longer exists blocks the pump.** Adding a member
+walks every instance the class carries, and one of them may point at a course
+row that is gone: the call is a `409` and names it
+(`course:<key> no longer exists — detach it from this class first`, code
+`linked_course_missing`). Reporting it as anything else would send staff off to
+raise a cap that does not exist — on a class every member-add now fails on.
+Detach the link and the class works again.
 
-A second `409` reads off the same claim and is deliberately told apart from it:
-one of the class's attached courses **no longer exists**
-(`course:<key> no longer exists — detach it from this class first`). A seat
-claim that matches nothing means "full" *or* "no such row", and reporting a
-stale attachment as a full course would send staff off to raise a capacity that
-is not there — on a class every member-add now fails on. Detach the link and
-the class works again.
+**Removing a member ends the stint; the row stays.** `DELETE
+/classes/{id}/members/{user}` is a **soft leave**: it stamps `left_at`, gives
+the class its seat back (the counter counts live members only), and sweeps the
+instance enrollments the class pumped for that student. The history is not
+erased — a second `POST /classes/{id}/members` inserts a **fresh** row for the
+same pair (the live-pair index is partial, so both can exist), and
+`class_member_count` never exceeds the live rows. Removing the wrong student
+from a class mid-year is therefore something the product can undo without
+losing who was there when.
 
-**Removals take back only what the class pumped, and repair before they
-delete.** Removing a member (`DELETE /classes/{id}/members/{user}`) or
-detaching a course (`DELETE /classes/{id}/courses/{course}`) sweeps the
+**Removals take back only what the class pumped.** A leave, or detaching an
+instance (`DELETE /classes/{id}/instances/{instance}`) sweeps the
 enrollment rows whose `source` is *this* class and no others — hand-placed
-rows survive every class operation. Even a tagged row is not automatically
-deleted: if a **second class** still claims that pair (it holds the same
-student *and* that course attached), the row is re-tagged to that class
-instead, because the row it skipped writing is the row now being swept and the
-student is still owed the seat. The heir is the lowest class id among the
-claimants, so repeating a sweep lands on the same class. Only a row nobody is
-left to claim is deleted and its seat handed back. Sweeps also tolerate rows
-that are already gone — deleting a course wipes its enrollments wholesale
+rows survive every class operation, and every swept row's seat is handed back
+to its instance's counter. There is no heir to consider: a second section
+teaching the same course holds its **own** instance and therefore its own
+roster row, so this class's row is released outright. Sweeps also tolerate rows
+that are already gone — deleting a course or detaching an instance wipes its
+enrollments wholesale
 while the class memberships survive — so "this class has a member" and "that
 member holds a pumped row" are independent facts.
 
-**A manual unenroll wins, permanently.** `DELETE /courses/{id}/enrollments/{user}`
+**A manual unenroll wins, permanently.** `DELETE /instances/{id}/enrollments/{user}`
 on a pumped student is allowed and sticks: nothing re-pumps them while they
 remain a member, because the pump runs on writes, never on a schedule. Staff
 put them back by enrolling them by hand (which makes the row hand-placed) or
 by detaching and re-attaching the course.
 
-**And a manual enroll wins too, permanently.** `POST /courses/{id}/enrollments`
+**And a manual enroll wins too, permanently.** `POST /instances/{id}/enrollments`
 landing on a row a class pumped takes the row *off* that class — its `source`
 is cleared, the response comes back with `"source": null` — so no later class
 sweep can undo a placement an operator made on purpose. That is the mirror of
 the rule above: hand-placed beats pumped in both directions, and without it
 "hand-placed" was a state only a *first* enroll could ever reach.
 
-**Delete guards.** A class still holding members or attached courses refuses
-deletion with a `409` ("remove its members and detach its courses first") —
+**Delete guards.** A class still holding live members or instances refuses
+deletion with a `409` ("remove its members and detach its instances first") —
 the roster it owes is never dropped out from under the courses silently. A
-term linked by any class refuses deletion the same way courses make it refuse.
-Deleting a **course** detaches it from every class it was on (its enrollments
-go with it), and a role change that takes a user off `student` drops their
+**term** carrying exams refuses deletion, and an **academic year** refuses while
+any class or term still belongs to it: the calendar never disappears under the
+structure. Deleting a **course** detaches it from every class it was on (its
+instances and their enrollments go with it, and the files those rows held are
+unlinked), and a role change that takes a user off `student` drops their
 class memberships exactly as it drops their enrollments — in one transaction,
-because a membership left behind would keep pumping them back into courses,
+because a membership left behind would keep pumping them back into instances,
 while an enrollment left behind would stay tagged with a class the released
 counters had already made deletable, and nothing could ever sweep it again.
 
 **A link to a deleted course detaches instead of refusing.** Should a
 `class_course` row ever be left pointing at a course row that is gone,
-`DELETE /classes/{id}/courses/{course}` still answers `204`: management rights
+`DELETE /classes/{id}/instances/{instance}` still answers `204`: management rights
 are read *off* the course, so a stale link had no readable owner and the detach
 used to `404` forever — which also left the class permanently undeletable, its
 attachment counter counting a row nothing could sweep. There is no roster left
@@ -3436,11 +3516,13 @@ to protect, and the caller is already teacher+.
 
 **Who may.** Creating, editing and deleting a class, and adding or removing
 its members, is **manager+** — a class is school structure, not classroom
-work. Attaching or detaching a course takes management rights on **that
-course** (its creator, a teacher assigned to it, or manager+), since the call
-writes that course's roster and nothing else: the same right enrolling one
-student takes. Every read (`GET /classes`, `/classes/{id}`, its members and
-its courses, all paged, newest first) is **teacher+** — and "newest" here means
+work. Attaching or detaching a course takes catalog rights on **that
+course** (its creator, or manager+), since the call writes that course's roster
+for this section and nothing else. Editing an instance's own policy
+(`PATCH /instances/{id}`) and its roster take instance rights (manager+, an
+assigned teacher, or the section's homeroom teacher). Every read
+(`GET /classes`, `/classes/{id}`, its members and its instances, all paged,
+newest first) is **teacher+** — and "newest" here means
 when the student was *added* or the course *attached*, not the student's or the
 course's own id, which is what a link row keyed on the pair would otherwise
 sort by. Rows written before that stamp existed carry none, and sort last.
@@ -3501,8 +3583,9 @@ grade's template — idempotent, so it is safe on a class that already carries
 some of the courses.
 
 The blueprint is a template, not a new kind of membership. Applying it calls
-the same attach a manager's own `POST /classes/{id}/courses` does, so what
-lands is ordinary `class_course` links and ordinary `enrollment` rows, and an
+the same attach a manager's own `POST /classes/{id}/instances` does, so what
+lands is ordinary `class_course` **instances** and the ordinary `enrollment`
+rows each implies, and an
 elective a student takes alone stays an individual enrollment nothing here can
 see.
 
@@ -3626,8 +3709,8 @@ so the skip is reported once for the whole grade — the sections after the firs
 one are not asked again — and never again on a later pump),
 `class_at_course_ceiling`, `class_roster_too_large`
 (the section holds more students than one attach may enroll at once),
-`course_full` (no free
-seat for the whole section), and
+`linked_course_missing` (an instance the section already carries points at a
+course that no longer exists), and
 `blueprint_deleted` (the template itself was deleted while the pump ran —
 nothing was attached, and there is nothing left to retry). That last one **ends
 the run**: it says nothing about the (section, course) pair it names, so every
@@ -3641,8 +3724,8 @@ code out of:
 
 | route | codes |
 | --- | --- |
-| `POST /classes/{id}/courses` | `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full` |
-| `POST /classes/{id}/members` | `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing` |
+| `POST /classes/{id}/instances` | `duplicate`, `class_at_course_ceiling`, `class_roster_too_large` |
+| `POST /classes/{id}/members` | `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `linked_course_missing` |
 
 The three *deleted* codes are a pump's alone: on a manual attach a deleted class
 or course is a `404`, and `blueprint_deleted` needs a blueprint nobody handed
@@ -3662,14 +3745,18 @@ pump, which only ever attaches courses, reports that second pair. One cause
 therefore reads the same whether a manager hit it by hand or a pump hit it in
 bulk, which is what lets a bilingual client branch and word it once. `code` is
 published on those two routes only and is simply **absent** from every other
-error body.
+error body — with one addition since the instance model: `linked_course_missing`,
+which only a member add can meet, is published on that route.
 
-**Removal spares what a human placed.** Every attachment a blueprint makes is
+**Removal spares what a human placed.** Every instance a blueprint mints is
 tagged with it. Dropping a course from the list detaches it only where the
-blueprint attached it (sweeping the enrollments it pumped, repairing to a rival
-class first exactly as a manual detach does), and a course a human attached to
+blueprint attached it — sweeping the enrollments it pumped, repairing to a rival
+class first exactly as a manual detach does, and **unlinking the files** the
+detached instances' exams, homework and submissions held (the sweep returns
+their blob keys, and the route unlinks them the way a manual detach does) — and
+a course a human attached to
 that class by hand carries no tag and is left exactly where it is. Deleting a
-blueprint applies that to its whole list.
+blueprint applies that to its whole list, and unlinks those files too.
 
 **Deleting the course itself takes it out of every template naming it**, in the
 same transaction that detaches it from the sections. A template holds its
@@ -3687,7 +3774,8 @@ and pumps it while the delete runs would otherwise leave rows tagged with a
 blueprint that no longer exists, and since the grade label *is* the record id,
 nothing could ever reach them again. The pump carries the other half of that —
 an attach whose blueprint was deleted mid-run writes nothing and is reported as
-`blueprint_deleted`. The attach's in-transaction claim is a `FOR KEY SHARE`
+`blueprint_deleted`. The delete returns the swept subtree's blob keys and the
+route unlinks them. The attach's in-transaction claim is a `FOR KEY SHARE`
 row lock on `class_blueprint` — the one strength a `DELETE` of the row
 cannot take — so a sourced attach that started first holds the row and the
 delete waits behind it; an attach starting after the delete finds no row
@@ -3699,9 +3787,12 @@ recreated at the same grade with the same list satisfies that comparison, which
 is accepted, since the end state is the one the caller asked for. The remaining
 cost is a **process crash** between the delete and its sweep, which no lock
 survives: it leaves inert tagged attachments behind, still detachable one at a
-time at `DELETE /classes/{id}/courses/{course}`, with every counter exact.
+time at `DELETE /classes/{id}/instances/{instance}`, with every counter exact —
+the crash window's files outlive their rows, which is the one leak the model
+cannot close from here.
 
-A blueprint names no term — the class names its own. The grade label is the
+A blueprint names no year — the class names its own, and the year is what the
+exam calendar hangs off. The grade label is the
 blueprint's id, so there is one per grade (a second is a `409`), and it must be
 non-empty and contain none of `/ \ ? # %`.
 
@@ -3742,27 +3833,50 @@ curl -s -b $JAR $BASE/events/$EV/attendance -H 'content-type: application/json' 
   -d '{"status":"present"}'
 curl -s -b $JAR $BASE/events/$EV/attendance
 
-# courses + weighted marks (as a teacher)
-# optional, manager+: weigh midterms triple — school policy, per kind
-curl -s -b $JAR -X PATCH $BASE/settings -H 'content-type: application/json' \
-  -d '{"exam_kinds":[{"name":"midterm","weight":3},{"name":"quiz","weight":1}]}'
+# the academic calendar: a year, then a term inside it (manager+)
+YR=$(curl -s -b $JAR $BASE/academic-years -H 'content-type: application/json' \
+  -d '{"name":"2026-2027","starts_at":1788000000000,"ends_at":1811000000000}' \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+TE=$(curl -s -b $JAR $BASE/terms -H 'content-type: application/json' \
+  -d '{"name":"1. Dönem","year":"'$YR'","starts_at":1788000000000,"ends_at":1794000000000}' \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+# the class section: the academic anchor, in that year. Naming yourself as the
+# homeroom teacher is what gives this teacher rights over its instances (D10) —
+# a manager could assign an instance teacher afterwards instead.
+ME=$(curl -s -b $JAR $BASE/users/me | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+CL=$(curl -s -b $JAR $BASE/classes -H 'content-type: application/json' \
+  -d '{"name":"9-A","grade":"9","year":"'$YR'","teacher_id":"'$ME'"}' \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+# the catalog course, then the instance this section teaches it in
+CO=$(curl -s -b $JAR $BASE/courses -H 'content-type: application/json' \
+  -d '{"title":"Matematik"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+IN=$(curl -s -b $JAR $BASE/classes/$CL/instances -H 'content-type: application/json' \
+  -d '{"course_id":"'$CO'"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+curl -s -b $JAR $BASE/instances/$IN              # hours, karne weight, teachers
+
+# roster: adding a member to the section enrolls them into $IN (the pump);
+# a teacher can also enroll one student by hand
 # find the student to enroll (here: a registered user "veli"): fragment
 # search over username/name, role-narrowed (teacher+)
 SID=$(curl -s -b $JAR "$BASE/users/search?q=vel&role=student" \
   | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-CO=$(curl -s -b $JAR $BASE/courses -H 'content-type: application/json' \
-  -d '{"title":"algebra"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-curl -s -b $JAR $BASE/courses/$CO/enrollments -H 'content-type: application/json' \
+curl -s -b $JAR $BASE/classes/$CL/members -H 'content-type: application/json' \
   -d "{\"user_id\":\"$SID\"}"
-EX=$(curl -s -b $JAR $BASE/courses/$CO/exams -H 'content-type: application/json' \
-  -d '{"title":"midterm","kind":"midterm"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+curl -s -b $JAR $BASE/instances/$IN/enrollments   # lists the pumped row
+
+# exams live on the instance and are filed in a dönem; weighted marks
+EX=$(curl -s -b $JAR $BASE/instances/$IN/exams -H 'content-type: application/json' \
+  -d '{"title":"1. Yazılı","kind":"yazili","term":"'$TE'"}' \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s -b $JAR $BASE/exams/$EX/results -H 'content-type: application/json' \
   -d "{\"mark\":90,\"user_id\":\"$SID\"}"
 curl -s -b $JAR $BASE/exams/$EX/statistics
 
-# lesson sessions + roll call (course manager creates; the session's teacher
-# or a course manager marks enrolled students)
-SE=$(curl -s -b $JAR $BASE/courses/$CO/sessions -H 'content-type: application/json' \
+# lesson sessions + roll call (instance teacher creates; the session's teacher
+# or an instance manager marks the enrolled students)
+SE=$(curl -s -b $JAR $BASE/instances/$IN/sessions -H 'content-type: application/json' \
   -d '{"topic":"limits","starts_at":1900000000000}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s -b $JAR $BASE/sessions/$SE/attendance -H 'content-type: application/json' \
   -d "{\"status\":\"present\",\"user_id\":\"$SID\"}"
@@ -3773,7 +3887,9 @@ curl -s -b $JAR -X POST $BASE/work/check-out
 curl -s -b $JAR $BASE/work/me
 
 # ...and as the student:
+curl -s -b $STUDENT_JAR $BASE/instances/me        # the sections' instances
 curl -s -b $STUDENT_JAR $BASE/marks/me
+curl -s -b $STUDENT_JAR "$BASE/marks/karne?term=$TE"   # the report card
 curl -s -b $STUDENT_JAR $BASE/attendance/me
 # pomodoro: start when the timer starts, finish when it rings
 curl -s -b $STUDENT_JAR -X POST $BASE/pomodoro/start
@@ -4438,8 +4554,9 @@ which half of a class gets to draw.
 
 **Inviting a group discloses that group.** A board's roster is visible to every
 participant, so each source carries the gate its own listing route carries —
-teacher+ for a class (`GET /classes/{id}/members`), the course's creator, an
-assigned teacher or a manager+ for a course (`GET /courses/{id}/enrollments`),
+teacher+ for a class (`GET /classes/{id}/members`), a manager+, one of the
+instance's assigned teachers or its class's homeroom teacher for an instance
+(`GET /instances/{id}/enrollments`),
 teacher+ for an event (`GET /events/{id}/roster`). A student may still build a
 board one id at a time; they cannot pour a class roster into one. A source that
 does not exist is a `400` naming the field, never a `404` — on these routes a
@@ -4657,11 +4774,14 @@ database itself decides the winner. Three tiers:
    `INSERT … SELECT … WHERE EXISTS` behind a real `FOREIGN KEY` (the
    existence proofs), the CTE recipes in `db::cap`. Used where
    the rule reads the row being written (state machines, delete guards).
-   "Is anything still attached?" is answered the same way, by a counter on the
+   "Is anything still attached?" is answered the same way, by counters on the
    row being deleted rather than a `SELECT` over the children: a course is
-   deletable while its `enrollment_count` is zero, a term while its
-   `course_count` is (courses claim that reference *before* they write the
-   link, and give it back when the link moves or the course is deleted). A fee
+   deletable while its `class_course_count` **and** `course_membership_count`
+   are zero (a şube attach or a club/etüt join claims that reference *before* it
+   writes the link, and gives it back when the link moves or is deleted), and a
+   term while its `exam_count` is zero and no `karne_snapshot` names it — the
+   count is the fast path, the snapshot `NOT EXISTS` is the record a `DELETE`
+   must not take with it. A fee
    plan reads the same way — editable *and* deletable while its
    `assignment_count` is zero, and frozen for good once it is not, since an
    assignment is never taken back.
@@ -4776,17 +4896,25 @@ src/
                    disk under FILES_PATH; FileName/FileContentType shared with note_file.rs)
     rag_output.rs  RagOutputId · RagOutput (what an AI service produced for a
                    course note; derived, disposable, cascaded from note and file)
-    course_session.rs CourseSessionId · SessionTopic · CourseSession (a course's lesson)
+    course_session.rs CourseSessionId · SessionTopic · CourseSession (an instance's lesson)
     session_attendance.rs SessionAttendanceId · SessionAttendance (roll call; one row per session+user)
     work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
-    enrollment.rs  EnrollmentId · Enrollment (one row per course+user; `source`
+    enrollment.rs  EnrollmentId · Enrollment (one row per instance+student; `source`
                    names the class that pumped it, absent when hand-placed)
-    class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a class section;
-                   deletable only with no members and no attached courses)
-    class_member.rs ClassMember (one student in a class; adding them enrolls
-                   them into every course the class holds)
-    class_course.rs ClassCourse (one course on a class; attaching it enrolls
-                   the class's whole roster)
+    course_membership.rs CourseMembershipId · CourseMembership (one row per
+                   catalog course+user: the club/etüt join a student makes alone)
+    academic_year.rs AcademicYearId · GradePromotion · AcademicYear (the school
+                   year: its terms, its sınıf geçme policy, its rollover)
+    class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a class
+                   section; belongs to an academic year; deletable only with no
+                   live members and no instances)
+    class_member.rs ClassMemberId · ClassMember (one student's stint in a class;
+                   `left_at` ends it — the row stays, the seat comes back, and a
+                   re-add is a fresh row)
+    class_course.rs ClassCourseId · DersSaati · ClassCourse (the **instance**:
+                   one course as one class teaches it — hours, karne weight,
+                   teachers, roster, and the key every exam/session/homework
+                   under it carries)
     class_blueprint.rs ClassBlueprintId · ClassBlueprint (a grade's course list;
                    applying it stocks every section at that grade, best-effort)
     class_pump.rs  attach/detach (the shared transaction behind both of those:
@@ -4869,7 +4997,7 @@ src/
     solution.rs    SolutionId · SolutionBody · Solution (discussion thread on an
                    approved pool question; dies with the question)
     homework.rs    HomeworkId · HomeworkTitle · HomeworkDescription · Homework
-                   (per-course assignment; required subject; optional `assigned`
+                   (per-instance assignment; required subject; optional `assigned`
                    student subset — absent/empty = the whole enrolled course)
     homework_submission.rs HomeworkSubmissionId · SubmissionText ·
                    HomeworkSubmission (one row per homework+user; immutable
@@ -4914,7 +5042,7 @@ src/
                    images.rs · review.rs (prior sittings)
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
-    boards.rs  classes.rs
+    boards.rs  classes.rs  instances.rs  academic_years.rs
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 

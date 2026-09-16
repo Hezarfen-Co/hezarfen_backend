@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_course\n                  SET enrollment_count = GREATEST(enrollment_count - 1, 0)\n                WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "00a2401b3c5acee26088b2f978927c983a73f8e8ff47ca6208a429958aec8a73"
+}

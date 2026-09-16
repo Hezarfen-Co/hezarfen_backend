@@ -13,21 +13,28 @@ use serde_json::json;
 
 const ROUNDS: usize = 20;
 
-/// Set up teacher + course + subject + two enrolled students, once per test.
+/// Set up şube instance + subject + two enrolled students, once per test, plus
+/// the teacher who acts on it.
+///
+/// Homework keys on the class×course *instance*, not the catalog course, so the
+/// fixture mints a şube and attaches the course to it. The plain `teacher`
+/// cookie acts through the şube's own sınıf öğretmeni seat, which is what
+/// [`taught_under`] names them for.
 async fn world(
     app: &axum::Router,
     db: &hezarfen_backend::database::Database,
 ) -> (String, String, String, String) {
     let teacher = login_as(app, db, "teacher", "teacher").await;
+    let mudur = login_as(app, db, "mudur", "manager").await;
     let ali = login(app, "ali").await;
     let ali_id = me_id(app, &ali).await;
     let veli = login(app, "veli").await;
     let veli_id = me_id(app, &veli).await;
-    let course = create_course(app, &teacher, "math").await;
-    let subject = create_subject(app, &teacher, &course, "algebra").await;
-    enroll(app, &teacher, &course, &ali_id).await;
-    enroll(app, &teacher, &course, &veli_id).await;
-    (teacher, course, subject, ali_id)
+    let t = taught_under(app, &mudur, &teacher, "math").await;
+    let subject = create_subject(app, &teacher, &t.course, "algebra").await;
+    enroll(app, &teacher, &t.instance, &ali_id).await;
+    enroll(app, &teacher, &t.instance, &veli_id).await;
+    (teacher, t.instance, subject, ali_id)
 }
 
 /// Title and due date are independent scalar columns: patching one must not
@@ -35,11 +42,11 @@ async fn world(
 #[tokio::test]
 async fn concurrent_title_and_due_at_patches_both_stick() {
     let (app, db) = app_and_db().await;
-    let (teacher, course, subject, _) = world(&app, &db).await;
+    let (teacher, instance, subject, _) = world(&app, &db).await;
 
     for round in 0..ROUNDS {
         let due = Timestamp::now().as_millis() + 3_600_000;
-        let id = create_homework(&app, &teacher, &course, &subject, "hw", due).await;
+        let id = create_homework(&app, &teacher, &instance, &subject, "hw", due).await;
         let uri = format!("/homework/{id}");
         let new_due = due + 86_400_000;
         let (a, b) = tokio::join!(
@@ -74,11 +81,11 @@ async fn concurrent_title_and_due_at_patches_both_stick() {
 #[tokio::test]
 async fn concurrent_title_and_assigned_patches_both_stick() {
     let (app, db) = app_and_db().await;
-    let (teacher, course, subject, ali_id) = world(&app, &db).await;
+    let (teacher, instance, subject, ali_id) = world(&app, &db).await;
 
     for round in 0..ROUNDS {
         let due = Timestamp::now().as_millis() + 3_600_000;
-        let id = create_homework(&app, &teacher, &course, &subject, "hw", due).await;
+        let id = create_homework(&app, &teacher, &instance, &subject, "hw", due).await;
         let uri = format!("/homework/{id}");
         let (a, b) = tokio::join!(
             send(
@@ -115,12 +122,12 @@ async fn concurrent_title_and_assigned_patches_both_stick() {
 #[tokio::test]
 async fn assigned_null_still_clears_the_subset() {
     let (app, db) = app_and_db().await;
-    let (teacher, course, subject, ali_id) = world(&app, &db).await;
+    let (teacher, instance, subject, ali_id) = world(&app, &db).await;
     let due = Timestamp::now().as_millis() + 3_600_000;
     let res = create_homework_with(
         &app,
         &teacher,
-        &course,
+        &instance,
         json!({ "title": "hw", "subject_id": subject, "due_at": due, "assigned": [ali_id] }),
     )
     .await;

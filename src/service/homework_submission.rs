@@ -39,7 +39,7 @@ pub async fn submit(
     text: Option<SubmissionText>,
 ) -> Result<Submitted, AppError> {
     let homework = crate::service::homework::gate_own_submission(id, user, db).await?;
-    crate::service::homework::require_open_term(&homework, db).await?;
+    crate::service::homework::require_open_instance(&homework, db).await?;
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before editing your submission",
     );
@@ -77,7 +77,7 @@ pub async fn submit(
 /// the read above, refusing the write rather than wiping graded work.
 pub async fn delete(db: &Database, user: &User, id: &str) -> Result<Vec<HomeworkFile>, AppError> {
     let homework = crate::service::homework::gate_own_submission(id, user, db).await?;
-    crate::service::homework::require_open_term(&homework, db).await?;
+    crate::service::homework::require_open_instance(&homework, db).await?;
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before deleting your submission",
     );

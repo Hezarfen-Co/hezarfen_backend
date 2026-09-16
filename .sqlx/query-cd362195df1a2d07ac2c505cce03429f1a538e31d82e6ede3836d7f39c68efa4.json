@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT enrollment_count AS \"count: i64\" FROM class_course WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "enrollment_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cd362195df1a2d07ac2c505cce03429f1a538e31d82e6ede3836d7f39c68efa4"
+}

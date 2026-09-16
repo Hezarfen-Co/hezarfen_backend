@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT file FROM homework_file\n           WHERE submission IN (SELECT id FROM homework_submission WHERE homework IN (\n               SELECT id FROM homework WHERE class_course = $1))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "87d155cfa8873b0ef20d5c940bb40effbc3eff4648cc6383428794385d6e5381"
+}

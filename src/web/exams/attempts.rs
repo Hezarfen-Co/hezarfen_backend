@@ -113,7 +113,7 @@ pub(crate) async fn attempt_progress(
 }
 
 /// Start, resume, or retake the caller's attempt. Requires the student role
-/// (staff run exams, they don't sit them), enrollment in the exam's course, a
+/// (staff run exams, they don't sit them), enrollment in the exam's instance, a
 /// sittable exam (`sync`/`async`/`open` mode), and — when a window exists — the
 /// window to be open. A still-running attempt is returned
 /// as-is (`200` instead of `201`), so a reconnecting client gets its original
@@ -130,9 +130,9 @@ pub(crate) async fn attempt_progress(
         (status = 201, description = "Attempt started (first sitting or a retake)", body = AttemptResponse),
         (status = 200, description = "Running attempt resumed (unchanged)", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "Exam not found (drafts are invisible here)", body = ErrorResponse),
-        (status = 409, description = "Unscheduled (offline-graded) exam, outside the window, no attempts remaining, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Unscheduled (offline-graded) exam, outside the window, no attempts remaining, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn start_attempt(
@@ -227,7 +227,7 @@ pub(crate) async fn my_attempt(
         (status = 200, description = "Attempt submitted", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "No such exam, or no attempt to finish", body = ErrorResponse),
-        (status = 409, description = "Already submitted, the deadline passed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Already submitted, the deadline passed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn finish_attempt(
@@ -328,7 +328,8 @@ pub(crate) async fn live_snapshot(
 ) -> Result<ExamLiveResponse, AppError> {
     let now = Timestamp::now();
     let (roster, _) =
-        crate::service::enrollment::list_for_course(db, exam.get_course(), None, 0).await?;
+        crate::service::enrollment::list_for_class_course(db, exam.get_class_course(), None, 0)
+            .await?;
     // Per student: their latest sitting (the one the monitor shows) plus how
     // many they've used.
     let mut attempts: HashMap<String, ExamAttempt> = HashMap::new();
@@ -439,7 +440,7 @@ pub(crate) async fn live_snapshot(
 /// on which sitting), who walked out of the room (`left_at`), who never
 /// showed at all (`absent`, once the window is over), time each student has
 /// left, and marks as they land. Requires teacher+ and management rights
-/// over the exam's course. Poll it to keep a monitor up to date.
+/// over the exam's instance. Poll it to keep a monitor up to date.
 #[utoipa::path(
     get,
     path = "/{id}/live",
@@ -449,7 +450,7 @@ pub(crate) async fn live_snapshot(
     responses(
         (status = 200, description = "Live snapshot", body = ExamLiveResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -461,10 +462,10 @@ pub(crate) async fn exam_live(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = exam_attempt::course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can monitor this exam",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can monitor this exam",
         ));
     }
     Ok(Json(live_snapshot(&exam, &st.db).await?))
@@ -549,8 +550,8 @@ pub(crate) struct AnswerSavedResponse {
 
 /// The exam's questions as the sitting student sees them: `correct` stripped,
 /// their own saved answers embedded — the latest sitting's, since a retake
-/// starts from a blank sheet. Requires enrollment in the exam's course (the
-/// questions are course content — leaving the course closes them) and an
+/// starts from a blank sheet. Requires enrollment in the exam's instance (the
+/// questions are the instance's content — leaving it closes them) and an
 /// attempt — start one with `POST /exams/{id}/attempt` first (404 until
 /// then). Readable in every attempt state, so a submitted student can still
 /// review what they wrote.
@@ -563,7 +564,7 @@ pub(crate) struct AnswerSavedResponse {
     responses(
         (status = 200, description = "Questions with the caller's answers embedded", body = [AttemptQuestionResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, or no attempt yet — start the attempt first", body = ErrorResponse),
     ),
 )]
@@ -631,7 +632,7 @@ pub(crate) async fn attempt_questions(
 
 /// Save (or overwrite) one answer in the caller's in-progress attempt.
 /// `choice` questions take `selected`; `text` questions take `text`. Requires
-/// the student role and enrollment in the exam's course — an unenrollment (or a
+/// the student role and enrollment in the exam's instance — an unenrollment (or a
 /// promotion out of `student`) mid-exam closes the sheet. Rejected once the
 /// attempt is submitted or its deadline has passed —
 /// the server clock, not the client's, is the judge — and rejected while the
@@ -647,9 +648,9 @@ pub(crate) async fn attempt_questions(
         (status = 200, description = "Answer saved", body = AnswerSavedResponse),
         (status = 400, description = "Payload doesn't match the question's kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's instance", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this instance's academic year is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -685,7 +686,7 @@ pub(crate) async fn save_answer(
 /// the grader's call), and the machine's `auto_score` over the choice
 /// questions is attached as a *suggestion*: the final mark stays human, via
 /// `POST /exams/{id}/results`. Requires teacher+ and management rights over
-/// the exam's course.
+/// the exam's instance.
 #[utoipa::path(
     get,
     path = "/{id}/attempts/{user}/answers",
@@ -698,7 +699,7 @@ pub(crate) async fn save_answer(
     responses(
         (status = 200, description = "The student's answers, judged", body = AttemptAnswersResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or the student has no attempt", body = ErrorResponse),
     ),
 )]
@@ -710,10 +711,10 @@ pub(crate) async fn attempt_answers(
     let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = exam_attempt::course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
+    let instance = exam_attempt::class_course_of(&exam, &st.db).await?;
+    if !can_manage_instance(&st.db, instance.get_id(), &user).await? {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
+            "only this instance's teachers, its class's homeroom teacher, or a manager/admin can read answer sheets",
         ));
     }
     let target = UserId::from_key(&target);

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT qi.file FROM question_image qi\n           JOIN exam e ON e.id = qi.exam\n           JOIN class_course cc ON cc.id = e.class_course\n           WHERE cc.course = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "question_image",
+            "name": "file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e9e9c3f5b35f35338501485a155be2784075bb0a5b29a270093da5e409ada3ed"
+}

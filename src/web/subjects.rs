@@ -41,9 +41,8 @@ async fn subject_with_course(id: &str, db: &Database) -> Result<(Subject, Course
     Ok((subject, course))
 }
 
-/// Fetch a single subject by id. Visible to whoever can view its course: the
-/// course's enrolled users, its creator, its assigned teachers, and
-/// managers/admins.
+/// Fetch a single subject by id. Visible to whoever can view its course: its
+/// creator, a manager/admin, or anyone the course reaches.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -53,7 +52,7 @@ async fn subject_with_course(id: &str, db: &Database) -> Result<(Subject, Course
     responses(
         (status = 200, description = "The subject", body = SubjectResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -65,7 +64,7 @@ async fn get_subject(
     let (subject, course) = subject_with_course(&id, &st.db).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this subject",
+            "only a user this course reaches, its creator, or a manager/admin can view this subject",
         ));
     }
     Ok(Json(SubjectResponse::new(&subject)))
@@ -85,9 +84,8 @@ async fn get_subject(
         (status = 200, description = "Updated subject", body = SubjectResponse),
         (status = 400, description = "Invalid name or description", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -100,10 +98,9 @@ async fn update_subject(
     let (subject, course) = subject_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can edit this subject",
+            "only the course creator or a manager/admin can edit this subject",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -138,9 +135,9 @@ async fn update_subject(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Exam questions or homework still reference this subject, or this course's term is archived — past years are read-only", body = ErrorResponse),
+        (status = 409, description = "Exam questions or homework still reference this subject", body = ErrorResponse),
     ),
 )]
 async fn delete_subject(
@@ -151,10 +148,9 @@ async fn delete_subject(
     let (subject, course) = subject_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can delete this subject",
+            "only the course creator or a manager/admin can delete this subject",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
     // No locks: the two checks *are* the delete's `WHERE`, decided against the
     // subject's own reference counters inside one statement. This used to be
     // three process-wide locks (the only site that held more than one) around

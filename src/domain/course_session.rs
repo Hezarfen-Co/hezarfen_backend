@@ -1,5 +1,5 @@
 use crate::constant::MAX_SESSION_TOPIC_LEN;
-use crate::domain::course::CourseId;
+use crate::domain::class_course::ClassCourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -56,7 +56,7 @@ impl SessionTopic {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CourseSession {
     pub(crate) id: CourseSessionId,
-    pub(crate) course: CourseId,
+    pub(crate) class_course: ClassCourseId,
     /// Who teaches this session. Must hold the `teacher` role or higher —
     /// enforced by [`crate::service::course_session::resolve_session_teacher`],
     /// where the target user row is at hand.
@@ -71,8 +71,8 @@ impl CourseSession {
         &self.id
     }
 
-    pub fn get_course(&self) -> &CourseId {
-        &self.course
+    pub fn get_class_course(&self) -> &ClassCourseId {
+        &self.class_course
     }
 
     pub fn get_teacher(&self) -> &UserId {

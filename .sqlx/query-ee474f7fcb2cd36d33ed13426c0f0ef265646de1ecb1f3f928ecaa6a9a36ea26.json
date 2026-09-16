@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n               DELETE FROM term\n                WHERE id = $1 AND exam_count = 0\n                  AND NOT EXISTS (SELECT 1 FROM karne_snapshot WHERE term = $1)\n               RETURNING year)\n           UPDATE academic_year\n              SET term_count = GREATEST(term_count - 1, 0)\n             FROM gone\n            WHERE academic_year.id = gone.year",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ee474f7fcb2cd36d33ed13426c0f0ef265646de1ecb1f3f928ecaa6a9a36ea26"
+}
