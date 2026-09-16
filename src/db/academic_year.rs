@@ -150,6 +150,31 @@ pub async fn update(
     }
 }
 
+/// Archive the year — the stamp that turns the whole year read-only. Idempotent
+/// by construction: the `WHERE` only matches an open row, so a repeat archive
+/// writes nothing and the *original* stamp stands — the year is never re-dated
+/// by a double click. `None` says this write landed on nothing: the row was
+/// already archived, or it is gone. The store does not tell those apart; the
+/// caller holds the row it read (the service layer) and only a race pays for
+/// the read that would.
+pub async fn archive(db: &Database, id: &AcademicYearId) -> Result<Option<AcademicYear>, AppError> {
+    let written = sqlx::query_as!(
+        AcademicYear,
+        r#"UPDATE academic_year SET archived_at = $2
+           WHERE id = $1 AND archived_at IS NULL
+           RETURNING id AS "id: AcademicYearId", name AS "name: AcademicYearName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp", creator AS "creator: UserId",
+                     grade_promotions AS "grade_promotions: Json<Vec<GradePromotion>>",
+                     class_count, term_count"#,
+        id.uuid(),
+        Timestamp::now().as_millis(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(written)
+}
+
 /// Delete the year, but only while no şube and no dönem links it — nothing
 /// here unlinks or cascades. `false` = refused, nothing was written.
 ///

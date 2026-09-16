@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT r.exam AS \"exam: ExamId\", r.app_user AS \"user: UserId\", r.seq,\n                  r.mark AS \"mark: Mark\", r.graded_by AS \"graded_by: UserId\"\n           FROM exam_result r JOIN exam e ON e.id = r.exam\n           WHERE r.app_user = $1 AND e.term = $2\n           ORDER BY r.exam DESC, r.seq DESC",
+  "query": "SELECT r.exam AS \"exam: ExamId\", r.app_user AS \"user: UserId\", r.seq,\n                  r.mark AS \"mark: Mark\", r.graded_by AS \"graded_by: UserId\"\n           FROM exam_result r JOIN exam_audience a ON a.exam = r.exam\n           WHERE r.app_user = $1 AND a.class_course = $2\n           ORDER BY r.exam DESC, r.seq DESC",
   "describe": {
     "columns": [
       {
@@ -73,5 +73,5 @@
       false
     ]
   },
-  "hash": "1105ea5febf1c2c9314b456dc8190a943a329f1319335a7ca8a89a71d6709a6f"
+  "hash": "51e98fcbadf1a0d128e4011e134012ea8d5f5f6e130edddcf25388e20f58cd28"
 }

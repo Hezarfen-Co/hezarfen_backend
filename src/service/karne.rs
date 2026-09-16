@@ -9,6 +9,11 @@
 //! contributes only its title — the two şubeler teaching it are their own
 //! instances and their own karne lines.
 //!
+//! A line's marks are the exams *addressed to* its instance
+//! (`exam_audience`), not only the ones it owns: an ortak sınav announced to
+//! several instances is each of their exams (D2), and its marks are a line of
+//! every one of their karnes.
+//!
 //! [`build`] serves a frozen report back once its dönem is archived
 //! ([`crate::db::karne`]), and computes live for an open one. [`freeze`] is the
 //! write half, called from [`crate::service::term::archive`]: from that moment
@@ -124,7 +129,8 @@ pub async fn freeze(db: &Database, term: &TermId) -> Result<(), AppError> {
 }
 
 /// The live computation: the student's şubeler in the dönem's year, their
-/// karne-counting instances, and the marked exams of this dönem inside them.
+/// karne-counting instances, and the marked exams of this dönem inside them —
+/// each mark under every instance it was addressed to, owner or not.
 async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneReport, AppError> {
     let school = crate::service::settings::load(db).await?;
 
@@ -151,7 +157,7 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
     let instance_ids: Vec<crate::domain::class_course::ClassCourseId> =
         instances.iter().map(|i| i.get_id().clone()).collect();
 
-    // The dönem's exams inside those instances, plus this student's marks in
+    // The dönem's exams inside those instances, plus this student's marks on
     // them. An exam another dönem owns is not this karne's to weigh.
     let exams: Vec<crate::domain::exam::Exam> =
         crate::db::exam::list_for_class_course_courses(db, &instance_ids)
@@ -163,7 +169,12 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
         .iter()
         .map(|exam| (exam.get_id().key(), exam))
         .collect();
-    let results = crate::db::exam_result::list_for_user_in_term(db, user, term.get_id()).await?;
+    // Each mark arrives under every instance it counts in: the read resolves
+    // the exam's audience, so an ortak sınav's marks are the karne of every
+    // instance it was announced to, not only of its owner.
+    let results =
+        crate::db::exam_result::list_for_user_in_term(db, user, term.get_id(), &instance_ids)
+            .await?;
 
     // Titles for the lines: one batch read for the whole report.
     let course_ids: Vec<crate::domain::course::CourseId> =
@@ -183,15 +194,17 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
     let mut weighted: Vec<(f64, i64)> = Vec::new();
     for instance in &instances {
         let mut pairs: Vec<(i64, i64)> = Vec::new();
-        for result in &results {
-            let Some(exam) = by_key.get(result.get_exam().key().as_str()) else {
-                // A mark for an exam of another şube's instance (or one whose
-                // instance dropped off the list): not this line's.
-                continue;
-            };
-            if exam.get_class_course() != instance.get_id() {
+        for (line, result) in &results {
+            // Every mark the read attributed to another instance stays out of
+            // this line; one line's marks are exactly those addressed under it.
+            if line != instance.get_id() {
                 continue;
             }
+            let Some(exam) = by_key.get(result.get_exam().key().as_str()) else {
+                // A mark whose exam left the list between the two reads (or a
+                // dönem's exam that is no longer there): not this line's.
+                continue;
+            };
             // The kind's current settings weight; an exam keeps a retired
             // kind, and its marks then count once.
             let weight = school
@@ -278,4 +291,61 @@ fn verdict(school: &crate::domain::settings::Settings, average: Option<f64>) -> 
     } else {
         "kaldi".to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ortak-sınav rule, read off the karne: an exam addressed to a second
+    /// instance is *that* instance's exam too (D2), so its mark is a line of
+    /// both karnes while an exam addressed to its owner alone stays on the
+    /// owner's line. Read through `exam.class_course` the second line would
+    /// have held no mark at all.
+    #[tokio::test]
+    async fn an_ortak_exam_counts_into_every_instance_it_is_addressed_to() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let fixture = crate::db::exam_result::tests::an_ortak_exam_karne(&db).await;
+
+        let report = build(&db, &fixture.student, &fixture.term).await.unwrap();
+        assert_eq!(report.instances.len(), 2, "a line per şube's instance");
+
+        let line = |instance: &crate::domain::class_course::ClassCourseId| {
+            report
+                .instances
+                .iter()
+                .find(|line| line.class_course == instance.key())
+                .unwrap_or_else(|| panic!("no line for {}", instance.key()))
+        };
+
+        // The owner sits both exams; the addressed instance only the ortak
+        // one. Both kinds are `yazili`, whose default weight is 1.
+        let owner = line(&fixture.owner);
+        assert_eq!(
+            owner.average,
+            Some(
+                (crate::db::exam_result::tests::ORTAK_MARK
+                    + crate::db::exam_result::tests::OWNER_MARK) as f64
+                    / 2.0
+            ),
+            "the owner's line averages its own mark and the ortak one"
+        );
+        assert_eq!(owner.band.as_deref(), Some("3"), "65 lands in the 3 band");
+
+        let addressed = line(&fixture.addressed);
+        assert_eq!(
+            addressed.average,
+            Some(crate::db::exam_result::tests::ORTAK_MARK as f64),
+            "the ortak mark — and only it — counts under the second instance"
+        );
+        assert_eq!(addressed.band.as_deref(), Some("5"));
+
+        // Each instance weighs one hour, so the dönem is their plain mean.
+        assert_eq!(report.year_average, Some(75.0));
+        assert_eq!(
+            report.verdict.as_deref(),
+            Some("gecti"),
+            "75 clears the floor"
+        );
+    }
 }

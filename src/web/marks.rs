@@ -3,9 +3,12 @@
 //!
 //! Both read through the *instance* (`class_course`): a student's marks are
 //! grouped by the course their şube is taught, so two sections teaching the
-//! same catalog course are two lines. The roll-up, the dönem average and the
-//! verdict live in [`crate::service::karne`]; this module is the HTTP shape and
-//! the teacher narrowing.
+//! same catalog course are two lines. A block's marks are the exams *addressed
+//! to* its instance (`exam_audience`), not only the ones it owns — an ortak
+//! sınav is each of its audiences' exam, so its mark appears in every one of
+//! their blocks. The roll-up, the dönem average and the verdict live in
+//! [`crate::service::karne`]; this module is the HTTP shape and the teacher
+//! narrowing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -418,5 +421,63 @@ mod tests {
         let pairs = [(85, 1), (70, 2)];
         assert_eq!(weighted_average(&pairs), Some(75.0));
         assert_eq!(weighted_average(&[]), None);
+    }
+
+    /// The ortak-sınav rule on the marks report: an exam addressed to a second
+    /// instance stands in *its* block too, while the exam addressed to its
+    /// owner alone stays out of it. Read through `exam.class_course` the second
+    /// block would have held no results.
+    #[tokio::test]
+    async fn an_ortak_exam_stands_in_every_block_it_is_addressed_to() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let fixture = crate::db::exam_result::tests::an_ortak_exam_karne(&db).await;
+        let ortak_mark = crate::db::exam_result::tests::ORTAK_MARK;
+        let owner_mark = crate::db::exam_result::tests::OWNER_MARK;
+
+        let report = build_report(&fixture.student, None, &db).await.unwrap();
+        assert_eq!(report.courses.len(), 2, "a block per şube's instance");
+
+        let block = |instance: &ClassCourseId| {
+            report
+                .courses
+                .iter()
+                .find(|block| block.instance == instance.key())
+                .unwrap_or_else(|| panic!("no block for {}", instance.key()))
+        };
+
+        let owner = block(&fixture.owner);
+        let owned_marks: Vec<(&str, i64)> = owner
+            .results
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.mark))
+            .collect();
+        assert_eq!(
+            owned_marks.len(),
+            2,
+            "the owner sits both exams, its own line"
+        );
+        assert!(owned_marks.contains(&("ortak", ortak_mark)));
+        assert!(owned_marks.contains(&("tek", owner_mark)));
+        assert_eq!(
+            owner.average,
+            Some((ortak_mark + owner_mark) as f64 / 2.0),
+            "both marks weigh 1 each"
+        );
+
+        let addressed = block(&fixture.addressed);
+        let marks: Vec<(&str, i64)> = addressed
+            .results
+            .iter()
+            .map(|entry| (entry.title.as_str(), entry.mark))
+            .collect();
+        assert_eq!(
+            marks,
+            vec![("ortak", ortak_mark)],
+            "the ortak exam is the second instance's own, the owner's one is not"
+        );
+        assert_eq!(addressed.average, Some(ortak_mark as f64));
+
+        // Each block weighs once, so the report is their plain mean.
+        assert_eq!(report.overall_average, Some(75.0));
     }
 }

@@ -117,6 +117,26 @@ pub async fn update(
     .await
 }
 
+/// Close a finished year: stamp `archived_at`, which is what makes the whole
+/// year read-only ([`require_open`]/[`require_writable`]). Idempotent — an
+/// already-archived year answers with the row it holds, original stamp and
+/// all, and a repeat never re-dates it; a missing row is the `404` every
+/// other year route answers. One conditional statement does the write
+/// ([`academic_year::archive`]), so two archives racing land one stamp: the
+/// loser finds `None` and reads the winner's row.
+pub async fn archive(db: &Database, id: &AcademicYearId) -> Result<AcademicYear, AppError> {
+    let year = read(db, id).await?.ok_or(AppError::NotFound)?;
+    if year.is_archived() {
+        return Ok(year);
+    }
+    match academic_year::archive(db, id).await? {
+        Some(archived) => Ok(archived),
+        // A concurrent archive (or a delete) got there first: the stored row
+        // is the answer, and only this no-op path pays for the second read.
+        None => read(db, id).await?.ok_or(AppError::NotFound),
+    }
+}
+
 /// Delete the year while nothing links it — the linked-refusal is the rule's
 /// own answer, so the message the web layer used to pick is coded here; a row
 /// that is already gone is the store's `404` ([`academic_year::delete`]).

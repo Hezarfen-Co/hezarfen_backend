@@ -307,8 +307,9 @@ pub(crate) async fn can_view_instance(
 /// same D10 rule every instance-scoped gate applies, computed once for the
 /// list.
 ///
-/// A manager+ caller does not go through here: the catalog-wide list is what
-/// those routes serve instead.
+/// [`my_instances`] serves this set to every caller as `GET /instances/me`;
+/// the catalog-wide list other instance routes hand a manager+ is
+/// [`crate::web::courses`]'.
 ///
 /// Staff are *not* members of the section they run, so the two ways a teacher
 /// reaches a şube are read separately and unioned: `class_member` (a student's
@@ -391,10 +392,16 @@ pub(crate) async fn instance_people(
     .await
 }
 
-/// The instances the caller is a live member of, newest first, paged via
-/// `?limit=&offset=` (omit `limit` for all of them); returns a
+/// The instances the caller may act in or see, paged via `?limit=&offset=`
+/// (omit `limit` for all of them), newest first; returns a
 /// `{items, total, limit, offset}` envelope. The route a student reads to find
-/// the courses their section is being taught.
+/// the courses their section is being taught, and a teacher the ones they run.
+///
+/// The set is exactly [`visible_instances`]'s — the caller's şubeler (a
+/// student's live membership, a homeroom teacher's) unioned with the instances
+/// they were assigned to teach, deduped by instance. One rule for what the
+/// caller may see, so this list and every instance-scoped gate can never
+/// disagree about which instances are theirs.
 #[utoipa::path(
     get,
     path = "/me",
@@ -413,18 +420,22 @@ async fn my_instances(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<InstanceResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    // The caller's live şubeler, then every instance they carry — the same
-    // path the karne walks, so the two can never disagree about which
-    // instances a student has.
-    let (members, _) =
-        crate::db::class_member::list_for_user(&st.db, user.get_id(), None, 0).await?;
-    let classes: Vec<ClassGroupId> = members
+    // Both reads the caller's identity feeds (`class_member` and the teach /
+    // homeroom assignments) are `visible_instances`'. Its order is the two
+    // arms' own — each newest first — so the union is sorted back into one
+    // newest-first order: `?limit=&offset=` pages over a total order, and a
+    // stable one is what keeps a page from handing the same row out twice.
+    let mut visible = visible_instances(&user, &st.db).await?;
+    visible.sort_by(|(a, _), (b, _)| {
+        b.get_attached_at()
+            .cmp(&a.get_attached_at())
+            .then_with(|| b.get_id().uuid().cmp(&a.get_id().uuid()))
+    });
+    let total = visible.len() as i64;
+    let window: Vec<ClassCourse> = paginate(&visible, limit, offset)
         .iter()
-        .map(|member| member.get_class().clone())
+        .map(|(instance, _)| instance.clone())
         .collect();
-    let rows = crate::db::class_course::list_for_class_ids(&st.db, &classes).await?;
-    let total = rows.len() as i64;
-    let window: Vec<ClassCourse> = paginate(&rows, limit, offset).to_vec();
     let with_teachers = crate::db::class_course_teacher::into_instances(&st.db, window).await?;
     let people = instance_people(&with_teachers, &st.db).await?;
     let items = with_teachers
@@ -1137,5 +1148,106 @@ mod tests {
         );
         assert!(visible[0].1, "and they run it");
         assert_eq!(visible[0].0.get_class(), class.get_id());
+    }
+
+    /// `GET /instances/me` serves [`visible_instances`]' set, so the second arm
+    /// of the union — the instances a teacher was *assigned* to teach — has to
+    /// surface there even when they are neither enrolled in nor homeroom of
+    /// the şube. Before the union the route was the member read alone, and a
+    /// teacher's assigned instances were invisible to them.
+    #[tokio::test]
+    async fn an_assigned_teacher_reads_the_instances_they_teach_once() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let office = crate::db::class_member::tests::fixture_user(&db, "union-office").await;
+        let teacher = crate::db::class_member::tests::fixture_user(&db, "union-teacher").await;
+        sqlx::query("UPDATE app_user SET role = 'teacher' WHERE id = $1")
+            .bind(teacher.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        let stranger = crate::db::class_member::tests::fixture_user(&db, "union-stranger").await;
+        let course = crate::db::class_member::tests::a_course("Matematik", &db).await;
+        let a = crate::db::class_member::tests::a_class("5-A", &db).await;
+        let b = crate::db::class_member::tests::a_class("5-B", &db).await;
+        let first = service::class_course::attach(&db, &a, &course, &office)
+            .await
+            .unwrap();
+        service::class_course::attach(&db, &b, &course, &office)
+            .await
+            .unwrap();
+        // The office staffing call, minus its role gate: what this test is
+        // about is the read, not who may write the row.
+        crate::db::class_course_teacher::assign(&db, first.get_id(), &teacher)
+            .await
+            .unwrap();
+
+        let teacher_user = crate::service::user::read(&db, &teacher)
+            .await
+            .unwrap()
+            .unwrap();
+        let visible = visible_instances(&teacher_user, &db).await.unwrap();
+        assert_eq!(visible.len(), 1, "the instance they teach, exactly once");
+        assert_eq!(visible[0].0.get_id(), first.get_id());
+        assert!(visible[0].1, "and they run it");
+
+        // A caller tied to neither section reads nothing — the union is not a
+        // door to every instance.
+        let stranger_user = crate::service::user::read(&db, &stranger)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            visible_instances(&stranger_user, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The two arms meet on a homeroom teacher who is also assigned to the
+    /// same instance: one instance, one row. The union is a set — a duplicate
+    /// would show the same instance twice on `GET /instances/me` and count it
+    /// twice in the page's `total`.
+    #[tokio::test]
+    async fn a_homeroom_teacher_assigned_to_the_same_instance_reads_it_once() {
+        use crate::domain::class_group::ClassName;
+
+        let (db, _leases) = crate::database::init_test_db().await;
+        let office = crate::db::class_member::tests::fixture_user(&db, "dedupe-office").await;
+        let teacher = crate::db::class_member::tests::fixture_user(&db, "dedupe-teacher").await;
+        sqlx::query("UPDATE app_user SET role = 'teacher' WHERE id = $1")
+            .bind(teacher.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        let course = crate::db::class_member::tests::a_course("Matematik", &db).await;
+        let class = service::class_group::create(
+            &db,
+            &office,
+            ClassName::try_new("5-A").unwrap(),
+            None,
+            None,
+            Some(teacher),
+        )
+        .await
+        .unwrap();
+        let instance = service::class_course::attach(&db, class.get_id(), &course, &office)
+            .await
+            .unwrap();
+        crate::db::class_course_teacher::assign(&db, instance.get_id(), &teacher)
+            .await
+            .unwrap();
+
+        let teacher_user = crate::service::user::read(&db, &teacher)
+            .await
+            .unwrap()
+            .unwrap();
+        let visible = visible_instances(&teacher_user, &db).await.unwrap();
+        assert_eq!(
+            visible.len(),
+            1,
+            "homeroom and assignment are one instance, not two rows"
+        );
+        assert_eq!(visible[0].0.get_id(), instance.get_id());
     }
 }

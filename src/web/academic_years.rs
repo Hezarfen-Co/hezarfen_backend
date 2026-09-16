@@ -7,7 +7,9 @@
 //! idempotent rather than automatic at a date.
 //!
 //! A year with structure still on it cannot be deleted (`409`), and an archived
-//! year is read-only: no new şube, no new dönem, no new exam inside it.
+//! year is read-only: no new şube, no new dönem, no new exam inside it. A
+//! finished year is closed with `POST /{id}/archive` (manager+), idempotently;
+//! there is deliberately no unarchive route.
 
 use crate::web::tenant_state::State;
 use axum::Json;
@@ -18,7 +20,9 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::domain::academic_year::{AcademicYear, AcademicYearName, GradePromotion};
+use crate::domain::academic_year::{
+    AcademicYear, AcademicYearId, AcademicYearName, GradePromotion,
+};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
@@ -30,6 +34,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create_year, list_years))
         .routes(routes!(get_year, update_year, delete_year))
+        .routes(routes!(archive_year))
         .routes(routes!(rollover))
 }
 
@@ -150,12 +155,9 @@ struct Rollover {
 
 /// The year a path id names, or a 404.
 async fn year_or_404(id: &str, db: &crate::database::Database) -> Result<AcademicYear, AppError> {
-    service::academic_year::read(
-        db,
-        &crate::domain::academic_year::AcademicYearId::from_key(id),
-    )
-    .await?
-    .ok_or(AppError::NotFound)
+    service::academic_year::read(db, &AcademicYearId::from_key(id))
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 /// The promotion list off the wire, each pair validated against the grade
@@ -317,6 +319,33 @@ async fn update_year(
     )
     .await?;
     Ok(Json(YearResponse::new(&updated)))
+}
+
+/// Archive an academic year. Requires manager+. Stamps `archived_at`, and from
+/// then on the whole year is past structure: no new şube, no new dönem, no
+/// exam inside it, and no edit or delete of the year itself. Idempotent — a
+/// second archive answers `200` with the stamp that already stood. There is no
+/// unarchive route: the row is deletable only while open.
+#[utoipa::path(
+    post,
+    path = "/{id}/archive",
+    tag = "academic-years",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Academic year id")),
+    responses(
+        (status = 200, description = "The archived academic year", body = YearResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+    ),
+)]
+async fn archive_year(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(id): Path<String>,
+) -> Result<Json<YearResponse>, AppError> {
+    let archived = service::academic_year::archive(&st.db, &AcademicYearId::from_key(&id)).await?;
+    Ok(Json(YearResponse::new(&archived)))
 }
 
 /// Delete an academic year. Requires manager+. Refused with a 409 while any

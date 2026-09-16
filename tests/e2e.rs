@@ -3607,16 +3607,36 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     let student_cookie = raw_session_cookie(&base, "ogrenci").await;
 
     // --- the year goes past -------------------------------------------------
-    // No route archives one yet (the year's own PATCH refuses an archived row
-    // and offers no archive), so the column is written the way an operator
-    // would; every gate below reads it.
-    let archived = sqlx::query("UPDATE academic_year SET archived_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(Uuid::parse_str(&year_id).unwrap())
-        .execute(&db)
+    let res = mudur
+        .post(format!("{base}/academic-years/{year_id}/archive"))
+        .send()
         .await
         .unwrap();
-    assert_eq!(archived.rows_affected(), 1, "the year went past");
+    assert_eq!(res.status(), StatusCode::OK);
+    let archived: Value = res.json().await.unwrap();
+    let stamp = archived["archived_at"]
+        .as_i64()
+        .expect("the archive answers the stamped year");
+    assert!(
+        stamp >= now,
+        "the stamp is the archive's own clock: {archived}"
+    );
+    assert_eq!(archived["id"], json!(year_id), "{archived}");
+
+    // A second archive is a `200` with the stamp that already stood: the year
+    // is never re-dated by a double click, and nothing is written twice.
+    let res = mudur
+        .post(format!("{base}/academic-years/{year_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "re-archiving stays a 200");
+    assert_eq!(
+        json_of(res).await["archived_at"].as_i64(),
+        Some(stamp),
+        "re-archiving must not move the stamp"
+    );
+
     let read: Value = json_of(
         mudur
             .get(format!("{base}/academic-years/{year_id}"))
@@ -3625,7 +3645,11 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
             .unwrap(),
     )
     .await;
-    assert_eq!(read["archived_at"], json!(now), "the read shows it: {read}");
+    assert_eq!(
+        read["archived_at"],
+        json!(stamp),
+        "the read shows it: {read}"
+    );
 
     // --- every write into the closed year is a 409 --------------------------
     let refusals: Vec<(&str, reqwest::Response)> = vec![
@@ -3735,6 +3759,11 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     assert_eq!(refused, 409, "the room door answers a real HTTP 409");
 
     // --- re-opening the year thaws the whole set ---------------------------
+    // Archiving a year is one-way — there is no unarchive route — so the
+    // column is cleared here the way an operator would, to prove the gates
+    // read the stamp and not some one-shot state. The dönem's own
+    // `archive`/`unarchive` pair (below) is the supported way to re-open a
+    // graded slice inside the year.
     sqlx::query("UPDATE academic_year SET archived_at = NULL WHERE id = $1")
         .bind(Uuid::parse_str(&year_id).unwrap())
         .execute(&db)
@@ -3764,12 +3793,16 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
 
     // Archive under the open socket: `finish` comes back as an error frame
     // carrying the archived refusal instead of submitting the sheet.
-    sqlx::query("UPDATE academic_year SET archived_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(Uuid::parse_str(&year_id).unwrap())
-        .execute(&db)
+    let res = mudur
+        .post(format!("{base}/academic-years/{year_id}/archive"))
+        .send()
         .await
         .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the year closes under the socket"
+    );
     ws_send(&mut ws, json!({ "type": "finish" })).await;
     let error = ws_frame_of_type(&mut ws, "error").await;
     assert!(
@@ -3829,7 +3862,11 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
             .unwrap(),
     )
     .await;
-    for path in ["/terms/{id}/archive", "/terms/{id}/unarchive"] {
+    for path in [
+        "/terms/{id}/archive",
+        "/terms/{id}/unarchive",
+        "/academic-years/{id}/archive",
+    ] {
         assert!(
             spec["paths"][path]["post"].is_object(),
             "{path} must be a documented POST in the served spec"

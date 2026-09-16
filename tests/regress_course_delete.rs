@@ -194,6 +194,92 @@ async fn the_sweep_that_takes_a_courses_marks_gives_their_kind_references_back()
     );
 }
 
+/// The dönem's own `exam_count` is claimed by `exam::create` for every exam
+/// filed in it, and the sweep that takes an instance's exams is what owes it
+/// back. Nothing covered the release on this path: the exam rows went with the
+/// sweep, but the claim stood, so `DELETE /terms/{id}` kept answering its
+/// guarded `409` forever — a dönem nothing could remove, and the academic year
+/// above it (whose own guard counts its dönemler) down with it.
+///
+/// The `409` before the detach is the fixture's own proof that the claim is
+/// what the guard reads; the `204` after it is the release. The course delete
+/// follows the detach onto an empty catalog, so both sweeps this file is built
+/// around run in order and neither may give the claim back twice.
+#[tokio::test]
+async fn the_sweep_that_takes_an_instances_exams_gives_its_term_the_count_back() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "term_count_ders_sil", "manager").await;
+    let t = taught(&app, &mudur, "Biyoloji").await;
+    let exam = create_exam(&app, &mudur, &t.instance, &t.term, "Vize", "yazili").await;
+
+    async fn exam_count(db: &hezarfen_backend::database::Database, term: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT exam_count FROM term WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(term).expect("a uuid term id"))
+            .fetch_one(db)
+            .await
+            .expect("the term read")
+    }
+    assert_eq!(
+        exam_count(&db, &t.term).await,
+        1,
+        "the exam must hold the dönem's claim"
+    );
+
+    // The guard is armed while the claim stands — the state the missing
+    // release left standing forever.
+    let refused = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{}", t.term),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "an exam still filed in the dönem must refuse its delete: {}",
+        refused.body
+    );
+
+    let detached = detach_instance(&app, &mudur, &t).await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "the instance detaches: {}",
+        detached.body
+    );
+    drop_course(&db, &t.course).await;
+
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM exam WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&exam).expect("a uuid exam id"))
+        .fetch_one(&db)
+        .await
+        .expect("the exam read");
+    assert_eq!(rows, 0, "the sweep must take the exam row itself");
+    assert_eq!(
+        exam_count(&db, &t.term).await,
+        0,
+        "the swept exam's dönem claim was never given back — the dönem can \
+         never be deleted"
+    );
+
+    let gone = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{}", t.term),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(
+        gone.status,
+        StatusCode::NO_CONTENT,
+        "the released dönem must be deletable: {}",
+        gone.body
+    );
+}
+
 /// The sitting's own write is held open, every gate already cleared, and the
 /// sweep that takes its exam fires into that window: an `AFTER INSERT` trigger
 /// on `exam_attempt` sleeps *inside* the create's own transaction, after the

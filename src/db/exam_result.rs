@@ -203,8 +203,14 @@ pub async fn grade(
     .await
 }
 
-/// The user's graded results restricted to one instance's exams — the raw
-/// rows behind the per-instance block of the marks report.
+/// The user's graded results that count under one instance — the raw rows
+/// behind the per-instance block of the marks report.
+///
+/// It reads `exam_audience`, not `exam.class_course`: an exam addressed to
+/// several instances (an ortak sınav) is *each* of their exams, and its marks
+/// count in every one of them, not only in the owner's. The owner's audience
+/// row is always written with the exam, so for an exam nobody else was
+/// addressed to this is the same set the owner column used to give.
 pub async fn list_for_user_in_course(
     db: &Database,
     class_course: &ClassCourseId,
@@ -214,8 +220,8 @@ pub async fn list_for_user_in_course(
         ExamResult,
         r#"SELECT r.exam AS "exam: ExamId", r.app_user AS "user: UserId", r.seq,
                   r.mark AS "mark: Mark", r.graded_by AS "graded_by: UserId"
-           FROM exam_result r JOIN exam e ON e.id = r.exam
-           WHERE r.app_user = $1 AND e.class_course = $2
+           FROM exam_result r JOIN exam_audience a ON a.exam = r.exam
+           WHERE r.app_user = $1 AND a.class_course = $2
            ORDER BY r.exam DESC, r.seq DESC"#,
         user.uuid(),
         class_course.uuid(),
@@ -225,27 +231,76 @@ pub async fn list_for_user_in_course(
     Ok(latest_per_pair(rows))
 }
 
-/// The user's graded results inside one dönem — every instance's exams whose
-/// `term` is `term`, which is exactly the karne's input slice (D8: a karne is
-/// per dönem, and an exam belongs to the dönem it was sat in).
+/// One row of [`list_for_user_in_term`]: a mark's own columns plus the
+/// instance the audience join resolved it under.
+///
+/// The instance is the *join's* answer, not a column of `exam_result`, so this
+/// is a second spelling of [`ExamResult`]'s five columns. Flat, and named after
+/// the query's column aliases: `query_as!` builds the row field by field out of
+/// the selected columns, so a nested or renamed field would not line up.
+/// [`into_parts`](AttributedResult::into_parts) hands the caller the domain row
+/// back.
+struct AttributedResult {
+    class_course: ClassCourseId,
+    exam: ExamId,
+    user: UserId,
+    seq: i64,
+    mark: Mark,
+    graded_by: UserId,
+}
+
+impl AttributedResult {
+    fn into_parts(self) -> (ClassCourseId, ExamResult) {
+        (
+            self.class_course,
+            ExamResult {
+                exam: self.exam,
+                user: self.user,
+                seq: self.seq,
+                mark: self.mark,
+                graded_by: self.graded_by,
+            },
+        )
+    }
+}
+
+/// The user's graded results inside one dönem, each paired with the instance it
+/// counts under — the karne's input slice (D8: a karne is per dönem, and an
+/// exam belongs to the dönem it was sat in).
+///
+/// A mark comes back once per *queried* instance the exam is addressed to
+/// (`exam_audience`), not only under its owner: an ortak sınav announced to
+/// several instances is each of their exams, and this is what puts its mark in
+/// every one of their karnes. Only the latest sitting per (instance, exam)
+/// comes back, the grade-of-record the per-instance read folds to as well.
 pub async fn list_for_user_in_term(
     db: &Database,
     user: &UserId,
     term: &TermId,
-) -> Result<Vec<ExamResult>, AppError> {
+    instances: &[ClassCourseId],
+) -> Result<Vec<(ClassCourseId, ExamResult)>, AppError> {
+    if instances.is_empty() {
+        return Ok(Vec::new());
+    }
+    let instances: Vec<uuid::Uuid> = instances.iter().map(ClassCourseId::uuid).collect();
     let rows = sqlx::query_as!(
-        ExamResult,
-        r#"SELECT r.exam AS "exam: ExamId", r.app_user AS "user: UserId", r.seq,
+        AttributedResult,
+        r#"SELECT DISTINCT ON (a.class_course, r.exam)
+                  a.class_course AS "class_course: ClassCourseId",
+                  r.exam AS "exam: ExamId", r.app_user AS "user: UserId", r.seq,
                   r.mark AS "mark: Mark", r.graded_by AS "graded_by: UserId"
-           FROM exam_result r JOIN exam e ON e.id = r.exam
-           WHERE r.app_user = $1 AND e.term = $2
-           ORDER BY r.exam DESC, r.seq DESC"#,
+           FROM exam_result r
+           JOIN exam e ON e.id = r.exam
+           JOIN exam_audience a ON a.exam = r.exam
+           WHERE r.app_user = $1 AND e.term = $2 AND a.class_course = ANY($3)
+           ORDER BY a.class_course, r.exam DESC, r.seq DESC"#,
         user.uuid(),
         term.uuid(),
+        &instances,
     )
     .fetch_all(db)
     .await?;
-    Ok(latest_per_pair(rows))
+    Ok(rows.into_iter().map(AttributedResult::into_parts).collect())
 }
 
 pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<ExamResult>, AppError> {
@@ -415,11 +470,155 @@ pub async fn remove(
     .await
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sqlx::Row as _;
 
     use crate::database::init_test_db;
+
+    /// The mark [`an_ortak_exam_karne`] grades on the exam addressed to both
+    /// instances, and the one it grades on the owner-only exam.
+    pub(crate) const ORTAK_MARK: i64 = 85;
+    pub(crate) const OWNER_MARK: i64 = 45;
+
+    /// The shape the audience attribution is read against: two şubeler, one
+    /// catalog course and one student who is a live member of both, so the
+    /// karne and the marks report each carry a line for *both* instances.
+    pub(crate) struct OrtakExam {
+        pub student: UserId,
+        pub term: TermId,
+        /// The instance both exams were created in — their owner.
+        pub owner: ClassCourseId,
+        /// The other instance the ortak exam was addressed to.
+        pub addressed: ClassCourseId,
+    }
+
+    /// A year with one dönem, two şubeler of it carrying the same catalog
+    /// course, and one student who sits both. Two exams are created in the
+    /// first şube's instance and graded: one owned there but **addressed to
+    /// both** (the second `exam_audience` row is written directly, which is
+    /// what a school-wide ortak sınav is), the other addressed to its owner
+    /// alone.
+    ///
+    /// That is what tells the two conclusions apart: read through
+    /// `exam_audience`, [`ORTAK_MARK`] stands on *both* instances' lines and
+    /// [`OWNER_MARK`] on the owner's alone; read through `exam.class_course`
+    /// (the shape this fixture was built to catch), the second instance held no
+    /// mark at all and the owner's line averaged only its own exam.
+    pub(crate) async fn an_ortak_exam_karne(db: &Database) -> OrtakExam {
+        use crate::domain::academic_year::AcademicYearName;
+        use crate::domain::class_group::ClassName;
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::exam::{
+            ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
+        };
+        use crate::domain::settings::Settings;
+        use crate::domain::term::TermName;
+
+        let office = crate::db::class_member::tests::fixture_user(db, "ortak-office").await;
+        let student = crate::db::class_member::tests::fixture_user(db, "ortak-student").await;
+        let year = crate::db::academic_year::create(
+            db,
+            &office,
+            AcademicYearName::try_new("ortak 2026-2027").unwrap(),
+            Timestamp::from_millis(0),
+            Timestamp::from_millis(1),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let term = crate::db::term::create(
+            db,
+            TermName::try_new("1. Dönem").unwrap(),
+            *year.get_id(),
+            Timestamp::from_millis(0),
+            Timestamp::from_millis(1),
+        )
+        .await
+        .unwrap();
+        let course = crate::db::course::create(
+            db,
+            &office,
+            CourseTitle::try_new("Matematik").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+        )
+        .await
+        .unwrap();
+        let mut instances: Vec<ClassCourseId> = Vec::new();
+        for name in ["5-A", "5-B"] {
+            let class = crate::db::class_group::create(
+                db,
+                &office,
+                ClassName::try_new(name).unwrap(),
+                None,
+                Some(*year.get_id()),
+                None,
+            )
+            .await
+            .unwrap();
+            crate::service::class_member::add(db, class.get_id(), &student, &office)
+                .await
+                .unwrap();
+            let instance =
+                crate::service::class_course::attach(db, class.get_id(), course.get_id(), &office)
+                    .await
+                    .unwrap();
+            instances.push(instance.get_id().clone());
+        }
+        let owner = instances[0].clone();
+        let addressed = instances[1].clone();
+
+        let kinds = Settings::defaults().get_exam_kinds().to_vec();
+        for (title, addressed_to_both, mark) in
+            [("ortak", true, ORTAK_MARK), ("tek", false, OWNER_MARK)]
+        {
+            let exam = crate::db::exam::create(
+                db,
+                &office,
+                &owner,
+                term.get_id(),
+                ExamTitle::try_new(title).unwrap(),
+                ExamDescription::try_new("").unwrap(),
+                ExamKind::try_new("yazili", &kinds).unwrap(),
+                ExamSchedule::try_new(None, None, None, None).unwrap(),
+                ExamAttemptLimit::try_new(1).unwrap(),
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            if addressed_to_both {
+                // The ortak half: the create wrote the owner's audience row,
+                // and the school announces the exam to the second section too.
+                sqlx::query("INSERT INTO exam_audience (exam, class_course) VALUES ($1, $2)")
+                    .bind(exam.get_id().uuid())
+                    .bind(addressed.uuid())
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+            super::grade(
+                db,
+                exam.get_id(),
+                &student,
+                1,
+                Mark::try_new(mark).unwrap(),
+                &office,
+                "yazili",
+            )
+            .await
+            .unwrap();
+        }
+
+        OrtakExam {
+            student,
+            term: *term.get_id(),
+            owner,
+            addressed,
+        }
+    }
 
     #[tokio::test]
     async fn retakes_keep_a_mark_per_sitting_with_the_latest_as_grade_of_record() {

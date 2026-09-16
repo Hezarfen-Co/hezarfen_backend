@@ -13,7 +13,11 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{GHOST_ID, Res, app_and_db, create_course, login_as, me_id, send};
+use common::{
+    FIXTURE_YEAR_ENDS_AT, GHOST_ID, Res, app_and_db, blob_dir, create_course, create_exam,
+    create_homework, create_subject, create_term, create_year, id_of, login_as, me_id, send,
+    upload_file_at,
+};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
 use hezarfen_backend::domain::course::CourseId;
@@ -1639,4 +1643,152 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
         1,
         "…and the stored list did not move"
     );
+}
+
+/// The bytes a swept instance held live only on disk: the exam questions'
+/// illustrations and the class's homework submission files. The sweep removes
+/// the rows and hands their blob names back, and the route is what unlinks
+/// them — a route that drops that list strands the bytes with nothing left
+/// pointing at them, which is the leak this pins closed.
+///
+/// This is the blueprint half of the sweep: dropping a course from the grade's
+/// template detaches the instances the blueprint itself attached, so the
+/// `PATCH` a manager makes is what owes the unlink, not only the row removal.
+#[tokio::test]
+async fn a_blueprint_removal_unlinks_the_swept_instances_blob_bytes() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let year = create_year(&app, &manager, "2026-2027").await;
+    let term = create_term(&app, &manager, &year, "1. Dönem").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+
+    // The template first, then the section: a create stocks from its grade's
+    // blueprint, so this instance carries the blueprint as its source — which
+    // is what lets the removal below sweep it at all.
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    let class =
+        common::create_class(&app, &manager, "9-A", json!({ "grade": "9", "year": year })).await;
+    assert_eq!(
+        source_of(&class, &algebra, &db).await,
+        Some(blueprint_id("9", &db).await),
+        "the create must stock the section from the template"
+    );
+    let instance = instance_of(&class, &algebra, &db).await;
+
+    // One student, so a submission file can exist: adding them to the şube
+    // pumped an enrollment into the instance the template attached.
+    let ali = login_as(&app, &db, "ali", "student").await;
+    let ali_id = me_id(&app, &ali).await;
+    let added = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(added.status, StatusCode::CREATED, "{:?}", added.body);
+
+    let subject = create_subject(&app, &manager, &algebra, "Cebir").await;
+    let exam = create_exam(&app, &manager, &instance, &term, "Vize", "yazili").await;
+    let question = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions"),
+        Some(&manager),
+        Some(json!({ "subject_id": subject, "text": "x kare", "kind": "text", "points": 5 })),
+    )
+    .await;
+    assert_eq!(question.status, StatusCode::CREATED, "{}", question.body);
+    let question = id_of(&question.body);
+    let image = upload_file_at(
+        &app,
+        &manager,
+        &format!("/exams/{exam}/questions/{question}/image"),
+        "map.png",
+        "image/png",
+        b"png-bytes",
+    )
+    .await;
+    assert_eq!(image.status, StatusCode::CREATED, "{}", image.body);
+
+    let homework = create_homework(
+        &app,
+        &manager,
+        &instance,
+        &subject,
+        "Ödev",
+        FIXTURE_YEAR_ENDS_AT,
+    )
+    .await;
+    let submission = upload_file_at(
+        &app,
+        &ali,
+        &format!("/homework/{homework}/submission/files"),
+        "odev.pdf",
+        "application/pdf",
+        b"pdf-bytes",
+    )
+    .await;
+    assert_eq!(
+        submission.status,
+        StatusCode::CREATED,
+        "{}",
+        submission.body
+    );
+
+    // Both blob names, straight out of the store: the bytes on disk are keyed
+    // by the row's own file name.
+    let files: Vec<String> = sqlx::query_scalar(
+        "SELECT file FROM question_image WHERE exam = $1
+         UNION ALL
+         SELECT f.file FROM homework_file f
+          WHERE f.submission IN (SELECT id FROM homework_submission WHERE homework = $2)",
+    )
+    .bind(uuid_of(&exam))
+    .bind(uuid_of(&homework))
+    .fetch_all(&db)
+    .await
+    .expect("the blob rows");
+    assert_eq!(
+        files.len(),
+        2,
+        "the fixture must have stored both blobs: {files:?}"
+    );
+    for file in &files {
+        assert!(
+            blob_dir().join(file).exists(),
+            "the fixture's blob {file} never landed on disk"
+        );
+    }
+
+    let patched = send(
+        &app,
+        "PATCH",
+        "/classes/blueprints/9",
+        Some(&manager),
+        Some(json!({ "course_ids": [] })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.body);
+    assert!(skips(&patched).is_empty(), "{:?}", patched.body);
+    assert!(
+        !attached(&class, &algebra, &db).await,
+        "the template takes back the instance it placed"
+    );
+    for file in &files {
+        assert!(
+            !blob_dir().join(file).exists(),
+            "the swept instance's blob {file} lingers on disk with nothing \
+             pointing at it"
+        );
+    }
 }

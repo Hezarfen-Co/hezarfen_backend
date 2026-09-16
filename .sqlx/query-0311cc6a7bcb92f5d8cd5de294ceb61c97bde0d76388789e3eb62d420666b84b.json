@@ -1,10 +1,21 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT r.exam AS \"exam: ExamId\", r.app_user AS \"user: UserId\", r.seq,\n                  r.mark AS \"mark: Mark\", r.graded_by AS \"graded_by: UserId\"\n           FROM exam_result r JOIN exam e ON e.id = r.exam\n           WHERE r.app_user = $1 AND e.class_course = $2\n           ORDER BY r.exam DESC, r.seq DESC",
+  "query": "SELECT DISTINCT ON (a.class_course, r.exam)\n                  a.class_course AS \"class_course: ClassCourseId\",\n                  r.exam AS \"exam: ExamId\", r.app_user AS \"user: UserId\", r.seq,\n                  r.mark AS \"mark: Mark\", r.graded_by AS \"graded_by: UserId\"\n           FROM exam_result r\n           JOIN exam e ON e.id = r.exam\n           JOIN exam_audience a ON a.exam = r.exam\n           WHERE r.app_user = $1 AND e.term = $2 AND a.class_course = ANY($3)\n           ORDER BY a.class_course, r.exam DESC, r.seq DESC",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_audience",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
         "name": "exam: ExamId",
         "type_info": "Uuid",
         "origin": {
@@ -15,7 +26,7 @@
         }
       },
       {
-        "ordinal": 1,
+        "ordinal": 2,
         "name": "user: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -26,7 +37,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "seq",
         "type_info": "Int8",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "mark: Mark",
         "type_info": "Int8",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "graded_by: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -62,7 +73,8 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid"
+        "Uuid",
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -70,8 +82,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "bcdb9a4b449617cf405b3abb592e68ad4a6eb5e1715a773eeb1ec939338c6e2e"
+  "hash": "0311cc6a7bcb92f5d8cd5de294ceb61c97bde0d76388789e3eb62d420666b84b"
 }
