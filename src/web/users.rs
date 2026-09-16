@@ -182,9 +182,10 @@ async fn apply_preferences(
 
 #[derive(Deserialize, IntoParams)]
 struct SearchUsers {
-    /// Case-insensitive fragment of a username, name, or surname. May be
-    /// blank when `role` is given — that lists the whole role.
-    q: String,
+    /// Case-insensitive fragment of a username, name, or surname. Omit it —
+    /// or leave it blank — to list everyone the caller may see, optionally
+    /// narrowed by `role`.
+    q: Option<String>,
     /// Restrict matches to one role: `parent`, `student`, `teacher`,
     /// `manager`, or `admin`. Omit to search every role.
     role: Option<String>,
@@ -200,12 +201,13 @@ struct SearchUsers {
 /// attendance) and, for a student or parent, the one way to find the staff
 /// member they are allowed to message. Any authenticated user may ask; a
 /// caller below teacher only ever sees the roles they may message (teacher,
-/// manager, admin), in the items *and* in `total`. `role` narrows to one role
-/// (e.g. `role=student` for an enroll picker) — a student or parent naming a
-/// role they may not message is refused; a blank `q` with a `role` lists
-/// everyone in that role. Paged via `?limit=&offset=` like the other lists
-/// (omit `limit` for every match); returns a `{items, total, limit, offset}`
-/// envelope carrying only id/username/display name — no contact details.
+/// manager, admin), in the items *and* in `total`. A blank or omitted `q`
+/// lists everyone the caller may see — what the pickers open with; `role`
+/// narrows to one role (e.g. `role=student` for an enroll picker), and a
+/// student or parent naming a role they may not message is refused. Paged
+/// via `?limit=&offset=` like the other lists (omit `limit` for every
+/// match); returns a `{items, total, limit, offset}` envelope carrying only
+/// id/username/display name — no contact details.
 #[utoipa::path(
     get,
     path = "/search",
@@ -214,7 +216,7 @@ struct SearchUsers {
     params(SearchUsers),
     responses(
         (status = 200, description = "A page of matching users (all matches when unpaged)", body = Page<PersonRef>),
-        (status = 400, description = "Blank query without a role, unknown role, or invalid limit/offset", body = ErrorResponse),
+        (status = 400, description = "Unknown role, or invalid limit/offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "A student or parent asked for a role they may not message", body = ErrorResponse),
     ),
@@ -224,12 +226,6 @@ async fn search_users(
     CurrentUser(user): CurrentUser,
     Query(req): Query<SearchUsers>,
 ) -> Result<Json<Page<PersonRef>>, AppError> {
-    if req.q.trim().is_empty() && req.role.is_none() {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "q",
-            reason: "must not be empty unless role is given",
-        }));
-    }
     let (limit, offset) = PageParams {
         limit: req.limit,
         offset: req.offset,
@@ -246,8 +242,15 @@ async fn search_users(
             "students and parents may only search staff (teacher or higher)",
         ));
     }
-    let (users, total) =
-        crate::service::user::search(&st.db, &req.q, role, allowed, limit, offset).await?;
+    let (users, total) = crate::service::user::search(
+        &st.db,
+        req.q.as_deref().unwrap_or(""),
+        role,
+        allowed,
+        limit,
+        offset,
+    )
+    .await?;
     let items = users.iter().map(PersonRef::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }

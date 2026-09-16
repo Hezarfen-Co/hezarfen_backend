@@ -11398,6 +11398,26 @@ async fn search_below_staff_sees_only_staff() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(common::items(&res.body)[0]["username"], "ayse");
+
+    // A blank `q` opens the directory, and below staff that directory is
+    // still staff only: the narrowing lives in the query, so it holds for the
+    // whole list and not just for a fragment.
+    for (who, cookie) in [("student", &ayse), ("parent", &anne)] {
+        let res = send(&app, "GET", "/users/search?q=", Some(cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{who}: {}", res.body);
+        let items = common::items(&res.body);
+        assert_eq!(res.body["total"], items.len(), "{who}: {}", res.body);
+        assert!(
+            !items
+                .iter()
+                .any(|user| user["username"] == "ayse" || user["username"] == "anne"),
+            "{who} must not see students or parents: {items:?}"
+        );
+        assert!(
+            items.iter().any(|user| user["username"] == "ayhan"),
+            "{who} must see the teacher: {items:?}"
+        );
+    }
 }
 
 // --- users: search matching semantics --------------------------------------
@@ -11455,20 +11475,46 @@ async fn search_matches_are_literal_not_like_wildcards() {
     assert_eq!(hits[0]["username"], "under_score");
 }
 
-/// A blank search fragment is refused, not treated as match-everything.
+/// A blank search fragment is the pickers' opening directory: it lists
+/// everyone the caller may see, exactly like a blank `q` scoped to a role.
 #[tokio::test]
-async fn search_rejects_a_blank_query() {
+async fn search_allows_a_blank_query() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     login(&app, "alice").await;
 
-    // Whitespace-only (url-encoded spaces) -> 400, not the full user list.
+    // Whitespace-only (url-encoded spaces) is the same blank, not an error.
     let res = send(&app, "GET", "/users/search?q=%20%20", Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let blank = common::items(&res.body);
+    assert!(
+        blank.iter().any(|user| user["username"] == "alice"),
+        "{blank:?}"
+    );
+    assert_eq!(res.body["total"], blank.len(), "{}", res.body);
 
-    // Missing `q` entirely is a deserialization failure, not a wildcard.
+    // An omitted `q` is the same blank.
     let res = send(&app, "GET", "/users/search", Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body), blank);
+
+    // So is an explicit empty one.
+    let res = send(&app, "GET", "/users/search?q=", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body), blank);
+
+    // The blank directory still honors the paging window.
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=&limit=1&offset=1",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(res.body["total"], blank.len());
 }
 
 /// The app is EN/TR, so the user picker must fold Turkish casing: `İ` (U+0130)

@@ -350,7 +350,7 @@ async fn user_search_is_paged_not_capped() {
     assert_eq!(total(&res.body), 12);
     assert_eq!(items(&res.body).len(), 2, "offset 10 of 12 leaves 2");
 
-    // Paging bounds are enforced, and a blank query is still refused.
+    // Paging bounds are enforced.
     let res = send(
         &app,
         "GET",
@@ -360,12 +360,12 @@ async fn user_search_is_paged_not_capped() {
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "limit=0 is a 400");
+
+    // A blank `q` is the opening directory, not an error: everyone the caller
+    // may see — the 12 `grp` accounts plus the teacher themselves.
     let res = send(&app, "GET", "/users/search?q=", Some(&teacher), None).await;
-    assert_eq!(
-        res.status,
-        StatusCode::BAD_REQUEST,
-        "blank q without a role is still a 400"
-    );
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(total(&res.body), 13, "blank q lists everyone visible");
 
     // Blank q scoped to a role is a listing, not an error.
     let res = send(

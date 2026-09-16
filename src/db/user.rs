@@ -213,8 +213,8 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
 /// narrows the *visible* set (the roles a non-staff caller may message —
 /// see [`Role::messageable_roles`]); it is part of the query, not a
 /// post-filter, so `total` counts only what the caller may see. A blank
-/// `query`
-/// matches everyone, so blank + `role` is a role-scoped listing. Returns
+/// `query` matches everyone visible: blank alone is the caller's whole
+/// directory, blank + `role` a role-scoped listing. Returns
 /// every match, ordered by username; the HTTP layer pages the result like
 /// any other list (no built-in cap — an over-broad fragment is windowed
 /// by `?limit`).
