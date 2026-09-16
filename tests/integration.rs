@@ -5218,6 +5218,137 @@ async fn admin_manages_roles_with_guards() {
     );
 }
 
+/// `POST /users` is the school-office path: an admin mints a school account
+/// outright, born with the role named (default `student`), with the username
+/// a global person credential exactly as at `POST /auth/register`. A username
+/// taken in this school, or an existing person under a different password, is
+/// a `409`; the reserved staff-reading names are a `400`.
+#[tokio::test]
+async fn admin_creates_a_user() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+
+    // A student may not mint accounts.
+    let student = login(&app, "kid").await;
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&student),
+            Some(json!({"username": "nope", "password": "secret1"}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // The admin mints a teacher directly — the row is born with the role.
+    let res = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({"username": "ayse", "password": "secret1", "role": "teacher"})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["username"], "ayse");
+    assert_eq!(res.body["role"], "teacher");
+    assert!(
+        res.body["name"].is_null(),
+        "a fresh account holds no profile"
+    );
+    let ayse_id = id_of(&res.body);
+
+    // The account is real: it logs in with the password the admin chose, and
+    // that session carries the role.
+    let login = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({"username": "ayse", "password": "secret1"})),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.body);
+    assert_eq!(login.body["role"], "teacher");
+    assert_eq!(login.body["id"], ayse_id);
+    let ayse = login.cookie.expect("session cookie set on login");
+    let me = send(&app, "GET", "/auth/me", Some(&ayse), None).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["role"], "teacher");
+
+    // Omitted role -> student.
+    let res = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({"username": "veli", "password": "secret1"})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["role"], "student");
+
+    // A username already taken in this school is a 409.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({"username": "ayse", "password": "secret1"}))
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    // The same name under a different password is a 409 too — the person
+    // already stands under a credential this caller has not proven.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({"username": "ayse", "password": "different1"}))
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+
+    // Refused before anything is written: a reserved name, an unknown role,
+    // and a password under the floor.
+    for body in [
+        json!({"username": "root", "password": "secret1"}),
+        json!({"username": "zey", "password": "secret1", "role": "wizard"}),
+        json!({"username": "zey", "password": "x"}),
+    ] {
+        let res = send(&app, "POST", "/users", Some(&admin), Some(body.clone())).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{body}: {}", res.body);
+    }
+
+    // The created student is really in the roster: the new teacher finds them.
+    let found = send(
+        &app,
+        "GET",
+        "/users/search?q=veli&role=student",
+        Some(&ayse),
+        None,
+    )
+    .await;
+    assert_eq!(found.status, StatusCode::OK, "{}", found.body);
+    assert!(
+        common::items(&found.body)
+            .iter()
+            .any(|item| item["username"] == "veli"),
+        "the minted student is searchable: {}",
+        found.body
+    );
+}
+
 /// The AI service principal must never be mintable, storable, or filterable
 /// over HTTP: it is the QUIC bridge's own identity, not an account anybody can
 /// hold. `Role` carries no `serde` derive (`src/domain/role.rs:21`), so no

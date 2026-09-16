@@ -704,7 +704,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 200 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 204 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -854,8 +854,10 @@ parent  <  student  <  teacher  <  manager  <  admin
 
 The check is **hierarchical** — a higher role satisfies any lower requirement
 (an admin can do anything a teacher can). New accounts always register as
-`student`; a role read is re-checked on every request, so a role change takes
-effect on the user's very next call (no re-login).
+`student`; an admin may also mint one outright at `POST /users`, optionally
+born with the role it is named (`student` by default, so a new teacher never
+passes through a student state). A role read is re-checked on every request, so
+a role change takes effect on the user's very next call (no re-login).
 
 `parent` is the read-only observer at the bottom of the ladder: an admin ties
 any number of students to a parent account (`POST /users/{id}/students`), and
@@ -974,7 +976,7 @@ still left exactly as they stand.
 | List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
-| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role, and nobody can demote the school's **last** admin (`409`) |
+| Create a user; list users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role, and nobody can demote the school's **last** admin (`409`) |
 
 ### Bootstrapping the first admin
 
@@ -997,6 +999,9 @@ startup. `compose.yaml` ships with the credentials above for local dev. See
 "Multi-school (SaaS)" for the rest of the lifecycle.
 
 That admin can then promote everyone else through `PATCH /users/{id}/role`.
+The same admin can also mint accounts directly with `POST /users`
+(`{username, password}`, optionally `role` — `student` by default), which is
+how staff are added without the register-then-promote two-step.
 
 The admin set cannot be emptied through the API: an admin never changes their
 own role, and a `PATCH /users/{id}/role` that would demote the last admin
@@ -1394,6 +1399,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/terms/{id}/unarchive`                                          | manager | Re-open an archived term. Requires manager+. Idempotent the same way as archiving: an already-open term answers `200`. |
 | GET    | `/time`                                                          | no      | Server clock: `{now}` UTC unix-millis, for a frontend to sync against. |
 | GET    | `/users`                                                         | admin   | List every user with their role, newest first. Admin only. Paged: pass `?limit=&offset=` to take a window (omit `limit` for the whole list); the response is a `{items, total, limit, offset}` envelope where `total` counts every user. |
+| POST   | `/users`                                                         | admin   | Create a school account directly — the school-office path for adding a student or a staff member with no self-registration and no invite. Admin only. `{username, password}` are required and `role` is optional (omitted → `student`); the row is born with its role rather than promoted into it, so a new teacher is never briefly a student. The username is a global **person** credential exactly as at `POST /auth/register`: a name new everywhere creates the person and this school's `app_user`, while a person who already exists is attached to this school only when the password matches the stored credential — a mismatch is a `409`. A username already taken in this school is a `409`, and the reserved staff-reading names (`admin`, `root`, …) are a `400`, the same policy registration holds. |
 | PATCH  | `/users/me`                                                      | student | Update the caller's own personal info: name, surname, email, phone, birth date, plus the public-profile pair `display_name` and `bio` (both readable school-wide at `GET /users/{id}/profile`, unlike the contact fields). Any authenticated role. Omitted fields stay as they are; an empty string clears a field. |
 | GET    | `/users/me/avatar`                                               | student | The caller's own avatar bytes. The self alias of `GET /{id}/avatar` — the static `/me/avatar` segment wins over `/{id}/avatar` in the router, so without this a client that never learned its own id gets a bodyless `405` on the obvious route. It serves the caller's own row and nothing else, so it asks no gate: the session already proves the reach. |
 | POST   | `/users/me/avatar`                                               | student | Upload (or replace) the caller's own avatar. `multipart/form-data` with the image under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes` (settings). Replacing one drops the previous picture. |

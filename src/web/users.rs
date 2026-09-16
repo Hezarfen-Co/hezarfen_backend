@@ -10,7 +10,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{
-    MAX_MAX_FILE_BYTES, MAX_PROFILE_CLASSES, MAX_PROFILE_COURSES, UPLOAD_BODY_OVERHEAD_BYTES,
+    MAX_MAX_FILE_BYTES, MAX_PROFILE_CLASSES, MAX_PROFILE_COURSES, RESERVED_USERNAMES,
+    UPLOAD_BODY_OVERHEAD_BYTES,
 };
 use crate::database::Database;
 use crate::domain::badge::{self, BadgeAward};
@@ -19,7 +20,7 @@ use crate::domain::class_group::ClassGroupId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
 use crate::domain::role::Role;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::{Password, User, UserId, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
@@ -34,7 +35,7 @@ use super::{
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list_users))
+        .routes(routes!(list_users, create_user))
         .routes(routes!(update_my_profile))
         .routes(routes!(update_my_preferences))
         .routes(routes!(my_students))
@@ -277,6 +278,92 @@ async fn list_users(
     let (users, total) = crate::service::user::list_all(&st.db, limit, offset).await?;
     let items = users.iter().map(UserResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CreateUser {
+    /// The new account's username — a global credential, exactly as at
+    /// `POST /auth/register`.
+    #[schema(example = "ada", min_length = 3, max_length = 32)]
+    username: String,
+    #[schema(example = "correct horse battery", min_length = 6, max_length = 128)]
+    password: String,
+    /// The role the account is born with. Omitted → `student`.
+    #[schema(example = "teacher")]
+    role: Option<String>,
+}
+
+/// Create a school account directly — the school-office path for adding a
+/// student or a staff member with no self-registration and no invite. Admin
+/// only. `{username, password}` are required and `role` is optional (omitted →
+/// `student`); the row is born with its role rather than promoted into it, so
+/// a new teacher is never briefly a student. The username is a global
+/// **person** credential exactly as at `POST /auth/register`: a name new
+/// everywhere creates the person and this school's `app_user`, while a person
+/// who already exists is attached to this school only when the password
+/// matches the stored credential — a mismatch is a `409`. A username already
+/// taken in this school is a `409`, and the reserved staff-reading names
+/// (`admin`, `root`, …) are a `400`, the same policy registration holds.
+#[utoipa::path(
+    post,
+    path = "/",
+    tag = "users",
+    security(("session_cookie" = [])),
+    request_body = CreateUser,
+    responses(
+        (status = 201, description = "Account created, holding the requested role", body = UserResponse),
+        (status = 400, description = "Invalid username or password (a reserved username included), or an unknown role", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires admin role", body = ErrorResponse),
+        (status = 409, description = "The username is taken in this school, or that person exists under a different password", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn create_user(
+    State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
+    _admin: RequireAdmin,
+    Json(req): Json<CreateUser>,
+) -> Result<(StatusCode, Json<UserResponse>), AppError> {
+    let username = Username::try_new(&req.username)?;
+    // The same policy `POST /auth/register` enforces: these names read as
+    // staff and invite impersonation, so no minting route may claim them. The
+    // `ADMIN_USERNAME` bootstrap does not come through here.
+    if RESERVED_USERNAMES.contains(&username.as_str()) {
+        return Err(ValidationError::Invalid {
+            field: "username",
+            reason: "this username is reserved",
+        }
+        .into());
+    }
+    let role = match req.role.as_deref() {
+        Some(raw) => Role::try_from_str(raw)?,
+        None => Role::Student,
+    };
+    let password = Password::try_new(&req.password)?;
+    let password_hash = password.hash_async().await?;
+
+    // Person half (control database): create the global account, or meet the
+    // one already standing — the credential login verifies, exactly as the
+    // register and school-create paths treat it. The stored hash is never
+    // rewritten here; the caller must prove they know it below.
+    let control = st.tenants.control();
+    let person =
+        crate::service::person::create_or_load(control, username.clone(), password_hash).await?;
+    if !person.get_password_hash().verify_async(&password).await {
+        return Err(AppError::Conflict(
+            "an account with that username exists under a different password",
+        ));
+    }
+
+    // School half, born with its role: a fresh row holds no enrollments or
+    // teaching assignments for a later promotion to sweep. A username already
+    // taken in this school refuses here, before the membership is written.
+    let user =
+        crate::service::user::create_with_role(&st.db, username, Some(*person.get_id()), role)
+            .await?;
+    crate::service::person::link_school(control, person.get_id(), &slug).await?;
+    Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))
 }
 
 /// Update the caller's own personal info: name, surname, email, phone, birth
@@ -537,10 +624,7 @@ async fn students_page(
 ) -> Result<Page<PersonRef>, AppError> {
     let (limit, offset) = page.resolve()?;
     let links = crate::service::parent_link::list_for_parent(db, parent).await?;
-    let ids: Vec<UserId> = links
-        .iter()
-        .map(|link| *link.get_student())
-        .collect();
+    let ids: Vec<UserId> = links.iter().map(|link| *link.get_student()).collect();
     let mut students = crate::service::user::list_by_ids(db, &ids).await?;
     // The link row alone is not the grant, exactly as [`ensure_can_observe`]
     // says: a link whose student side changed role (a sweep lost a race with
