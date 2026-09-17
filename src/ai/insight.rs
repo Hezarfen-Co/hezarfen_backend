@@ -329,7 +329,7 @@ pub async fn serve(
         ));
     }
     let db = &tenant.db;
-    let answer = match capability {
+    match capability {
         AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY => {
             let request: SummaryWriteRequest = decode(payload)?;
             encode(&db::insight::write_summaries(db, request.rows).await.map_err(refusal)?)
@@ -374,14 +374,11 @@ pub async fn serve(
         // `scope_of` matched above, so the table and this match agree; the
         // arm exists so a table entry without an operation is a compile-time
         // miss instead of a runtime surprise.
-        other => {
-            return Err((
-                "unknown_capability",
-                format!("the backend serves no `{other}` operation"),
-            ));
-        }
-    };
-    answer
+        other => Err((
+            "unknown_capability",
+            format!("the backend serves no `{other}` operation"),
+        )),
+    }
 }
 
 /// Decode one payload into the operation's own type. A payload that does not

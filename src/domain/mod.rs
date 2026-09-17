@@ -53,6 +53,7 @@ pub mod note_file;
 pub mod parent_link;
 pub mod payment_ledger;
 pub mod person;
+pub mod podcast_job;
 pub mod pomodoro;
 pub mod pool_question;
 pub mod pool_question_image;

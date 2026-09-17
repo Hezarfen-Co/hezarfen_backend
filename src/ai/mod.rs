@@ -13,10 +13,12 @@
 //!
 //! * [`api`] — which REST paths a service may read back through the bridge
 //! * [`protocol`] — frames on the wire
+//! * [`capability`] — the capabilities the **backend** serves, and their scopes
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`rag`] — the `rag.index` payloads, and the course-note dispatch behind them
 //! * [`rag_chat`] — the `rag.chat` payloads: a scoped question and the citations behind its answer
-//! * [`podcast`] — the `podcast.*` job payloads, and the relay behind them
+//! * [`podcast`] — the `podcast.*` job payloads, the relay behind submit/cancel,
+//!   and the job-state report the service calls back
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
 //! * [`registry`] — who is connected here, and who gets the next request
 //! * [`tls`] — the listener's certificate
@@ -24,10 +26,11 @@
 //! The transport is generic; the features land on top of it. So far that is
 //! the chatbot (`web::chatbot`), which routes on the `chat.reply` capability,
 //! course-note indexing (`web::course_notes`), which routes on `rag.index`,
-//! and the podcast relay (`web::podcast`), which routes on the four
-//! `podcast.*` capabilities and streams the audio they produce.
+//! and the podcast relay (`web::podcast`), which dispatches `podcast.submit`/
+//! `podcast.cancel`, serves `podcast.report`, and streams the ingested audio.
 
 pub mod api;
+pub mod capability;
 pub mod chat;
 pub mod error;
 pub mod insight;

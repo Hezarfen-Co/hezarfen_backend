@@ -63,6 +63,13 @@ pub enum AppError {
     Validation(#[from] ValidationError),
     #[error("not found")]
     NotFound,
+    /// The resource existed, its retention window has passed, and nothing
+    /// about it is served any more — a podcast job older than
+    /// [`crate::constant::PODCAST_JOB_RETENTION_SECS`] today. A dedicated
+    /// `410` so a client can tell "gone for good" from "never existed" (`404`)
+    /// and from "not written yet" (`409`) without parsing a sentence.
+    #[error("expired: {0}")]
+    Expired(&'static str),
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden: {0}")]
@@ -152,6 +159,7 @@ impl AppError {
         match self {
             AppError::Validation(_) => "validation",
             AppError::NotFound => "not_found",
+            AppError::Expired(_) => "expired",
             AppError::Unauthorized => "unauthorized",
             AppError::Forbidden(_) => "forbidden",
             AppError::ModuleDisabled(_) => "module_disabled",
@@ -266,6 +274,7 @@ impl AppError {
             }
             AppError::Validation(v) => (StatusCode::BAD_REQUEST, v.to_string()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            AppError::Expired(m) => (StatusCode::GONE, m.to_string()),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_string()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.to_string()),

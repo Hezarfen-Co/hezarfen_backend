@@ -120,6 +120,7 @@ pub(crate) fn public_message(err: &AppError, room: &str) -> String {
     match err {
         AppError::Validation(err) => err.to_string(),
         AppError::NotFound => "not found".to_string(),
+        AppError::Expired(message) => (*message).to_string(),
         AppError::Unauthorized => "unauthorized".to_string(),
         AppError::Forbidden(message) => (*message).to_string(),
         AppError::Conflict(message) => (*message).to_string(),

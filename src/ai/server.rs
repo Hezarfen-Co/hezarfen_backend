@@ -646,12 +646,7 @@ async fn serve_upload(
             // sender so its write stops rather than filling a stream nobody
             // reads.
             let _ = recv.stop(1u32.into());
-            upload_refusal(
-                request.id.clone(),
-                request.school.clone(),
-                &code,
-                message,
-            )
+            upload_refusal(request.id.clone(), request.school.clone(), code, message)
         }
     };
     if let Err(e) = write_frame(send, &response).await {
@@ -1092,7 +1087,7 @@ async fn serve_capability(inner: &Inner, request: CapabilityRequest) -> Capabili
     let call = capability::serve(
         &request.capability,
         tenant.as_ref(),
-        &control,
+        control,
         &request.payload,
     );
     match tokio::time::timeout(inner.request_timeout, call).await {

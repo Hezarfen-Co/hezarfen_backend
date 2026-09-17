@@ -2,16 +2,18 @@
 //!
 //! Everything here runs over a real QUIC socket on loopback — a real
 //! handshake, real TLS, real streams — with [`Behaviour::Podcast`] standing in
-//! for what the service would do with a request. The four dispatching doors
-//! are driven through the real router, so what they assert is what a browser
-//! would receive, and the fake service's `seen` log is what the *service*
-//! received.
+//! for what the service does with a request. The **backend owns the job**: the
+//! submit door mints the id, writes the `podcast_job` row, and only then
+//! dispatches `podcast.submit`; the three reading doors answer from that row
+//! alone; and the service reports every transition and uploads the finished
+//! episode on its own client-initiated streams — the same connection it
+//! registered with, exactly the shape `tests/ai_bridge.rs` drives.
 //!
-//! The audio door is tested against a real directory tree — the same
-//! `FILES_PATH` layout the deployment uses — because its whole job is refusing
-//! paths that escape a school's directory. Every refusal test first proves the
-//! target file exists, so a pass cannot come from the file simply being
-//! missing.
+//! The assertions therefore split in two: what a browser gets from the real
+//! router, and what the *service* received ([`FakeService::seen`]) or what the
+//! school's own database and blob directory hold. A reading door that quietly
+//! round-tripped to the service would fail the `seen` assertions; a submit that
+//! did not write its row first would fail the database ones.
 
 mod common;
 
@@ -19,35 +21,40 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use hezarfen_backend::ai::protocol::{
     Greeting, Hello, Request, Response, read_frame, write_frame,
 };
 use hezarfen_backend::ai::{AiBridge, BridgeConfig};
 use hezarfen_backend::constant::{
-    AI_ALPN, AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_RESULT_CAPABILITY,
-    AI_PODCAST_STATUS_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY, AI_PROTOCOL,
+    AI_ALPN, AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY, AI_PROTOCOL,
+    PODCAST_JOB_RETENTION_SECS, PODCAST_JOB_STALE_FLOOR_SECS,
 };
+use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::module::{Module, ModuleSet};
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 const TOKEN: &str = "shared-ai-token";
 
-/// The four capabilities one podcast service declares.
-const CAPABILITIES: [&str; 4] = [
-    AI_PODCAST_SUBMIT_CAPABILITY,
-    AI_PODCAST_STATUS_CAPABILITY,
-    AI_PODCAST_RESULT_CAPABILITY,
-    AI_PODCAST_CANCEL_CAPABILITY,
-];
+/// The two capabilities a live podcast worker offers. Status and result are
+/// not capabilities any more — the backend answers those from its own row — so
+/// a service declaring only these serves every reading door.
+const CAPABILITIES: [&str; 2] = [AI_PODCAST_SUBMIT_CAPABILITY, AI_PODCAST_CANCEL_CAPABILITY];
 
-/// The job id the fake service mints, and the `audio_id` it answers — a path
-/// relative to the school's output root, exactly as the real service writes it.
-const JOB_ID: &str = "job-1";
-const AUDIO_ID: &str = "ses/duz_okuma/bolum-1/episode.mp3";
 /// A source id shaped like the backend ids the service is handed.
 const SOURCE_ID: &str = "019732e3-7b00-7000-8000-00000000dead";
+/// The narration the caller asks for; the reports echo the same value, as the
+/// service's first report resolves it.
+const FORMAT: &str = "duz_okuma";
+/// The estimate the fake service answers a submit with.
+const ETA_SECS: i64 = 2700;
+/// What the fake service says its uploaded episode runs for.
+const DURATION_SECS: f64 = 12.5;
+const AUDIO_NAME: &str = "bolum-1.mp3";
+const AUDIO_TYPE: &str = "audio/mpeg";
 
 // ---------------------------------------------------------------- harness --
 
@@ -103,10 +110,13 @@ fn hello(service: &str, capabilities: &[&str]) -> Hello {
 }
 
 /// A connected fake service. Holding it keeps the connection (and so the
-/// registration) alive; dropping it is how a test simulates a crash.
+/// registration) alive; dropping it is how a test simulates a crash. `conn` is
+/// the registration connection itself — the one a real service opens its own
+/// streams on when it reports a transition or uploads an episode.
 struct FakeService {
     _endpoint: quinn::Endpoint,
     _control: (quinn::SendStream, quinn::RecvStream),
+    conn: quinn::Connection,
     /// Every request this service received, in arrival order.
     seen: Arc<Mutex<Vec<Request>>>,
 }
@@ -120,10 +130,12 @@ impl FakeService {
 /// What the fake service does with each request it receives.
 #[derive(Clone)]
 enum Behaviour {
-    /// Answer like the podcast service: a queued receipt, a status snapshot, a
-    /// finished job's artifacts, a cancel verdict — each echoing the job id it
-    /// was asked about, so a mis-routed id shows up in the answer.
+    /// Answer like the podcast service: a receipt echoing the backend's own
+    /// job id, and a cancel verdict.
     Podcast,
+    /// Accept the job under an id of the service's own choosing — the one
+    /// answer the submit door must not trust.
+    WrongEcho,
     /// Answer with a handled failure.
     Fail { code: String, message: String },
 }
@@ -149,6 +161,7 @@ async fn connect_service(bridge: &AiBridge, hello: Hello, behaviour: Behaviour) 
     FakeService {
         _endpoint: endpoint,
         _control: (send, recv),
+        conn,
         seen,
     }
 }
@@ -165,23 +178,26 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                 };
                 seen.lock().unwrap().push(request.clone());
                 let response = match behaviour {
-                    Behaviour::Podcast => Some(Response::Ok {
+                    Behaviour::Podcast => Response::Ok {
                         id: request.id.clone(),
                         school: request.school.clone(),
                         payload: podcast_answer(&request),
-                    }),
-                    Behaviour::Fail { code, message } => Some(Response::Err {
+                    },
+                    Behaviour::WrongEcho => Response::Ok {
+                        id: request.id.clone(),
+                        school: request.school.clone(),
+                        payload: wrong_echo_answer(),
+                    },
+                    Behaviour::Fail { code, message } => Response::Err {
                         id: request.id.clone(),
                         school: request.school.clone(),
                         code,
                         message,
-                    }),
+                    },
                 };
-                if let Some(response) = response {
-                    let _ = write_frame(&mut send, &response).await;
-                    let _ = send.finish();
-                    let _ = send.stopped().await;
-                }
+                let _ = write_frame(&mut send, &response).await;
+                let _ = send.finish();
+                let _ = send.stopped().await;
             });
         }
     });
@@ -189,34 +205,25 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
 
 /// What the podcast service would answer for this capability.
 fn podcast_answer(request: &Request) -> Value {
-    let job_id = request
-        .payload
-        .get("job_id")
-        .cloned()
-        .unwrap_or_else(|| json!(JOB_ID));
     match request.capability.as_str() {
-        AI_PODCAST_SUBMIT_CAPABILITY => {
-            json!({ "job_id": JOB_ID, "state": "queued", "eta_secs": 2700 })
-        }
-        AI_PODCAST_STATUS_CAPABILITY => json!({
-            "job_id": job_id,
-            "state": "running",
-            "stage": "tts",
-            "progress": 0.5,
-            "error_code": null,
+        // The receipt must echo the backend's own job id — the id every later
+        // call names — so the fake echoes the payload it was handed.
+        AI_PODCAST_SUBMIT_CAPABILITY => json!({
+            "job_id": request.payload["job_id"],
+            "state": "queued",
+            "eta_secs": ETA_SECS,
         }),
-        AI_PODCAST_RESULT_CAPABILITY => json!({
-            "job_id": job_id,
-            "audio_id": AUDIO_ID,
-            "duration_secs": 12.5,
-            "script_id": "script-1",
-            "audio_ids": [AUDIO_ID],
-            "script_ids": ["script-1"],
-            "format": "duz_okuma",
+        AI_PODCAST_CANCEL_CAPABILITY => json!({
+            "job_id": request.payload["job_id"],
+            "cancelled": true,
         }),
-        AI_PODCAST_CANCEL_CAPABILITY => json!({ "job_id": job_id, "cancelled": true }),
         other => panic!("the fake podcast service was asked for `{other}`"),
     }
+}
+
+/// The receipt of a service that keyed the job by an id it minted itself.
+fn wrong_echo_answer() -> Value {
+    json!({ "job_id": "019732e3-7b00-7000-8000-00000000beef", "state": "queued", "eta_secs": 60 })
 }
 
 /// Registration completes asynchronously after the welcome is on the wire, so
@@ -234,9 +241,11 @@ async fn await_workers(bridge: &AiBridge, expected: usize) {
     );
 }
 
-/// A registered podcast service offering all four capabilities, the router
-/// wired to its bridge, and a logged-in student's cookie.
-async fn podcast_app() -> (FakeService, Router, String) {
+/// A registered podcast service offering the two capabilities a live worker
+/// needs, the router wired to its bridge, a logged-in student's cookie, and
+/// the school's database handle — the fixture every round-trip test starts
+/// from.
+async fn podcast_app() -> (FakeService, Router, String, Database) {
     let bridge = bridge().await;
     let service = connect_service(
         &bridge,
@@ -245,39 +254,347 @@ async fn podcast_app() -> (FakeService, Router, String) {
     )
     .await;
     await_workers(&bridge, 1).await;
-    let (app, _db) = common::app_with_ai(Some(bridge)).await;
+    let (app, db) = common::app_with_ai(Some(bridge)).await;
     let cookie = common::login(&app, "ali").await;
-    (service, app, cookie)
+    (service, app, cookie, db)
 }
+
+/// A logged-in caller and the school's database, with **no AI service in the
+/// picture at all**: the reading doors answer from the row, so the lifetime
+/// rules and the read refusals need no worker — and a dispatch would be
+/// impossible.
+async fn app_without_ai() -> (Router, String, Database) {
+    let (app, db) = common::app_and_db().await;
+    let cookie = common::login(&app, "ali").await;
+    (app, cookie, db)
+}
+
+// ------------------------------------------------------------- http doors --
 
 /// Submit one job and return the response.
 async fn submit(app: &Router, cookie: &str, body: Value) -> common::Res {
     common::send(app, "POST", "/podcast/jobs", Some(cookie), Some(body)).await
 }
 
+/// Submit one job with the standard body (asserting the `202`) and hand back
+/// the backend-minted id every other door names.
+async fn submit_job(app: &Router, cookie: &str) -> String {
+    let res = submit(
+        app,
+        cookie,
+        json!({ "source_id": SOURCE_ID, "format": FORMAT }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    res.body["job_id"]
+        .as_str()
+        .expect("the receipt names the job")
+        .to_string()
+}
+
+/// One `GET /podcast/jobs/{id}`.
+async fn status_of(app: &Router, cookie: &str, id: &str) -> common::Res {
+    common::send(app, "GET", &format!("/podcast/jobs/{id}"), Some(cookie), None).await
+}
+
+/// One `GET /podcast/jobs/{id}/result`.
+async fn result_of(app: &Router, cookie: &str, id: &str) -> common::Res {
+    common::send(
+        app,
+        "GET",
+        &format!("/podcast/jobs/{id}/result"),
+        Some(cookie),
+        None,
+    )
+    .await
+}
+
+/// One `POST /podcast/jobs/{id}/cancel`.
+async fn cancel_of(app: &Router, cookie: &str, id: &str) -> common::Res {
+    common::send(
+        app,
+        "POST",
+        &format!("/podcast/jobs/{id}/cancel"),
+        Some(cookie),
+        None,
+    )
+    .await
+}
+
+/// One `GET /podcast/jobs/{id}/audio`, raw — the body is audio bytes or a JSON
+/// refusal, never a parsed envelope.
+async fn audio_of(app: &Router, cookie: &str, id: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+    common::send_raw(
+        app,
+        "GET",
+        &format!("/podcast/jobs/{id}/audio"),
+        Some(cookie),
+        None,
+        Vec::new(),
+    )
+    .await
+}
+
+// ------------------------------------------------------------ service i/o --
+
+/// One `podcast.report` call, exactly as the real service writes it: a
+/// client-initiated capability frame on the connection it registered with,
+/// echoing the job's own identity — the backend refuses a report that
+/// describes a different job.
+fn report_frame(job_id: &str, user_id: &str, state: &str, stage: &str, progress: f64) -> Value {
+    json!({
+        "id": format!("report-{state}"),
+        "school": DEMO_SLUG,
+        "capability": "podcast.report",
+        "payload": {
+            "job_id": job_id,
+            "source_id": SOURCE_ID,
+            "format": FORMAT,
+            "user_id": user_id,
+            "state": state,
+            "stage": stage,
+            "progress": progress,
+            "error_code": null,
+        },
+    })
+}
+
+/// One `BlobUploadRequest` for `job_id`, declaring the header of the bytes
+/// that follow it on the same stream.
+fn upload_frame(job_id: &str, name: &str, content_type: &str, size: usize) -> Value {
+    json!({
+        "id": format!("upload-{job_id}"),
+        "upload": true,
+        "school": DEMO_SLUG,
+        "job_id": job_id,
+        "name": name,
+        "content_type": content_type,
+        "size": size,
+        "duration_secs": DURATION_SECS,
+    })
+}
+
+/// Send one client-initiated frame and read the one frame the backend answers
+/// with — the shape every service→backend call rides.
+async fn capability_call(conn: &quinn::Connection, request: Value) -> Value {
+    let (mut send, mut recv) = conn.open_bi().await.expect("client-initiated stream");
+    write_frame(&mut send, &request).await.expect("write the call");
+    let _ = send.finish();
+    read_frame::<_, Value>(&mut recv).await.expect("read the answer")
+}
+
+/// One audio upload on a fresh client-initiated stream: the header frame,
+/// exactly `body.len()` raw bytes, FIN — then the backend's one answer frame.
+async fn blob_upload(conn: &quinn::Connection, frame: Value, body: &[u8]) -> Value {
+    let (mut send, mut recv) = conn.open_bi().await.expect("upload stream");
+    write_frame(&mut send, &frame)
+        .await
+        .expect("write the upload frame");
+    send.write_all(body).await.expect("write the audio bytes");
+    let _ = send.finish();
+    read_frame::<_, Value>(&mut recv)
+        .await
+        .expect("read the upload answer")
+}
+
+/// Assert one report was stored: the answer's payload echoes the job and says
+/// `stored` — an unstored report is a refusal, never a quiet success.
+fn assert_report_stored(answer: &Value, job_id: &str) {
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert_eq!(answer["payload"]["job_id"], job_id);
+    assert_eq!(answer["payload"]["stored"], true);
+}
+
+/// The flat refusal code out of one capability answer frame.
+fn refusal_code(answer: &Value) -> String {
+    assert_eq!(answer["status"], "err", "{answer}");
+    answer["code"]
+        .as_str()
+        .expect("a refusal carries its code")
+        .to_string()
+}
+
+// ------------------------------------------------------------------- rows --
+
+fn uuid_of(key: &str) -> Uuid {
+    Uuid::parse_str(key).expect("a uuid key")
+}
+
+/// The wall clock in unix milliseconds — the unit every timestamp column here
+/// stores.
+fn now_ms() -> i64 {
+    Timestamp::now().as_millis()
+}
+
+/// How many podcast jobs this user has on the books.
+async fn rows_for(db: &Database, user: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM podcast_job WHERE user_id = $1")
+        .bind(uuid_of(user))
+        .fetch_one(db)
+        .await
+        .expect("count the user's jobs")
+}
+
+/// Write one job row by hand. The shapes the reading doors' own lifetime rules
+/// are about — untouched past the staleness window, aged out of retention —
+/// are ones no door can mint, so the fixture writes them directly.
+async fn seed_job(
+    db: &Database,
+    job: Uuid,
+    user: &str,
+    state: &str,
+    eta_secs: Option<i64>,
+    updated_at: i64,
+) -> Uuid {
+    sqlx::query(
+        "INSERT INTO podcast_job (id, user_id, source_id, state, stage, progress, \
+             eta_secs, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, '', 0, $5, $6, $6)",
+    )
+    .bind(job)
+    .bind(uuid_of(user))
+    .bind(SOURCE_ID)
+    .bind(state)
+    .bind(eta_secs)
+    .bind(updated_at)
+    .execute(db)
+    .await
+    .expect("seed the job row");
+    job
+}
+
+/// The same, but `done` and naming an artifact: the row shape the audio door
+/// reads its key and headers from, whether or not the bytes are still on disk.
+async fn seed_done_job(
+    db: &Database,
+    job: Uuid,
+    user: &str,
+    key: &str,
+    bytes: i64,
+    updated_at: i64,
+) -> Uuid {
+    sqlx::query(
+        "INSERT INTO podcast_job (id, user_id, source_id, state, stage, progress, \
+             audio_key, audio_name, audio_type, audio_bytes, duration_secs, \
+             created_at, updated_at) \
+         VALUES ($1, $2, $3, 'done', '', 1, $4, $5, $6, $7, $8, $9, $9)",
+    )
+    .bind(job)
+    .bind(uuid_of(user))
+    .bind(SOURCE_ID)
+    .bind(key)
+    .bind(AUDIO_NAME)
+    .bind(AUDIO_TYPE)
+    .bind(bytes)
+    .bind(DURATION_SECS)
+    .bind(updated_at)
+    .execute(db)
+    .await
+    .expect("seed the done row");
+    job
+}
+
+/// Write `bytes` at `key` under the demo school's blob directory — the layout
+/// an ingested episode lands in, and the only place the audio door reads.
+fn write_blob(key: &str, bytes: &[u8]) {
+    let path = common::blob_dir().join(key);
+    std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create the blob tree");
+    std::fs::write(&path, bytes).expect("write the blob");
+    assert!(path.is_file(), "the fixture blob really landed");
+}
+
+/// Deterministic pseudo-random episode bytes, past one 64 KiB read chunk so a
+/// passing door proves it streamed the body rather than fitting one write.
+fn episode_bytes() -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..128 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------ round trips --
 
+/// The submit door writes the row before it dispatches, and hands the service
+/// the id it minted — the one handle every later call names. A service keying
+/// its own record by what it was sent can therefore never disagree with the
+/// row, and the receipt carries the service's own ETA.
 #[tokio::test]
-async fn a_submit_round_trips_the_source_and_format_to_the_service() {
-    let (service, app, cookie) = podcast_app().await;
+async fn a_submit_writes_the_row_and_hands_the_service_its_own_job_id() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
 
     let res = submit(
         &app,
         &cookie,
-        json!({ "source_id": SOURCE_ID, "format": "duz_okuma" }),
+        json!({ "source_id": SOURCE_ID, "format": FORMAT }),
     )
     .await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
-    assert_eq!(res.body["job_id"], JOB_ID);
     assert_eq!(res.body["state"], "queued");
-    assert_eq!(res.body["eta_secs"], 2700);
+    assert_eq!(res.body["eta_secs"], ETA_SECS);
+    let job_id = res.body["job_id"]
+        .as_str()
+        .expect("the receipt names the job")
+        .to_string();
 
     let seen = service.seen();
     assert_eq!(seen.len(), 1, "exactly one dispatch");
     assert_eq!(seen[0].capability, AI_PODCAST_SUBMIT_CAPABILITY);
     assert_eq!(seen[0].school, DEMO_SLUG, "the school rides the frame");
+    assert_eq!(
+        seen[0].payload["job_id"], job_id,
+        "the service was handed the row's own id"
+    );
     assert_eq!(seen[0].payload["source_id"], SOURCE_ID);
-    assert_eq!(seen[0].payload["format"], "duz_okuma");
+    assert_eq!(seen[0].payload["format"], FORMAT);
+    assert_eq!(seen[0].payload["user_id"], user);
+
+    let (state, eta, source): (String, Option<i64>, String) =
+        sqlx::query_as("SELECT state, eta_secs, source_id FROM podcast_job WHERE id = $1")
+            .bind(uuid_of(&job_id))
+            .fetch_one(&db)
+            .await
+            .expect("the row is on the books");
+    assert_eq!(state, "queued");
+    assert_eq!(eta, Some(ETA_SECS), "the service's estimate landed on the row");
+    assert_eq!(source, SOURCE_ID);
+}
+
+/// A service that accepts the job under an id of its own has answered about a
+/// different job: the echo is checked, not trusted, because the backend's id is
+/// the only handle every later call uses. The refusal is a `502` — the backend
+/// cannot vouch for an answer it did not understand — and the row is
+/// tombstoned rather than left claiming `queued` forever.
+#[tokio::test]
+async fn a_submit_that_echoes_another_job_id_is_a_bad_gateway() {
+    let bridge = bridge().await;
+    let _service =
+        connect_service(&bridge, hello("podcast", &CAPABILITIES), Behaviour::WrongEcho).await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge)).await;
+    let cookie = common::login(&app, "ali").await;
+    let user = common::me_id(&app, &cookie).await;
+
+    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.body);
+    assert_eq!(res.body["error"], "bad_reply");
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT state, error_code FROM podcast_job WHERE user_id = $1")
+            .bind(uuid_of(&user))
+            .fetch_all(&db)
+            .await
+            .expect("read back the tombstone");
+    assert_eq!(
+        rows,
+        vec![("failed".to_string(), Some("bad_reply".to_string()))],
+        "exactly one row, and it records why"
+    );
 }
 
 /// The format is optional and the service applies its own default: an omitted
@@ -285,7 +602,7 @@ async fn a_submit_round_trips_the_source_and_format_to_the_service() {
 /// distinguish "absent" from "empty".
 #[tokio::test]
 async fn an_omitted_format_is_not_sent_at_all() {
-    let (service, app, cookie) = podcast_app().await;
+    let (service, app, cookie, _db) = podcast_app().await;
 
     let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
@@ -299,179 +616,493 @@ async fn an_omitted_format_is_not_sent_at_all() {
     );
 }
 
-/// A blank source id is refused here, before the bridge: the service would
-/// refuse it too, and a round trip to learn that is a round trip wasted.
+/// A blank source id is refused here, before the bridge and before the row:
+/// the service would refuse it too, and a round trip to learn that is a round
+/// trip wasted.
 #[tokio::test]
-async fn a_blank_source_id_is_refused_before_dispatch() {
-    let (service, app, cookie) = podcast_app().await;
+async fn a_blank_source_id_is_refused_before_anything_is_written() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
 
     let res = submit(&app, &cookie, json!({ "source_id": "   " })).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     assert!(service.seen().is_empty(), "nothing reaches the service");
+    assert_eq!(rows_for(&db, &user).await, 0, "and no row is written");
 }
 
+/// A report lands on the row, and the reading doors answer from it: the
+/// service's `seen` log must not grow, because `podcast.status` and
+/// `podcast.result` are not calls the backend makes any more — a relayed read
+/// would show up here as a second request.
 #[tokio::test]
-async fn a_status_read_round_trips_the_job_id() {
-    let (service, app, cookie) = podcast_app().await;
+async fn a_running_report_lands_on_the_row_and_the_reads_stay_off_the_service() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job_id = submit_job(&app, &cookie).await;
 
-    let res = common::send(
-        &app,
-        "GET",
-        &format!("/podcast/jobs/{JOB_ID}"),
-        Some(&cookie),
-        None,
-    )
-    .await;
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "running", "tts", 0.5),
+        )
+        .await,
+        &job_id,
+    );
+
+    let res = status_of(&app, &cookie, &job_id).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["job_id"], JOB_ID);
+    assert_eq!(res.body["job_id"], job_id);
     assert_eq!(res.body["state"], "running");
     assert_eq!(res.body["stage"], "tts");
     assert_eq!(res.body["progress"], 0.5);
     assert!(res.body["error_code"].is_null());
 
-    let seen = service.seen();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].capability, AI_PODCAST_STATUS_CAPABILITY);
-    assert_eq!(seen[0].payload["job_id"], JOB_ID);
+    let state: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(uuid_of(&job_id))
+        .fetch_one(&db)
+        .await
+        .expect("the report really landed");
+    assert_eq!(state, "running");
+    assert_eq!(
+        service.seen().len(),
+        1,
+        "the reads answered from the row, not the service"
+    );
 }
 
+/// The whole pipeline, end to end: submit, a running report, the finished mp3
+/// uploaded as raw bytes, the done report, then the result door naming the
+/// artifact and the audio door streaming the very bytes that were uploaded —
+/// with the content type the row recorded.
 #[tokio::test]
-async fn a_result_read_round_trips_the_artifacts() {
-    let (service, app, cookie) = podcast_app().await;
+async fn a_finished_job_serves_the_uploaded_bytes() {
+    let (service, app, cookie, _db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job_id = submit_job(&app, &cookie).await;
 
-    let res = common::send(
-        &app,
-        "GET",
-        &format!("/podcast/jobs/{JOB_ID}/result"),
-        Some(&cookie),
-        None,
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "running", "tts", 0.25),
+        )
+        .await,
+        &job_id,
+    );
+
+    let bytes = episode_bytes();
+    let answer = blob_upload(
+        &service.conn,
+        upload_frame(&job_id, AUDIO_NAME, AUDIO_TYPE, bytes.len()),
+        &bytes,
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["job_id"], JOB_ID);
-    assert_eq!(res.body["audio_id"], AUDIO_ID);
-    assert_eq!(res.body["duration_secs"], 12.5);
-    assert_eq!(res.body["script_id"], "script-1");
-    assert_eq!(res.body["audio_ids"], json!([AUDIO_ID]));
-    assert_eq!(res.body["script_ids"], json!(["script-1"]));
-    assert_eq!(res.body["format"], "duz_okuma");
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert_eq!(answer["key"], format!("podcast/{job_id}.mp3"));
+    assert_eq!(answer["size"], bytes.len() as u64);
 
-    let seen = service.seen();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].capability, AI_PODCAST_RESULT_CAPABILITY);
-    assert_eq!(seen[0].payload["job_id"], JOB_ID);
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "done", "", 1.0),
+        )
+        .await,
+        &job_id,
+    );
+
+    let res = result_of(&app, &cookie, &job_id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["job_id"], job_id);
+    assert_eq!(res.body["audio_id"], format!("podcast/{job_id}.mp3"));
+    assert_eq!(res.body["duration_secs"], DURATION_SECS);
+    assert_eq!(res.body["format"], FORMAT);
+
+    let (status, headers, body) = audio_of(&app, &cookie, &job_id).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["content-type"], AUDIO_TYPE, "the row's own type");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["cache-control"], "private, no-store");
+    assert_eq!(body, bytes, "the door streams the uploaded bytes, unchanged");
+
+    assert_eq!(
+        service.seen().len(),
+        1,
+        "the upload and the reports are the service's own calls, not dispatches"
+    );
 }
 
+/// Cancelling a live job reaches the worker that owns the queue and stamps the
+/// verdict on the row — the row then records that the job stopped, so a poll
+/// after the service is gone still reads the truth.
 #[tokio::test]
-async fn a_cancel_round_trips_the_verdict() {
-    let (service, app, cookie) = podcast_app().await;
+async fn a_cancel_of_a_live_job_stops_it() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let job_id = submit_job(&app, &cookie).await;
 
-    let res = common::send(
-        &app,
-        "POST",
-        &format!("/podcast/jobs/{JOB_ID}/cancel"),
-        Some(&cookie),
-        None,
-    )
-    .await;
+    let res = cancel_of(&app, &cookie, &job_id).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["job_id"], JOB_ID);
+    assert_eq!(res.body["job_id"], job_id);
     assert_eq!(res.body["cancelled"], true);
 
     let seen = service.seen();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].capability, AI_PODCAST_CANCEL_CAPABILITY);
-    assert_eq!(seen[0].payload["job_id"], JOB_ID);
+    assert_eq!(seen.len(), 2, "the cancel rode a second dispatch");
+    assert_eq!(seen[1].capability, AI_PODCAST_CANCEL_CAPABILITY);
+    assert_eq!(seen[1].payload["job_id"], job_id);
+
+    let state: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(uuid_of(&job_id))
+        .fetch_one(&db)
+        .await
+        .expect("the row records the verdict");
+    assert_eq!(state, "cancelled");
+}
+
+/// A job that already stopped is not an error to cancel: the verdict is
+/// `false` — this call cancelled nothing — and no worker is needed at all,
+/// because the row is terminal and the door answers before it looks for one.
+#[tokio::test]
+async fn a_cancel_of_a_terminal_job_answers_false_without_the_service() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job_id = submit_job(&app, &cookie).await;
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "failed", "", 0.0),
+        )
+        .await,
+        &job_id,
+    );
+
+    // The pipeline is gone by the time the caller gives up on it.
+    drop(service);
+
+    let res = cancel_of(&app, &cookie, &job_id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["job_id"], job_id);
+    assert_eq!(res.body["cancelled"], false);
+
+    let state: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(uuid_of(&job_id))
+        .fetch_one(&db)
+        .await
+        .expect("the row is still there");
+    assert_eq!(state, "failed", "the verdict never rewrites a terminal row");
 }
 
 // --------------------------------------------------------------- refusals --
 
-/// With a bridge but no worker, every door answers the shared AI-unavailable
-/// `503` — never a `500`, and never a dispatch into nothing. The audio door is
-/// not in this list on purpose: it reads a local file and needs no service.
+/// A submit that reaches no service writes nothing: the `503` is the whole
+/// answer, so a poll can never find a job nobody will ever work on. Both
+/// shapes of "nobody to ask" answer that `503` with their own message — a
+/// configured-but-unconnected bridge, and a deployment with no bridge at all.
 #[tokio::test]
-async fn every_dispatching_door_is_503_with_no_worker_registered() {
-    let bridge = bridge().await;
-    let (app, _db) = common::app_with_ai(Some(bridge)).await;
+async fn a_submit_that_reaches_no_service_is_503_and_writes_no_row() {
+    let (app, db) = common::app_with_ai(Some(bridge().await)).await;
     let cookie = common::login(&app, "ali").await;
+    let user = common::me_id(&app, &cookie).await;
+    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert_eq!(res.body["error"], "no AI service is connected right now");
+    assert_eq!(rows_for(&db, &user).await, 0, "no worker, no row");
 
-    let doors = [
-        ("POST", "/podcast/jobs".to_string(), true),
-        ("GET", format!("/podcast/jobs/{JOB_ID}"), false),
-        ("GET", format!("/podcast/jobs/{JOB_ID}/result"), false),
-        ("POST", format!("/podcast/jobs/{JOB_ID}/cancel"), false),
-    ];
-    for (method, uri, body) in doors {
-        let res = common::send(
-            &app,
-            method,
-            &uri,
-            Some(&cookie),
-            body.then(|| json!({ "source_id": SOURCE_ID })),
-        )
-        .await;
-        assert_eq!(
-            res.status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "{method} {uri}: {}",
-            res.body
-        );
-        assert_eq!(res.body["error"], "no AI service is connected right now");
-    }
-}
-
-/// The same doors with no bridge at all (the deployment never set
-/// `AI_QUIC_ADDR`): still a `503`, with the other message.
-#[tokio::test]
-async fn every_dispatching_door_is_503_when_the_bridge_is_off() {
-    let (app, _db) = common::app_with_ai(None).await;
+    // The deployment never set `AI_QUIC_ADDR`: there is no bridge at all.
+    let (app, db) = common::app_with_ai(None).await;
     let cookie = common::login(&app, "ali").await;
-
+    let user = common::me_id(&app, &cookie).await;
     let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
     assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
     assert_eq!(
         res.body["error"],
         "the AI service is not enabled on this deployment"
     );
+    assert_eq!(rows_for(&db, &user).await, 0);
 }
 
-/// The service's own refusal code decides the HTTP status, so a client can
-/// branch the same way it does on the bridge: `busy` is the service at
-/// capacity (transient, `503`), `not_found` is a job it never had (`404`), and
-/// `not_ready` is a job that has not finished (`409`).
+/// A service that refuses the job — at capacity, say — leaves the row as the
+/// record of that: exactly one row, `failed` with the service's own code, and
+/// the refusal reaches the caller with its own status.
 #[tokio::test]
-async fn a_service_refusal_keeps_its_code_and_status() {
-    let cases = [
-        ("busy", StatusCode::SERVICE_UNAVAILABLE),
-        ("not_found", StatusCode::NOT_FOUND),
-        ("not_ready", StatusCode::CONFLICT),
-    ];
-    for (code, expected) in cases {
-        let bridge = bridge().await;
-        let _service = connect_service(
-            &bridge,
-            hello("podcast", &CAPABILITIES),
-            Behaviour::Fail {
-                code: code.to_string(),
-                message: format!("the service refused with {code}"),
-            },
-        )
-        .await;
-        await_workers(&bridge, 1).await;
-        let (app, _db) = common::app_with_ai(Some(bridge)).await;
-        let cookie = common::login(&app, "ali").await;
+async fn a_refusing_service_tombstones_the_row() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("podcast", &CAPABILITIES),
+        Behaviour::Fail {
+            code: "busy".to_string(),
+            message: "the queue is at capacity".to_string(),
+        },
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge)).await;
+    let cookie = common::login(&app, "ali").await;
+    let user = common::me_id(&app, &cookie).await;
 
-        let res = common::send(
-            &app,
-            "GET",
-            &format!("/podcast/jobs/{JOB_ID}"),
-            Some(&cookie),
-            None,
-        )
-        .await;
-        assert_eq!(res.status, expected, "{code}: {}", res.body);
-        assert_eq!(res.body["error"], code);
+    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert_eq!(res.body["error"], "busy");
+
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT state, error_code FROM podcast_job WHERE user_id = $1")
+            .bind(uuid_of(&user))
+            .fetch_all(&db)
+            .await
+            .expect("read back the tombstone");
+    assert_eq!(
+        rows,
+        vec![("failed".to_string(), Some("busy".to_string()))],
+        "exactly one row, and it records the refusal"
+    );
+}
+
+/// A foreign job id reads as absent on every door — the same `404` an id that
+/// never existed earns, so the answer leaks nothing about somebody else's job.
+/// The cancel is the sharp one: it must not reach the service on a foreign id
+/// either.
+#[tokio::test]
+async fn another_users_job_reads_as_absent() {
+    let (service, app, ali, _db) = podcast_app().await;
+    let job_id = submit_job(&app, &ali).await;
+    let seen_before = service.seen().len();
+
+    let ayse = common::login(&app, "ayse").await;
+    let doors = [
+        ("GET", format!("/podcast/jobs/{job_id}")),
+        ("GET", format!("/podcast/jobs/{job_id}/result")),
+        ("GET", format!("/podcast/jobs/{job_id}/audio")),
+        ("POST", format!("/podcast/jobs/{job_id}/cancel")),
+    ];
+    for (method, uri) in doors {
+        let res = common::send(&app, method, &uri, Some(&ayse), None).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{method} {uri}: {}", res.body);
+        assert_eq!(res.body["error"], "not found");
     }
+    assert_eq!(
+        service.seen().len(),
+        seen_before,
+        "nothing about a foreign job was dispatched"
+    );
+}
+
+/// A terminal job past its retention window is gone for good: `410`, not the
+/// `404` of a job that never existed — the row is still there, but nothing
+/// about it is served any more.
+#[tokio::test]
+async fn an_expired_job_reads_as_gone() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job = Uuid::now_v7();
+    let key = format!("podcast/{job}.mp3");
+    // Terminal, with its artifact named (the schema's `done` CHECK), and one
+    // minute past the retention window.
+    let aged = now_ms() - (PODCAST_JOB_RETENTION_SECS + 60) * 1_000;
+    seed_done_job(&db, job, &user, &key, 41, aged).await;
+
+    let res = status_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(res.status, StatusCode::GONE, "{}", res.body);
+    assert_eq!(res.body["error"], "this podcast job has expired");
+}
+
+/// A job nobody has updated inside its own ETA-scaled window is presented as
+/// `failed`/`interrupted` — and the projection is read-side only: the row the
+/// database holds still says `running`, so the service's next report (or its
+/// own sweep) is what actually repairs it.
+#[tokio::test]
+async fn a_stale_job_reads_as_interrupted_but_the_row_is_untouched() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job = Uuid::now_v7();
+    // Past the staleness floor (the window a small ETA resolves to), far
+    // inside the retention window.
+    let aged = now_ms() - (PODCAST_JOB_STALE_FLOOR_SECS + 100) * 1_000;
+    seed_job(&db, job, &user, "running", Some(5), aged).await;
+
+    let res = status_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["state"], "failed");
+    assert_eq!(res.body["error_code"], "interrupted");
+
+    let stored: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(job)
+        .fetch_one(&db)
+        .await
+        .expect("the row is still there");
+    assert_eq!(stored, "running", "the projection wrote nothing");
+}
+
+/// Neither the result nor the bytes exist before the job is done: both reading
+/// doors answer `409` with `not_ready`, so a client branches on the code
+/// instead of parsing the sentence.
+#[tokio::test]
+async fn the_result_and_audio_doors_are_not_ready_before_done() {
+    let (service, app, cookie, _db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job_id = submit_job(&app, &cookie).await;
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "running", "tts", 0.5),
+        )
+        .await,
+        &job_id,
+    );
+
+    let res = result_of(&app, &cookie, &job_id).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.body["code"], "not_ready");
+
+    let (status, _, body) = audio_of(&app, &cookie, &job_id).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let refusal: Value = serde_json::from_slice(&body).expect("a JSON refusal");
+    assert_eq!(refusal["code"], "not_ready");
+}
+
+/// A `done` report that arrives before its audio was uploaded is refused
+/// `audio_missing`: the row must never claim a finished episode whose bytes are
+/// not there (the schema's own CHECK backstops the same rule), and the row
+/// stays `running` so the service can upload and report again.
+#[tokio::test]
+async fn a_done_report_before_the_upload_is_refused() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job_id = submit_job(&app, &cookie).await;
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &user, "running", "tts", 0.5),
+        )
+        .await,
+        &job_id,
+    );
+
+    let answer = capability_call(
+        &service.conn,
+        report_frame(&job_id, &user, "done", "", 1.0),
+    )
+    .await;
+    assert_eq!(refusal_code(&answer), "audio_missing");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(uuid_of(&job_id))
+        .fetch_one(&db)
+        .await
+        .expect("the row is still there");
+    assert_eq!(state, "running", "the refusal wrote nothing");
+}
+
+/// A `done` row whose blob is gone from the host answers `409 audio_missing`:
+/// the record is intact and the bytes are not — a state a client can report,
+/// unlike a generic `500`. The result door still names the artifact, so the
+/// row itself is provably fine and only the file is missing.
+#[tokio::test]
+async fn the_audio_door_reports_a_missing_blob() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job = Uuid::now_v7();
+    let key = format!("podcast/{job}.mp3");
+    seed_done_job(&db, job, &user, &key, 41, now_ms()).await;
+    assert!(
+        !common::blob_dir().join(&key).exists(),
+        "the blob really is gone"
+    );
+
+    let res = result_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["audio_id"], key);
+
+    let (status, _, body) = audio_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let refusal: Value = serde_json::from_slice(&body).expect("a JSON refusal");
+    assert_eq!(refusal["code"], "audio_missing");
+}
+
+/// The reading doors need no AI service at all: a finished job's row and its
+/// blob are served with no bridge configured — which is the whole reason the
+/// row exists (a restarted service, or a wiped service volume, costs nothing
+/// but the liveness the row's own projection already covers).
+#[tokio::test]
+async fn the_reading_doors_need_no_service() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let job = Uuid::now_v7();
+    let key = format!("podcast/{job}.mp3");
+    let bytes = episode_bytes();
+    write_blob(&key, &bytes);
+    seed_done_job(&db, job, &user, &key, bytes.len() as i64, now_ms()).await;
+
+    let res = status_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["state"], "done");
+
+    let res = result_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["audio_id"], key);
+
+    let (status, headers, body) = audio_of(&app, &cookie, &job.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], AUDIO_TYPE);
+    assert_eq!(body, bytes);
+}
+
+/// The old `GET /podcast/audio?path=…` door is gone with the caller-chosen path
+/// it resolved: it could not be owner-scoped, so the whole route is a `404` —
+/// the per-job door is the only audio door, and it streams what the school's
+/// own row names. The fixture proves the file exists, so the answer is the
+/// missing route, not a missing target.
+#[tokio::test]
+async fn the_old_path_audio_door_is_gone() {
+    let (app, cookie, _db) = app_without_ai().await;
+    write_blob("podcast/escape/kept.mp3", b"bytes the old door would have served");
+
+    let res = common::send(
+        &app,
+        "GET",
+        "/podcast/audio?path=podcast/escape/kept.mp3",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// Authentication is the whole gate on every door: no cookie is a `401`, not a
+/// handler — and not a dispatch under somebody else's name either.
+#[tokio::test]
+async fn every_door_requires_a_session() {
+    let (service, app, _cookie, _db) = podcast_app().await;
+    let id = common::GHOST_ID;
+
+    let doors = [
+        ("POST", "/podcast/jobs".to_string(), Some(json!({ "source_id": SOURCE_ID }))),
+        ("GET", format!("/podcast/jobs/{id}"), None),
+        ("GET", format!("/podcast/jobs/{id}/result"), None),
+        ("GET", format!("/podcast/jobs/{id}/audio"), None),
+        ("POST", format!("/podcast/jobs/{id}/cancel"), None),
+    ];
+    for (method, uri, body) in doors {
+        let res = common::send(&app, method, &uri, None, body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}: {}",
+            res.body
+        );
+        assert_eq!(res.body["error"], "unauthorized");
+    }
+    assert!(
+        service.seen().is_empty(),
+        "an anonymous call dispatches nothing"
+    );
 }
 
 /// The nest sits behind the school's `chatbot` module — the AI package's only
@@ -491,183 +1122,7 @@ async fn a_school_without_the_chatbot_module_has_no_podcast_nest() {
         .await
         .expect("narrow the demo school");
 
-    let res = common::send(
-        &app,
-        "GET",
-        &format!("/podcast/jobs/{JOB_ID}"),
-        Some(&cookie),
-        None,
-    )
-    .await;
+    let res = status_of(&app, &cookie, common::GHOST_ID).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
     assert_eq!(res.body["module"], "chatbot");
-}
-
-/// Authentication is the whole gate for the dispatching doors: no cookie is a
-/// `401`, not a dispatch under somebody else's name.
-#[tokio::test]
-async fn the_dispatching_doors_require_a_session() {
-    let (service, app, _cookie) = podcast_app().await;
-
-    let res = common::send(
-        &app,
-        "POST",
-        "/podcast/jobs",
-        None,
-        Some(json!({ "source_id": SOURCE_ID })),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
-    assert!(service.seen().is_empty(), "an anonymous call dispatches nothing");
-}
-
-// -------------------------------------------------------------- audio door --
-
-/// Write `bytes` at `relative` under the demo school's blob directory and
-/// return the absolute path it landed at.
-fn school_file(relative: &str, bytes: &[u8]) -> std::path::PathBuf {
-    let path = common::blob_dir().join(relative);
-    std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create the directory tree");
-    std::fs::write(&path, bytes).expect("write the file");
-    path
-}
-
-/// One raw `GET /podcast/audio?path=…`.
-async fn fetch_audio(
-    app: &Router,
-    cookie: Option<&str>,
-    path: &str,
-) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
-    let uri = format!("/podcast/audio?path={path}");
-    common::send_raw(app, "GET", &uri, cookie, None, Vec::new()).await
-}
-
-/// The happy path: a file under the school's own directory streams back with
-/// its bytes and an audio content type.
-#[tokio::test]
-async fn the_audio_door_serves_a_file_under_the_schools_directory() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let bytes = b"ID3\x03\x00\x00\x00fake-mp3-bytes".to_vec();
-    school_file("podcast/serve/ok.mp3", &bytes);
-
-    let (status, headers, body) = fetch_audio(&app, Some(&cookie), "podcast/serve/ok.mp3").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["content-type"], "audio/mpeg");
-    assert_eq!(headers["x-content-type-options"], "nosniff");
-    assert_eq!(headers["cache-control"], "private, no-store");
-    assert_eq!(body, bytes, "the bytes are the file's, unchanged");
-}
-
-/// Without a session the door is a `401` — and the very same path serves `200`
-/// with one, so the refusal is authorization and not a missing file.
-#[tokio::test]
-async fn the_audio_door_refuses_an_unauthenticated_caller() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let bytes = b"authorized-only".to_vec();
-    school_file("podcast/auth/only.mp3", &bytes);
-
-    let (anonymous, _, _) = fetch_audio(&app, None, "podcast/auth/only.mp3").await;
-    assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
-
-    let (authorized, _, body) = fetch_audio(&app, Some(&cookie), "podcast/auth/only.mp3").await;
-    assert_eq!(authorized, StatusCode::OK);
-    assert_eq!(body, bytes);
-}
-
-/// A `..` segment is refused even though the file it names exists and the file
-/// *inside* the school's directory is served — the refusal is the shape check,
-/// not a missing target.
-#[tokio::test]
-async fn the_audio_door_refuses_a_dotdot_segment_to_an_existing_file() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let inside = b"inside the school".to_vec();
-    let outside = b"outside the school".to_vec();
-    school_file("podcast/traversal/inside.mp3", &inside);
-    // What `../` would reach: the deployment-wide files root, one level above
-    // the school's own directory.
-    let escaped = common::files_dir().join("traversal-outside.mp3");
-    std::fs::write(&escaped, &outside).expect("write the outside file");
-    assert!(escaped.is_file(), "the traversal target really exists");
-
-    let (served, _, body) = fetch_audio(&app, Some(&cookie), "podcast/traversal/inside.mp3").await;
-    assert_eq!(served, StatusCode::OK);
-    assert_eq!(body, inside);
-
-    let (refused, _, body) =
-        fetch_audio(&app, Some(&cookie), "podcast/traversal/../../traversal-outside.mp3").await;
-    assert_eq!(refused, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&body));
-    assert_ne!(body, outside, "the escaped file's bytes never came back");
-}
-
-/// An absolute path is refused even though the file it names exists — and a
-/// naive `root.join(path)` would have *served* it, since joining an absolute
-/// path replaces the base.
-#[tokio::test]
-async fn the_audio_door_refuses_an_absolute_path_to_an_existing_file() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let outside = common::files_dir().join("absolute-outside.mp3");
-    std::fs::write(&outside, b"not for the audio door").expect("write the outside file");
-
-    let (status, _, body) = fetch_audio(
-        &app,
-        Some(&cookie),
-        outside.to_str().expect("a UTF-8 temp path"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&body));
-    assert_ne!(body, b"not for the audio door");
-}
-
-/// A symlink inside the school's directory is refused when it resolves out of
-/// it — the escape a plain "does the path start with the root" prefix check
-/// would miss, since the link itself sits inside the root.
-#[tokio::test]
-async fn the_audio_door_refuses_a_symlink_that_escapes_the_school() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let target = common::files_dir().join("symlink-outside.mp3");
-    std::fs::write(&target, b"reached through a link").expect("write the target");
-    let link = common::blob_dir().join("podcast/symlink/escape.mp3");
-    std::fs::create_dir_all(link.parent().expect("parent dir")).expect("create the directory tree");
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(&target, &link).expect("create the symlink");
-    assert!(target.is_file(), "the link's target really exists");
-
-    let (status, _, body) = fetch_audio(&app, Some(&cookie), "podcast/symlink/escape.mp3").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{:?}", String::from_utf8_lossy(&body));
-    assert_ne!(body, b"reached through a link");
-}
-
-/// Another school's episode is invisible even when the caller knows its exact
-/// path: the demo caller's request resolves under the *demo* directory, where
-/// that path does not exist — though the file itself does, one school over.
-#[tokio::test]
-async fn the_audio_door_never_reaches_another_schools_file() {
-    let (app, _db) = common::app_and_db().await;
-    let cookie = common::login(&app, "ali").await;
-    let other = common::files_dir().join("baska-okul/podcast/ses/episode.mp3");
-    std::fs::create_dir_all(other.parent().expect("parent dir")).expect("create the directory tree");
-    std::fs::write(&other, b"the other school's episode").expect("write the file");
-    assert!(other.is_file());
-
-    let (status, _, _) = fetch_audio(&app, Some(&cookie), "podcast/ses/episode.mp3").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-/// The door needs no AI bridge at all: a produced file is served with the
-/// service long gone.
-#[tokio::test]
-async fn the_audio_door_needs_no_service() {
-    let (app, _db) = common::app_with_ai(None).await;
-    let cookie = common::login(&app, "ali").await;
-    let bytes = b"produced before the service left".to_vec();
-    school_file("podcast/offline/episode.mp3", &bytes);
-
-    let (status, _, body) = fetch_audio(&app, Some(&cookie), "podcast/offline/episode.mp3").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, bytes);
 }
