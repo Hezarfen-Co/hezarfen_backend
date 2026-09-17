@@ -35,7 +35,7 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
         // The (class, user) pair is the membership row's own key, so the point
         // check is one existence probe — and `left_at IS NULL` makes it the
         // *live* stint's, the row the partial unique index
-        // `class_member_live_pair` carries: a student who left the şube is
+        // `class_member_live_pair` carries: a student who left the section is
         // history, not audience, and a stale probe would let them be marked
         // present at (and counted by) an event their section no longer
         // attends.

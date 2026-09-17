@@ -93,7 +93,7 @@ impl TermName {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Term {
     pub(crate) id: TermId,
-    /// The academic year this dönem is a grading slice of.
+    /// The academic year this term is a grading slice of.
     pub(crate) year: AcademicYearId,
     pub(crate) name: TermName,
     pub(crate) starts_at: Timestamp,

@@ -27,8 +27,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
 struct CreateTerm {
     #[schema(example = "1. Dönem", max_length = 100)]
     name: String,
-    /// The academic year this dönem is a slice of (`GET /academic-years`).
-    /// Required — a dönem outside a year has no karne to be counted into.
+    /// The academic year this term is a slice of (`GET /academic-years`).
+    /// Required — a term outside a year has no report card to be counted into.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     year: String,
     /// Term start, UTC unix-milliseconds. May lie in the past — a school
@@ -53,7 +53,7 @@ struct TermResponse {
     id: String,
     #[schema(example = "1. Dönem")]
     name: String,
-    /// The academic year this dönem belongs to (`GET /academic-years/{id}`).
+    /// The academic year this term belongs to (`GET /academic-years/{id}`).
     year: String,
     /// Term start, UTC unix-milliseconds.
     starts_at: i64,
@@ -76,9 +76,9 @@ impl TermResponse {
     }
 }
 
-/// Create a dönem inside an academic year. Requires manager+. Past dates are
-/// allowed — dönemler are calendar structure, not schedules; an *archived* year
-/// refuses the new dönem (`409`), because past years take no new structure.
+/// Create a term inside an academic year. Requires manager+. Past dates are
+/// allowed — terms are calendar structure, not schedules; an *archived* year
+/// refuses the new term (`409`), because past years take no new structure.
 #[utoipa::path(
     post,
     path = "/",
@@ -199,8 +199,8 @@ async fn update_term(
         .await?
         .ok_or(AppError::NotFound)?;
     service::term::require_writable(&term)?;
-    // The year above the dönem is the other half of the read-only rule, and
-    // the half a closed dönem no longer covers: a dönem still open inside an
+    // The year above the term is the other half of the read-only rule, and
+    // the half a closed term no longer covers: a term still open inside an
     // archived year takes no edit either.
     service::academic_year::require_open(&st.db, term.get_year()).await?;
     // Pre-flight only: the range check is re-made inside the UPDATE's own
@@ -215,11 +215,11 @@ async fn update_term(
     Ok(Json(TermResponse::new(&updated)))
 }
 
-/// Delete a dönem. Requires manager+. Refused with a 409 while anything still
-/// hangs off it — an exam filed in it, or a karne frozen for it — so a dönem is
-/// never dropped out from under marks that name it; move or delete those
-/// first. The dönem's own academic year is untouched (that is `DELETE
-/// /academic-years/{id}`, which refuses while a dönem still links it).
+/// Delete a term. Requires manager+. Refused with a 409 while anything still
+/// hangs off it — an exam filed in it, or a report card frozen for it — so a
+/// term is never dropped out from under marks that name it; move or delete
+/// those first. The term's own academic year is untouched (that is `DELETE
+/// /academic-years/{id}`, which refuses while a term still links it).
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -248,13 +248,13 @@ async fn delete_term(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Archive a dönem. Requires manager+. Archiving **freezes the karnes**: every
-/// student with a roster row under the dönem's year gets a snapshot of their
-/// report, and from then on `GET /marks/karne` serves that record instead of
-/// recomputing — a mark corrected after the fact no longer rewrites what a
-/// family holds. An archived dönem takes no edits and no delete; exams may
+/// Archive a term. Requires manager+. Archiving **freezes the report cards**:
+/// every student with a roster row under the term's year gets a snapshot of
+/// their report, and from then on `GET /marks/karne` serves that record instead
+/// of recomputing — a mark corrected after the fact no longer rewrites what a
+/// family holds. An archived term takes no edits and no delete; exams may
 /// still be created in it while its *year* is open (the archive is a record,
-/// not a wall). Idempotent — archiving an already-archived dönem answers `200`
+/// not a wall). Idempotent — archiving an already-archived term answers `200`
 /// with the stamp it already had and never re-freezes.
 #[utoipa::path(
     post,

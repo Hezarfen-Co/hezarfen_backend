@@ -48,7 +48,7 @@
 //!   nothing in this file reads or writes it. Do not add a no-show penalty
 //!   here: the seat was reserved and the food was cooked.
 //!
-//! Money is `i64` minor units (kuruş) end to end. No float, no decimal, ever.
+//! Money is `i64` minor units end to end. No float, no decimal, ever.
 //!
 //! The ledger row ids are **derived TEXT keys**, not minted uuids — they are
 //! the identity the store's uniqueness check enforces (`id TEXT PRIMARY
@@ -185,7 +185,7 @@ impl LedgerAmount {
     }
 }
 
-/// How the money arrived ("cash", "havale", …). Free text: the backend never
+/// How the money arrived ("cash", "bank transfer", …). Free text: the backend never
 /// speaks to a payment gateway and stores no card data, ever.
 #[derive(Debug, Clone, PartialEq, Eq, Type)]
 #[sqlx(transparent)]

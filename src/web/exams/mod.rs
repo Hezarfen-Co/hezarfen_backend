@@ -292,7 +292,7 @@ async fn list_exams(
 
 /// Fetch a single exam by id. Visible to **any instance the exam is addressed
 /// to** — its owner's enrolled students and teachers, and, for an announced
-/// exam (ortak sınav), each addressed section's alike — plus managers/admins;
+/// exam (a shared exam), each addressed section's alike — plus managers/admins;
 /// drafts only show to the managers of an addressed instance (everyone else
 /// gets a `404`, as if the exam doesn't exist yet — because it doesn't,
 /// officially).
@@ -503,7 +503,7 @@ async fn delete_exam(
 
 /// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
 /// management rights over **an instance the exam is addressed to** (the
-/// announced-to section's teacher grades its own students on an ortak sınav);
+/// announced-to section's teacher grades its own students on a shared exam);
 /// the target must be a student enrolled in one of them. Only students carry
 /// marks; students never grade — and nobody
 /// grades themselves. A draft can't be graded (`409`) — a mark would point at

@@ -1,4 +1,4 @@
-//! Class sections (şube): a named set of students the school moves as one.
+//! Class sections: a named set of students the school moves as one.
 //!
 //! Nothing here is a second kind of membership — adding a student to a class
 //! enrolls them into every course the class carries, and attaching a course
@@ -65,13 +65,13 @@ struct CreateClass {
     #[schema(max_length = 200, example = "9-A")]
     name: String,
     /// The school's own label for the year this class sits in ("9", "10-A",
-    /// "anaokulu"). Free text; omit (or send `""`) for a class with no grade.
+    /// "kindergarten"). Free text; omit (or send `""`) for a class with no grade.
     #[schema(max_length = 20, example = "9")]
     grade: Option<String>,
     /// The academic year this class sits in (`GET /academic-years`). Optional;
-    /// a şube with no year takes no exam and is never rolled over.
+    /// a class with no year takes no exam and is never rolled over.
     year: Option<String>,
-    /// The class's homeroom teacher (sınıf öğretmeni) — a teacher, manager or
+    /// The class's homeroom teacher — a teacher, manager or
     /// admin account. Optional; omit (or send `""`) for a class with none.
     #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     teacher_id: Option<String>,
@@ -130,7 +130,7 @@ struct ClassResponse {
     /// The academic year this class sits in (`GET /academic-years`); `null`
     /// when unassigned.
     year: Option<String>,
-    /// The class's homeroom teacher (sınıf öğretmeni); `null` when none is
+    /// The class's homeroom teacher; `null` when none is
     /// assigned — as it is for every class after the account was demoted below
     /// `teacher`.
     teacher: Option<PersonRef>,
@@ -208,7 +208,7 @@ struct ClassMemberResponse {
     /// When they left, UTC unix-millis; `null` while the stint is live. Only
     /// ever non-null on a history read — every route here lists live rows.
     left_at: Option<i64>,
-    /// The şube this member was copied out of by a year rollover, or `null`
+    /// The class section this member was copied out of by a year rollover, or `null`
     /// when a human placed them.
     #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     source_class_group: Option<String>,
@@ -240,15 +240,15 @@ struct ClassCourseResponse {
     course: String,
     /// Who attached it.
     attached_by: PersonRef,
-    /// Weekly lesson hours; the instance's weight in the year's karne average.
+    /// Weekly lesson hours; the instance's weight in the year's report-card average.
     #[schema(example = 5)]
     ders_saati: i64,
-    /// Whether this instance's marks count toward the karne.
+    /// Whether this instance's marks count toward the report card.
     counts_toward_karne: bool,
     /// How many students are enrolled right now.
     #[schema(example = 28)]
     enrollment_count: i64,
-    /// The staff assigned to run this instance, beyond the şube's homeroom
+    /// The staff assigned to run this instance, beyond the class's homeroom
     /// teacher (who may act on it too).
     teachers: Vec<PersonRef>,
 }
@@ -295,7 +295,7 @@ fn grade_or_none(text: Option<&str>) -> Result<Option<ClassGrade>, AppError> {
 /// The homeroom teacher a request names, as the row itself — an empty string is
 /// *no* teacher, exactly like `grade`, so omitting the field and clearing it
 /// with `""` land on the same stored row. The named account must exist and hold
-/// teacher-or-higher: a class's sınıf öğretmeni is staff, and the check is the
+/// teacher-or-higher: a class's homeroom teacher is staff, and the check is the
 /// same shape `add_member` uses for a non-student. The `User` comes back so the
 /// caller can name them in the response without a second read.
 async fn teacher_or_none(text: Option<&str>, db: &Database) -> Result<Option<User>, AppError> {
@@ -362,9 +362,9 @@ async fn classes_page(
 
 /// Create a class. Requires manager+ — a class is school structure, not a
 /// teacher's own room. `grade` is a free-text label for the year ("9", "10-A"),
-/// `year` links the academic year (which is what binds the şube to a karne and
-/// to the rollover), `teacher_id` names the homeroom teacher (sınıf öğretmeni,
-/// a teacher+ account); all optional.
+/// `year` links the academic year (which is what binds the class to a report
+/// card and to the rollover), `teacher_id` names the homeroom teacher (a
+/// teacher+ account); all optional.
 ///
 /// If a blueprint covers the new class's grade, the class is **stocked from it
 /// at once** — the same best-effort pump `POST /classes/{id}/blueprint` runs, so
@@ -901,7 +901,7 @@ async fn remove_member(
 /// class×course row every exam, session, lesson and roster under this class's
 /// course now keys on. Requires teacher+ and catalog rights on that course
 /// (its creator, or a manager/admin): attaching writes that course's roster for
-/// this section, and the weekly hours and karne policy the instance starts
+/// this section, and the weekly hours and report-card policy the instance starts
 /// with. The class's whole roster is enrolled in one go, and students already
 /// enrolled by hand keep their own rows. Attaching the same course twice is a
 /// 409.
@@ -955,7 +955,7 @@ async fn attach_course(
 }
 
 /// List the instances a class carries — each a catalog course as this section
-/// teaches it, with its hours, karne policy and teachers — newest first, paged
+/// teaches it, with its hours, report-card policy and teachers — newest first, paged
 /// via `?limit=&offset=` (omit `limit` for all of them). Requires teacher+.
 /// Returns a `{items, total, limit, offset}` envelope. `POST /instances/{id}`
 /// edits one; this is the read that names them.
@@ -1013,7 +1013,7 @@ async fn list_class_courses(
 /// takes the whole instance, so its roster goes with it: every enrollment on it
 /// is swept, the rows this class pumped and the ones an operator placed by hand
 /// alike — an enrollment cannot outlive the instance it hangs off, and "a hand
-/// row survives the şube" is the *member* exit's rule, applied where the
+/// row survives the class section" is the *member* exit's rule, applied where the
 /// instance is still standing. An instance that exists but belongs to another
 /// class, or one that is already gone, is a 404.
 #[utoipa::path(
@@ -1222,8 +1222,8 @@ struct BlueprintStatusResponse {
     /// every section is stocked.
     #[schema(example = 12)]
     matched: i64,
-    /// Every section at the grade, in sync or not. Unpaged: it is the şube one
-    /// school runs at one grade.
+    /// Every section at the grade, in sync or not. Unpaged: the set one school
+    /// runs at one grade.
     sections: Vec<SectionStatusResponse>,
 }
 
@@ -1580,7 +1580,7 @@ mod tests {
     /// The same nullable rule on the homeroom teacher, plus the bar it holds:
     /// absent and `""` are the same *no teacher* (and never touch the store),
     /// an id naming nobody is a `400`, and so is one naming a student — a
-    /// class's sınıf öğretmeni is staff.
+    /// class's homeroom teacher is staff.
     #[tokio::test]
     async fn an_empty_teacher_is_no_teacher_and_a_student_is_never_one() {
         use crate::domain::role::Role;

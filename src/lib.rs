@@ -120,8 +120,8 @@ fn courses_router(state: &AppState) -> OpenApiRouter<AppState> {
 }
 
 /// `/instances` and the three foreign-module route pairs mounted inside it —
-/// the same split as `/courses`, one anchor down: the instance is what a şube
-/// teaches, and what exams, sessions and homework hang off. Each child carries
+/// the same split as `/courses`, one anchor down: the instance is what a class
+/// section teaches, and what exams, sessions and homework hang off. Each child carries
 /// its own module's gate *and*, through the outer one applied here, the course
 /// gate (an instance is a course taught somewhere), so either module being off
 /// refuses it.

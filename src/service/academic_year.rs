@@ -1,7 +1,7 @@
 //! Academic-year workflows: the archived-year refusal every write against past
 //! structure pays, the link resolver class/term create pass through, and the
-//! rollover — the one command that carries a year's şubeler into the next. The
-//! queries live in [`crate::db::academic_year`].
+//! rollover — the one command that carries a year's class sections into the
+//! next. The queries live in [`crate::db::academic_year`].
 
 use crate::database::Database;
 use crate::db::academic_year;
@@ -57,8 +57,8 @@ pub async fn create(
 /// Turn an optional request-supplied year id into a validated reference —
 /// `None` stays `None`, an unknown id is a `400` naming the field, and an
 /// *archived* one is the year's `409`. This is the single spot every new link
-/// to a year passes through: a şube create/update and a dönem create alike,
-/// so past years take no new structure. The mirror of
+/// to a year passes through: a class-section create/update and a term create
+/// alike, so past years take no new structure. The mirror of
 /// [`crate::service::term::resolve`], one layer up the calendar.
 pub async fn resolve(db: &Database, id: Option<&str>) -> Result<Option<AcademicYearId>, AppError> {
     let Some(id) = id else {
@@ -150,9 +150,9 @@ pub async fn delete(db: &Database, target: AcademicYear) -> Result<(), AppError>
     }
 }
 
-/// What one [`rollover`] carried: how many şubeler were planted in the target
-/// year, how many live students came with them, and the grades that stayed
-/// behind because the year lists no promotion for them (graduation).
+/// What one [`rollover`] carried: how many class sections were planted in the
+/// target year, how many live students came with them, and the grades that
+/// stayed behind because the year lists no promotion for them (graduation).
 #[derive(Debug, Clone)]
 pub struct RolloverReport {
     pub classes: usize,
@@ -160,35 +160,37 @@ pub struct RolloverReport {
     pub graduated: Vec<String>,
 }
 
-/// Carry `from`'s şubeler into `target`, the explicit year-boundary command.
+/// Carry `from`'s class sections into `target`, the explicit year-boundary
+/// command.
 ///
 /// A grade with **no** promotion entry is not rolled over — that is how
-/// graduation is expressed — and a şube carrying no grade at all is not
-/// either: there is nothing to promote it on. Each rolled şube is created
-/// afresh in the target year with the same name and the mapped grade, then
-/// gets copies of everything that belongs to the *structure* of the year: its
-/// instances (same courses, same `ders_saati`, same karne policy, `source`
-/// left NULL so no blueprint sweep can take a copied link back), each
+/// graduation is expressed — and a class section carrying no grade at all is
+/// not either: there is nothing to promote it on. Each rolled class section is
+/// created afresh in the target year with the same name and the mapped grade,
+/// then gets copies of everything that belongs to the *structure* of the year:
+/// its instances (same courses, same `ders_saati`, same report-card policy,
+/// `source` left NULL so no blueprint sweep can take a copied link back), each
 /// instance's assigned teachers, and every **live** member — copied through
 /// the pump, which is also what enrolls them into the new instances, and
-/// tagged `source_class_group` with the şube they were copied out of (the
-/// provenance §4.9 asks for: the new roster still names the old stint's şube).
-/// The old year is untouched: it stays the record of what was taught.
+/// tagged `source_class_group` with the class section they were copied out of
+/// (the provenance §4.9 asks for: the new roster still names the old stint's
+/// class section). The old year is untouched: it stays the record of what was
+/// taught.
 ///
 /// Refusals: the target year must be empty (a second rollover into it is a
 /// `409`, which is also what makes the command idempotent — a re-run is
 /// refused, never duplicated), archived (read-only), and distinct from the
 /// source. The emptiness check is a pre-flight read, an accepted race in the
 /// README's sense: two rollovers racing the same empty target can each plant
-/// şubeler; the class writes themselves serialize on the year row, so the
-/// counters stay honest either way.
+/// class sections; the class writes themselves serialize on the year row, so
+/// the counters stay honest either way.
 ///
-/// Each şube is carried over on its own: a failure mid-run leaves the
-/// şubeler already planted in place, and a re-run is refused by the emptiness
-/// guard — the report says what landed, and the operator resolves the rest by
-/// hand. One transaction per write, never one across the run: the store owns
-/// concurrency, and a run-wide transaction would hold the year row for the
-/// length of the whole school.
+/// Each class section is carried over on its own: a failure mid-run leaves the
+/// class sections already planted in place, and a re-run is refused by the
+/// emptiness guard — the report says what landed, and the operator resolves
+/// the rest by hand. One transaction per write, never one across the run: the
+/// store owns concurrency, and a run-wide transaction would hold the year row
+/// for the length of the whole school.
 pub async fn rollover(
     db: &Database,
     target: &AcademicYearId,
@@ -218,7 +220,7 @@ pub async fn rollover(
         };
         let Some(mapped) = from_year.promotion_for(grade.as_str()) else {
             // No promotion entry: this grade graduated. Reported once per
-            // label, however many şubeler carry it.
+            // label, however many class sections carry it.
             let label = grade.as_str().to_string();
             if !report.graduated.contains(&label) {
                 report.graduated.push(label);
@@ -238,8 +240,8 @@ pub async fn rollover(
         let planted_id = planted.get_id().clone();
 
         // The structure first, so the member copy below enrolls the students
-        // into every instance the new şube carries; the pump's member axis is
-        // what pays those enrollments.
+        // into every instance the new class section carries; the pump's member
+        // axis is what pays those enrollments.
         for instance in
             class_course::list_for_class_ids(db, std::slice::from_ref(class.get_id())).await?
         {
@@ -247,10 +249,10 @@ pub async fn rollover(
                 class_course::attach_sourced(db, &planted_id, instance.get_course(), by, None)
                     .await?;
             let Attached::Made(copied) = landed else {
-                // A fresh şube cannot hold the course already, and its caps
-                // cannot be full: anything else here is the store disagreeing
-                // with the read one statement earlier, which is a 500 and not
-                // a partial rollover.
+                // A fresh class section cannot hold the course already, and
+                // its caps cannot be full: anything else here is the store
+                // disagreeing with the read one statement earlier, which is a
+                // 500 and not a partial rollover.
                 return Err(AppError::Internal(format!(
                     "rollover: attaching {} to the new class was refused",
                     instance.get_course().key()
@@ -272,10 +274,10 @@ pub async fn rollover(
             .await?
             .0
         {
-            // The stint carries where the student came from: the copy names the
-            // şube it was copied out of, so last year's roster is still legible
-            // from the new one (and the tag is written in the same statement as
-            // the stint — see `add_member_sourced`).
+            // The stint carries where the student came from: the copy names
+            // the class section it was copied out of, so last year's roster is
+            // still legible from the new one (and the tag is written in the
+            // same statement as the stint — see `add_member_sourced`).
             match class_pump::add_member_sourced(
                 db,
                 &planted_id,

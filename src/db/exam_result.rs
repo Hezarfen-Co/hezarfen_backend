@@ -207,7 +207,7 @@ pub async fn grade(
 /// behind the per-instance block of the marks report.
 ///
 /// It reads `exam_audience`, not `exam.class_course`: an exam addressed to
-/// several instances (an ortak sınav) is *each* of their exams, and its marks
+/// several instances (a shared exam) is *each* of their exams, and its marks
 /// count in every one of them, not only in the owner's. The owner's audience
 /// row is always written with the exam, so for an exam nobody else was
 /// addressed to this is the same set the owner column used to give.
@@ -264,14 +264,14 @@ impl AttributedResult {
     }
 }
 
-/// The user's graded results inside one dönem, each paired with the instance it
-/// counts under — the karne's input slice (D8: a karne is per dönem, and an
-/// exam belongs to the dönem it was sat in).
+/// The user's graded results inside one term, each paired with the instance it
+/// counts under — the report card's input slice (D8: a report card is per term,
+/// and an exam belongs to the term it was sat in).
 ///
 /// A mark comes back once per *queried* instance the exam is addressed to
-/// (`exam_audience`), not only under its owner: an ortak sınav announced to
+/// (`exam_audience`), not only under its owner: a shared exam announced to
 /// several instances is each of their exams, and this is what puts its mark in
-/// every one of their karnes. Only the latest sitting per (instance, exam)
+/// every one of their report cards. Only the latest sitting per (instance, exam)
 /// comes back, the grade-of-record the per-instance read folds to as well.
 pub async fn list_for_user_in_term(
     db: &Database,
@@ -481,23 +481,23 @@ pub(crate) mod tests {
     pub(crate) const ORTAK_MARK: i64 = 85;
     pub(crate) const OWNER_MARK: i64 = 45;
 
-    /// The shape the audience attribution is read against: two şubeler, one
+    /// The shape the audience attribution is read against: two sections, one
     /// catalog course and one student who is a live member of both, so the
-    /// karne and the marks report each carry a line for *both* instances.
+    /// report card and the marks report each carry a line for *both* instances.
     pub(crate) struct OrtakExam {
         pub student: UserId,
         pub term: TermId,
         /// The instance both exams were created in — their owner.
         pub owner: ClassCourseId,
-        /// The other instance the ortak exam was addressed to.
+        /// The other instance the shared exam was addressed to.
         pub addressed: ClassCourseId,
     }
 
-    /// A year with one dönem, two şubeler of it carrying the same catalog
+    /// A year with one term, two sections of it carrying the same catalog
     /// course, and one student who sits both. Two exams are created in the
-    /// first şube's instance and graded: one owned there but **addressed to
+    /// first section's instance and graded: one owned there but **addressed to
     /// both** (the second `exam_audience` row is written directly, which is
-    /// what a school-wide ortak sınav is), the other addressed to its owner
+    /// what a school-wide shared exam is), the other addressed to its owner
     /// alone.
     ///
     /// That is what tells the two conclusions apart: read through
@@ -590,7 +590,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
             if addressed_to_both {
-                // The ortak half: the create wrote the owner's audience row,
+                // The shared-exam half: the create wrote the owner's audience row,
                 // and the school announces the exam to the second section too.
                 sqlx::query("INSERT INTO exam_audience (exam, class_course) VALUES ($1, $2)")
                     .bind(exam.get_id().uuid())
@@ -740,7 +740,7 @@ pub(crate) mod tests {
     async fn an_exam(db: &Database, exam: &ExamId, kind: &str) {
         // The exam has to be real: a mark is refused on one that isn't. Its
         // creator is a real row (idempotently — [`the_two_people`] re-runs it)
-        // and so are its parents: the instance it is taught in and the dönem it
+        // and so are its parents: the instance it is taught in and the term it
         // is graded in, both through the shared fixtures.
         let teacher = UserId::from_key(TEACHER);
         sqlx::query(

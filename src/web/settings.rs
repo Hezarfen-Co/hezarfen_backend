@@ -107,23 +107,23 @@ struct SettingsResponse {
     /// cancelling close. `null` = no cutoff.
     #[schema(example = 120)]
     meal_cancel_cutoff_minutes: Option<i64>,
-    /// The branş (teaching subject) vocabulary a profile's `branch` may name.
+    /// The subject-specialisation vocabulary a profile's `branch` may name.
     /// Empty = the school keeps no list, and no profile may carry one.
     #[schema(max_items = 20, example = json!(["Matematik", "Fizik"]))]
     branches: Vec<String>,
-    /// What an absence may be excused as (raporlu/izinli/…). Empty = the
+    /// What an absence may be excused as ("raporlu", "izinli", …). Empty = the
     /// school names no kinds.
     #[schema(max_items = 20, example = json!(["raporlu", "izinli"]))]
     excuse_kinds: Vec<String>,
-    /// Per-dönem excused-absence day limit; `null` = no limit configured.
+    /// Per-term excused-absence day limit; `null` = no limit configured.
     #[schema(example = 10)]
     max_excused_absent_days: Option<i64>,
-    /// Per-dönem unexcused-absence day limit; `null` = no limit configured.
+    /// Per-term unexcused-absence day limit; `null` = no limit configured.
     #[schema(example = 20)]
     max_unexcused_absent_days: Option<i64>,
     /// The school's IANA timezone; `null` = the deployment default
     /// (`Europe/Istanbul`), which is what an unset setting reads as. It is the
-    /// zone the devamsızlık days are bucketed in.
+    /// zone the absence days are bucketed in.
     #[schema(example = "Europe/Istanbul")]
     timezone: Option<String>,
 }
@@ -226,7 +226,7 @@ struct UpdateSettings {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 120, minimum = 0, maximum = 10_080)]
     meal_cancel_cutoff_minutes: Option<Option<i64>>,
-    /// Replaces the whole branş list when present: at most 20 entries, each
+    /// Replaces the whole subject list when present: at most 20 entries, each
     /// 1–50 characters, unique. `[]` means the school keeps no list — and a
     /// profile's `branch` may then only be cleared, never set.
     #[schema(max_items = 20, example = json!(["Matematik", "Fizik"]))]
@@ -235,18 +235,18 @@ struct UpdateSettings {
     /// each 1–50 characters, unique. `[]` clears it.
     #[schema(max_items = 20, example = json!(["raporlu", "izinli"]))]
     excuse_kinds: Option<Vec<String>>,
-    /// Per-dönem excused-absence day limit, `0`–`365`. Omit to keep the
+    /// Per-term excused-absence day limit, `0`–`365`. Omit to keep the
     /// current value; send `null` for no limit at all.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 10, minimum = 0, maximum = 365)]
     max_excused_absent_days: Option<Option<i64>>,
-    /// Per-dönem unexcused-absence day limit, `0`–`365`. Omit to keep the
+    /// Per-term unexcused-absence day limit, `0`–`365`. Omit to keep the
     /// current value; send `null` for no limit at all.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 20, minimum = 0, maximum = 365)]
     max_unexcused_absent_days: Option<Option<i64>>,
     /// The school's IANA timezone — one of the deployment's allow-list
-    /// (`Europe/Istanbul`, `UTC`), by name. It is the zone the devamsızlık
+    /// (`Europe/Istanbul`, `UTC`), by name. It is the zone the absence
     /// days are bucketed in and the one a menu's serving minute is *not*
     /// (that clock is UTC on purpose). Omit to keep the current value; send
     /// `null` to fall back to the deployment default.

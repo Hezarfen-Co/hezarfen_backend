@@ -1,4 +1,4 @@
-//! Exam workflows: the create that resolves the exam's instance and dönem,
+//! Exam workflows: the create that resolves the exam's instance and term,
 //! the PATCH re-derive — the merge (set / clear / keep per field) re-judged
 //! against a fresh read every retry round, and the mode-freeze, re-draft, and
 //! kind gates that guard it — and the delete that collects the image blob keys
@@ -24,22 +24,22 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 use crate::service::exam_attempt::require_open;
 
-/// Publish (or draft) an exam on one class×course instance, inside one dönem.
+/// Publish (or draft) an exam on one class×course instance, inside one term.
 ///
 /// Two refusals stand in front of the write. The instance's catalog course
-/// must be class-delivered (`kind = course`): a kulüp or etüt has no exams —
-/// D9 keeps the two membership tiers apart, and an exam on a club would be a
-/// roster nothing enrolls into. And the instance's *year* must still be open
-/// (D8: the dönem is a grading slice inside the year, so the year is what the
-/// exam's structure belongs to; a dönem archived inside an open year does not
-/// close exam creation — the archive is a record, not a wall).
+/// must be class-delivered (`kind = course`): a club or supervised study has
+/// no exams — D9 keeps the two membership tiers apart, and an exam on a club
+/// would be a roster nothing enrolls into. And the instance's *year* must
+/// still be open (D8: the term is a grading slice inside the year, so the year
+/// is what the exam's structure belongs to; a term archived inside an open
+/// year does not close exam creation — the archive is a record, not a wall).
 ///
-/// The `term` is the dönem the exam is sat in, and it is required; the store's
+/// The `term` is the term the exam is sat in, and it is required; the store's
 /// create claims it in the same transaction as the row. It must be one of the
-/// *instance's own year's* dönems: a dönem is a grading slice inside a year, so
+/// *instance's own year's* terms: a term is a grading slice inside a year, so
 /// a term from another year is refused here with a `400` on the field rather
 /// than filed — the write would succeed in the store and misfile the exam in
-/// the karne of a year it is not taught in.
+/// the report card of a year it is not taught in.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the sibling entities' create(field, field, ..) shape"
@@ -72,12 +72,13 @@ pub async fn create(
             reason: "only a ders can carry exams — a club or etüt is joined, not sat",
         }));
     }
-    // The dönem must be one of the instance's own year's: the year is the
-    // scope a karne is computed over (and a dönem is a grading slice *inside*
-    // it), so an exam filed under another year's dönem would be counted into a
-    // report whose terms it does not belong to — invisible to the year it is
-    // actually taught in and foreign to the one it names. The instance's year
-    // is its şube's, read through the one seam that resolves it.
+    // The term must be one of the instance's own year's: the year is the
+    // scope a report card is computed over (and a term is a grading slice
+    // *inside* it), so an exam filed under another year's term would be
+    // counted into a report whose terms it does not belong to — invisible to
+    // the year it is actually taught in and foreign to the one it names. The
+    // instance's year is its section's, read through the one seam that
+    // resolves it.
     let Some(term_row) = crate::db::term::read(db, term).await? else {
         return Err(crate::domain::term::gone_error());
     };
@@ -125,9 +126,9 @@ pub async fn list_for_class_course(
     exam::list_for_class_course(db, class_course).await
 }
 
-/// Every exam of every instance in `instances` (one query) — the karne and
-/// marks reports' cross-instance read, and the list behind a caller's visible
-/// instances.
+/// Every exam of every instance in `instances` (one query) — the report-card
+/// and marks reports' cross-instance read, and the list behind a caller's
+/// visible instances.
 pub async fn list_for_class_course_courses(
     db: &Database,
     instances: &[ClassCourseId],
@@ -141,12 +142,12 @@ pub async fn list_for_courses(db: &Database, courses: &[CourseId]) -> Result<Vec
     exam::list_for_courses(db, courses).await
 }
 
-// ---- audience: the ortak sınav (D2) ---------------------------------------
+// ---- audience: the shared exam (D2) ---------------------------------------
 
 /// The exam, or the `404` a gone id deserves — and the caller's right to act
 /// on the exam's **owner** instance, or the `403` D10 answers
 /// ([`crate::service::class_course::ensure_instance_teacher`]: manager+, an
-/// assigned teacher, or the şube's homeroom teacher).
+/// assigned teacher, or the section's homeroom teacher).
 ///
 /// The audience routes never move the exam, they announce it, so the gate is
 /// the owner's and not the target's: the section that runs the exam decides
@@ -159,21 +160,21 @@ async fn managed_exam(db: &Database, user: &User, id: &ExamId) -> Result<Exam, A
     Ok(exam)
 }
 
-/// Announce `exam` to another instance — the ortak sınav write (D2).
+/// Announce `exam` to another instance — the shared-exam write (D2).
 ///
 /// The exam stays owned by the instance it was created on; an audience row is
-/// what makes a second (third, …) şube sit the same sitting and carry the
-/// mark in its own marks and karne ([`crate::db::exam_result`] reads through
-/// `exam_audience`). Three rules keep the announcement from filing academic
-/// work where it cannot be graded:
+/// what makes a second (third, …) class section sit the same sitting and carry the
+/// mark in its own marks and report card ([`crate::db::exam_result`] reads
+/// through `exam_audience`). Three rules keep the announcement from filing
+/// academic work where it cannot be graded:
 ///
 /// - the target must teach the **same catalog course** — a mark on an algebra
 ///   exam standing in a geometry instance's report is a subject that report
 ///   never taught;
-/// - both instances must sit under the **same academic year** — a karne is
-///   computed over one year, so an announcement across years would file the
+/// - both instances must sit under the **same academic year** — a report card
+///   is computed over one year, so an announcement across years would file the
 ///   mark into a year the exam is not taught in (the rule [`create`] already
-///   applies to the dönem);
+///   applies to the term);
 /// - the target may not be the owner itself: the owner's audience row always
 ///   exists, and the owner cannot be withdrawn (see [`remove_audience`]) —
 ///   deleting the exam is what ends it.
@@ -245,7 +246,7 @@ pub async fn add_audience(
 /// [`crate::db::exam_audience::remove`]'s boolean carries — never a silent
 /// success. The exam's own year must still be open, like every other write
 /// against the exam's structure ([`update`] and [`delete`]): withdrawing from
-/// an archived year's ortak sınav is a `409`, not a silent edit of a past
+/// an archived year's shared exam is a `409`, not a silent edit of a past
 /// year's record. The answer is the audience the exam holds after the call.
 pub async fn remove_audience(
     db: &Database,
@@ -533,8 +534,8 @@ mod tests {
             .unwrap()
     }
 
-    /// An instance of `course` inside a fresh şube of `year` — one side of an
-    /// announcement.
+    /// An instance of `course` inside a fresh class section of `year` — one
+    /// side of an announcement.
     async fn instance_in(
         db: &Database,
         manager: &UserId,

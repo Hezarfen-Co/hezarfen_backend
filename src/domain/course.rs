@@ -63,9 +63,9 @@ impl CourseDescription {
     }
 }
 
-/// A validated course kind: `course` (a regular class — ders), `study` (a
-/// supervised study session — etüt), or `club` (a student club — kulüp).
-/// Only `course` is class-delivered (a şube attaches it as an instance);
+/// A validated course kind: `course` (a regular class), `study` (a supervised
+/// study session), or `club` (a student club).
+/// Only `course` is class-delivered (a section attaches it as an instance);
 /// `study`/`club` are school-scoped and joined individually.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
@@ -86,9 +86,9 @@ impl CourseKind {
         &self.0
     }
 
-    /// Whether a şube attaches this kind as an instance. Only a regular ders
-    /// (`course`) is class-delivered; clubs and etüt are school-scoped and
-    /// joined individually ([`crate::domain::course_membership`]).
+    /// Whether a section attaches this kind as an instance. Only a regular
+    /// course (`course`) is class-delivered; clubs and supervised studies are
+    /// school-scoped and joined individually ([`crate::domain::course_membership`]).
     pub fn is_class_delivered(&self) -> bool {
         self.0 == "course"
     }
@@ -143,7 +143,7 @@ impl Course {
         self.class_course_count
     }
 
-    /// How many users hold an individual (club/etüt) membership.
+    /// How many users hold an individual (club/study) membership.
     pub fn get_course_membership_count(&self) -> i64 {
         self.course_membership_count
     }

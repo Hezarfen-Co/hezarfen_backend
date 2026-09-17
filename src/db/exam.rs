@@ -35,11 +35,11 @@ pub async fn create(
     draft: bool,
 ) -> Result<Exam, AppError> {
     // A missing parent is refused by the real foreign keys: an instance, a
-    // dönem or a creator that is gone is `SQLSTATE 23503`, and this call
+    // term or a creator that is gone is `SQLSTATE 23503`, and this call
     // site's parent-gone answer is the same `NotFound` the old
     // existence-proof touch answered with.
     //
-    // The dönem is *claimed* in the same statement as the row (`exam_count`
+    // The term is *claimed* in the same statement as the row (`exam_count`
     // +1, a conditional write on the term row), the shape the old course
     // create used against `term.course_count`: the count is what the term's
     // own delete guard reads, and claim-and-insert in one CTE means no crash
@@ -47,8 +47,8 @@ pub async fn create(
     //
     // The owner's `exam_audience` row is written in the same transaction,
     // *always*: the audience is what every listing reads through, so an exam
-    // with no audience row would be invisible to its own instance. An ortak
-    // sınav is extra audience rows on this one exam (D2), never a second
+    // with no audience row would be invisible to its own instance. A shared
+    // exam is extra audience rows on this one exam (D2), never a second
     // shape.
     let id = ExamId::generate();
     let creator = *creator;
@@ -104,7 +104,7 @@ pub async fn create(
 /// future type rustc can check, exactly as
 /// [`crate::db::answer_image::upsert_in`] does for the same reason.
 ///
-/// Everything it decides is the closure's own: a claim that matched no dönem
+/// Everything it decides is the closure's own: a claim that matched no term
 /// row is [`crate::domain::term::gone_error`], any other foreign key is the
 /// parent-gone `NotFound`, and the audience row is written in the same
 /// transaction as the row it names.
@@ -171,7 +171,7 @@ pub(crate) async fn insert_in(
     .await;
     let exam = match written {
         Ok(Some(exam)) => exam,
-        // The conditional claim matched no dönem row: the term is gone.
+        // The conditional claim matched no term row: the term is gone.
         Ok(None) => return Err(crate::domain::term::gone_error()),
         Err(err) if foreign_key_violation(&err) => return Err(AppError::NotFound),
         Err(err) => return Err(err.into()),
@@ -229,7 +229,7 @@ pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
 ///
 /// It reads through `exam_audience` rather than off `exam.class_course`: the
 /// owner's row is always there (the create writes it), so the two agree for
-/// every exam this instance owns, and the join is what lets an ortak sınav be
+/// every exam this instance owns, and the join is what lets a shared exam be
 /// one exam addressed to several instances (D2) without a second read path.
 pub async fn list_for_class_course(
     db: &Database,
@@ -258,12 +258,12 @@ pub async fn list_for_class_course(
     .await?)
 }
 
-/// Every exam of every instance in `instances` (one query) — the karne and
+/// Every exam of every instance in `instances` (one query) — the report card and
 /// marks reports' cross-instance read, and the list behind a caller's visible
 /// courses.
 ///
 /// `DISTINCT ON (e.id)` because an exam may be addressed to several instances
-/// at once (an ortak sınav): the filters ask "is this exam visible here", not
+/// at once (a shared exam): the filters ask "is this exam visible here", not
 /// "how many audiences does it have", so each exam is returned once with its
 /// own owner instance.
 pub async fn list_for_class_course_courses(
@@ -536,7 +536,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
         true,
         async move |conn| {
             // The row lock every other exam-child writer contends on. The
-            // dönem rides out of the same read: the term's `exam_count` is
+            // term rides out of the same read: the term's `exam_count` is
             // given back in this transaction, and the row that names it is
             // the one being deleted.
             let locked = sqlx::query!(
@@ -653,7 +653,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
             let Some(exam) = deleted else {
                 return Err(AppError::NotFound);
             };
-            // The dönem gets its exam reference back inside the same
+            // The term gets its exam reference back inside the same
             // transaction — the other half of the claim `create` makes.
             sqlx::query!(
                 r#"UPDATE term SET exam_count = GREATEST(exam_count - 1, 0)
@@ -696,7 +696,7 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
     .execute(db)
     .await
     .unwrap();
-    // The exam hangs off the *instance* and carries the dönem it is graded in
+    // The exam hangs off the *instance* and carries the term it is graded in
     // (both foreign keys): both are real rows, minted per call —
     // [`crate::db::course::a_test_instance`] mints the class, the course and
     // the link, [`crate::db::term::a_test_term`] the year under the term.
@@ -761,7 +761,7 @@ mod tests {
                 .execute(&db)
                 .await
                 .unwrap();
-                // The exam's parents: a dönem, and an instance of *this*
+                // The exam's parents: a term, and an instance of *this*
                 // course. Attaching it is the claim the racing delete
                 // contends on, so the round where the course is gone refuses
                 // here — which is the refusal this test wants to see answered.

@@ -1,14 +1,14 @@
-//! The `karne_snapshot` table: the frozen per-student, per-dönem report
+//! The `karne_snapshot` table: the frozen per-student, per-term report card
 //! written when a term is archived.
 //!
-//! Karne is a *computed* read (D8) — per-instance weighted average, graded
-//! against the school's bands, then a `ders_saati`-weighted year average. The
-//! snapshot exists for the moment that computation must stop moving: once a
-//! dönem is archived, the report is a record of what the school issued, and a
-//! later correction to a mark must not silently rewrite a karne a family
-//! already holds. [`crate::service::karne::freeze`] writes the rows;
-//! [`crate::service::karne::build`] serves the snapshot back for an archived
-//! term and computes live for an open one.
+//! A report card is a *computed* read (D8) — per-instance weighted average,
+//! graded against the school's bands, then a `ders_saati`-weighted year
+//! average. The snapshot exists for the moment that computation must stop
+//! moving: once a term is archived, the report is a record of what the school
+//! issued, and a later correction to a mark must not silently rewrite a report
+//! card a family already holds. [`crate::service::karne::freeze`] writes the
+//! rows; [`crate::service::karne::build`] serves the snapshot back for an
+//! archived term and computes live for an open one.
 
 use sqlx::types::Json;
 
@@ -47,7 +47,7 @@ pub async fn snapshot(
     Ok(())
 }
 
-/// `user`'s frozen report for `term`, or `None` when that dönem was never
+/// `user`'s frozen report for `term`, or `None` when that term was never
 /// frozen (or they had no roster row to freeze).
 pub async fn read_snapshot(
     db: &Database,

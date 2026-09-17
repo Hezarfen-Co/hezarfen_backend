@@ -59,7 +59,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 /// schedule, and an installment with no date is not part of one.
 #[derive(Debug, Deserialize, ToSchema)]
 struct InstallmentBody {
-    /// What this installment bills, **minor units** (kuruş), positive. Integer
+    /// What this installment bills, **minor units**, positive. Integer
     /// only: this API never speaks decimals or floats about money.
     #[schema(minimum = 1, maximum = 10000000, example = 150000_i64)]
     amount_minor: i64,
@@ -115,7 +115,7 @@ struct UpdateFeePlan {
 
 #[derive(Serialize, ToSchema)]
 struct InstallmentResponse {
-    /// Minor units (kuruş).
+    /// Minor units.
     amount_minor: i64,
     due_at: i64,
 }
@@ -556,7 +556,7 @@ async fn require_line(id: &str, db: &Database) -> Result<PaymentLedger, AppError
 struct RecordPayment {
     /// The charge line this money pays.
     charge_id: String,
-    /// How much came in, **minor units** (kuruş), positive. Partial payments
+    /// How much came in, **minor units**, positive. Partial payments
     /// are the norm; together they may not exceed the charge.
     #[schema(minimum = 1, maximum = 10000000, example = 50000)]
     amount_minor: i64,
@@ -579,7 +579,7 @@ struct RecordPayment {
 struct RecordRefund {
     /// The payment being handed back.
     credit_id: String,
-    /// How much goes back out, **minor units** (kuruş), positive. Partials
+    /// How much goes back out, **minor units**, positive. Partials
     /// allowed, up to what the credit was worth.
     #[schema(minimum = 1, maximum = 10000000, example = 50000)]
     amount_minor: i64,
@@ -809,7 +809,7 @@ struct StatementEntry {
     /// The plan it came from, and its name when the plan still exists.
     plan: Option<String>,
     plan_name: Option<String>,
-    /// What the installment bills, minor units (kuruş).
+    /// What the installment bills, minor units.
     #[schema(example = 150000)]
     amount_minor: i64,
     /// When it falls due, unix milliseconds.
@@ -1016,7 +1016,7 @@ async fn user_statement(
 #[derive(Serialize, ToSchema)]
 struct PaymentBalanceResponse {
     student: PersonRef,
-    /// `credits + reversals - charges - refunds`, in **minor units** (kuruş).
+    /// `credits + reversals - charges - refunds`, in **minor units**.
     /// Negative means the family owes the school. Derived on every read, never
     /// stored.
     #[schema(example = -100000)]

@@ -3,9 +3,9 @@
 //! Every exam is *owned* by exactly one instance — the `class_course` column
 //! on its own row — and [`crate::db::exam::insert_in`] writes that owner's
 //! audience row in the same transaction as the exam. The rows beyond it are
-//! the **ortak sınav**'s (D2): one exam announced to another şube's instance,
+//! the **shared exam**'s (D2): one exam announced to another section's instance,
 //! sat and graded once, standing in every addressed instance's marks and
-//! karne. Every exam read goes through this table
+//! report card. Every exam read goes through this table
 //! ([`crate::db::exam::list_for_class_course`] and the marks reports' joins),
 //! so the audience set is the single answer to "which instances does this
 //! exam belong to" and the owner column is only the join's tie-break.
@@ -27,7 +27,7 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 
 /// One audience row, resolved to what a client needs to name it: the
-/// instance, the şube it belongs to and the catalog course it teaches.
+/// instance, the section it belongs to and the catalog course it teaches.
 #[derive(Debug, sqlx::FromRow)]
 pub struct Audience {
     class_course: ClassCourseId,
@@ -41,7 +41,7 @@ impl Audience {
         &self.class_course
     }
 
-    /// The şube that instance belongs to.
+    /// The section that instance belongs to.
     pub fn get_class(&self) -> &ClassGroupId {
         &self.class
     }
@@ -141,7 +141,7 @@ pub async fn list_for_instance(
 /// The enrollment predicate the sitting and grading gates ask once one exam
 /// can be announced to several instances (D2): for an exam nobody was
 /// announced to this is the owner-only check those gates used to run, row for
-/// row, and for an ortak sınav it admits the addressed sections' students —
+/// row, and for a shared exam it admits the addressed sections' students —
 /// who sit and are graded at their own instance exactly like the owner's.
 pub async fn enrolled(db: &Database, exam: &ExamId, user: &UserId) -> Result<bool, AppError> {
     Ok(sqlx::query_scalar!(

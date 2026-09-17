@@ -586,7 +586,7 @@ async fn close_board(
 #[derive(Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum InviteSource {
-    /// Everyone currently in this class section (şube). The homeroom teacher is
+    /// Everyone currently in this class section. The homeroom teacher is
     /// not implied — the field is a label and grants nothing.
     Class { class: String },
     /// Everyone the course reaches: the union of every instance's roster and

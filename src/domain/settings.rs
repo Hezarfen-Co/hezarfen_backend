@@ -215,16 +215,16 @@ pub struct Settings {
     /// for both deadlines; `None` = no cutoff at all, which is also what an
     /// unset column reads as.
     pub(crate) meal_cancel_cutoff_minutes: Option<i64>,
-    /// Öğretmen branş lists (D6): the school's subject specialisations a
+    /// Teacher branch lists (D6): the school's subject specialisations a
     /// teacher profile may name. `None`-while-unset; an empty list is legal
-    /// (a school that never configured branş).
+    /// (a school that never configured one).
     pub(crate) branches: Option<Json<Vec<String>>>,
-    /// What an absence may be excused as (raporlu/izinli/…): the vocabulary
-    /// pointed at by an excused roll-call row. `None`-while-unset, like
-    /// `branches`.
+    /// What an absence may be excused as (with a report / on leave / …): the
+    /// vocabulary pointed at by an excused roll-call row. `None`-while-unset,
+    /// like `branches`.
     pub(crate) excuse_kinds: Option<Json<Vec<String>>>,
-    /// Devamsızlık policy (D7): the per-dönem excused/unexcused day limits a
-    /// student may exceed. `None` = no limit configured.
+    /// Absence policy (D7): the per-term excused/unexcused day limits a student
+    /// may exceed. `None` = no limit configured.
     pub(crate) max_excused_absent_days: Option<i64>,
     pub(crate) max_unexcused_absent_days: Option<i64>,
     /// The school's IANA timezone, used to bucket attendance days. `None`
@@ -439,7 +439,7 @@ impl Settings {
             )?;
         }
 
-        // Branş and excuse-kind lists follow the same rules as the kinds and
+        // Branch and excuse-kind lists follow the same rules as the kinds and
         // statuses above, but empty is legal on both — a school that never
         // configured either is not forced to invent one.
         let branches = if branches.is_empty() {
@@ -580,7 +580,7 @@ impl Settings {
         self.meal_cancel_cutoff_minutes
     }
 
-    /// The branş (subject specialisation) vocabulary a teacher profile may
+    /// The branch (subject specialisation) vocabulary a teacher profile may
     /// name; empty while the school never configured one.
     pub fn get_branches(&self) -> Vec<String> {
         self.branches
@@ -598,12 +598,12 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// The per-dönem excused-absence day limit; `None` = no limit configured.
+    /// The per-term excused-absence day limit; `None` = no limit configured.
     pub fn get_max_excused_absent_days(&self) -> Option<i64> {
         self.max_excused_absent_days
     }
 
-    /// The per-dönem unexcused-absence day limit; `None` = no limit configured.
+    /// The per-term unexcused-absence day limit; `None` = no limit configured.
     pub fn get_max_unexcused_absent_days(&self) -> Option<i64> {
         self.max_unexcused_absent_days
     }
@@ -717,7 +717,7 @@ mod tests {
         let defaults = Settings::defaults();
         let rebuilt = Settings::try_new(defaults.params()).unwrap();
         assert_eq!(rebuilt.get_exam_kinds(), defaults.get_exam_kinds());
-        // The Türkiye 5-point scale ships by default, so a mark always labels.
+        // The Turkish 5-point scale ships by default, so a mark always labels.
         assert_eq!(defaults.get_grade_bands().len(), DEFAULT_GRADE_BANDS.len());
         assert_eq!(defaults.grade_label(90.0), Some("5"));
         assert_eq!(defaults.grade_label(0.0), Some("1"));

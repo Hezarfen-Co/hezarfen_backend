@@ -233,7 +233,7 @@ pub struct User {
     // type and size live on the row.
     pub(crate) display_name: Option<DisplayName>,
     pub(crate) bio: Option<Bio>,
-    /// The staff member's branş (subject area), free text validated against
+    /// The staff member's branch (subject area), free text validated against
     /// the school's own `Settings::get_branches()` list at the web layer —
     /// optional like every other profile field, and clearable.
     pub(crate) branch: Option<String>,
@@ -328,7 +328,7 @@ impl User {
         self.bio.as_ref()
     }
 
-    /// The staff member's branş, as stored (free text; membership in the
+    /// The staff member's branch, as stored (free text; membership in the
     /// school's list is the write path's check, not this read's).
     pub fn get_branch(&self) -> Option<&str> {
         self.branch.as_deref()

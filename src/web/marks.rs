@@ -1,12 +1,12 @@
 //! Mark reports: the per-instance weighted average a student carries, and the
-//! karne — the same numbers rolled up per dönem.
+//! report card — the same numbers rolled up per term.
 //!
 //! Both read through the *instance* (`class_course`): a student's marks are
-//! grouped by the course their şube is taught, so two sections teaching the
+//! grouped by the course their section is taught, so two sections teaching the
 //! same catalog course are two lines. A block's marks are the exams *addressed
-//! to* its instance (`exam_audience`), not only the ones it owns — an ortak
-//! sınav is each of its audiences' exam, so its mark appears in every one of
-//! their blocks. The roll-up, the dönem average and the verdict live in
+//! to* its instance (`exam_audience`), not only the ones it owns — a shared
+//! exam is each of its audiences' exam, so its mark appears in every one of
+//! their blocks. The roll-up, the term average and the verdict live in
 //! [`crate::service::karne`]; this module is the HTTP shape and the teacher
 //! narrowing.
 
@@ -64,11 +64,11 @@ struct MarkEntry {
     graded_by: String,
 }
 
-/// A student's marks in one instance — one catalog course as one şube teaches
+/// A student's marks in one instance — one catalog course as one section teaches
 /// it.
 #[derive(Serialize, ToSchema)]
 struct CourseMarks {
-    /// The instance these marks belong to (`GET /instances/{id}`). Two şubeler
+    /// The instance these marks belong to (`GET /instances/{id}`). Two sections
     /// teaching the same course are two blocks.
     instance: String,
     course: CourseResponse,
@@ -108,11 +108,11 @@ fn weighted_average(pairs: &[(i64, i64)]) -> Option<f64> {
     Some(total as f64 / total_weight as f64)
 }
 
-/// The instances a student's report is built from: the şubeler they are a live
-/// member of, and the instances those şubeler carry — the same path the karne
-/// walks, so the two can never disagree about which blocks a student has.
+/// The instances a student's report is built from: the sections they are a live
+/// member of, and the instances those sections carry — the same path the report
+/// card walks, so the two can never disagree about which blocks a student has.
 ///
-/// A hand-placed enrollment outside their şubeler is deliberately not a source
+/// A hand-placed enrollment outside their sections is deliberately not a source
 /// here: a student's academic identity is their section, and adding an
 /// instance to it is what the office does with `POST /classes/{id}/instances`.
 async fn enrolled_instances(user: &UserId, db: &Database) -> Result<Vec<ClassCourse>, AppError> {
@@ -274,19 +274,19 @@ async fn user_marks(
     Ok(Json(build_report(&target, viewer, &st.db).await?))
 }
 
-/// The `?term=` selector both karne routes share. Omitted, it means the newest
-/// dönem on the calendar — the one a family is reading about now.
+/// The `?term=` selector both report-card routes share. Omitted, it means the
+/// newest term on the calendar — the one a family is reading about now.
 #[derive(Deserialize, IntoParams)]
 struct KarneQuery {
-    /// The dönem to report on (`GET /terms`). Omit for the newest one.
+    /// The term to report on (`GET /terms`). Omit for the newest one.
     #[param(example = "019732e3-7b00-7000-8000-00000000dead")]
     term: Option<String>,
 }
 
-/// The dönem the request names, resolved *without* the archive gate: an
-/// archived dönem's karne is exactly what a family asks for, and the service
-/// serves its frozen snapshot. A dönem that does not exist is a 404, as is an
-/// empty calendar.
+/// The term the request names, resolved *without* the archive gate: an
+/// archived term's report card is exactly what a family asks for, and the
+/// service serves its frozen snapshot. A term that does not exist is a 404, as
+/// is an empty calendar.
 async fn resolve_term(query: &KarneQuery, db: &Database) -> Result<TermId, AppError> {
     match query.term.as_deref() {
         Some(id) => Ok(*service::term::read(db, &TermId::from_key(id))
@@ -303,15 +303,15 @@ async fn resolve_term(query: &KarneQuery, db: &Database) -> Result<TermId, AppEr
     }
 }
 
-/// Narrow a karne to the instances `viewer` runs: the lines stay, the dönem
-/// average is recomputed over them (each weighted by its `ders_saati`, the
-/// karne's own rule), and the verdict is dropped.
+/// Narrow a report card to the instances `viewer` runs: the lines stay, the
+/// term average is recomputed over them (each weighted by its `ders_saati`,
+/// the report card's own rule), and the verdict is dropped.
 ///
-/// Dropping it is the honest half: the verdict is a whole-karne judgement
-/// against the school's passing floor, and the floor's rule lives in
-/// [`crate::service::karne`] — a partially-seen karne states no verdict rather
-/// than one computed from a subset. A caller who runs every instance in the
-/// report sees it, because nothing is filtered.
+/// Dropping it is the honest half: the verdict is a judgement over the whole
+/// report card against the school's passing floor, and the floor's rule lives
+/// in [`crate::service::karne`] — a partially-seen report card states no
+/// verdict rather than one computed from a subset. A caller who runs every
+/// instance in the report sees it, because nothing is filtered.
 async fn narrow_karne(
     mut report: KarneReport,
     viewer: &User,
@@ -324,7 +324,7 @@ async fn narrow_karne(
             kept.push(line);
         }
     }
-    // Nothing was filtered: the report is the whole karne, verdict included.
+    // Nothing was filtered: the report is the whole report card, verdict included.
     if kept.len() == lines_seen {
         report.instances = kept;
         return Ok(report);
@@ -343,10 +343,10 @@ async fn narrow_karne(
     Ok(report)
 }
 
-/// The current user's karne for one dönem: every instance of their şubeler that
-/// counts toward the karne, the `ders_saati`-weighted average across them, and
-/// the verdict. An archived dönem serves the snapshot the school froze when it
-/// was closed; an open one computes live.
+/// The current user's report card for one term: every instance of their
+/// sections that counts toward the report card, the `ders_saati`-weighted
+/// average across them, and the verdict. An archived term serves the snapshot
+/// the school froze when it was closed; an open one computes live.
 #[utoipa::path(
     get,
     path = "/karne",
@@ -370,10 +370,10 @@ async fn my_karne(
     ))
 }
 
-/// Any user's karne for one dönem. Requires teacher+, or a parent tied to the
-/// target student. A linked parent and manager+ read the whole karne; an
-/// exactly-teacher caller sees only the lines of the instances they run, with
-/// the dönem average recomputed over those and no verdict (see
+/// Any user's report card for one term. Requires teacher+, or a parent tied to
+/// the target student. A linked parent and manager+ read the whole report card;
+/// an exactly-teacher caller sees only the lines of the instances they run,
+/// with the term average recomputed over those and no verdict (see
 /// [`narrow_karne`]).
 #[utoipa::path(
     get,
@@ -413,9 +413,9 @@ async fn user_karne(
 mod tests {
     use super::*;
 
-    /// The dönem's own number, each instance weighted by its `ders_saati`: the
-    /// karne's arithmetic, checked here against the report shape this module
-    /// serves.
+    /// The term's own number, each instance weighted by its `ders_saati`: the
+    /// report card's arithmetic, checked here against the report shape this
+    /// module serves.
     #[test]
     fn the_report_shape_carries_the_instance_it_grouped_by() {
         let pairs = [(85, 1), (70, 2)];
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(weighted_average(&[]), None);
     }
 
-    /// The ortak-sınav rule on the marks report: an exam addressed to a second
+    /// The shared-exam rule on the marks report: an exam addressed to a second
     /// instance stands in *its* block too, while the exam addressed to its
     /// owner alone stays out of it. Read through `exam.class_course` the second
     /// block would have held no results.

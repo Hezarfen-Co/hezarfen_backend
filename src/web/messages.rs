@@ -36,7 +36,7 @@ struct SendMessage {
     subject: String,
     #[schema(example = "I may be 10 minutes late.", max_length = 10000)]
     body: Option<String>,
-    /// Optional free-text tag the UI shows as a badge ("Etüt", "Sınav", …).
+    /// Optional free-text tag the UI shows as a badge ("Study", "Exam", …).
     /// Blank counts as absent.
     #[schema(example = "Etüt", max_length = 50)]
     label: Option<String>,

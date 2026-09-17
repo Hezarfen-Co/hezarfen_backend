@@ -51,11 +51,11 @@ pub struct SettingsPatch {
     pub dietary_tags: Option<Vec<String>>,
     /// Absent keeps the knob; `Some(None)` clears it (no cutoff at all).
     pub meal_cancel_cutoff_minutes: Option<Option<i64>>,
-    /// The school's branş list, raw like `dietary_tags` (the workflow's own
-    /// validation step, holding the stored list, decides whether an empty
-    /// list means "keep" or "clear" — see `Settings::try_new`).
+    /// The school's subject-specialisation list, raw like `dietary_tags` (the
+    /// workflow's own validation step, holding the stored list, decides whether
+    /// an empty list means "keep" or "clear" — see `Settings::try_new`).
     pub branches: Option<Vec<String>>,
-    /// The devamsızlık excuse kinds, raw like `branches`.
+    /// The absence excuse kinds, raw like `branches`.
     pub excuse_kinds: Option<Vec<String>>,
     /// Absent keeps the limit; `Some(None)` clears it (no ceiling).
     pub max_excused_absent_days: Option<Option<i64>>,
@@ -177,12 +177,13 @@ pub async fn apply(db: &Database, patch: &SettingsPatch) -> Result<Settings, App
         params.meal_cancel_cutoff_minutes = patch
             .meal_cancel_cutoff_minutes
             .unwrap_or(params.meal_cancel_cutoff_minutes);
-        // The year's shape: the branş and excuse-kind lists ride the same
-        // idiom as `dietary_tags` below — an *absent* field keeps the stored
-        // list, an explicitly submitted one replaces it whole (empty is a
-        // legal list: a school that never configured branş keeps none), and
-        // both are validated by `Settings::try_new` under the stored-list
-        // rules at the end of this merge.
+        // The year's shape: the subject-specialisation and excuse-kind lists
+        // ride the same idiom as `dietary_tags` below — an *absent* field
+        // keeps the stored list, an explicitly submitted one replaces it whole
+        // (empty is a legal list: a school that never configured subject
+        // specialisations keeps none), and both are validated by
+        // `Settings::try_new` under the stored-list rules at the end of this
+        // merge.
         params.branches = patch
             .branches
             .clone()

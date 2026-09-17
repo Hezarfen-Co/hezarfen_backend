@@ -176,9 +176,9 @@ pub async fn gate_own_submission(
 /// order that matters: a student the homework never named is refused by the
 /// audience check with a 404 and never learns the homework exists.
 ///
-/// The gate keys on the homework's instance → its şube → that şube's year
-/// (D8): a dönem archived inside an open year does not close homework, the
-/// year does.
+/// The gate keys on the homework's instance → its class section → that
+/// section's year (D8): a term archived inside an open year does not close
+/// homework, the year does.
 pub async fn require_open_instance(homework: &Homework, db: &Database) -> Result<(), AppError> {
     crate::service::class_course::require_open(db, homework.get_class_course()).await
 }

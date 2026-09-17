@@ -121,8 +121,8 @@ pub async fn read(db: &Database, id: &ClassCourseId) -> Result<Option<ClassCours
 }
 
 /// PATCH one instance's own policy: the weekly hours and whether it counts
-/// toward the karne. Both are non-clearable, so an omitted field keeps the
-/// stored value.
+/// toward the report card. Both are non-clearable, so an omitted field keeps
+/// the stored value.
 pub async fn update(
     db: &Database,
     id: &ClassCourseId,
@@ -133,7 +133,8 @@ pub async fn update(
 }
 
 /// The academic year this instance sits under, if any — the seam every
-/// instance-scoped write reads the archive gate off (instance → şube → year).
+/// instance-scoped write reads the archive gate off (instance → section →
+/// year).
 pub async fn year_of(
     db: &Database,
     instance: &ClassCourseId,
@@ -150,8 +151,9 @@ pub async fn year_of(
 /// read-only. A pre-flight guard, accepted race (see README concurrency
 /// model): a year archived after this read still lets the write through.
 ///
-/// A şube with no year, or one whose year row is gone, passes: a dangling
-/// link is not this guard's error, and the caller that cares answers it.
+/// A class section with no year, or one whose year row is gone, passes: a
+/// dangling link is not this guard's error, and the caller that cares answers
+/// it.
 pub async fn require_open(db: &Database, instance: &ClassCourseId) -> Result<(), AppError> {
     if let Some(year) = year_of(db, instance).await? {
         crate::service::academic_year::require_open(db, &year).await?;
@@ -216,9 +218,9 @@ pub async fn unassign_teacher(
 /// A 403 unless `user` may act on this instance — D10, the one gate every
 /// instance-scoped route shares in place of a `class_course_teacher` lookup of
 /// its own. It passes when the user is `manager`+ (the office), when they are
-/// one of the instance's assigned teachers, or when they are the şube's
-/// homeroom teacher (sınıf öğretmeni) — the three ways a person legitimately
-/// runs a section's course.
+/// one of the instance's assigned teachers, or when they are the section's
+/// homeroom teacher — the three ways a person legitimately runs a section's
+/// course.
 ///
 /// A gone instance is a `404`, never a 403: the route the user asked about
 /// does not exist.
@@ -321,8 +323,8 @@ mod tests {
         );
     }
 
-    /// Two şubeler teaching one catalog course are two instances — that is the
-    /// whole remodel — and each keeps its own roster.
+    /// Two class sections teaching one catalog course are two instances — that
+    /// is the whole remodel — and each keeps its own roster.
     #[tokio::test]
     async fn two_classes_teaching_one_course_keep_their_own_rosters() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -354,8 +356,8 @@ mod tests {
             "…and nowhere near 5-B's"
         );
 
-        // Detaching one şube takes its instance and its roster; the other
-        // şube's instance and roster stand.
+        // Detaching one class section takes its instance and its roster; the
+        // other section's instance and roster stand.
         detach(&db, &fifth_a, &algebra).await.unwrap();
         assert_eq!(source_of(first.get_id(), &student, &db).await, None);
         assert_eq!(
@@ -505,7 +507,7 @@ mod tests {
         );
     }
 
-    /// D10: the instance's own teacher, the şube's homeroom teacher and a
+    /// D10: the instance's own teacher, the section's homeroom teacher and a
     /// manager may act on it; another instance's teacher and a plain student
     /// may not. Assignment itself is the office's call and the assignee must
     /// hold the teacher bar.

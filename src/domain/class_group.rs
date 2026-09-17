@@ -1,11 +1,11 @@
-//! A class section (şube): a named set of students the school manages as one,
-//! so a course attach enrolls the whole set at once. The membership and the
+//! A class section: a named set of students the school manages as one, so a
+//! course attach enrolls the whole set at once. The membership and the
 //! attachments live in their own tables (`class_member`, `class_course`) and are
 //! counted on this row — a class may only be deleted at zero on both, the same
 //! stored guard shape courses and terms use.
 //!
 //! A class belongs to an academic year ([`crate::domain::academic_year`]), not
-//! to a term: the şube keeps the same roster all year and the dönem is a
+//! to a term: the section keeps the same roster all year and the term is a
 //! grading slice inside it. It claims a reference on its year before the link
 //! is written; the reference is its *own* column
 //! ([`crate::constant::ACADEMIC_YEAR_CLASS_COUNT_FIELD`]) rather than the
@@ -65,7 +65,7 @@ impl ClassName {
 }
 
 /// The school's own label for the year a class sits in ("9", "10-A",
-/// "anaokulu"). Free text on purpose — no school's grade ladder is the next
+/// "kindergarten"). Free text on purpose — no school's grade ladder is the next
 /// one's — and optional: a club-shaped class has no grade at all.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
@@ -86,7 +86,7 @@ impl ClassGrade {
 /// guard are database-side columns only, so no whole-row save can clobber one
 /// (see [`crate::db::cap`]).
 ///
-/// `teacher` is the section's homeroom teacher (sınıf öğretmeni): optional, not
+/// `teacher` is the section's homeroom teacher: optional, not
 /// refcounted, and merely a label pointing at a teacher-or-higher account — the
 /// web layer holds that bar, and a demotion sweeps the column
 /// ([`crate::db::class_group::unassign_everywhere`]).
@@ -121,7 +121,7 @@ impl ClassGroup {
         self.year.as_ref()
     }
 
-    /// The homeroom teacher (sınıf öğretmeni), if one is assigned.
+    /// The homeroom teacher, if one is assigned.
     pub fn get_teacher(&self) -> Option<&UserId> {
         self.teacher.as_ref()
     }

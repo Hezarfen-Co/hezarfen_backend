@@ -5,7 +5,7 @@
 //! [`crate::db::class_pump`].
 //!
 //! An instance is the academic anchor now: it carries the weekly hours
-//! (`ders_saati`), whether it counts toward the karne, the roster counter and
+//! (`ders_saati`), whether it counts toward the report card, the roster counter
 //! its own teachers ([`crate::db::class_course_teacher`]). Reads speak the
 //! *bare uuid* id of the instance; the (class, course) pair survives as the
 //! UNIQUE key the attach gates on.
@@ -82,7 +82,7 @@ pub async fn list_for_class(
 }
 
 /// The instances one catalog course is taught in, newest first — the read
-/// behind "which şubeler run this course".
+/// behind "which sections run this course".
 pub async fn list_for_course(
     db: &Database,
     course: &CourseId,
@@ -183,7 +183,7 @@ pub async fn read(db: &Database, id: &ClassCourseId) -> Result<Option<ClassCours
 }
 
 /// The class this instance belongs to, or `None` when the id names no row —
-/// the seam every instance-scoped route reads the şube (and, through it, the
+/// the seam every instance-scoped route reads the section (and, through it, the
 /// year) off.
 pub async fn class_of(db: &Database, id: &ClassCourseId) -> Result<Option<ClassGroupId>, AppError> {
     let row = sqlx::query!(

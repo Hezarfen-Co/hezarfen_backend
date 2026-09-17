@@ -3,7 +3,7 @@
 //! Listed newest first; deleted with its whole subtree in one guarded cascade.
 //!
 //! The catalog is a template since the K12 remodel (D1): the academic work —
-//! roster, exams, timetable, teachers — lives on the instances a şube attaches,
+//! roster, exams, timetable, teachers — lives on the instances a section attaches,
 //! so this row carries only what every instance shares (title, description,
 //! kind) and two counters. The catalog is Manager+-owned (D6): there is no
 //! per-teacher ownership list, and the two counters are the delete guard.
@@ -46,7 +46,7 @@ impl CourseRow {
 }
 
 /// Mint a catalog course. No term is claimed any more: the catalog is not
-/// bound to a dönem (exams are, through their instance), and no capacity is
+/// bound to a term (exams are, through their instance), and no capacity is
 /// stored — the roster counter lives on the instance and gates nothing.
 pub async fn create(
     db: &Database,
@@ -464,12 +464,12 @@ pub(crate) async fn sweep_instance_subtree(
     .await?;
     // Both directions of the audience table, and each has to go before the
     // row it names. The rows *addressed to* this instance (an exam owned by
-    // another instance may be announced here — an ortak sınav) reference the
+    // another instance may be announced here — a shared exam) reference the
     // `class_course` row the caller deletes right after this sweep and would
     // otherwise refuse it with a `23503`. The rows *of* the exams this sweep
     // deletes reference *those* exams the same way (`exam_audience.exam` is
     // `NO ACTION` too), so they block the `DELETE FROM exam` below wherever
-    // they point — an audience of a swept exam in a şube that is *not* being
+    // they point — an audience of a swept exam in a section that is *not* being
     // detached included.
     //
     // The instance row is held `FOR UPDATE` by the caller from before this
@@ -543,12 +543,12 @@ pub(crate) async fn sweep_instance_subtree(
     )
     .execute(&mut *tx)
     .await?;
-    // The swept exams give their dönem's reference back off the rows this
+    // The swept exams give their term's reference back off the rows this
     // statement removed, per term (the mirror of `Exam::delete`'s
     // single-exam release): `db::exam::create` claimed `term.exam_count` for
-    // each of them, and a claim nothing releases leaves the dönem's
+    // each of them, and a claim nothing releases leaves the term's
     // `exam_count = 0` delete guard permanently failing — which takes the
-    // term, and the academic year whose own guard counts its dönems, down
+    // term, and the academic year whose own guard counts its terms, down
     // with it. Fused with the delete for the same reason the two releases
     // above are: a concurrent single-exam delete releases its own claim, so a
     // count taken before this statement could give one back twice.
@@ -848,7 +848,7 @@ mod tests {
     }
 
     /// A catalog course, minted per call. The catalog is a school-wide
-    /// template since the remodel: no dönem to link, no capacity to store.
+    /// template since the remodel: no term to link, no capacity to store.
     async fn a_course(db: &Database) -> Course {
         create(
             db,
@@ -861,7 +861,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A şube, for the tests that need an instance attached to it.
+    /// A section, for the tests that need an instance attached to it.
     async fn a_class(
         on: &UserId,
         name: &str,
@@ -993,7 +993,7 @@ mod tests {
     async fn a_delete_racing_an_attach_never_answers_500() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = a_person(&db, "mgr", "manager").await;
-        // One şube per racer; each round attaches them all into one fresh
+        // One section per racer; each round attaches them all into one fresh
         // catalog course, so the round's delete has six rival claims to meet.
         let mut classes = Vec::new();
         for seat in 0..6 {

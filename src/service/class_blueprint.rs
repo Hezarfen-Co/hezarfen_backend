@@ -372,8 +372,8 @@ pub async fn pump(
 /// still show it.
 ///
 /// Unpaged, like the [`crate::db::class_group::list_for_grade`] it is built on: the set
-/// is the şube one school runs at one grade, and the caller is asking about
-/// all of them.
+/// is the class sections one school runs at one grade, and the caller is
+/// asking about all of them.
 pub async fn status(
     db: &Database,
     blueprint: &ClassBlueprint,

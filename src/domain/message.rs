@@ -156,7 +156,7 @@ impl MessageBody {
     }
 }
 
-/// A sender-chosen tag ("Etüt", "Sınav", …) the UI renders as a badge.
+/// A sender-chosen tag ("Study", "Exam", …) the UI renders as a badge.
 /// Required-and-bounded here; "no label" is `Option<MessageLabel>` on the row.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]

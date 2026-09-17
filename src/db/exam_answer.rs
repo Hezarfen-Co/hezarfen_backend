@@ -312,7 +312,7 @@ mod tests {
         let kinds = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
-        // The instance and the dönem are foreign keys now: real rows the
+        // The instance and the term are foreign keys now: real rows the
         // fixture mints.
         let (instance, _course) = crate::db::course::a_test_instance(&db).await;
         let term = crate::db::term::a_test_term(&db).await;

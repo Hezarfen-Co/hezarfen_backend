@@ -1,10 +1,10 @@
-//! The **instance**: one catalog course as taught in one şube — the academic
+//! The **instance**: one catalog course as taught in one class section — the
 //! anchor of the K12 model.
 //!
 //! Everything a class actually runs hangs off this row: its roster, its
-//! teachers, its exams, its lessons and its homework. Two şubeler teaching the
+//! teachers, its exams, its lessons and its homework. Two sections teaching the
 //! same course are two instances and share none of it. The weekly hours
-//! (`ders_saati`) and the karne policy (`counts_toward_karne`) are the
+//! (`ders_saati`) and the report-card policy (`counts_toward_karne`) are the
 //! instance's own, so two sections may legitimately differ.
 //!
 //! The catalog CRUD stays in [`super::courses`]; the exam, session and
@@ -74,11 +74,11 @@ pub fn homework_routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateInstance {
-    /// Weekly lesson hours: the instance's weight in the year's karne average.
+    /// Weekly lesson hours: the instance's weight in the year's report-card average.
     /// Omit to keep the stored value; at least 1 and at most 40.
     #[schema(minimum = 1, maximum = 40, example = 5)]
     ders_saati: Option<i64>,
-    /// Whether this instance's marks count into the karne. Omit to keep the
+    /// Whether this instance's marks count into the report card. Omit to keep the
     /// stored value.
     counts_toward_karne: Option<bool>,
 }
@@ -105,13 +105,13 @@ struct CreateExamInCourse {
     #[schema(max_length = 2000)]
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`;
-    /// defaults: `yazili`, `sozlu`, `uygulama`). The kind's
-    /// settings-configured weight decides how heavily the exam counts into the
-    /// instance's average.
+    /// defaults: `yazili`, `sozlu`, `uygulama` — written, oral, practice). The
+    /// kind's settings-configured weight decides how heavily the exam counts
+    /// into the instance's average.
     #[schema(max_length = 50, example = "yazili")]
     kind: String,
-    /// The dönem the exam is sat in (`GET /terms`). Required, and it must be a
-    /// dönem of this instance's şube's academic year — that is the slice the
+    /// The term the exam is sat in (`GET /terms`). Required, and it must be a
+    /// term of this instance's section's academic year — that is the slice the
     /// exam's marks are counted into.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     term: String,
@@ -185,26 +185,26 @@ struct CreateSessionInCourse {
     ends_at: Option<i64>,
 }
 
-/// Public shape of one instance: the course as this şube teaches it, with the
+/// Public shape of one instance: the course as this section teaches it, with the
 /// policy that is the instance's own.
 #[derive(Serialize, ToSchema)]
 pub struct InstanceResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
-    /// The şube (class section) that teaches it.
+    /// The class section that teaches it.
     pub class: String,
     /// The catalog course being taught (`GET /courses/{id}`) — its title lives
     /// there, shared by every instance of it.
     pub course: String,
-    /// Weekly lesson hours; the instance's weight in the year's karne average.
+    /// Weekly lesson hours; the instance's weight in the year's report-card average.
     #[schema(example = 5)]
     pub ders_saati: i64,
-    /// Whether this instance's marks count toward the karne.
+    /// Whether this instance's marks count toward the report card.
     pub counts_toward_karne: bool,
     /// How many students are enrolled right now.
     #[schema(example = 28)]
     pub enrollment_count: i64,
-    /// The staff assigned to run this instance — separate from the şube's
+    /// The staff assigned to run this instance — separate from the section's
     /// homeroom teacher, who may also act here (see `GET /instances/{id}`).
     pub teachers: Vec<PersonRef>,
 }
@@ -239,9 +239,9 @@ struct EnrollmentResponse {
     user: PersonRef,
     /// Who enrolled them.
     enrolled_by: PersonRef,
-    /// The şube this row was pumped by, or `null` when a human placed it
-    /// directly. A row with a şube on it is *swept* when that şube drops the
-    /// student or detaches the course; a `null` one is nobody's to take back.
+    /// The section this row was pumped by, or `null` when a human placed it
+    /// directly. A row with a section on it is *swept* when that section drops
+    /// the student or detaches the course; a `null` one is nobody's to take back.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     source: Option<String>,
 }
@@ -303,7 +303,7 @@ pub(crate) async fn instance_people(
 /// the courses their section is being taught, and a teacher the ones they run.
 ///
 /// The set is exactly
-/// [`crate::service::instance::visible_instances`]'s — the caller's şubeler (a
+/// [`crate::service::instance::visible_instances`]'s — the caller's sections (a
 /// student's live membership, a homeroom teacher's) unioned with the instances
 /// they were assigned to teach, deduped by instance. One rule for what the
 /// caller may see, so this list and every instance-scoped gate can never
@@ -352,7 +352,7 @@ async fn my_instances(
 }
 
 /// Fetch one instance by id. Visible to its enrolled students, its assigned
-/// teachers, its şube's homeroom teacher, and managers/admins.
+/// teachers, its section's homeroom teacher, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -384,7 +384,7 @@ async fn get_instance(
 }
 
 /// Update one instance's own policy. Requires teacher+ and a right over this
-/// instance: manager+, one of its assigned teachers, or its şube's homeroom
+/// instance: manager+, one of its assigned teachers, or its section's homeroom
 /// teacher. Omitted fields keep their value; both are non-clearable.
 #[utoipa::path(
     patch,
@@ -507,7 +507,7 @@ async fn unassign_teacher(
 /// Enroll a student into this instance (idempotent upsert). Requires teacher+
 /// and a right over the instance. Only students can be enrolled — enrollment is
 /// student membership, and it gates sitting exams, being graded, and the
-/// roster. The row is hand-placed (`source` `null`), so no şube sweep can take
+/// roster. The row is hand-placed (`source` `null`), so no section sweep can take
 /// it back.
 #[utoipa::path(
     post,
@@ -624,7 +624,7 @@ async fn unenroll(
 
 /// Create an exam inside one instance. Requires teacher+ and a right over the
 /// instance; the exam's marks count into the instance's average with its
-/// kind's weight (`GET /settings`) and into the dönem's karne named by `term`.
+/// kind's weight (`GET /settings`) and into the term's report card named by `term`.
 /// Omit `mode` for an offline-graded exam nobody can sit; `sync`/`async` take
 /// a window (async also `duration_ms`), `open` is sittable anytime with an
 /// optional per-attempt `duration_ms`. `max_attempts` (default 1, `0` =
@@ -664,7 +664,7 @@ async fn create_exam_in_instance(
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
     let school = service::settings::load(&st.db).await?;
     let kind = ExamKind::try_new(&req.kind, school.get_exam_kinds())?;
-    // The dönem is resolved *without* the archive gate: a dönem archived inside
+    // The term is resolved *without* the archive gate: a term archived inside
     // an open year is a record, not a wall (the year is what
     // [`service::exam::create`] refuses). An unknown id is this route's 400.
     let Some(term) = service::term::read(&st.db, &TermId::from_key(&req.term)).await? else {
@@ -707,7 +707,7 @@ async fn create_exam_in_instance(
 
 /// List one instance's exams, paged via `?limit=&offset=` (omit `limit` for
 /// all of them). Visible to the instance's enrolled students, its teachers,
-/// its şube's homeroom teacher, and managers/admins — but drafts appear only
+/// its section's homeroom teacher, and managers/admins — but drafts appear only
 /// to the instance's managers. Returns a `{items, total, limit, offset}`
 /// envelope.
 #[utoipa::path(
@@ -975,9 +975,9 @@ mod tests {
     use super::*;
     use crate::domain::class_group::ClassGroupId;
 
-    /// The read path behind `GET /instances/me` is `class_member` → the şubeler
-    /// → their instances. A student enrolled by a şube sees exactly that
-    /// şube's instances, and a second şube teaching the same course is a
+    /// The read path behind `GET /instances/me` is `class_member` → the sections
+    /// → their instances. A student enrolled by a section sees exactly that
+    /// section's instances, and a second section teaching the same course is a
     /// different row.
     #[tokio::test]
     async fn a_member_reads_their_own_sections_instances() {
@@ -1015,7 +1015,7 @@ mod tests {
     /// member read alone left their own instances out of
     /// [`visible_instances`] — while [`can_manage_instance`] let them act on
     /// every one of them. The homeroom column is the second, separate way a
-    /// teacher reaches a şube, and it has to be unioned in.
+    /// teacher reaches a section, and it has to be unioned in.
     #[tokio::test]
     async fn a_homeroom_teacher_sees_their_sections_instances() {
         use crate::domain::class_group::ClassName;
@@ -1060,7 +1060,7 @@ mod tests {
     /// `GET /instances/me` serves [`visible_instances`]' set, so the second arm
     /// of the union — the instances a teacher was *assigned* to teach — has to
     /// surface there even when they are neither enrolled in nor homeroom of
-    /// the şube. Before the union the route was the member read alone, and a
+    /// the section. Before the union the route was the member read alone, and a
     /// teacher's assigned instances were invisible to them.
     #[tokio::test]
     async fn an_assigned_teacher_reads_the_instances_they_teach_once() {

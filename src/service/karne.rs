@@ -1,20 +1,20 @@
-//! Karne workflows: the report a student's dönem adds up to, and the freeze
-//! that turns it into a record when the dönem is archived.
+//! Report-card workflows: the report a student's term adds up to, and the
+//! freeze that turns it into a record when the term is archived.
 //!
-//! Karne is *computed*, not stored (D8): per instance, the student's marks are
-//! weighted by their exam kinds' settings weights and averaged; the average
-//! takes a label from the school's grade bands; and the dönem's own number is
-//! a single average over the instances, each weighted by its `ders_saati` (the
-//! karne weight the şube set on the instance). The catalog's `course` row
-//! contributes only its title — the two şubeler teaching it are their own
-//! instances and their own karne lines.
+//! The report card is *computed*, not stored (D8): per instance, the student's
+//! marks are weighted by their exam kinds' settings weights and averaged; the
+//! average takes a label from the school's grade bands; and the term's own
+//! number is a single average over the instances, each weighted by its
+//! `ders_saati` (the report-card weight the section set on the instance). The
+//! catalog's `course` row contributes only its title — the two class sections
+//! teaching it are their own instances and their own report-card lines.
 //!
 //! A line's marks are the exams *addressed to* its instance
-//! (`exam_audience`), not only the ones it owns: an ortak sınav announced to
+//! (`exam_audience`), not only the ones it owns: a shared exam announced to
 //! several instances is each of their exams (D2), and its marks are a line of
-//! every one of their karnes.
+//! every one of their report cards.
 //!
-//! [`build`] serves a frozen report back once its dönem is archived
+//! [`build`] serves a frozen report back once its term is archived
 //! ([`crate::db::karne`]), and computes live for an open one. [`freeze`] is the
 //! write half, called from [`crate::service::term::archive`]: from that moment
 //! a later correction to a mark no longer rewrites what a family holds.
@@ -34,11 +34,11 @@ use crate::domain::term::{Term, TermId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// One instance's line on a karne: the average of the marks the student holds
-/// in it this dönem, its band label, and the `ders_saati` it weighs into the
-/// year average with. `course` is the catalog course's title (what a family
-/// reads); `class_course` is the instance itself, for anything that must act
-/// on the line.
+/// One instance's line on a report card: the average of the marks the student
+/// holds in it this term, its band label, and the `ders_saati` it weighs into
+/// the year average with. `course` is the catalog course's title (what a
+/// family reads); `class_course` is the instance itself, for anything that
+/// must act on the line.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct KarneInstance {
     pub class_course: String,
@@ -51,9 +51,9 @@ pub struct KarneInstance {
     pub band: Option<String>,
 }
 
-/// A student's karne for one dönem: every instance of their şubeler that
-/// counts toward the karne, the `ders_saati`-weighted average across them, and
-/// the verdict.
+/// A student's report card for one term: every instance of their class
+/// sections that counts toward the report card, the `ders_saati`-weighted
+/// average across them, and the verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct KarneReport {
     pub user: String,
@@ -67,9 +67,9 @@ pub struct KarneReport {
     pub verdict: Option<String>,
 }
 
-/// The student's karne for `term`.
+/// The student's report card for `term`.
 ///
-/// An archived dönem serves its frozen snapshot when one exists — the record
+/// An archived term serves its frozen snapshot when one exists — the record
 /// the school issued, which no later correction may rewrite. A term that was
 /// never frozen (or is still open) computes live from the marks standing now,
 /// which is what a snapshot-less archive must not silently serve: the caller
@@ -90,15 +90,16 @@ pub async fn build(db: &Database, user: &UserId, term: &TermId) -> Result<KarneR
 /// Write (or refresh) a frozen report for every student with a roster row
 /// under `term`'s year — the archive half.
 ///
-/// The students are the live rosters of the year's şubeler: an enrollment is
-/// what puts a student under a şube, and the şube is what binds them to the
-/// year the dönem is a slice of. Every such student gets exactly one snapshot
-/// per dönem, computed by the same [`compute`] the live read uses, so the
-/// frozen report and the served one can never disagree.
+/// The students are the live rosters of the year's class sections: an
+/// enrollment is what puts a student under a class section, and the class
+/// section is what binds them to the year the term is a slice of. Every such
+/// student gets exactly one snapshot per term, computed by the same [`compute`]
+/// the live read uses, so the frozen report and the served one can never
+/// disagree.
 ///
 /// One snapshot write per student, one transaction each; the run pays a read
-/// per şube rather than a join, because freeze runs once per archived dönem,
-/// where the report it fixes is read for years.
+/// per class section rather than a join, because freeze runs once per archived
+/// term, where the report it fixes is read for years.
 pub async fn freeze(db: &Database, term: &TermId) -> Result<(), AppError> {
     let term = crate::service::term::read(db, term)
         .await?
@@ -128,14 +129,15 @@ pub async fn freeze(db: &Database, term: &TermId) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The live computation: the student's şubeler in the dönem's year, their
-/// karne-counting instances, and the marked exams of this dönem inside them —
-/// each mark under every instance it was addressed to, owner or not.
+/// The live computation: the student's class sections in the term's year,
+/// their report-card-counting instances, and the marked exams of this term
+/// inside them — each mark under every instance it was addressed to, owner or
+/// not.
 async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneReport, AppError> {
     let school = crate::service::settings::load(db).await?;
 
-    // The şubeler the student is live in *this year*: a membership from
-    // another year is history and its marks belong to that year's karne.
+    // The class sections the student is live in *this year*: a membership from
+    // another year is history and its marks belong to that year's report card.
     let (memberships, _) = crate::db::class_member::list_for_user(db, user, None, 0).await?;
     let member_classes: Vec<ClassGroupId> = memberships
         .iter()
@@ -157,8 +159,8 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
     let instance_ids: Vec<crate::domain::class_course::ClassCourseId> =
         instances.iter().map(|i| i.get_id().clone()).collect();
 
-    // The dönem's exams inside those instances, plus this student's marks on
-    // them. An exam another dönem owns is not this karne's to weigh.
+    // The term's exams inside those instances, plus this student's marks on
+    // them. An exam another term owns is not this report card's to weigh.
     let exams: Vec<crate::domain::exam::Exam> =
         crate::db::exam::list_for_class_course_courses(db, &instance_ids)
             .await?
@@ -170,8 +172,8 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
         .map(|exam| (exam.get_id().key(), exam))
         .collect();
     // Each mark arrives under every instance it counts in: the read resolves
-    // the exam's audience, so an ortak sınav's marks are the karne of every
-    // instance it was announced to, not only of its owner.
+    // the exam's audience, so a shared exam's marks are the report card of
+    // every instance it was announced to, not only of its owner.
     let results =
         crate::db::exam_result::list_for_user_in_term(db, user, term.get_id(), &instance_ids)
             .await?;
@@ -202,7 +204,7 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
             }
             let Some(exam) = by_key.get(result.get_exam().key().as_str()) else {
                 // A mark whose exam left the list between the two reads (or a
-                // dönem's exam that is no longer there): not this line's.
+                // term's exam that is no longer there): not this line's.
                 continue;
             };
             // The kind's current settings weight; an exam keeps a retired
@@ -253,8 +255,8 @@ fn weighted_average(pairs: &[(i64, i64)]) -> Option<f64> {
     Some(total as f64 / total_weight as f64)
 }
 
-/// The single dönem number: each instance's average weighted by its
-/// `ders_saati`. `None` while no instance has an average — a karne with
+/// The single term number: each instance's average weighted by its
+/// `ders_saati`. `None` while no instance has an average — a report card with
 /// nothing graded has no verdict to give.
 fn ders_saati_average(weighted: &[(f64, i64)]) -> Option<f64> {
     let total_weight: i64 = weighted.iter().map(|(_, saati)| saati).sum();
@@ -297,11 +299,11 @@ fn verdict(school: &crate::domain::settings::Settings, average: Option<f64>) -> 
 mod tests {
     use super::*;
 
-    /// The ortak-sınav rule, read off the karne: an exam addressed to a second
-    /// instance is *that* instance's exam too (D2), so its mark is a line of
-    /// both karnes while an exam addressed to its owner alone stays on the
-    /// owner's line. Read through `exam.class_course` the second line would
-    /// have held no mark at all.
+    /// The shared-exam rule, read off the report card: an exam addressed to a
+    /// second instance is *that* instance's exam too (D2), so its mark is a
+    /// line of both report cards while an exam addressed to its owner alone
+    /// stays on the owner's line. Read through `exam.class_course` the second
+    /// line would have held no mark at all.
     #[tokio::test]
     async fn an_ortak_exam_counts_into_every_instance_it_is_addressed_to() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -318,7 +320,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no line for {}", instance.key()))
         };
 
-        // The owner sits both exams; the addressed instance only the ortak
+        // The owner sits both exams; the addressed instance only the shared
         // one. Both kinds are `yazili`, whose default weight is 1.
         let owner = line(&fixture.owner);
         assert_eq!(
@@ -340,7 +342,7 @@ mod tests {
         );
         assert_eq!(addressed.band.as_deref(), Some("5"));
 
-        // Each instance weighs one hour, so the dönem is their plain mean.
+        // Each instance weighs one hour, so the term is their plain mean.
         assert_eq!(report.year_average, Some(75.0));
         assert_eq!(
             report.verdict.as_deref(),

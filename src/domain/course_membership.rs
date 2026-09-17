@@ -27,7 +27,7 @@ impl CourseMembershipId {
 }
 
 /// A user's individual membership in a *school-scoped* course (D9): a club or
-/// an etüt a student joins directly. A class-delivered course
+/// a supervised study a student joins directly. A class-delivered course
 /// ([`crate::domain::course::CourseKind::is_class_delivered`]) is joined
 /// through its instance instead, never here — that gate lives in the service.
 #[derive(Debug, Clone, sqlx::FromRow)]

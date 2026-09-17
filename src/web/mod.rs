@@ -474,7 +474,7 @@ mod tests {
         crate::service::user::set_role(&db, teacher.get_id(), Role::Teacher)
             .await
             .unwrap();
-        // The two assignments the undo owes: the şube's homeroom teacher, and
+        // The two assignments the undo owes: the section's homeroom teacher, and
         // a teacher assigned to one of its instances (the catalog's own
         // assignment list is gone with D6 — who teaches is per instance).
         let assigned = async |db: &Database| {

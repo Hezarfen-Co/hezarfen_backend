@@ -72,3 +72,6 @@ live `ls src/` win on conflict.
 - Commits are emoji + conventional type. Vocabulary in use: `feat`, `fix`,
   `docs`, `test`, `style`, `chore`. Never `refactor` (unused in this repo's
   history). `🎨 style` is reserved for `cargo fmt` commits.
+- Code, comments and commit messages are English. Turkish survives only where
+  it is the data under test (test fixtures, fold tables) or user-visible
+  content (product defaults, OpenAPI examples and descriptions).

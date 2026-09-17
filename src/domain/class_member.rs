@@ -44,8 +44,8 @@ impl ClassMemberId {
 }
 
 /// One student's stint in one class. `added_by` is who put them there;
-/// `source_class_group` names the şube a rollover copied them from (absent for
-/// a hand-added member).
+/// `source_class_group` names the section a rollover copied them from (absent
+/// for a hand-added member).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassMember {
     pub(crate) id: ClassMemberId,

@@ -1,6 +1,6 @@
 //! The `course_membership` table: a student's individual membership in a
-//! *school-scoped* course (D9) — a kulüp or an etüt, joined directly rather
-//! than through a şube's instance.
+//! *school-scoped* course (D9) — a club or a supervised study, joined directly
+//! rather than through a section's instance.
 //!
 //! It is the `enrollment` table's twin minus two things: the instance key (a
 //! club has no class to belong to) and the roster pump's `source` tag (a
@@ -10,7 +10,7 @@
 //!
 //! Whether a given course *may* be joined this way is
 //! [`crate::service::enrollment::join_activity`]'s decision: a class-delivered
-//! ders ([`crate::domain::course::CourseKind::is_class_delivered`]) is joined
+//! course ([`crate::domain::course::CourseKind::is_class_delivered`]) is joined
 //! through its instance, never here.
 
 use crate::database::{Database, tx_with_retry, unique_violation};
@@ -174,8 +174,8 @@ pub async fn list_for_course(
     .await
 }
 
-/// Every membership `user` holds, newest first — the "my clubs and etüts"
-/// read.
+/// Every membership `user` holds, newest first — the "my clubs and supervised
+/// studies" read.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,

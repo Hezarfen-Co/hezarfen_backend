@@ -92,7 +92,7 @@ pub async fn grade(
     }
 
     // ... and be enrolled in an instance the exam is addressed to — the
-    // owner's or an announced sibling's (an ortak sınav, D2): an addressed
+    // owner's or an announced sibling's (a shared exam, D2): an addressed
     // section's student is graded exactly like the owner's.
     if !crate::service::exam::enrolled_anywhere(db, &exam, target).await? {
         return Err(AppError::Validation(ValidationError::Invalid {

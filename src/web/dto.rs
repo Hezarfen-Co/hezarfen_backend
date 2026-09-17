@@ -209,10 +209,10 @@ impl UserResponse {
 }
 
 /// Public shape of a course — the **catalog** row, the school's template for a
-/// ders. Shared by `courses` (CRUD) and the reports that embed the course an
-/// instance teaches. The taught thing is the *instance*
+/// taught course. Shared by `courses` (CRUD) and the reports that embed the
+/// course an instance teaches. The taught thing is the *instance*
 /// ([`super::instances::InstanceResponse`]): teachers, weekly hours and the
-/// karne weight live there, per şube.
+/// report-card weight live there, per class section.
 #[derive(Serialize, ToSchema)]
 pub struct CourseResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
@@ -223,17 +223,16 @@ pub struct CourseResponse {
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
-    /// `course` (a regular class), `study` (a supervised study session —
-    /// etüt), or `club` (a student club — kulüp). Only a `course` is taught
-    /// through şube instances and carries exams; a `study`/`club` is joined
-    /// school-wide.
+    /// `course` (a regular class), `study` (a supervised study session), or
+    /// `club` (a student club). Only a `course` is taught through class-section
+    /// instances and carries exams; a `study`/`club` is joined school-wide.
     #[schema(example = "course")]
     pub kind: String,
-    /// How many şube instances teach this course right now — the count the
-    /// delete refusal watches (`0` is what lets the row go).
+    /// How many class×course instances teach this course right now — the count
+    /// the delete refusal watches (`0` is what lets the row go).
     #[schema(example = 3)]
     pub class_course_count: i64,
-    /// How many individual club/etüt memberships the course carries.
+    /// How many individual club/study memberships the course carries.
     #[schema(example = 12)]
     pub course_membership_count: i64,
 }
@@ -295,8 +294,8 @@ pub struct HomeworkResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     /// The class×course instance this homework belongs to
-    /// (`GET /instances/{id}`) — the şube's own assignment, not a school-wide
-    /// course's.
+    /// (`GET /instances/{id}`) — the class section's own assignment, not a
+    /// school-wide course's.
     pub class_course: String,
     /// The course subject this homework is tagged with.
     pub subject: String,
@@ -386,10 +385,10 @@ pub struct ExamResponse {
     pub id: String,
     pub creator: String,
     /// The class×course instance the exam belongs to (`GET /instances/{id}`) —
-    /// two şubeler teaching the same course sit their own exams.
+    /// two class sections teaching the same course sit their own exams.
     pub class_course: String,
-    /// The dönem the exam is sat in (`GET /terms`); its marks count into that
-    /// dönem's karne.
+    /// The term the exam is sat in (`GET /terms`); its marks count into that
+    /// term's report card.
     pub term: String,
     pub title: String,
     pub description: String,

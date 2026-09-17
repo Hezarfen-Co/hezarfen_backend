@@ -67,7 +67,7 @@ enum AudienceDto {
     /// The students currently enrolled in this course (live — enrollment
     /// changes move people in and out).
     Course { course: String },
-    /// The students currently in this class section (şube) — live, so adding
+    /// The students currently in this class section — live, so adding
     /// or removing a member moves them in and out. The homeroom teacher is not
     /// implied. If the class is later deleted the event survives with an empty
     /// roster.

@@ -1,8 +1,8 @@
 //! One dish on a published [`Menu`](crate::domain::menu::Menu): what it is,
 //! what it costs, and which dietary tags it carries.
 //!
-//! Money is **minor units** (kuruş) as `i64` — never a float, never a decimal,
-//! at any layer. `tags` are validated against the school's `dietary_tags`
+//! Money is **minor units** as `i64` — never a float, never a decimal, at any
+//! layer. `tags` are validated against the school's `dietary_tags`
 //! list, the same contract a menu's `slot` has with `meal_slots`.
 //!
 //! The queries live in [`crate::db::menu_dish`]; the dish-cap gate in
@@ -87,8 +87,8 @@ impl DishDescription {
     }
 }
 
-/// What one serving costs, in **minor units** (kuruş). Never negative — a
-/// giveaway dish is `0`, and money that flows the other way is a ledger line.
+/// What one serving costs, in **minor units**. Never negative — a giveaway
+/// dish is `0`, and money that flows the other way is a ledger line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[sqlx(transparent)]
 pub struct DishPrice(i64);

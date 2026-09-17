@@ -2,13 +2,13 @@ use super::*;
 
 use crate::domain::class_course::ClassCourseId;
 
-// ---- audience: the ortak sınav ---------------------------------------------
+// ---- audience: the shared exam ----------------------------------------------
 // An exam is owned by the instance it was created on, but it can be announced
 // to other instances of the same course in the same academic year: one
-// sitting, one mark, standing in every addressed instance's marks and karne.
+// sitting, one mark, standing in every addressed instance's marks and report card.
 // The gate is the owner instance's (a manager+, its assigned teachers, its
-// şube's homeroom teacher) — the instance that runs the exam decides who else
-// sits it.
+// class section's homeroom teacher) — the instance that runs the exam decides
+// who else sits it.
 
 /// One instance an exam is announced to.
 #[derive(Serialize, ToSchema)]
@@ -16,7 +16,7 @@ pub(crate) struct ExamAudienceResponse {
     /// The class×course instance the exam is announced to.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     instance: String,
-    /// The şube (class section) that instance belongs to.
+    /// The class section that instance belongs to.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     class: String,
     /// The catalog course that instance teaches — the exam's own course, by
@@ -43,8 +43,8 @@ impl ExamAudienceResponse {
 /// pair of questions every exam-level gate asks (D2).
 ///
 /// A caller *sees* the exam when any addressed instance admits them as a
-/// viewer (its enrolled students, its teachers, its şube's homeroom teacher,
-/// manager+), and *acts* on it — grading, the results readers, the live
+/// viewer (its enrolled students, its teachers, its class section's homeroom
+/// teacher, manager+), and *acts* on it — grading, the results readers, the live
 /// monitor — when they manage one of them. Both are exactly the predicates
 /// that instance's own routes apply
 /// ([`super::instances::list_instance_exams`], `POST /instances/{id}/exams`),
@@ -81,12 +81,12 @@ pub(crate) struct AddAudience {
     instance: String,
 }
 
-/// Announce an exam to another instance — the **ortak sınav** write: one exam
-/// addressed to a sibling şube, so it and its marks stand in that section's
-/// exam list, marks report and karne. Requires teacher+ and management rights
-/// over the exam's **owner** instance (an assigned teacher, its şube's
-/// homeroom teacher, or a manager/admin) — the target instance's teachers
-/// have no say.
+/// Announce an exam to another instance — the **shared exam** write: one exam
+/// addressed to a sibling class section, so it and its marks stand in that
+/// section's exam list, marks report and report card. Requires teacher+ and
+/// management rights over the exam's **owner** instance (an assigned teacher,
+/// its class section's homeroom teacher, or a manager/admin) — the target
+/// instance's teachers have no say.
 /// The target must teach the exam's own catalog course and sit under the same
 /// academic year (`400` otherwise), the owner itself is refused (`400`), and
 /// an archived target year is a `409`. Announcing a pair that already stands
@@ -128,8 +128,8 @@ pub(crate) async fn add_audience(
 /// behind the announce routes' answer, useful on its own to a client that
 /// wants to show where else an exam is sat. Visible to the exam's own
 /// audience: an addressed instance's enrolled students, its teachers (or its
-/// şube's homeroom teacher), and managers/admins — except drafts, which stay
-/// a `404` to everyone but an addressed instance's managers.
+/// class section's homeroom teacher), and managers/admins — except drafts,
+/// which stay a `404` to everyone but an addressed instance's managers.
 #[utoipa::path(
     get,
     path = "/{id}/audience",

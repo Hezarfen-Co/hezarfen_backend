@@ -36,10 +36,10 @@ pub async fn can_manage_instance(
 }
 
 /// The instances a caller may see, each with whether they run it: the
-/// instances their şubeler carry (a student's roster, and a homeroom
+/// instances their class sections carry (a student's roster, and a homeroom
 /// teacher's), the instances they were assigned to teach (a teacher), and —
-/// for a homeroom teacher — their own şube's. The per-instance answer is the
-/// same D10 rule every instance-scoped gate applies, computed once for the
+/// for a homeroom teacher — their own section's. The per-instance answer is
+/// the same D10 rule every instance-scoped gate applies, computed once for the
 /// list.
 ///
 /// [`crate::web::instances`] serves this set to every caller as
@@ -48,20 +48,20 @@ pub async fn can_manage_instance(
 /// question by it, which is why it lives here now.
 ///
 /// Staff are *not* members of the section they run, so the two ways a teacher
-/// reaches a şube are read separately and unioned: `class_member` (a student's
-/// live stint) and the homeroom column (`class_group.teacher`, read through
-/// [`super::class_group::list_for_teacher`]). Leaving the second out dropped
-/// every row for a homeroom teacher who was neither enrolled nor assigned —
-/// even though [`super::class_course::ensure_instance_teacher`] lets them act
-/// on all of them.
+/// reaches a class section are read separately and unioned: `class_member` (a
+/// student's live stint) and the homeroom column (`class_group.teacher`, read
+/// through [`super::class_group::list_for_teacher`]). Leaving the second out
+/// dropped every row for a homeroom teacher who was neither enrolled nor
+/// assigned — even though [`super::class_course::ensure_instance_teacher`]
+/// lets them act on all of them.
 pub async fn visible_instances(
     user: &User,
     db: &Database,
 ) -> Result<Vec<(ClassCourse, bool)>, AppError> {
     let mut rows: Vec<(ClassCourse, bool)> = Vec::new();
-    // The şubeler the caller is a live member of, unioned with the ones they
-    // are the homeroom teacher of (an empty second read for a student, and a
-    // cheap one for anyone else — it is keyed on the teacher column).
+    // The class sections the caller is a live member of, unioned with the ones
+    // they are the homeroom teacher of (an empty second read for a student,
+    // and a cheap one for anyone else — it is keyed on the teacher column).
     //
     // The homeroom half carries the live-`teacher` floor the whole gate does
     // (see [`super::class_course::ensure_instance_teacher`]): the column is

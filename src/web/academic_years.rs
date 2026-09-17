@@ -1,13 +1,14 @@
-//! Academic years (eğitim yılı) — the top of the calendar.
+//! Academic years — the top of the calendar.
 //!
-//! A year is the container a şube and its dönemler belong to, and the one that
-//! carries the sınıf-geçme policy (`grade_promotions`). A grade absent from that
-//! policy is not carried over by [`rollover`](crate::service::academic_year::rollover)
+//! A year is the container a class section and its terms belong to, and the one
+//! that carries the grade-promotion policy (`grade_promotions`). A grade absent
+//! from that policy is not carried over by
+//! [`rollover`](crate::service::academic_year::rollover)
 //! — that is how graduation is expressed — so the command is explicit and
 //! idempotent rather than automatic at a date.
 //!
 //! A year with structure still on it cannot be deleted (`409`), and an archived
-//! year is read-only: no new şube, no new dönem, no new exam inside it. A
+//! year is read-only: no new section, no new term, no new exam inside it. A
 //! finished year is closed with `POST /{id}/archive` (manager+), idempotently;
 //! there is deliberately no unarchive route.
 
@@ -49,7 +50,7 @@ struct CreateYear {
     /// Year end, UTC unix-milliseconds; must be after `starts_at`.
     #[schema(example = 1_810_000_000_000_i64)]
     ends_at: i64,
-    /// The sınıf-geçme policy: each pair maps a grade label to the label its
+    /// The grade-promotion policy: each pair maps a grade label to the label its
     /// students move to at `POST /academic-years/{id}/rollover`. A grade the
     /// list does not name is not rolled over — it graduates. Omit for a year
     /// whose rollover is not decided yet.
@@ -67,7 +68,7 @@ struct UpdateYear {
     grade_promotions: Option<Vec<PromotionBody>>,
 }
 
-/// One sınıf-geçme pair off the wire.
+/// One grade-promotion pair off the wire.
 #[derive(Deserialize, Serialize, ToSchema)]
 struct PromotionBody {
     #[schema(max_length = 20, example = "5")]
@@ -97,10 +98,10 @@ struct YearResponse {
     /// Who created it.
     creator: String,
     grade_promotions: Vec<PromotionBody>,
-    /// How many şubeler sit in this year.
+    /// How many class sections sit in this year.
     #[schema(example = 12)]
     class_count: i64,
-    /// How many dönemler it holds.
+    /// How many terms it holds.
     #[schema(example = 2)]
     term_count: i64,
 }
@@ -128,12 +129,12 @@ impl YearResponse {
     }
 }
 
-/// What one rollover carried: how many şubeler were planted in the target
-/// year, how many live students came with them, and the grades left behind
-/// because the year names no promotion for them — the graduating ones.
+/// What one rollover carried: how many class sections were planted in the
+/// target year, how many live students came with them, and the grades left
+/// behind because the year names no promotion for them — the graduating ones.
 #[derive(Serialize, ToSchema)]
 struct RolloverResponse {
-    /// The year that received the şubeler.
+    /// The year that received the class sections.
     year: String,
     #[schema(example = 12)]
     classes: usize,
@@ -147,7 +148,7 @@ struct RolloverResponse {
 
 #[derive(Deserialize, ToSchema)]
 struct Rollover {
-    /// The year the şubeler come *from* — usually the one that just ended.
+    /// The year the class sections come *from* — usually the one that just ended.
     /// Must be a different, existing year; the target must still be empty.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     from_year: String,
@@ -187,7 +188,7 @@ fn check_range(
 
 /// Create an academic year. Requires manager+. Past dates are allowed — years
 /// are calendar structure, not schedules. `grade_promotions` is the
-/// sınıf-geçme policy the rollover applies.
+/// grade-promotion policy the rollover applies.
 #[utoipa::path(
     post,
     path = "/",
@@ -322,7 +323,7 @@ async fn update_year(
 }
 
 /// Archive an academic year. Requires manager+. Stamps `archived_at`, and from
-/// then on the whole year is past structure: no new şube, no new dönem, no
+/// then on the whole year is past structure: no new section, no new term, no
 /// exam inside it, and no edit or delete of the year itself. Idempotent — a
 /// second archive answers `200` with the stamp that already stood. There is no
 /// unarchive route: the row is deletable only while open.
@@ -349,7 +350,7 @@ async fn archive_year(
 }
 
 /// Delete an academic year. Requires manager+. Refused with a 409 while any
-/// şube or dönem still links it — move or delete them first. An archived year
+/// section or term still links it — move or delete them first. An archived year
 /// must be re-opened (`PATCH` is not enough: there is no unarchive here, so
 /// the row is only deletable while open) like every other past-structure
 /// write.
@@ -378,9 +379,10 @@ async fn delete_year(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Carry another year's şubeler into this one. Requires manager+. Each şube of
-/// `from_year` whose grade the target year promotes is planted afresh here —
-/// same name, mapped grade, and copies of its instances (`ders_saati`, karne
+/// Carry another year's class sections into this one. Requires manager+. Each
+/// section of `from_year` whose grade the target year promotes is planted afresh
+/// here — same name, mapped grade, and copies of its instances (`ders_saati`,
+/// report-card
 /// policy, teachers) and of every live member, who are also enrolled into the
 /// new instances. A grade with no promotion entry stays behind: that is
 /// graduation, and `graduated` names it. The target must be empty (a second

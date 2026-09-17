@@ -99,7 +99,7 @@ struct CreateDish {
     name: String,
     #[schema(max_length = 500)]
     description: Option<String>,
-    /// Price in **minor units** (kuruş) — `4550` is 45,50 ₺. Integer only:
+    /// Price in **minor units** — `4550` is 45,50 ₺. Integer only:
     /// this API never speaks decimals or floats about money.
     #[schema(minimum = 0, maximum = 1000000, example = 4550_i64)]
     price_minor: i64,
@@ -129,7 +129,7 @@ struct DishResponse {
     #[schema(example = "Mercimek çorbası")]
     name: String,
     description: Option<String>,
-    /// Minor units (kuruş).
+    /// Minor units.
     price_minor: i64,
     tags: Vec<String>,
     /// Which of `tags` the **calling user's** own dietary profile flags — the
@@ -1232,7 +1232,7 @@ async fn user_attendance(
 #[derive(Serialize, ToSchema)]
 struct BalanceResponse {
     student: PersonRef,
-    /// `credits + reversals - charges`, in **minor units** (kuruş). Negative
+    /// `credits + reversals - charges`, in **minor units**. Negative
     /// means the student owes the school. Derived on every read, never stored.
     #[schema(example = -4500)]
     balance_minor: i64,
@@ -1428,7 +1428,7 @@ async fn user_ledger(
 struct RecordCredit {
     /// The student the money is for.
     student_id: String,
-    /// How much came in, **minor units** (kuruş), positive.
+    /// How much came in, **minor units**, positive.
     #[schema(minimum = 1, maximum = 10000000, example = 25000)]
     amount_minor: i64,
     /// How it arrived ("cash", "havale", …). Free text — the backend speaks to

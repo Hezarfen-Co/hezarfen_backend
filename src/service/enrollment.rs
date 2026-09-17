@@ -1,10 +1,10 @@
 //! Enrollment workflows: the target-user gates the enroll/unenroll HTTP
 //! handlers pay (the target must exist and still be a student; unenrolling a
 //! pair with no row is a 404) wrapped around the instance-keyed write in
-//! [`crate::db::enrollment`], plus the school-scoped club/etüt membership
-//! ([`crate::db::course_membership`]) with the one rule that keeps the two
-//! tiers apart: a class-delivered ders is joined through its instance, never
-//! directly.
+//! [`crate::db::enrollment`], plus the school-scoped club/supervised-study
+//! membership ([`crate::db::course_membership`]) with the one rule that keeps
+//! the two tiers apart: a class-delivered course is joined through its
+//! instance, never directly.
 
 use crate::database::Database;
 use crate::db::course_membership;
@@ -65,14 +65,14 @@ pub async fn list_for_class_course(
     enrollment::list_for_class_course(db, class_course, limit, offset).await
 }
 
-/// Join `target` to a school-scoped course — a kulüp or an etüt — on `added_by`
-/// 's orders.
+/// Join `target` to a school-scoped course — a club or a supervised study —
+/// on `added_by`'s orders.
 ///
-/// The one refusal this tier owns: a class-delivered ders
+/// The one refusal this tier owns: a class-delivered course
 /// ([`CourseKind::is_class_delivered`](crate::domain::course::CourseKind::is_class_delivered))
-/// has no school-wide roster to join — its students come from the şubeler that
-/// teach it — so a direct join is a `400` naming the course, and the instance's
-/// enrollment route is where that request belongs.
+/// has no school-wide roster to join — its students come from the class
+/// sections that teach it — so a direct join is a `400` naming the course, and
+/// the instance's enrollment route is where that request belongs.
 pub async fn join_activity(
     db: &Database,
     course: &CourseId,

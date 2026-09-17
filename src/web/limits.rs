@@ -171,8 +171,8 @@ struct CourseLimits {
     max_title_len: usize,
     max_description_len: usize,
     /// The only accepted `kind` values. Only `course` is taught through class
-    /// instances (exams, sessions, homework); `study` (etüt) and `club` are
-    /// joined school-wide.
+    /// instances (exams, sessions, homework); `study` (supervised study) and
+    /// `club` are joined school-wide.
     #[schema(example = json!(["course", "study", "club"]))]
     kinds: Vec<&'static str>,
     max_subject_name_len: usize,
@@ -282,7 +282,7 @@ struct MealLimits {
     /// Dietary tags one student's profile may carry, and its kitchen note.
     max_dietary_tags: usize,
     max_dietary_note_len: usize,
-    /// Money is **minor units** (kuruş) as an integer everywhere — never a
+    /// Money is **minor units** as an integer everywhere — never a
     /// decimal, never a float. These cap one dish and one ledger line.
     max_dish_price_minor: i64,
     max_ledger_amount_minor: i64,
@@ -309,7 +309,7 @@ struct MealLimits {
 }
 
 /// School payments: fee plans, their assignment, and the payment ledger. Money
-/// is **minor units** (kuruş) as an integer, and one ledger line is capped by
+/// is **minor units** as an integer, and one ledger line is capped by
 /// the same `max_ledger_amount_minor` the meal ledger publishes.
 #[derive(Serialize, ToSchema)]
 struct PaymentLimits {
@@ -363,7 +363,7 @@ struct ChatbotLimits {
 /// chatbot group to bound its input.
 #[derive(Serialize, ToSchema)]
 struct RagLimits {
-    /// Hard ceiling on the `(sınıf, ders)` scope pairs one ask may carry. The
+    /// Hard ceiling on the `(class, course)` scope pairs one ask may carry. The
     /// corpus is routed by the pair, so this bounds what one question can ask
     /// a retrieval to sweep.
     max_scope_pairs: usize,

@@ -42,7 +42,7 @@ enum Verdict {
 /// records.
 ///
 /// `source` is the class the roster pump wrote this row on behalf of, or
-/// `None` for a hand-placed (seçmeli) enrollment. The two halves of that
+/// `None` for a hand-placed (elective) enrollment. The two halves of that
 /// rule: only a row carrying the key is a class's to take back
 /// ([`crate::db::class_pump`]), and a hand unenroll wins permanently.
 ///
@@ -260,7 +260,7 @@ pub async fn list_for_exam_audience(
 /// behind an event addressed at a course.
 ///
 /// The two membership tiers again: an enrollment in any of the course's
-/// instances, or an individual club/etüt membership. Both are existence
+/// instances, or an individual club/supervised-study membership. Both are existence
 /// probes on their own indexes; one entity's audience must not fold a whole
 /// roster to answer yes.
 pub async fn user_is_in_course(
@@ -289,11 +289,11 @@ pub async fn user_is_in_course(
 /// instances' rosters and its own individual memberships.
 ///
 /// One course's "students" is two populations since D9 split the two tiers: a
-/// ders reaches them through the instance a şube teaches (enrollment), and a
-/// club/etüt through the school-scoped membership. A reader that wants the
-/// course's audience — an event addressed at the course, a who-missed report —
-/// means both, and deduping in SQL keeps a student who is in two of its
-/// instances on the list once.
+/// course reaches them through the instance a section teaches (enrollment), and
+/// a club or supervised study through the school-scoped membership. A reader
+/// that wants the course's audience — an event addressed at the course, a
+/// who-missed report — means both, and deduping in SQL keeps a student who is
+/// in two of its instances on the list once.
 pub async fn list_users_for_course(
     db: &Database,
     course: &CourseId,

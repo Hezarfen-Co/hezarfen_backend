@@ -400,7 +400,7 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
-        // The instance and the dönem are foreign keys now: real rows the
+        // The instance and the term are foreign keys now: real rows the
         // fixture mints.
         let (instance, _course) = crate::db::course::a_test_instance(db).await;
         let term = crate::db::term::a_test_term(db).await;

@@ -56,7 +56,7 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
 }
 
 /// Every class `user` is the homeroom teacher of, newest first — the visible
-/// set a sınıf öğretmeni reads their own instances through (D10), the read
+/// set a homeroom teacher reads their own instances through (D10), the read
 /// behind `visible_instances` in the web layer.
 pub async fn list_for_teacher(db: &Database, user: &UserId) -> Result<Vec<ClassGroup>, AppError> {
     class_group::list_for_teacher(db, user).await

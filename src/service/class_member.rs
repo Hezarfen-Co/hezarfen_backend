@@ -92,7 +92,7 @@ pub async fn leave(db: &Database, class: &ClassGroupId, user: &UserId) -> Result
 }
 
 /// Take `user` out of `class` for good — the hard exit, which deletes the
-/// stint rather than stamping it. Kept for the şube-transfer rollback path
+/// stint rather than stamping it. Kept for the section-transfer rollback path
 /// alone, where the stint being undone must leave no trace a later read could
 /// mistake for history; every route uses [`leave`].
 ///
@@ -417,9 +417,9 @@ mod tests {
     }
 
     /// D4: a member exit **releases** the rows the leaving section wrote —
-    /// there is no heir to hand one over to. Two şubeler teaching the same
-    /// catalog course hold the student in their *own* instance, each with its
-    /// own row tagged with its own class, so a release may only take the
+    /// there is no heir to hand one over to. Two class sections teaching the
+    /// same catalog course hold the student in their *own* instance, each with
+    /// its own row tagged with its own class, so a release may only take the
     /// leaving section's row and count back; the rival's row stands exactly as
     /// written. The old rule re-tagged the row with a rival section instead
     /// (keeping it on the juncture of a class that no longer held the student),

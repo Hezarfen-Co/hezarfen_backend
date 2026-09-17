@@ -89,13 +89,13 @@ pub struct StudentResponse {
 }
 
 /// What the backend would ask a service to compute for one class (a course
-/// as one şube teaches it). Defined for the contract; nothing dispatches it
+/// as one section teaches it). Defined for the contract; nothing dispatches it
 /// yet — see the module docs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassRequest {
     /// The course or class the analysis is about.
     pub course_id: String,
-    /// The dönem to read; omitted, the service uses the current one.
+    /// The term to read; omitted, the service uses the current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
     /// Length of the attention list.

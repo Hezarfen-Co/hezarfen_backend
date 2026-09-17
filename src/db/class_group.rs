@@ -12,7 +12,7 @@ use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// The refusal a şube write naming a year that is not there gets — the mirror
+/// The refusal a section write naming a year that is not there gets — the mirror
 /// of [`crate::domain::term::gone_error`], one layer up the calendar.
 fn year_gone() -> AppError {
     AppError::Validation(ValidationError::Invalid {
@@ -268,11 +268,11 @@ pub async fn list_for_year(
     Ok(classes)
 }
 
-/// Every class `user` is the homeroom teacher (sınıf öğretmeni) of, newest
-/// first — the same order [`list_all`] gives, since this is a narrowing of
-/// that list and not a second one.
+/// Every class `user` is the homeroom teacher of, newest first — the same
+/// order [`list_all`] gives, since this is a narrowing of that list and not a
+/// second one.
 ///
-/// It is the read behind "which şubeler do I run": the homeroom teacher of a
+/// It is the read behind "which sections do I run": the homeroom teacher of a
 /// section may act on every instance of it (D10, the third arm of
 /// [`crate::service::class_course::ensure_instance_teacher`]) without being a
 /// member of it or assigned to the instance — and without a read like this the
@@ -321,7 +321,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// the delete as a `23503`), plus the provenance tags naming it from rows that
 /// outlive it — a rollover copy's `source_class_group` and a handed-over
 /// enrollment's `source`, both hard foreign keys into this table. Dropping a
-/// şube takes its own history with it; a row that merely *remembers* the şube
+/// section takes its own history with it; a row that merely *remembers* the section
 /// keeps standing, untagged. An event aimed at the class keeps standing with
 /// `audience_class` cleared — the course twin's documented outcome
 /// (`db::course::delete`): the roster resolves live, so it simply reads empty.
@@ -363,7 +363,7 @@ pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> 
         )
         .execute(&mut *tx)
         .await?;
-        // The roster history goes with the şube. The 0/0 guard counts *live*
+        // The roster history goes with the section. The 0/0 guard counts *live*
         // stints, so a class whose last student soft-left passes it with the
         // history row still standing — and `class_member.class` is a hard
         // foreign key, which would answer the delete below as a `23503`.
@@ -373,11 +373,11 @@ pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> 
         )
         .execute(&mut *tx)
         .await?;
-        // …and the same key from the *other* side: a stint another şube holds
+        // …and the same key from the *other* side: a stint another section holds
         // remembers where it came from (a rollover copy's `source_class_group`)
         // and an enrollment a class wrote remembers which class pumped it
         // (its `source`). Both are hard keys into this row, so both would
-        // refuse the delete. The rows outlive the şube and stay; only the tag
+        // refuse the delete. The rows outlive the section and stay; only the tag
         // goes.
         sqlx::query!(
             r#"UPDATE class_member SET source_class_group = NULL WHERE source_class_group = $1"#,
@@ -442,7 +442,7 @@ mod tests {
         UserId::from_key(&id.to_string())
     }
 
-    /// A real academic year: the şube's year link is a foreign key now, and
+    /// A real academic year: the section's year link is a foreign key now, and
     /// the class-count claim it carries is what these tests are about.
     async fn a_year(name: &str, db: &Database) -> AcademicYear {
         let at = crate::domain::timestamp::Timestamp::from_millis;
@@ -617,7 +617,7 @@ mod tests {
     }
 
     /// The bite test for the class half of the academic-year delete guard
-    /// (D3): a year is undeletable while a *şube* links it, on its own
+    /// (D3): a year is undeletable while a *section* links it, on its own
     /// column, and every way that link can end gives the reference back.
     /// Claiming into `term_count` instead would pass the first assert and
     /// fail the roundtrip through the year's own delete.
@@ -871,7 +871,7 @@ mod tests {
     /// none — so the class passes it with the history row still standing, and
     /// `class_member.class` (a hard foreign key) is what used to answer this
     /// delete, as a `23503` the route turns into a 500. The roster history
-    /// goes with the şube it belongs to.
+    /// goes with the section it belongs to.
     #[tokio::test]
     async fn a_soft_left_member_does_not_block_the_delete_and_goes_with_it() {
         use crate::db::class_pump::{self, Attached};

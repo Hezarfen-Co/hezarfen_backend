@@ -113,10 +113,10 @@ pub async fn update(
 /// refcount, claimed by [`crate::db::exam::create`] *before* it writes the
 /// link, so the check and the delete are one conditional write on one record:
 /// an exam write racing this either claims first (and the delete is refused)
-/// or finds the row gone (and is refused itself). A frozen karne
+/// or finds the row gone (and is refused itself). A frozen report card
 /// ([`crate::db::karne`]) has no counter — it is written once per archived
-/// dönem — so its existence is the `NOT EXISTS` half of the same guard: a
-/// dönem a family holds a karne for is history, not a calendar entry.
+/// term — so its existence is the `NOT EXISTS` half of the same guard: a
+/// term a family holds a report card for is history, not a calendar entry.
 ///
 /// The referencing foreign keys (`exam.term`, `karne_snapshot.term`, both
 /// `NO ACTION`) are the backstop behind the guard, not a second one: while
@@ -127,7 +127,7 @@ pub async fn update(
 /// The year is handed its reference back in the *same statement* — a
 /// `DELETE … RETURNING year` feeding the decrement, the shape
 /// [`crate::db::course::delete`] uses for its classes — so a year whose last
-/// dönem was just deleted is deletable the moment this lands. The counter
+/// term was just deleted is deletable the moment this lands. The counter
 /// lives on the year row and only this statement may release it: without the
 /// release the year's own `term_count = 0` delete guard could never pass
 /// again, and a year nobody links would be undeletable forever.
@@ -202,7 +202,7 @@ pub async fn unarchive(db: &Database, term: Term) -> Result<Term, AppError> {
     }
 }
 
-/// A real dönem behind a real academic year — the parent every exam names and
+/// A real term behind a real academic year — the parent every exam names and
 /// the grading slice every term-keyed read scopes to. Minted per call.
 #[cfg(test)]
 pub(crate) async fn a_test_term(db: &Database) -> TermId {
@@ -313,7 +313,7 @@ mod tests {
     /// 500 instead of the 404 or 409 the request owes.
     ///
     /// The racer is [`crate::db::exam::create`] against this
-    /// dönem: it claims `exam_count` on the term row before it writes the
+    /// term: it claims `exam_count` on the term row before it writes the
     /// link, which is the same record and the same column the guard reads. Both
     /// sides are swept across each other sub-millisecond, exactly as in
     /// [`crate::db::subject::delete`]'s race test — a whole

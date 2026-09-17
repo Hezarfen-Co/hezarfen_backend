@@ -1,13 +1,13 @@
-//! A grade's course template: the courses every class section (şube) at one
-//! grade carries.
+//! A grade's course template: the courses every class section at one grade
+//! carries.
 //!
-//! A school runs many şube at grade "9" and stocks each of them by hand, one
+//! A school runs many sections at grade "9" and stocks each of them by hand, one
 //! attach at a time. A blueprint is that list said once. It is a layer *above*
 //! [`crate::db::class_pump`], never a replacement for it: applying a
 //! blueprint calls the same [`crate::service::class_course::attach`] a manager's own call does,
 //! so the rows it lands are ordinary `class_course` links and ordinary
-//! `enrollment` rows, and an elective (seçmeli) placed by hand next to them is
-//! still an individual enrollment nothing here can see.
+//! `enrollment` rows, and an elective placed by hand next to them is still an
+//! individual enrollment nothing here can see.
 //!
 //! This module is the pure shape: the id (the grade label *is* the primary
 //! key, so "one blueprint per grade" holds by construction), the row, the

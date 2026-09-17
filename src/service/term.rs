@@ -1,7 +1,7 @@
 //! Term workflows: the archived-refusal rule every write against past
-//! structure pays, the id resolver a request-supplied dönem passes through,
+//! structure pays, the id resolver a request-supplied term passes through,
 //! the row-level write gate, the delete's linked-refusal mapping, and the
-//! archive that freezes every karne inside the dönem. The queries live in
+//! archive that freezes every report card inside the term. The queries live in
 //! [`crate::db::term`].
 
 use crate::database::Database;
@@ -11,7 +11,7 @@ use crate::domain::term::{Term, TermId, TermName, archived_error};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 
-/// Mint a dönem inside an academic year. The year is claimed in the same
+/// Mint a term inside an academic year. The year is claimed in the same
 /// statement as the row (see [`term::create`]): past years take no new
 /// structure, which is why the web layer resolves the id through
 /// [`crate::service::academic_year::resolve`] first.
@@ -43,7 +43,7 @@ pub async fn list_all(
 /// `None` stays `None`, an unknown id is a `400` naming the field, and an
 /// *archived* one is a `409 term_archived`. That last refusal lives here
 /// rather than in each handler because this is the single spot every
-/// request-supplied dönem passes through (an exam names one): past years take
+/// request-supplied term passes through (an exam names one): past years take
 /// no new structure.
 pub async fn resolve(db: &Database, id: Option<&str>) -> Result<Option<TermId>, AppError> {
     let Some(id) = id else {
@@ -107,18 +107,19 @@ pub async fn delete(db: &Database, target: Term) -> Result<(), AppError> {
     }
 }
 
-/// Archive a dönem; idempotent — an already-archived term answers with the
+/// Archive a term; idempotent — an already-archived term answers with the
 /// stamp it already had.
 ///
-/// The archive freezes every student's karne for the dönem first
-/// ([`crate::service::karne::freeze`]): from the moment the dönem is closed
+/// The archive freezes every student's report card for the term first
+/// ([`crate::service::karne::freeze`]): from the moment the term is closed
 /// the report is the record the school issued, and a later correction to a
 /// mark must not silently rewrite what a family holds. The freeze runs *before*
 /// the stamp so a failure leaves nothing archived-but-unfrozen — an archived
-/// dönem whose snapshot is missing would go on serving live computations, and
-/// the store's delete guard (which refuses a dönem a karne was frozen for)
-/// would not see it either. A dönem that is already archived is left alone: a
-/// second archive must not re-freeze over a record that was already issued.
+/// term whose snapshot is missing would go on serving live computations, and
+/// the store's delete guard (which refuses a term a report card was frozen
+/// for) would not see it either. A term that is already archived is left
+/// alone: a second archive must not re-freeze over a record that was already
+/// issued.
 pub async fn archive(db: &Database, target: Term) -> Result<Term, AppError> {
     if !target.is_archived() {
         crate::service::karne::freeze(db, target.get_id()).await?;

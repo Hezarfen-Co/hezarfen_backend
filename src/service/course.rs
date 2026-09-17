@@ -1,10 +1,11 @@
-//! Course workflows: the catalog's CRUD — the template a şube attaches, with
-//! no term, capacity or teacher list of its own any more (D1/D5/D6: staffing
-//! and roster live on the instances, [`crate::service::class_course`]) — the
-//! two gates over a catalog row every caller of those routes shares
-//! ([`can_manage_course`], [`can_view_course`]), and the delete that collects
-//! the image/homework/note-file blob keys before the guarded cascade sweeps
-//! those rows. The queries live in [`crate::db::course`].
+//! Course workflows: the catalog's CRUD — the template a class section
+//! attaches, with no term, capacity or teacher list of its own any more
+//! (D1/D5/D6: staffing and roster live on the instances,
+//! [`crate::service::class_course`]) — the two gates over a catalog row every
+//! caller of those routes shares ([`can_manage_course`], [`can_view_course`]),
+//! and the delete that collects the image/homework/note-file blob keys before
+//! the guarded cascade sweeps those rows. The queries live in
+//! [`crate::db::course`].
 
 use crate::database::Database;
 use crate::db::course;
@@ -13,7 +14,7 @@ use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-/// Mint a catalog course. The catalog is not bound to a dönem (D1): exams are,
+/// Mint a catalog course. The catalog is not bound to a term (D1): exams are,
 /// through their instance, and no capacity is stored — the roster counter
 /// lives on the instance and gates nothing.
 pub async fn create(
@@ -120,8 +121,8 @@ pub async fn update(
 /// rows its cascade removed — exactly whose files the web layer may unlink.
 #[derive(Debug)]
 pub struct DeleteOutcome {
-    /// `false` = refused, nothing was written: a şube still teaches this
-    /// course, or a student still holds an individual membership in it.
+    /// `false` = refused, nothing was written: a class section still teaches
+    /// this course, or a student still holds an individual membership in it.
     pub deleted: bool,
     pub image_files: Vec<String>,
     pub answer_image_files: Vec<String>,

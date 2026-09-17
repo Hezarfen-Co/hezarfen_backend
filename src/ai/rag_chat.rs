@@ -9,7 +9,7 @@
 //! The service answers *about* a school's course-note corpus, so the request
 //! carries both who is asking (so the service can read that person's own data
 //! back through the bridge's api reads, as `on_behalf_of`) and the
-//! `(sınıf, ders)` scope the corpus is routed by. The reply returns the answer
+//! `(class, course)` scope the corpus is routed by. The reply returns the answer
 //! text plus the citations behind it, so the backend can resolve each cited
 //! passage to the course-note file it came from.
 
@@ -20,20 +20,20 @@ use crate::constant::{
     AI_RAG_CHAT_CAPABILITY, AI_RAG_CHAT_TIMEOUT_SECS, MAX_RAG_CITATIONS, MAX_RAG_CITATION_PAGES,
 };
 
-/// One `(sınıf, ders)` pair the question is scoped to.
+/// One `(class, course)` pair the question is scoped to.
 ///
 /// The corpus is routed by the **pair**: a grade and a subject list sent
 /// separately would cross-product into combinations the asker never named, so
-/// each pair is one scope the service may retrieve from. `sinif` is optional —
-/// a question about a subject across every grade names `ders` alone — and
-/// `ders` is required, since a subject-less scope retrieves nothing.
+/// each pair is one scope the service may retrieve from. The class is optional —
+/// a question about a subject across every grade names the course alone — and
+/// the course is required, since a subject-less scope retrieves nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RagScopePair {
     /// The class/grade the subject is taught in (`"9"`, `"10"`), or omitted to
     /// scope the subject across grades.
     #[serde(default)]
     pub sinif: Option<String>,
-    /// The subject/course name the pair is scoped to (Matematik, Fizik). The
+    /// The subject/course name the pair is scoped to (Mathematics, Physics). The
     /// one field a pair cannot go without.
     pub ders: String,
 }
@@ -66,7 +66,7 @@ pub struct RagChatRequestPayload {
     /// request's copy, so a service may answer on it: a student must not be
     /// handed an answer scoped for a manager.
     pub asker_role: String,
-    /// The `(sınıf, ders)` pairs the question is scoped to — one entry per pair,
+    /// The `(class, course)` pairs the question is scoped to — one entry per pair,
     /// because the RAG routes corpora by the pair. At most
     /// [`MAX_RAG_SCOPE_PAIRS`](crate::constant::MAX_RAG_SCOPE_PAIRS); a request
     /// carrying more is refused rather than narrowed.
@@ -434,7 +434,7 @@ mod tests {
         );
 
         // The three optional fields default to empty on a minimal service
-        // reply, and a scope pair may omit `sinif`.
+        // reply, and a scope pair may omit the class.
         let bare: RagChatReplyPayload =
             serde_json::from_value(json!({ "text": "bilmiyorum", "abstained": true })).unwrap();
         assert_eq!(bare.reason, "");

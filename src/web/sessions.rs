@@ -116,7 +116,7 @@ fn is_live_session_teacher(session: &CourseSession, user: &User) -> bool {
 
 /// Who may take (or amend) a session's roll call: the session's own teacher,
 /// or anyone who manages its instance (manager+, one of its teachers, or its
-/// şube's homeroom teacher) — in both cases only while still `teacher`+.
+/// section's homeroom teacher) — in both cases only while still `teacher`+.
 async fn can_roll_call(
     session: &CourseSession,
     instance: &ClassCourse,

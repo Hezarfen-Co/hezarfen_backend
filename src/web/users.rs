@@ -94,9 +94,9 @@ struct UpdateProfile {
     /// Free text under the profile's name.
     #[schema(example = "Sınıfın en hızlı pomodorocusu.", max_length = 500)]
     bio: Option<String>,
-    /// The teacher's branş (subject): one of the school's `branches` from
+    /// The teacher's subject specialisation: one of the school's `branches` from
     /// `GET /settings`, by name. Omit to keep the current value; send `""` to
-    /// clear it (a school that lists no branş stores none).
+    /// clear it (a school that lists no subjects stores none).
     #[schema(example = "Matematik", max_length = 50)]
     branch: Option<String>,
 }
@@ -134,11 +134,11 @@ fn merge_field<T>(
     }
 }
 
-/// Resolve the branş a request names. Same shape as [`merge_field`] — absent
+/// Resolve the `branch` a request names. Same shape as [`merge_field`] — absent
 /// is "keep", `""` is an explicit clear — with the one check a free string
 /// cannot make: the value must be one the *school* lists (`GET /settings`).
 /// The vocabulary is the school's, so nothing else can decide it, and a school
-/// with no list can only ever have branşes cleared.
+/// with no list can only ever have its `branch` cleared.
 fn merge_branch(
     patch: Option<&str>,
     allowed: &[String],
@@ -176,7 +176,7 @@ async fn apply_profile(
     let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
     let display_name = merge_field(req.display_name.as_deref(), DisplayName::try_new)?;
     let bio = merge_field(req.bio.as_deref(), Bio::try_new)?;
-    // Only a request that actually names a branş pays the settings read.
+    // Only a request that actually names a branch pays the settings read.
     let branch = match req.branch {
         Some(_) => {
             let school = crate::service::settings::load(db).await?;
@@ -842,8 +842,8 @@ struct ProfileResponse {
     role: RoleSchema,
     #[schema(example = "Sınıfın en hızlı pomodorocusu.")]
     bio: Option<String>,
-    /// The teacher's branş, one of the school's `branches` (`GET /settings`);
-    /// `null` when none is set — or when the school lists none.
+    /// The teacher's subject specialisation, one of the school's `branches`
+    /// (`GET /settings`); `null` when none is set — or when the school lists none.
     #[schema(example = "Matematik")]
     branch: Option<String>,
     /// Present only once a picture is uploaded; the bytes are at
@@ -907,7 +907,7 @@ struct ProfileCourseRef {
     id: String,
     #[schema(example = "Matematik")]
     title: String,
-    /// `course`, `study` (etüt), or `club` (kulüp).
+    /// `course`, `study` (supervised study), or `club`.
     #[schema(example = "course")]
     kind: String,
 }

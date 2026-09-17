@@ -206,7 +206,7 @@ async fn list_homework(
 }
 
 /// Fetch a single homework by id. Visible to whoever can view its instance (its
-/// enrolled students, its teachers, its şube's homeroom teacher, and
+/// enrolled students, its teachers, its class section's homeroom teacher, and
 /// managers/admins). A student the homework is *not* assigned to gets a 404 —
 /// the same no-leak an unseen exam draft gets, so a subset assignment never
 /// reveals itself to the students left out of it. To a caller without
@@ -1190,7 +1190,7 @@ struct HomeworkReportEntry {
     result: Option<HomeworkResultResponse>,
 }
 
-/// A student's homework report across the instances their şube carries, paged
+/// A student's homework report across the instances their class section carries, paged
 /// via `?limit=&offset=` (omit `limit` for all of it): one row per homework in
 /// their audience — submitted/late/missing state plus the grade once one
 /// exists. Statuses and marks, never the submitted files (observers get the

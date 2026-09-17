@@ -15,8 +15,8 @@
 //!
 //! so a *negative* balance means the family owes the school. Every amount on a
 //! row is stored positive; the sign lives in the `kind`, so a line's meaning
-//! never depends on how it was read. Money is `i64` minor units (kuruş) end to
-//! end. No float, no decimal, ever.
+//! never depends on how it was read. Money is `i64` minor units end to end.
+//! No float, no decimal, ever.
 //!
 //! The rules the rest of the code depends on:
 //!

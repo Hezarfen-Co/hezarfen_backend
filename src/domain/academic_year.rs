@@ -1,8 +1,7 @@
-//! An academic year (eğitim yılı): the container a şube and its dönemler
-//! belong to. Above [`crate::domain::term::Term`], which is a grading slice
-//! inside it.
+//! An academic year: the container a class section and its terms belong to.
+//! Above [`crate::domain::term::Term`], which is a grading slice inside it.
 //!
-//! The year carries the sınıf geçme policy (`grade_promotions`): a mapping
+//! The year carries the grade-promotion policy (`grade_promotions`): a mapping
 //! from one grade label to the next, applied by the explicit, idempotent
 //! rollover command ([`crate::service::academic_year::rollover`]). A grade
 //! absent from the list is not rolled over — that is how graduation is
@@ -81,7 +80,7 @@ impl AcademicYearName {
     }
 }
 
-/// One sınıf-geçme mapping: a student who finished `from_grade` moves to
+/// One grade-promotion mapping: a student who finished `from_grade` moves to
 /// `to_grade` at rollover.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GradePromotion {
@@ -187,7 +186,7 @@ impl AcademicYear {
         &self.grade_promotions.0
     }
 
-    /// The grade a şube of `grade` rolls into, or `None` when the grade has no
+    /// The grade a section at `grade` rolls into, or `None` when the grade has no
     /// promotion entry (graduation).
     pub fn promotion_for(&self, grade: &str) -> Option<&str> {
         self.grade_promotions

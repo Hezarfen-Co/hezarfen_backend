@@ -4,9 +4,9 @@
 //! [`crate::service::class_member`].
 //!
 //! The table is a history: `left_at` NULL is the live stint, and every read
-//! here filters on it — a student who left the şube holds no seat and appears
-//! on no roster, while their earlier row survives for the record (and for the
-//! karne's attribution).
+//! here filters on it — a student who left the section holds no seat and
+//! appears on no roster, while their earlier row survives for the record (and
+//! for the report card's attribution).
 
 use crate::constant::CLASS_MEMBER_TABLE;
 use crate::database::Database;
@@ -34,7 +34,7 @@ pub async fn list_for_class(
 }
 
 /// The classes one student is currently in, newest stint first — the read
-/// behind "which class section (şube) am I in". A left stint is history and
+/// behind "which class section am I in". A left stint is history and
 /// does not appear.
 pub async fn list_for_user(
     db: &Database,

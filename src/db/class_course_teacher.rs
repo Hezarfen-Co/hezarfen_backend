@@ -1,7 +1,7 @@
 //! The `class_course_teacher` junction: who teaches one instance.
 //!
 //! D6 moved teacher assignment off the catalog course and onto the instance —
-//! two şubeler teaching the same course may legitimately have different
+//! two sections teaching the same course may legitimately have different
 //! teachers — so this is the table every instance-membership gate reads
 //! ([`crate::service::class_course::ensure_instance_teacher`]) and the one the
 //! demotion sweep strips ([`crate::db::user::set_role_cascade`]).

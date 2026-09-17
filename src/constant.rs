@@ -63,7 +63,7 @@ pub const MAX_COURSE_NOTE_FILES: usize = 10;
 
 pub const MAX_MESSAGE_SUBJECT_LEN: usize = 200;
 pub const MAX_MESSAGE_BODY_LEN: usize = 10_000;
-/// A message's optional sender-chosen tag ("Etüt", "Sınav", …) — free text,
+/// A message's optional sender-chosen tag ("Study", "Exam", …) — free text,
 /// rendered as a badge by the UI.
 pub const MAX_MESSAGE_LABEL_LEN: usize = 50;
 
@@ -105,8 +105,8 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
-/// A class section (şube) is named like a course, but its optional `grade` is
-/// a free-text label the school picks ("9", "10-A", "anaokulu") — a line of
+/// A class section is named like a course, but its optional `grade` is
+/// a free-text label the school picks ("9", "10-A", "kindergarten") — a line of
 /// display text, so it is bounded like the other short labels, not like a
 /// description.
 pub const MAX_CLASS_NAME_LEN: usize = 200;
@@ -130,14 +130,14 @@ pub const MAX_CLASS_GRADE_LEN: usize = 20;
 pub const MAX_CLASS_MEMBERS: i64 = 200;
 pub const MAX_CLASS_COURSES: i64 = 50;
 
-/// Weekly lesson hours of a class×course instance (D8's karne weight). Bounded
+/// Weekly lesson hours of a class×course instance (D8's report-card weight). Bounded
 /// so a typo cannot make one instance dominate the year average.
 pub const MIN_DERS_SAATI: i64 = 1;
 pub const MAX_DERS_SAATI: i64 = 40;
 
-/// The default grade-display bands: the Türkiye 5-point scale (85–100 = 5,
-/// … 0–44 = 1). Schools edit the list via `PATCH /settings`; the karne verdict
-/// reads the band labelled `"2"` as the pass boundary.
+/// The default grade-display bands: the Turkish 5-point scale (85–100 = 5,
+/// … 0–44 = 1). Schools edit the list via `PATCH /settings`; the report-card
+/// verdict reads the band labelled `"2"` as the pass boundary.
 pub const DEFAULT_GRADE_BANDS: [(i64, &str); 5] =
     [(85, "5"), (70, "4"), (55, "3"), (45, "2"), (0, "1")];
 
@@ -168,7 +168,7 @@ pub const MAX_SESSION_TOPIC_LEN: usize = 200;
 /// `PATCH /settings`. An exam's kind decides how heavily it counts into the
 /// course average — the defaults all weigh 1 (a plain average) so weighting
 /// is opt-in policy, not baked-in opinion. The defaults are the Turkish K12
-/// classroom's own: yazılı, sözlü, uygulama.
+/// classroom's own: written, oral, practice.
 pub const DEFAULT_EXAM_KINDS: [(&str, i64); 3] = [("yazili", 1), ("sozlu", 1), ("uygulama", 1)];
 
 /// Bounds for the school-editable lists in settings (exam kinds, attendance
@@ -192,7 +192,7 @@ pub const MAX_TERM_NAME_LEN: usize = 100;
 /// An academic year is named like a term ("2026-2027").
 pub const MAX_ACADEMIC_YEAR_NAME_LEN: usize = 100;
 
-/// The per-dönem devamsızlık limits a school may configure; a bound so a typo
+/// The per-term absence limits a school may configure; a bound so a typo
 /// cannot disable the rule or make it absurd.
 pub const MAX_ABSENCE_DAYS: i64 = 365;
 
@@ -248,7 +248,7 @@ pub const MAX_MENU_CAPACITY: i64 = 10_000;
 pub const MAX_DIETARY_TAGS: usize = 10;
 pub const MAX_DIETARY_NOTE_LEN: usize = 500;
 
-/// Money is **minor units** (kuruş) as `i64` everywhere — never a decimal and
+/// Money is **minor units** as `i64` everywhere — never a decimal and
 /// never a float. `MAX_DISH_PRICE_MINOR` caps one dish (10 000 ₺);
 /// `MAX_LEDGER_AMOUNT_MINOR` caps one ledger line (100 000 ₺), which is wide
 /// enough for a term's prepayment.
@@ -287,8 +287,8 @@ pub const MAX_MEAL_CANCEL_CUTOFF_MINUTES: i64 = 7 * 24 * 60;
 /// school sets its hour.
 pub const MAX_MEAL_SERVING_MINUTE: i64 = 24 * 60 - 1;
 
-/// The only accepted course kinds. `course`: a regular class (ders). `study`:
-/// a supervised study session (etüt). Behaviorally identical — the kind is a
+/// The only accepted course kinds. `course`: a regular class. `study`: a
+/// supervised study session. Behaviorally identical — the kind is a
 /// label for the UI, everything else (enrollment, exams, sessions, marks)
 /// works the same.
 pub const COURSE_KINDS: [&str; 3] = ["course", "study", "club"];
@@ -356,7 +356,7 @@ pub const MAX_FEE_PLAN_ASSIGN_WRITES: usize = 3_000;
 /// charge, the refunds under a payment, and every reversal among them. The
 /// over-payment cap folds that whole subtree one query per line while holding
 /// the process-global payment lock, so an unbounded subtree is an unbounded
-/// stall for every other payment in the school: 2 000 one-kuruş payments make
+/// stall for every other payment in the school: 2 000 one-minor-unit payments make
 /// the next one issue 2 001 queries with the lock held. Twenty pieces is
 /// already a pathological way to settle a single installment.
 pub const MAX_LEDGER_APPLIED_LINES: usize = 20;
@@ -596,7 +596,7 @@ pub const AI_RAG_CHAT_TIMEOUT_SECS: u64 = 90;
 
 /// The capability an AI service declares to analyse one student (ZEKA,
 /// `hezarfen_zeka`). It is the on-demand half of ZEKA — the service also
-/// recomputes on its own schedule — and it is what a teacher's "hesapla" is
+/// recomputes on its own schedule — and it is what a teacher's "calculate" is
 /// routed to. The service reads the student's own data back through the
 /// bridge's api reads and has the backend write its `zeka_*` rows — no AI
 /// service holds a school database credential here (see the storage-surface
@@ -612,7 +612,7 @@ pub const AI_INSIGHT_STUDENT_CAPABILITY: &str = "insight.student";
 pub const AI_INSIGHT_STUDENT_TIMEOUT_SECS: u64 = 120;
 
 /// The capability an AI service declares to analyse one class×course (a
-/// şube's own instance of a course). Declared here so the name exists in one
+/// section's own instance of a course). Declared here so the name exists in one
 /// place, but **no door dispatches it yet**: the request would name a course
 /// the service has to enumerate a roster for, and the bridge's read allowlist
 /// carries no member listing — that half of the contract is still open
@@ -784,7 +784,7 @@ pub const PODCAST_JOB_STALE_ETA_FACTOR: i64 = 3;
 /// a client sees one vocabulary however the job died.
 pub const PODCAST_INTERRUPTED_CODE: &str = "interrupted";
 
-/// The most `(sınıf, ders)` scope pairs one `rag.chat` request may carry. The
+/// The most `(class, course)` scope pairs one `rag.chat` request may carry. The
 /// corpus is routed by the **pair** — a grade and a subject list sent
 /// separately would cross-product into combinations the asker never named — so
 /// this is the number of pairs handed to the service in one call, bounding
@@ -1229,7 +1229,7 @@ pub const POMODORO_COUNTED_TODAY_FIELD: &str = "pomodoro_counted_today";
 pub const MIN_COUNTED_POMODORO_MS: i64 = 300_000;
 pub const MAX_COUNTED_POMODORO_PER_DAY: i64 = 16;
 /// A stint's optional student-given label — the student's own name for what
-/// the stint is for ("math", "TYT denemesi"), free text rather than a subject
+/// the stint is for ("math", "mock exam"), free text rather than a subject
 /// link, bounded like the other short labels.
 pub const MAX_POMODORO_LABEL_LEN: usize = 100;
 /// The staff-side and second student-side totals, same shape and same rules:

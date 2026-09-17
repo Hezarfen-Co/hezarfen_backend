@@ -2,12 +2,12 @@
 //! field-scoped PATCH whose `WHERE` re-checks the merged range, and the 0/0
 //! delete guard.
 //!
-//! The year is the top of the academic calendar (D3): a şube belongs to a year
-//! and a dönem ([`crate::db::term`]) is a grading slice inside it. Its two
-//! counters are the delete guard — a year that still carries a şube or a dönem
-//! is refused outright, because dropping it silently would strand the year's
-//! structure. The rollover that reads and writes the şubeler lives one layer
-//! up ([`crate::service::academic_year::rollover`]).
+//! The year is the top of the academic calendar (D3): a section belongs to a
+//! year and a term ([`crate::db::term`]) is a grading slice inside it. Its two
+//! counters are the delete guard — a year that still carries a section or a
+//! term is refused outright, because dropping it silently would strand the
+//! year's structure. The rollover that reads and writes the sections lives one
+//! layer up ([`crate::service::academic_year::rollover`]).
 
 use sqlx::types::Json;
 
@@ -175,7 +175,7 @@ pub async fn archive(db: &Database, id: &AcademicYearId) -> Result<Option<Academ
     Ok(written)
 }
 
-/// Delete the year, but only while no şube and no dönem links it — nothing
+/// Delete the year, but only while no section and no term links it — nothing
 /// here unlinks or cascades. `false` = refused, nothing was written.
 ///
 /// Both counts are read off the year's own row, so the check and the delete
@@ -205,7 +205,7 @@ pub async fn delete(db: &Database, year: AcademicYear) -> Result<bool, AppError>
 }
 
 /// A real academic year for the fixtures of the tables that hang off one: a
-/// dönem ([`crate::db::term::a_test_term`]) and, through it, every exam. Minted
+/// term ([`crate::db::term::a_test_term`]) and, through it, every exam. Minted
 /// per call — the name is unique — with a creator that is a real `app_user`
 /// row, because `creator` is a foreign key.
 #[cfg(test)]

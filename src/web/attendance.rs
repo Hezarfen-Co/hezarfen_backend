@@ -1,6 +1,6 @@
 //! Attendance reports: the event tallies, the lesson roll call per instance,
-//! and the devamsızlık block a Turkish school actually reads — how many
-//! *days* a student was away in each dönem, and whether that is over the
+//! and the absence block a Turkish school actually reads — how many
+//! *days* a student was away in each term, and whether that is over the
 //! configured limit.
 //!
 //! The day counts are bucketed in the school's timezone
@@ -88,13 +88,13 @@ fn attendance_rate(present: u64, absent: u64, late: u64) -> Option<f64> {
 #[derive(Serialize, ToSchema)]
 struct CourseAttendance {
     /// The instance these tallies belong to (`GET /instances/{id}`) — the
-    /// course as one şube teaches it.
+    /// course as one class section teaches it.
     instance: String,
     course: CourseResponse,
     counts: StatusCounts,
 }
 
-/// The configured per-dönem absence limits, or `null` per limit when the
+/// The configured per-term absence limits, or `null` per limit when the
 /// school set none.
 #[derive(Serialize, ToSchema)]
 struct AbsenceLimits {
@@ -102,7 +102,7 @@ struct AbsenceLimits {
     max_unexcused_days: Option<i64>,
 }
 
-/// One dönem's devamsızlık: how many days the student was away, split the way
+/// One term's absence: how many days the student was away, split the way
 /// a Turkish school splits it.
 ///
 /// A *day* is a calendar day at the school on which at least one lesson was
@@ -112,14 +112,14 @@ struct AbsenceLimits {
 /// neither (its semantics are the school's own).
 #[derive(Serialize, ToSchema)]
 struct TermAbsence {
-    /// The dönem (`GET /terms/{id}`).
+    /// The term (`GET /terms/{id}`).
     term: String,
     name: String,
     #[schema(example = 3)]
     absent_days: i64,
     #[schema(example = 1)]
     excused_days: i64,
-    /// The unexcused absence days — the count the mazeretsiz limit watches.
+    /// The unexcused absence days — the count the unexcused limit watches.
     /// Equal to `absent_days`; both are published because a client should not
     /// have to know that.
     #[schema(example = 3)]
@@ -131,7 +131,7 @@ struct TermAbsence {
 }
 
 /// A user's full attendance report: generic events, lesson roll call overall,
-/// the roll call broken down per instance, and the per-dönem devamsızlık.
+/// the roll call broken down per instance, and the per-term absence breakdown.
 #[derive(Serialize, ToSchema)]
 struct AttendanceReport {
     /// The user's id.
@@ -144,8 +144,8 @@ struct AttendanceReport {
     /// the user has roll-call rows in it — attendance is a historical record,
     /// so unenrolling never hides an absence.
     courses: Vec<CourseAttendance>,
-    /// The per-dönem absent-day counts, oldest dönem first. A lesson that falls
-    /// in no dönem's range is not counted here (it still counts in the
+    /// The per-term absent-day counts, oldest term first. A lesson that falls
+    /// in no term's range is not counted here (it still counts in the
     /// tallies).
     devamsizlik: Vec<TermAbsence>,
 }
@@ -153,7 +153,7 @@ struct AttendanceReport {
 /// The school's day boundary as a fixed offset in minutes.
 ///
 /// The allow-list in [`crate::constant::TIMEZONES`] names zones whose offset
-/// is constant (Türkiye has run on UTC+3 with no DST since 2016), so the
+/// is constant (Turkey has run on UTC+3 with no DST since 2016), so the
 /// backend buckets days without carrying a timezone database — the same
 /// arithmetic the settings module's own list is built on. An unrecognised name
 /// falls back to [`crate::constant::DEFAULT_TIMEZONE`]'s offset, which is what
@@ -174,7 +174,7 @@ fn zoned_day(millis: i64, offset_minutes: i32) -> chrono::NaiveDate {
         .date_naive()
 }
 
-/// The dönem an instant falls in: the containing term with the latest start,
+/// The term an instant falls in: the containing term with the latest start,
 /// or `None` when the calendar does not cover it.
 fn term_of(instant: i64, terms: &[Term]) -> Option<&Term> {
     terms
@@ -187,7 +187,7 @@ fn term_of(instant: i64, terms: &[Term]) -> Option<&Term> {
 
 /// Assemble the report: tally the user's event rows, then their session rows
 /// grouped by the (denormalized) instance. A `viewer` narrows the per-instance
-/// blocks — and the overall session tally, and the devamsızlık — to the
+/// blocks — and the overall session tally, and the absence block — to the
 /// instances that viewer runs (self-reports and manager+ reports pass `None`).
 /// Event tallies are school-wide, not course data, so they stay in either case.
 async fn build_report(
@@ -267,13 +267,13 @@ async fn build_report(
     })
 }
 
-/// The devamsızlık block: for every dönem the visible rows reach, the count of
+/// The absence block: for every term the visible rows reach, the count of
 /// distinct school-days on which the student was `absent` (unexcused) and on
 /// which they were `excused`.
 ///
 /// The day is the *lesson's* day (`course_session.starts_at`), never when the
 /// teacher got round to marking: a roll call taken a week late must not move an
-/// absence into another dönem. The lessons are read one instance at a time
+/// absence into another term. The lessons are read one instance at a time
 /// (they are the same instances the blocks are built from), and the terms once.
 async fn absence_by_term(
     rows: &[&SessionAttendance],
@@ -302,7 +302,7 @@ async fn absence_by_term(
     let offset = zone_offset_minutes(school.get_timezone());
     let (terms, _) = crate::service::term::list_all(db, None, 0).await?;
 
-    // A day counts once per (dönem, status class), which is what the
+    // A day counts once per (term, status class), which is what the
     // regulation counts.
     let mut unexcused: HashSet<(String, chrono::NaiveDate)> = HashSet::new();
     let mut excused: HashSet<(String, chrono::NaiveDate)> = HashSet::new();
@@ -320,7 +320,7 @@ async fn absence_by_term(
             continue;
         };
         let Some(term) = term_of(*start, &terms) else {
-            // A lesson outside every dönem's range is not this block's.
+            // A lesson outside every term's range is not this block's.
             continue;
         };
         let key = term.get_id().key();
@@ -369,8 +369,8 @@ async fn absence_by_term(
 }
 
 /// The current user's attendance report: event tallies, lesson roll-call
-/// tallies, a per-instance breakdown with attendance rates, and the per-dönem
-/// devamsızlık.
+/// tallies, a per-instance breakdown with attendance rates, and the per-term
+/// absence breakdown.
 #[utoipa::path(
     get,
     path = "/me",
@@ -390,7 +390,7 @@ async fn my_report(
 
 /// Any user's attendance report. Requires teacher+, or a parent tied to the
 /// target student. Managers, admins, and parents see every instance; a teacher
-/// sees the event tallies plus only the roll-call blocks — and the devamsızlık
+/// sees the event tallies plus only the roll-call blocks — and the absence
 /// days — of the instances they run.
 #[utoipa::path(
     get,
@@ -427,7 +427,7 @@ mod tests {
     use super::*;
 
     /// The day bucket is the school's day, not UTC's: 22:30 UTC in summer
-    /// İstanbul is already tomorrow. This is the whole reason the timezone is
+    /// Istanbul is already tomorrow. This is the whole reason the timezone is
     /// read off the settings.
     #[test]
     fn the_day_bucket_follows_the_school_zone() {

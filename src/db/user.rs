@@ -469,7 +469,7 @@ pub async fn set_role_cascade(
             )
             .execute(&mut *tx)
             .await?;
-            // The individual club/etüt memberships go with them: a demoted
+            // The individual club/supervised-study memberships go with them: a demoted
             // account may hold no seat in a school-scoped course either, and
             // each course gets its membership count back.
             sqlx::query!(
@@ -711,7 +711,7 @@ pub async fn set_profile(
             "bio",
             text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
         )
-        // The branş is plain text, not a newtype: the school's own list is
+        // The subject area is plain text, not a newtype: the school's own list is
         // settings data, so its membership check belongs to the write path
         // that holds that list (the web layer), not to a row type.
         .set(

@@ -74,7 +74,7 @@ pub async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppE
 }
 
 /// A 403 unless `user` is enrolled in an instance the exam is addressed to —
-/// its owner, or any sibling it was announced to (an ortak sınav, D2). The
+/// its owner, or any sibling it was announced to (a shared exam, D2). The
 /// same wall the exam room checks at its door, re-applied to the sitting's
 /// content paths so an unenrollment mid-exam cuts them too. Finishing stays
 /// exempt: like the rejoin lock, submitting what's already saved writes
@@ -126,7 +126,7 @@ pub async fn class_course_of(exam: &Exam, db: &Database) -> Result<ClassCourse, 
 
 /// The archived-year refusal every exam write pays: the exam's instance must
 /// still sit under an open year. Past years are read-only, and the year — not
-/// the dönem the exam names — is what the exam's structure belongs to.
+/// the term the exam names — is what the exam's structure belongs to.
 ///
 /// The instance read doubles as the dangling-reference check
 /// ([`class_course_of`]); the year itself is read by
@@ -460,7 +460,7 @@ mod tests {
         .await
         .unwrap();
         let (class_course, _course) = crate::db::course::a_test_instance(db).await;
-        // A dönem for the exam to be sat in: the year it belongs to is real
+        // A term for the exam to be sat in: the year it belongs to is real
         // (the create claims it), and the shape is the calendar's own.
         let manager = crate::db::class_member::tests::fixture_user(db, "manager").await;
         let year = crate::db::academic_year::create(

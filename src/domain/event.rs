@@ -91,8 +91,8 @@ pub enum EventAudienceKind {
     /// A course's enrolled students. Staff running the course are not implied
     /// members — a mixed gathering wants a registration or role audience.
     Course,
-    /// A class section's (şube) students, read live off `class_member` — the
-    /// same live resolution `Course` and `Role` get, so adding a student to the
+    /// A class section's students, read live off `class_member` — the same live
+    /// resolution `Course` and `Role` get, so adding a student to the
     /// class puts them on every one of its events' rosters at once. The
     /// homeroom teacher is not implied, matching `Course`. A deleted class
     /// leaves the event standing with an empty roster, exactly as a deleted

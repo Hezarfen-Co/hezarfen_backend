@@ -49,21 +49,21 @@ struct CreateCourse {
     #[schema(max_length = 2000)]
     description: Option<String>,
     /// `course` (a regular class — the default), `study` (a supervised study
-    /// session — etüt), or `club` (a student club — kulüp). Only a `course` is
-    /// taught through şube instances (and carries exams, sessions and
-    /// homework); a `study`/`club` is joined school-wide.
+    /// session), or `club` (a student club). Only a `course` is taught through
+    /// class-section instances (and carries exams, sessions and homework); a
+    /// `study`/`club` is joined school-wide.
     #[schema(example = "course")]
     kind: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct JoinMember {
-    /// The user to add to the club/etüt.
+    /// The user to add to the club or study.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user_id: String,
 }
 
-/// Public shape of one individual membership in a club or etüt — the
+/// Public shape of one individual membership in a club or study — the
 /// school-scoped tier, distinct from a class instance's roster.
 #[derive(Serialize, ToSchema)]
 struct MembershipResponse {
@@ -101,7 +101,7 @@ struct UpdateCourse {
     title: Option<String>,
     #[schema(max_length = 2000)]
     description: Option<String>,
-    /// `course`, `study` (etüt), or `club` (kulüp). Omit to keep the current
+    /// `course`, `study` (supervised study), or `club`. Omit to keep the current
     /// kind.
     kind: Option<String>,
 }
@@ -154,10 +154,10 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
 
 /// Create a catalog course owned by the current user. Requires the `teacher`
 /// role or higher. `kind` picks the flavor — `course` (a regular class, the
-/// default), `study` (a supervised study session — etüt), or `club` (a
-/// student club — kulüp). A catalog row teaches nobody by itself: a şube
-/// attaches it into an instance (`POST /classes/{id}/instances`), and a
-/// `study`/`club` is joined school-wide (`POST /courses/{id}/members`).
+/// default), `study` (a supervised study session), or `club` (a student
+/// club). A catalog row teaches nobody by itself: a class section attaches it
+/// into an instance (`POST /classes/{id}/instances`), and a `study`/`club` is
+/// joined school-wide (`POST /courses/{id}/members`).
 #[utoipa::path(
     post,
     path = "/",
@@ -232,7 +232,7 @@ async fn list_courses(
 /// `{items, total, limit, offset}` envelope.
 ///
 /// Both membership tiers are here: a student's enrollments in the instances
-/// their şubeler teach, and an individual club/etüt membership. The
+/// their class sections teach, and an individual club/study membership. The
 /// *instances* themselves are `GET /instances/me`.
 #[utoipa::path(
     get,
@@ -369,7 +369,7 @@ async fn update_course(
 
 /// Delete a catalog course. Requires teacher+; only its creator or a
 /// manager/admin may delete it. Refused with a 409 while the course is still
-/// taught anywhere — detach it from every şube (`DELETE
+/// taught anywhere — detach it from every class section (`DELETE
 /// /classes/{id}/instances/{instance}`) and remove its individual members
 /// first, so a course that carries teaching is never dropped by accident.
 /// Once free, it cascades the instances' exams (with their results, questions,
@@ -428,13 +428,13 @@ async fn delete_course(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---- club/etüt membership ---------------------------------------------------
+// ---- club/study membership -------------------------------------------------
 
-/// Add a user to a club or etüt — the **school-scoped** membership tier.
+/// Add a user to a club or study — the **school-scoped** membership tier.
 /// Requires teacher+ and catalog rights (its creator, or a manager/admin).
-/// Only students can be added, and only to a `study` (etüt) or `club`
-/// (kulüp): a regular ders (`kind` `course`) has no school-wide roster — its
-/// students come from the şubeler that teach it, and that join is
+/// Only students can be added, and only to a `study` (supervised study) or
+/// `club`: a regular course (`kind` `course`) has no school-wide roster — its
+/// students come from the class sections that teach it, and that join is
 /// `POST /instances/{id}/enrollments` (400 here). Idempotent: a pair that
 /// already holds a membership is returned as-is.
 #[utoipa::path(
@@ -474,7 +474,7 @@ async fn join_member(
     Ok(Json(MembershipResponse::new(&membership, &people)))
 }
 
-/// List a club/etüt's members, newest first, paged via `?limit=&offset=`
+/// List a club/study's members, newest first, paged via `?limit=&offset=`
 /// (omit `limit` for the whole list). Requires teacher+ and catalog rights.
 /// Returns a `{items, total, limit, offset}` envelope. An instance's roster
 /// is `GET /instances/{id}/enrollments`.
@@ -524,7 +524,7 @@ async fn list_members(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Remove a user from a club or etüt. Requires teacher+ and catalog rights.
+/// Remove a user from a club or study. Requires teacher+ and catalog rights.
 /// Existing exam results and badges are untouched — the membership is a door,
 /// not a record of what happened inside. A pair holding no membership is a
 /// 404.

@@ -1,11 +1,11 @@
 //! A course as taught in one class: the academic *instance*.
 //!
 //! The anchor of the K12 model. A course in the school catalog is a template;
-//! attaching it to a şube mints one of these rows, and exams, sessions,
+//! attaching it to a class section mints one of these rows, and exams, sessions,
 //! roll-call, homework and enrollments all key on the instance — so two
-//! şubeler teaching the same course have separate rosters, exams, timetables
-//! and teachers. The row carries the weekly hours (`ders_saati`, the karne
-//! weight) and whether it counts toward the karne.
+//! sections teaching the same course have separate rosters, exams, timetables
+//! and teachers. The row carries the weekly hours (`ders_saati`, the report-card
+//! weight) and whether it counts toward the report card.
 //!
 //! The attach/detach workflows live in [`crate::service::class_course`]; the
 //! row's reads in [`crate::db::class_course`] — this file is the row shape and
@@ -51,7 +51,7 @@ impl ClassCourseId {
 }
 
 /// Weekly lesson hours of an instance: the weight the instance carries in the
-/// year's karne average, and the count a timetable grid would lay out.
+/// year's report-card average, and the count a timetable grid would lay out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct DersSaati(i64);
@@ -74,7 +74,7 @@ impl DersSaati {
 
 /// One course taught in one class. `attached_by` is who attached it, `source`
 /// the blueprint that placed it (absent for a hand attach). `ders_saati` and
-/// `counts_toward_karne` are the instance's own policy — what two şubeler
+/// `counts_toward_karne` are the instance's own policy — what two sections
 /// teaching the same catalog course may legitimately differ on.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassCourse {

@@ -44,7 +44,7 @@ struct PublishSlots {
     #[schema(example = 1_900_000_000_000_i64)]
     starts_at: i64,
     ends_at: i64,
-    /// Free-text hint shown to requesters ("office hours", "veli görüşmesi").
+    /// Free-text hint shown to requesters ("office hours", "parent meeting").
     #[schema(max_length = 500)]
     note: Option<String>,
     /// Repeat the same window every week up to and including `until`.

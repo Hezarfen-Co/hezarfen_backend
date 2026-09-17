@@ -1,7 +1,7 @@
 //! The pump behind the class layer: one link row changed, and every
 //! `enrollment` row that link implies reconciled with it, in one transaction.
 //!
-//! A class section (şube) has two link tables — `class_member` (a student in
+//! A class section has two link tables — `class_member` (a student in
 //! it) and `class_course` (a course attached to it, as that class×course
 //! *instance*) — and the *product* of the two is the roster it owes: every
 //! live member is enrolled in every instance the class carries, in real
@@ -387,7 +387,7 @@ pub(crate) async fn add_member(
     add_member_sourced(db, class, user, by, None).await
 }
 
-/// [`add_member`] carrying the stint's *provenance*: the şube the student was
+/// [`add_member`] carrying the stint's *provenance*: the section the student was
 /// copied from, written into `source_class_group` in the same statement as
 /// the row. `None` is the hand add — a student someone put here, who came
 /// from nowhere (the pump is the only writer of this column, and a rollover
@@ -508,13 +508,13 @@ pub(crate) async fn add_member_sourced(
 ///
 /// The instance's own id is minted here (v7, so a class's instances list in
 /// creation order) and its policy columns take the schema defaults: one weekly
-/// hour, counted toward the karne, an empty roster. A PATCH on `/instances`
+/// hour, counted toward the report card, an empty roster. A PATCH on `/instances`
 /// changes them afterwards.
 ///
 /// Two counters ride the write, both in this one transaction: the class's
 /// `class_course_count` (claimed by the conditional CTE, so a full or gone
 /// class writes nothing) and the *catalog's* `class_course_count` — how many
-/// şubeler teach this course, which is what [`crate::db::course::delete`]'s
+/// sections teach this course, which is what [`crate::db::course::delete`]'s
 /// guard reads. This is the only insert path into `class_course`; every layer
 /// above it (hand attach, blueprint pump, rollover copy) reaches the counter
 /// through here.
@@ -583,7 +583,7 @@ pub(crate) async fn attach_course(
                 Attached::Gone
             });
         }
-        // The catalog's own counter: how many şubeler teach this course. It is
+        // The catalog's own counter: how many sections teach this course. It is
         // what [`crate::db::course::delete`]'s guard reads — a course a class
         // still teaches may not go — and this insert is the only place it can
         // be claimed. It is a *count*, not a capacity (D5: nothing is refused
@@ -788,7 +788,7 @@ pub(crate) async fn leave_member(
 /// The sweep's rule, and it is the whole rule: **every row the ended stint
 /// owned goes, and each instance gets its roster count back**. An enrollment
 /// is keyed `(class_course, app_user)` — one row per *instance* — so a student
-/// in two şubeler that teach the same course holds two rows, one on each
+/// in two sections that teach the same course holds two rows, one on each
 /// section's instance, and the seat they keep is the other section's own row,
 /// written when they joined it. Handing this row over to a rival class (the
 /// pre-remodel rule, when one school-wide course carried one roster) would
@@ -875,7 +875,7 @@ async fn drop_member(
         .collect::<Vec<_>>();
         // Every row this class's tag owns goes, and each instance gets its
         // roster count back — see the doc above: the student's seat in a
-        // second şube teaching the same course is that şube's *own* row, so
+        // second section teaching the same course is that section's *own* row, so
         // there is no heir to hand this one over to.
         for (instance, member) in rows {
             release(tx, instance, member).await?;
@@ -969,7 +969,7 @@ pub(crate) async fn detach_course(
         .execute(&mut *tx)
         .await?;
         // …and the catalog's own counter: the course is taught in one fewer
-        // şube from this commit. Same transaction as the delete, so the link
+        // section from this commit. Same transaction as the delete, so the link
         // and its count move together — `course::delete`'s guard reads this,
         // and a course whose last instance was just detached is deletable the
         // moment this lands. `GREATEST` for the same reason the class counter
@@ -988,7 +988,7 @@ pub(crate) async fn detach_course(
 
 /// The row goes, and the instance's roster count with it. It is the *only*
 /// fate for an enrollment a section's exit owns: the roster is per instance
-/// (D4), so a student who is also in another şube teaching the same course
+/// (D4), so a student who is also in another section teaching the same course
 /// keeps their seat there through that section's own row — see
 /// [`drop_member`].
 ///

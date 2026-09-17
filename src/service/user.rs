@@ -173,8 +173,9 @@ pub async fn set_profile(
     birth_date: Option<Option<BirthDate>>,
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
-    // The branş, clearable like `bio`; membership in the school's
-    // `Settings::get_branches()` list is the caller's check, not this one's.
+    // The subject specialisation, clearable like `bio`; membership in the
+    // school's `Settings::get_branches()` list is the caller's check, not this
+    // one's.
     branch: Option<Option<String>>,
 ) -> Result<User, AppError> {
     user::set_profile(

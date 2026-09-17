@@ -1,4 +1,4 @@
-//! The `(sınıf, ders)` scope a RAG question is answered from.
+//! The `(class, course)` scope a RAG question is answered from.
 //!
 //! The RAG corpus is routed by the **pair** — a grade and a subject list sent
 //! separately would cross-product into combinations the asker never named
@@ -10,7 +10,7 @@
 //! The derivation is the school's own visibility rules, not a second copy of
 //! them. A student's or a teacher's pairs are the courses their
 //! [`super::instance::visible_instances`] teach them — the very set
-//! `GET /instances/me` serves — and a club/etüt membership
+//! `GET /instances/me` serves — and a club/supervised-study membership
 //! ([`crate::db::course_membership`]) adds its subject with no grade, since a
 //! school-scoped course belongs to no section. A parent has no sections of
 //! their own, so their scope is their linked children's, read child by child
@@ -36,7 +36,7 @@ use crate::domain::role::Role;
 use crate::domain::user::User;
 use crate::error::{AppError, ValidationError};
 
-/// The `(sınıf, ders)` pairs `user`'s questions may be scoped to, in
+/// The `(class, course)` pairs `user`'s questions may be scoped to, in
 /// first-seen order and deduped — one entry per distinct pair.
 ///
 /// `role` is the caller's **live** session role, the same value the
@@ -47,10 +47,11 @@ use crate::error::{AppError, ValidationError};
 /// sections do not exist.
 ///
 /// The instance arm reads its rows through [`super::instance::visible_instances`]
-/// and the two lookup tables (the şubeler the pairs sit in and the titles of
-/// every course named) in one batch read each — never one query per instance:
-/// a teacher can be assigned to dozens of sections, and a per-row lookup would
-/// spend the request's whole budget before the AI service is even called.
+/// and the two lookup tables (the class sections the pairs sit in and the
+/// titles of every course named) in one batch read each — never one query per
+/// instance: a teacher can be assigned to dozens of sections, and a per-row
+/// lookup would spend the request's whole budget before the AI service is even
+/// called.
 pub async fn for_user(
     db: &Database,
     user: &User,
@@ -83,16 +84,16 @@ pub async fn for_user(
                 .map(|(instance, _)| instance),
         );
     }
-    // The school-scoped courses the asker joined directly (kulüp, etüt).
-    // Every role may hold one — the table's own gate is the student role, so
-    // for staff this read is simply empty.
+    // The school-scoped courses the asker joined directly (club, supervised
+    // study). Every role may hold one — the table's own gate is the student
+    // role, so for staff this read is simply empty.
     let memberships =
         crate::db::course_membership::list_for_user(db, user.get_id(), None, 0)
             .await?
             .0;
 
-    // One batch read per lookup, over every id the two arms named: the
-    // şubeler decide each instance's grade, and the courses carry the titles
+    // One batch read per lookup, over every id the two arms named: the class
+    // sections decide each instance's grade, and the courses carry the titles
     // every pair is scoped by. Ids repeat freely — a class usually carries
     // several instances — and `list_by_ids` answers each row once.
     let class_ids: Vec<ClassGroupId> = instances
@@ -111,7 +112,7 @@ pub async fn for_user(
     let classes = crate::db::class_group::list_by_ids(db, &class_ids).await?;
     let courses = crate::db::course::list_by_ids(db, &course_ids).await?;
 
-    // Grade labels, keyed by şube. A class with no grade at all (a
+    // Grade labels, keyed by class section. A class with no grade at all (a
     // club-shaped section, and the shape a fixture class carries) simply
     // contributes no entry, so its instances scope the subject across every
     // grade — the documented meaning of an absent `sinif`.
@@ -164,10 +165,10 @@ pub async fn for_user(
 }
 
 /// Append `pair` unless the very same pair is already in the list — a scope is
-/// a set. Two şubeler at one grade teaching one course are one scope, and a
-/// course attached to a section while also joined as a club contributes both
-/// of its pairs; a duplicate would spend one of the cap's slots twice and hand
-/// the service the same corpus under two entries.
+/// a set. Two class sections at one grade teaching one course are one scope,
+/// and a course attached to a section while also joined as a club contributes
+/// both of its pairs; a duplicate would spend one of the cap's slots twice and
+/// hand the service the same corpus under two entries.
 fn push_pair(
     pairs: &mut Vec<RagScopePair>,
     seen: &mut HashSet<(Option<String>, String)>,
@@ -203,8 +204,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A şube carrying a grade label — the half of every instance pair, since
-    /// `a_class` deliberately has none.
+    /// A class section carrying a grade label — the half of every instance
+    /// pair, since `a_class` deliberately has none.
     async fn graded_class(db: &Database, name: &str, grade: &str) -> ClassGroupId {
         let office = crate::db::class_member::tests::fixture_user(db, "ragscope-office").await;
         crate::service::class_group::create(
@@ -221,7 +222,7 @@ mod tests {
         .clone()
     }
 
-    /// Attach a catalog course to a şube, answering the instance.
+    /// Attach a catalog course to a class section, answering the instance.
     async fn attach(
         db: &Database,
         class: &ClassGroupId,
@@ -243,8 +244,8 @@ mod tests {
             .unwrap();
     }
 
-    /// A student's pair is the şube's grade plus the course attached to it —
-    /// the same set `GET /instances/me` hands them.
+    /// A student's pair is the section's grade plus the course attached to
+    /// it — the same set `GET /instances/me` hands them.
     #[tokio::test]
     async fn a_students_sections_scope_their_subjects() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -304,8 +305,8 @@ mod tests {
         );
     }
 
-    /// A club or etüt is school-scoped: it belongs to no şube, so its subject
-    /// is scoped with no grade at all.
+    /// A club or supervised study is school-scoped: it belongs to no class
+    /// section, so its subject is scoped with no grade at all.
     #[tokio::test]
     async fn a_club_membership_scopes_a_subject_with_no_grade() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -328,9 +329,9 @@ mod tests {
         assert_eq!(scope, vec![pair(None, "Satranç")]);
     }
 
-    /// The same pair reached twice is one scope: two şubeler at one grade
-    /// teaching one course are two instances and a single `(sınıf, ders)`,
-    /// which is what the corpus is routed by.
+    /// The same pair reached twice is one scope: two class sections at one
+    /// grade teaching one course are two instances and a single
+    /// `(class, course)`, which is what the corpus is routed by.
     #[tokio::test]
     async fn a_pair_reached_twice_rides_once() {
         let (db, _leases) = crate::database::init_test_db().await;

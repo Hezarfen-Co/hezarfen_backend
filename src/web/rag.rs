@@ -6,7 +6,7 @@
 //! thread, the payload format, and the last look at the reply before it is
 //! stored. There are no intent or rule tables, and every thread is private to
 //! its owner. What differs is the **scope**: every question carries the
-//! `(sınıf, ders)` pairs the corpus is routed by, derived server-side from the
+//! `(class, course)` pairs the corpus is routed by, derived server-side from the
 //! asker's own memberships ([`crate::service::rag_scope`]) and never from the
 //! request body, and every citation the service returns is resolved here to
 //! the course-note file that owns the cited document — the `doc_id` only the

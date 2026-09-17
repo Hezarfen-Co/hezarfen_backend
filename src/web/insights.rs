@@ -124,7 +124,7 @@ struct AcceptedResponse {
 
 #[derive(Deserialize, ToSchema, Default)]
 struct ComputeStudentRequest {
-    /// ISO-8601 date to compute from; omit for the dönem's beginning.
+    /// ISO-8601 date to compute from; omit for the term's beginning.
     #[schema(example = "2026-09-01")]
     since: Option<String>,
     /// Compute only these sections; omit for all of them.
@@ -1076,7 +1076,7 @@ async fn ensure_can_read(caller: &User, target: &UserId, db: &Database) -> Resul
 /// runs are [`service::instance::visible_instances`]'s `manages` half, which
 /// is the same D10 rule every instance-scoped route applies
 /// ([`service::class_course::ensure_instance_teacher`]): an assigned teacher
-/// or the şube's homeroom teacher, and nobody else.
+/// or the class section's homeroom teacher, and nobody else.
 async fn teacher_reaches(
     db: &Database,
     teacher: &User,

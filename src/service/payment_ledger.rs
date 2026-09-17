@@ -207,12 +207,12 @@ async fn against(
         if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
             // The fold cannot say *why* the room is gone: a reversal is a
             // child of the line it undoes and folds in at `+amount` exactly
-            // as a payment does, so a reversed charge reads as full to the
-            // kuruş. The stored answer is the same either way — nothing may
-            // be recorded against it — but "already paid in full" told a
-            // bursar money had arrived when none ever did. The reversal's
-            // id is derived from its target's, so telling the two apart is
-            // one read, taken only on the refusal path.
+            // as a payment does, so a reversed charge reads as full down to
+            // the minor unit. The stored answer is the same either way —
+            // nothing may be recorded against it — but "already paid in full"
+            // told a bursar money had arrived when none ever did. The
+            // reversal's id is derived from its target's, so telling the two
+            // apart is one read, taken only on the refusal path.
             if let Some(text) = &reversed {
                 let reversed_there =
                     payment_ledger::read(&mut *tx, &PaymentLedgerId::for_reversal(&target.id))
