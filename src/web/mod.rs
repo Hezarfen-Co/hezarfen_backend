@@ -62,12 +62,14 @@ pub use page::{Page, PageParams, Scheduled, WindowParams, paginate};
 
 use std::path::{Path as FsPath, PathBuf};
 
+use axum::Json;
 use axum::extract::Multipart;
 use axum::extract::multipart::MultipartError;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer};
+use serde_json::json;
 use utoipa::ToSchema;
 
 use crate::constant::{QUESTION_IMAGE_CONTENT_TYPES, SCHEDULE_PAST_GRACE_MS};
@@ -361,6 +363,18 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(de).map(Some)
+}
+
+/// The AI-unavailable `503`. Shared by every route that can refuse because no
+/// AI service is reachable: built here rather than as an `AppError` variant —
+/// `AppError`'s 503s all mean "the database is reconnecting", which this is
+/// not. No `Retry-After` — when a service will dial back in is unknowable.
+pub(crate) fn ai_unavailable(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": message })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

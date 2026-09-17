@@ -53,7 +53,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
 use crate::state::{AppState, scoped_key};
 
-use super::{CurrentUser, Page, PageParams};
+use super::{CurrentUser, Page, PageParams, ai_unavailable};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -406,12 +406,12 @@ async fn send_message(
     // documented racy — that is fine here: it never guards a write, it only
     // spares the user a thread full of rows nothing could ever answer.
     let Some(bridge) = st.ai.clone() else {
-        return Ok(unavailable(
+        return Ok(ai_unavailable(
             "the AI service is not enabled on this deployment",
         ));
     };
     if !bridge.has_capability(AI_CHAT_CAPABILITY) {
-        return Ok(unavailable("no AI service is connected right now"));
+        return Ok(ai_unavailable("no AI service is connected right now"));
     }
 
     // Each create rides the thread's own row — it moves `updated_at` (the
@@ -473,18 +473,6 @@ async fn send_message(
 /// ceiling. Applied to what the user sends *and* to what the service answers.
 fn content_cap(settings: &Settings) -> usize {
     (settings.get_max_chatbot_message_len().max(0) as usize).min(MAX_CHATBOT_MESSAGE_LEN)
-}
-
-/// The AI-unavailable `503`. Built here rather than as an `AppError` variant:
-/// this is the only route that can produce it, and `AppError`'s 503s all mean
-/// "the database is reconnecting", which this is not. No `Retry-After` — when
-/// a service will dial back in is unknowable.
-fn unavailable(message: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": message })),
-    )
-        .into_response()
 }
 
 /// Fetch one turn's answer and settle its row. Runs detached from the request.
