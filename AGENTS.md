@@ -75,3 +75,29 @@ live `ls src/` win on conflict.
 - Code, comments and commit messages are English. Turkish survives only where
   it is the data under test (test fixtures, fold tables) or user-visible
   content (product defaults, OpenAPI examples and descriptions).
+- Tests have two paths, and the DEFAULT one is GitHub's.
+  * DEFAULT — push, and GitHub does everything: `Clippy`, the full suite on
+    the runner, the release build, the pack and the deploy.
+  * SPECIAL (faster) — run the full suite on this machine first, then GitHub
+    only packs and deploys. `scripts/gate-local.sh` runs Clippy + the whole
+    nextest suite + the doc gate with CI's env (~10 min here vs ~55 min on a
+    4-core runner); on success it writes a stamp to `.git/local-gate/<tree>.ok`
+    (inside `.git`, never committed) and prints a
+    `Local-Gate: <tree> (<n> passed, <t>s)` trailer. Put that line in the
+    commit being pushed — `scripts/gate-local.sh --amend` appends it to HEAD,
+    which cannot invalidate the stamp because an amend does not change the
+    tree — and the workflow's "Decide test gate" step skips the runner suite.
+    The step VERIFIES the trailer against `HEAD^{tree}`; a stale or
+    copy-pasted trailer silently falls back to running the suite.
+  * `--scope <filter>` is quick iteration only: a scoped run never produces
+    the trailer, because the trailer is a claim about the full suite.
+  * `.githooks/pre-push` (opt in per clone: `git config core.hooksPath
+    .githooks`) refuses a forged or stale trailer — one whose tree is not the
+    tree being pushed, or that claims a full-suite pass with no matching stamp
+    on disk. It never blocks an ordinary untested push: that is the default
+    path, and CI will test it.
+  * `SKIP_LOCAL_GATE=1 git push` skips the hook's trailer check and says so.
+    A manual redeploy's `tests` dispatch input overrides the trailer logic in
+    the other direction: `force` runs the suite on the runner for that ref,
+    `auto`/`skip` redeploy the newest green artifact.
+  * A red local gate is the definition of not-done: never push on one.

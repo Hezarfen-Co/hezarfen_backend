@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Refuse a FORGED or STALE local-verification trailer.
+#
+# The default path is: push and let GitHub run the suite, build, pack and
+# deploy. An untested push is legitimate, so this hook does NOT require a
+# stamp. Its single job is to keep the opt-in fast lane honest.
+#
+# The fast lane is a commit carrying
+#
+#     Local-Gate: <tree-sha> (<n> passed, <t>s)
+#
+# which makes the workflow's "Decide test gate" step skip the runner suite.
+# That is a claim about verification that happened HERE, so this hook checks
+# it before the bytes leave:
+#
+#   * the trailer's tree must be the tree being pushed  (a stale trailer is a
+#     lie about lineage, and CI would silently fall back to running the suite
+#     anyway — so say it here, once, instead of 55 minutes later);
+#   * there must be a matching stamp in .git/local-gate/, written by
+#     scripts/gate-local.sh, and it must be a FULL-suite stamp (a scoped run
+#     never produces a trailer);
+#   * the stamp's counts and duration must match the trailer, so a
+#     hand-typed line cannot pass.
+#
+# To push without the trailer, delete the line (the default path). To skip
+# this check entirely and loudly:
+#
+#     SKIP_LOCAL_GATE=1 git push ...
+#
+# (that skips only THIS hook's trailer check; the commit's trailer, if any,
+# still decides whether GitHub runs the suite).
+
+set -uo pipefail
+
+zero=0000000000000000000000000000000000000000
+
+if [ "${SKIP_LOCAL_GATE:-}" = 1 ]; then
+    cat <<'EOF'
+SKIP_LOCAL_GATE=1: NOT checking Local-Gate trailers.
+  skipped: that the trailer's tree matches the tree being pushed;
+  skipped: that a matching full-suite stamp exists in .git/local-gate/;
+  skipped: that the trailer's counts/duration match that stamp.
+Any trailer on these commits still decides whether GitHub runs its own suite.
+EOF
+    exit 0
+fi
+
+gitdir=$(git rev-parse --git-dir)
+stamp_dir=$gitdir/local-gate
+refused=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    [ "$local_sha" != "$zero" ] || continue # branch deletion: nothing to verify
+    tree=$(git rev-parse --verify -q "$local_sha^{tree}") || continue
+    short=$(git rev-parse --short "$local_sha")
+
+    trailer=$(git log -1 --format=%B "$local_sha" |
+        grep -E '^Local-Gate: [0-9a-f]{40} \([0-9]+ passed, [0-9]+s\)$' | tail -1 || true)
+    # No trailer: the default path. GitHub runs the suite; nothing to check.
+    [ -n "$trailer" ] || continue
+
+    claim_tree=$(printf '%s\n' "$trailer" | sed -n 's/^Local-Gate: \([0-9a-f]\{40\}\) .*/\1/p')
+    claim_passed=$(printf '%s\n' "$trailer" | sed -n 's/^Local-Gate: [0-9a-f]\{40\} (\([0-9]*\) passed.*/\1/p')
+    claim_seconds=$(printf '%s\n' "$trailer" | sed -n 's/^Local-Gate: [0-9a-f]\{40\} (.*, \([0-9]*\)s)$/\1/p')
+
+    if [ "$claim_tree" != "$tree" ]; then
+        cat >&2 <<EOF
+REFUSING the push: $short carries a stale Local-Gate trailer.
+
+    trailer claims tree : $claim_tree
+    tree being pushed  : $tree
+
+A trailer naming another tree is a stale or copy-pasted claim; GitHub would
+silently run the suite anyway, so the fast lane would just be a lie. Either
+re-prove the tree you are pushing:
+
+    scripts/gate-local.sh            # prints the correct trailer
+    scripts/gate-local.sh --amend    # ...and appends it to HEAD
+
+or drop the trailer line from the commit message and let GitHub run the suite
+(the default path). To bypass this check: SKIP_LOCAL_GATE=1 git push ...
+EOF
+        refused=1
+        continue
+    fi
+
+    stamp=$stamp_dir/$tree.ok
+    if [ ! -f "$stamp" ]; then
+        cat >&2 <<EOF
+REFUSING the push: $short claims a full-suite pass for tree $tree, but there
+is no stamp for it on this machine (looked for $stamp).
+
+The trailer is a claim that the suite ran HERE. Without the stamp it cannot be
+told apart from a hand-typed line. Reproduce a real stamp with:
+
+    scripts/gate-local.sh
+
+or drop the trailer and let GitHub run the suite. To bypass:
+SKIP_LOCAL_GATE=1 git push ...
+EOF
+        refused=1
+        continue
+    fi
+
+    stamp_scope=$(sed -n 's/^scope: //p' "$stamp" | tail -1)
+    stamp_passed=$(sed -n 's/^passed: //p' "$stamp" | tail -1)
+    stamp_seconds=$(sed -n 's/^duration_seconds: //p' "$stamp" | tail -1)
+    stamp_time=$(sed -n 's/^time: //p' "$stamp" | tail -1)
+
+    if [ "$stamp_scope" != full ]; then
+        cat >&2 <<EOF
+REFUSING the push: the trailer for tree $tree claims the full suite, but the
+stamp on disk is a scoped run (scope: $stamp_scope, $stamp_time).
+
+A scoped run is quick iteration, not a claim about the suite. Run the whole
+thing — scripts/gate-local.sh — or drop the trailer.
+EOF
+        refused=1
+        continue
+    fi
+
+    if [ "$stamp_passed" != "$claim_passed" ] || [ "$stamp_seconds" != "$claim_seconds" ]; then
+        cat >&2 <<EOF
+REFUSING the push: the trailer for tree $tree does not match its stamp.
+
+    trailer says : $claim_passed passed, ${claim_seconds}s
+    stamp says   : $stamp_passed passed, ${stamp_seconds}s   ($stamp_time)
+
+One of the two was edited by hand. Re-run scripts/gate-local.sh and use the
+line it prints.
+EOF
+        refused=1
+        continue
+    fi
+
+    echo "pre-push: tree $tree verified locally ($stamp_passed passed, ${stamp_seconds}s, $stamp_time) — GitHub will skip its own suite."
+done
+
+exit $refused

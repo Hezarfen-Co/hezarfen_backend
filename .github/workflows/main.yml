@@ -12,6 +12,18 @@
 #                      restart the stack, /health-gated rollback to the
 #                      previous tag, independent after-the-fact verify.
 #
+# Two test paths, the default being the full one:
+#   DEFAULT   GitHub does everything: the suite runs on the runner, then the
+#             build, the pack and the deploy.
+#   SPECIAL   Run the full suite on your own machine first
+#             (scripts/gate-local.sh — 565s there vs ~55min on a 4-core
+#             runner). It prints (or, with --amend, appends) a
+#             `Local-Gate: <tree> (<n> passed, <t>s)` trailer; commit it and
+#             GitHub only packs and deploys. The "Decide test gate" step
+#             verifies the trailer against HEAD^{tree} before honouring it —
+#             a stale or copy-pasted trailer silently falls back to running
+#             the suite.
+#
 # Clippy and Build and test run in parallel. Deploy needs both green.
 # A new push cancels in-flight Clippy/Build on the same ref; it never
 # cancels an in-flight Deploy (two deploys racing would interleave the
@@ -21,11 +33,14 @@
 #   * "Re-run failed jobs" on a run whose Deploy step failed re-runs ONLY the
 #     ~1-minute deploy job — the built image is still in the run's artifact.
 #   * workflow_dispatch (the manual door: Actions tab → Run workflow on main,
-#     or `gh workflow run main.yml --ref main`) deploys WITHOUT the suite: it
-#     takes the newest artifact a green Build-and-test produced — which can
-#     lag HEAD while a push is mid-CI, and that is the point: redeploy the
-#     known-good image, e.g. after a server-side fix (env file, proxy,
-#     database). For env-only changes a plain
+#     or `gh workflow run main.yml --ref main`) deploys WITHOUT the suite by
+#     default: it takes the newest artifact a green Build-and-test produced —
+#     which can lag HEAD while a push is mid-CI, and that is the point:
+#     redeploy the known-good image, e.g. after a server-side fix (env file,
+#     proxy, database). Its `tests` input overrides that: `force` runs the
+#     whole build job, suite included, on the dispatched ref and deploys that
+#     fresh artifact; `skip` (and `auto`) take the newest green one. For
+#     env-only changes a plain
 #     `ssh <vps> 'systemctl --user restart hezarfen_backend_compose'` needs no
 #     workflow at all: the stack re-reads its env files on the next
 #     `podman compose up`.
@@ -49,6 +64,15 @@ on:
       - main
   # The manual redeploy door — see the header comment for how and why.
   workflow_dispatch:
+    inputs:
+      tests:
+        description: "Run the test suite on this run? auto/skip redeploy the newest green artifact; force builds and tests the dispatched ref first."
+        type: choice
+        options:
+          - auto
+          - skip
+          - force
+        default: auto
 
 # Deploy serialisation lives on the deploy job, not the workflow: a new
 # push must be allowed to cancel stale Clippy/Build without touching an
@@ -115,9 +139,10 @@ jobs:
 
   build:
     name: Build and test
-    # Pushes only: a manual redeploy reuses the newest green artifact
-    # instead of paying the suite again.
-    if: github.event_name == 'push'
+    # Pushes always build (and, by default, test). A manual redeploy reuses
+    # the newest green artifact instead of paying the suite again, unless the
+    # dispatch asks for `tests: force`, which builds and tests this ref.
+    if: github.event_name == 'push' || github.event.inputs.tests == 'force'
     concurrency:
       group: ci-${{ github.workflow }}-${{ github.ref }}-build
       cancel-in-progress: true
@@ -173,10 +198,48 @@ jobs:
           # later run.
           prefix-key: v1-rust-gnu
 
+      # ── Which test path this run takes ──────────────────────────────────
+      # SPECIAL: a commit carrying a self-consistent `Local-Gate:` trailer was
+      # already through the suite on the developer's machine
+      # (scripts/gate-local.sh prints it; --amend appends it), so this run
+      # only packs and deploys.
+      # Verified, never trusted: the trailer's tree must equal HEAD^{tree}, so
+      # a stale or copy-pasted trailer silently falls back to running the
+      # suite. The log always says which branch was taken, and why.
+      # Trailer shape: `Local-Gate: <40-hex tree> (<n> passed, <t>s)`.
+      - name: Decide test gate
+        id: gate
+        run: |
+          set -euo pipefail
+          # Only reaches here on a push, or a dispatch with tests=force (the
+          # job-level `if` skips the other dispatch modes) — and force means
+          # the caller explicitly asked for the suite.
+          mode='${{ github.event.inputs.tests }}'
+          tree=$(git rev-parse HEAD^{tree})
+          if [ "$mode" = force ]; then
+            echo "workflow_dispatch tests=force ⇒ running the suite on this ref"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          claim=$(git log -1 --format=%B \
+            | sed -n 's/^Local-Gate: \([0-9a-f]\{40\}\) (\(.*\))$/\1|\2/p' \
+            | tail -1)
+          if [ -z "$claim" ]; then
+            echo "no Local-Gate trailer on $(git rev-parse --short HEAD) ⇒ running the suite (the default path)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "${claim%%|*}" != "$tree" ]; then
+            echo "local gate claims tree ${claim%%|*}; actual tree $tree ⇒ running tests anyway"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "local gate trailer matches tree $tree ⇒ skipping the suite (${claim#*|})"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # The suite mints a control+school database pair per test; the default
       # 100-connection ceiling runs out under that, so the server gets the
       # same 500 the compose stack runs (see compose.yaml).
       - name: Start Postgres
+        if: steps.gate.outputs.skip != 'true'
         run: |
           docker run -d --name hezarfen_backend_pg \
             -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_PASSWORD" \
@@ -189,6 +252,7 @@ jobs:
           docker exec hezarfen_backend_pg pg_isready -U "$PG_USER"
 
       - name: Install cargo-nextest
+        if: steps.gate.outputs.skip != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -202,6 +266,7 @@ jobs:
       # nextest does not know is warned about by name — so a silently
       # ignored slow-timeout cannot hide.
       - name: Test environment
+        if: steps.gate.outputs.skip != 'true'
         run: |
           df -h /
           free -m
@@ -223,18 +288,20 @@ jobs:
       # not the yardstick — so 70 min clears the worst green by ~10 min and
       # still sits below the 90-minute job timeout.
       - name: Test
+        if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
           timeout --foreground 4200 \
             cargo nextest run --no-fail-fast --config-file .config/nextest.toml
 
-      # Always, including when the step above was killed: the discriminator.
-      # If the stall is a DB-side wait (the suite mints and clones control+
-      # school databases per test), this names the query and the state; if it
-      # is disk or memory, df/free show it; docker's own log shows a crashed
-      # or refusing Postgres.
+      # Always *within the test path*, including when the step above was
+      # killed: the discriminator. If the stall is a DB-side wait (the suite
+      # mints and clones control+school databases per test), this names the
+      # query and the state; if it is disk or memory, df/free show it;
+      # docker's own log shows a crashed or refusing Postgres. Skipped when
+      # the local gate already proved the suite — there is no container then.
       - name: Stall diagnostics
-        if: always()
+        if: always() && steps.gate.outputs.skip != 'true'
         run: |
           echo '=== df -h / ==='; df -h / || true
           echo '=== free -m ==='; free -m || true
@@ -300,19 +367,20 @@ jobs:
       group: deploy
       cancel-in-progress: false
     # Push: only behind green clippy AND a green build — both gate the server.
-    # Dispatch: both CI jobs are skipped on purpose (see their `if`), and
-    # `always()` is what stops that skip from cascading past this gate.
+    # Dispatch: clippy/build are skipped unless tests=force, and `always()` is
+    # what stops that skip from cascading past this gate; a skipped job is
+    # accepted only there, and a failure anywhere still blocks.
     if: >-
       always() &&
-      ((needs.clippy.result == 'success' && needs.build.result == 'success') ||
-       (github.event_name == 'workflow_dispatch' &&
-        needs.clippy.result == 'skipped' &&
-        needs.build.result == 'skipped'))
+      (needs.clippy.result == 'success' || needs.clippy.result == 'skipped') &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-24.04
     steps:
-      # A push deploy takes the release this very run built and gated.
+      # The release this very run built and gated: a push always; a dispatch
+      # with tests=force too. A dispatch that reused the newest green build
+      # has no build job at all, hence the `skipped` branch below.
       - name: Fetch this run's release
-        if: github.event_name == 'push'
+        if: needs.build.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: release
@@ -324,7 +392,7 @@ jobs:
       # release we want back on the server. `gh run list --status success`
       # would skip exactly those, hence the per-run job check.
       - name: Find the newest green build
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.build.result == 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -344,7 +412,7 @@ jobs:
           echo "run_id=$run_id" >> "$GITHUB_ENV"
 
       - name: Fetch the green release
-        if: github.event_name == 'workflow_dispatch'
+        if: needs.build.result == 'skipped'
         uses: actions/download-artifact@v4
         with:
           name: release
