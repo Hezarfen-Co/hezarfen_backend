@@ -30,7 +30,9 @@ use crate::web::CurrentUser;
 use std::collections::BTreeMap;
 
 pub fn routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(bridge_certificate, capabilities))
+    OpenApiRouter::new()
+        .routes(routes!(bridge_certificate))
+        .routes(routes!(capabilities))
 }
 
 /// Everything a service needs to reach the bridge, except the shared token
@@ -123,6 +125,7 @@ pub struct CapabilityWorkers {
     get,
     path = "/capabilities",
     tag = "ai",
+    security(("session_cookie" = [])),
     responses(
         (status = 200, description = "Every capability a connected worker serves, grouped and sorted", body = CapabilitiesResponse),
         (status = 401, description = "No authenticated session", body = ErrorResponse),

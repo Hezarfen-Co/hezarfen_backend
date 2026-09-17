@@ -966,6 +966,7 @@ async fn a_chat_request_names_the_askers_school_role() {
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: Some(bridge.clone()),

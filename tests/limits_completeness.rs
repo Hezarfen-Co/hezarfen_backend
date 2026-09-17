@@ -114,11 +114,24 @@ const EXCLUDED: &[(&str, &str)] = &[
          waits on it",
     ),
     (
+        "AI_RAG_CHAT_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_RAG_CHAT_TIMEOUT_SECS",
+        "deadline on one RAG ask round trip; the browser waits on its message \
+         stream, never on this number",
+    ),
+    (
         "CHAT_STREAM_POLL_MS",
         "server-side poll cadence behind the SSE stream",
     ),
     (
         "CHATBOT_PENDING_STALE_SECS",
+        "when a stuck answer is declared failed",
+    ),
+    (
+        "RAG_PENDING_STALE_SECS",
         "when a stuck answer is declared failed",
     ),
     // Seed data for the settings singleton, not a bound. The live list is on
@@ -202,6 +215,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     (
         "DEFAULT_CHATBOT_RATE_LIMIT",
+        "env-tunable; live value served in /limits `rate`",
+    ),
+    (
+        "DEFAULT_RAG_RATE_LIMIT",
         "env-tunable; live value served in /limits `rate`",
     ),
     ("MILLIS_PER_DAY", "unit conversion, not a limit"),

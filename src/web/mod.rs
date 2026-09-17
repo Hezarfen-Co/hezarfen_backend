@@ -32,6 +32,7 @@ pub mod notes;
 pub mod payments;
 pub mod pomodoro;
 pub mod questions;
+pub mod rag;
 pub mod room;
 pub mod sessions;
 pub mod settings;
@@ -100,6 +101,66 @@ use crate::error::{AppError, ValidationError};
 /// the caller's own: a demoted account may hold neither, and the row this
 /// request did not write is exactly the one a lost sweep left behind.
 ///
+/// The Sender half of one SSE turn stream. Shared by the chatbot and RAG
+/// nests, which stream a finished answer identically.
+pub(crate) type EventSender =
+    tokio::sync::mpsc::Sender<Result<axum::response::sse::Event, axum::Error>>;
+
+/// Queue one SSE event. `Err` means the client hung up — stop streaming.
+pub(crate) async fn sse_send(
+    tx: &EventSender,
+    name: &str,
+    data: serde_json::Value,
+) -> Result<(), ()> {
+    let event = axum::response::sse::Event::default()
+        .event(name)
+        .json_data(&data)
+        .unwrap_or_else(|err| {
+            tracing::error!("could not encode an SSE event: {err}");
+            axum::response::sse::Event::default()
+                .event("error")
+                .data("{\"code\":\"internal\"}")
+        });
+    tx.send(Ok(event)).await.map_err(|_| ())
+}
+
+/// Queue the terminal `error` event, with a stable code the frontend branches
+/// on and a human-readable message.
+pub(crate) async fn sse_error(tx: &EventSender, code: &str, message: &str) {
+    let _ = sse_send(
+        tx,
+        "error",
+        serde_json::json!({ "code": code, "message": message }),
+    )
+    .await;
+}
+
+/// Cut a finished answer into a handful of `delta` chunks.
+///
+/// Fake streaming: `hab/2` is unary, so the whole text is already in hand and
+/// this only lets the UI paint it progressively instead of in one jump. The
+/// day the protocol grows chunk frames, this is the single function that goes
+/// away — nothing else in the stream knows where a chunk came from.
+///
+/// Splits on character boundaries (never bytes: a clipped UTF-8 sequence would
+/// render as garbage), and never returns an empty chunk. Short answers stay
+/// whole — dribbling "hi" out one letter at a time is worse than not
+/// pretending to stream at all.
+pub(crate) fn slice_reply(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let size = chars
+        .len()
+        .div_ceil(crate::constant::REPLY_CHUNKS)
+        .max(crate::constant::MIN_CHUNK_CHARS);
+    chars
+        .chunks(size)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
 /// A missing user counts as demoted. The ordinary path is one extra read and no
 /// write at all.
 pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<(), AppError> {

@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
         chatbot_limit: UserRateLimiter::per_user_minute(cfg.chatbot_per_minute),
+        rag_limit: UserRateLimiter::per_user_minute(cfg.rag_per_minute),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai,

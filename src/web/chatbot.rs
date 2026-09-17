@@ -39,7 +39,7 @@ use utoipa_axum::routes;
 use crate::ai::chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 use crate::ai::{AiBridge, AiError};
 use crate::constant::{
-    AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, MIN_CHUNK_CHARS, REPLY_CHUNKS,
+    AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, REPLY_CHUNKS,
 };
 use crate::database::Database;
 use crate::domain::chatbot_message::{
@@ -53,7 +53,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
 use crate::state::{AppState, scoped_key};
 
-use super::{CurrentUser, Page, PageParams, ai_unavailable};
+use super::{CurrentUser, Page, PageParams, ai_unavailable, slice_reply, sse_error, sse_send};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -768,12 +768,12 @@ async fn stream_message(
                 Ok(Some(message)) => message,
                 // Deleted mid-stream (the thread went away) — say so and stop.
                 Ok(None) => {
-                    send_error(&tx, "not_found", "this message no longer exists").await;
+                    sse_error(&tx, "not_found", "this message no longer exists").await;
                     return;
                 }
                 Err(err) => {
                     tracing::warn!("chat stream read failed: {err}");
-                    send_error(&tx, "internal", "could not read the message").await;
+                    sse_error(&tx, "internal", "could not read the message").await;
                     return;
                 }
             };
@@ -785,17 +785,17 @@ async fn stream_message(
                 MessageStatus::Pending => continue,
                 MessageStatus::Complete => {
                     for chunk in slice_reply(message.get_content().as_str()) {
-                        if send(&tx, "delta", json!({ "text": chunk })).await.is_err() {
+                        if sse_send(&tx, "delta", json!({ "text": chunk })).await.is_err() {
                             return;
                         }
                     }
                     let done = json!({ "message": ChatbotMessageResponse::new(&message) });
-                    let _ = send(&tx, "done", done).await;
+                    let _ = sse_send(&tx, "done", done).await;
                     return;
                 }
                 MessageStatus::Failed => {
                     let code = message.get_error_code().unwrap_or("failed");
-                    send_error(&tx, code, "the assistant could not answer this message").await;
+                    sse_error(&tx, code, "the assistant could not answer this message").await;
                     return;
                 }
             }
@@ -803,49 +803,6 @@ async fn stream_message(
     });
 
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
-}
-
-type EventSender = mpsc::Sender<Result<Event, axum::Error>>;
-
-/// Queue one SSE event. `Err` means the client hung up — stop streaming.
-async fn send(tx: &EventSender, name: &str, data: serde_json::Value) -> Result<(), ()> {
-    let event = Event::default()
-        .event(name)
-        .json_data(&data)
-        .unwrap_or_else(|err| {
-            tracing::error!("could not encode a chat SSE event: {err}");
-            Event::default()
-                .event("error")
-                .data("{\"code\":\"internal\"}")
-        });
-    tx.send(Ok(event)).await.map_err(|_| ())
-}
-
-async fn send_error(tx: &EventSender, code: &str, message: &str) {
-    let _ = send(tx, "error", json!({ "code": code, "message": message })).await;
-}
-
-/// Cut a finished answer into a handful of `delta` chunks.
-///
-/// Fake streaming: `hab/2` is unary, so the whole text is already in hand and
-/// this only lets the UI paint it progressively instead of in one jump. The
-/// day the protocol grows chunk frames, this is the single function that goes
-/// away — nothing else in the stream knows where a chunk came from.
-///
-/// Splits on character boundaries (never bytes: a clipped UTF-8 sequence would
-/// render as garbage), and never returns an empty chunk. Short answers stay
-/// whole — dribbling "hi" out one letter at a time is worse than not
-/// pretending to stream at all.
-fn slice_reply(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return Vec::new();
-    }
-    let size = chars.len().div_ceil(REPLY_CHUNKS).max(MIN_CHUNK_CHARS);
-    chars
-        .chunks(size)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
 }
 
 #[cfg(test)]

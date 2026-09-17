@@ -615,6 +615,22 @@ pub const MAX_RAG_SCOPE_PAIRS: usize = 200;
 /// a retrieval over the whole course-note corpus before it generates anything.
 pub const DEFAULT_RAG_RATE_LIMIT: u32 = 6;
 
+/// The most citations one `rag.chat` answer may carry into its stored reply.
+/// The service is a trust boundary — everything it sends is written verbatim
+/// into a school's database — so an answer citing more is refused whole rather
+/// than trimmed: dropping entries would leave `[N]` markers in the answer text
+/// pointing at nothing, and a reader cannot tell a clipped citation list from
+/// a complete one.
+pub const MAX_RAG_CITATIONS: usize = 50;
+
+/// The most pages one citation may name, the second axis of the same bound.
+/// One reply's citations are therefore at most
+/// `MAX_RAG_CITATIONS × MAX_RAG_CITATION_PAGES` page numbers, so however a
+/// service distributes them it cannot turn a single stored answer into an
+/// unbounded payload — the same storage-protection shape as
+/// [`MAX_NOTE_FILES`], but for a body this backend does not compose.
+pub const MAX_RAG_CITATION_PAGES: usize = 50;
+
 /// Hard ceiling on one chat message's characters — the newtype bound, above
 /// which no school setting can reach. Sized for a pasted question with its
 /// working, well under [`AI_MAX_FRAME_BYTES`] once history rides along.

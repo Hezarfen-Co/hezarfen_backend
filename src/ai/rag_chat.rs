@@ -16,6 +16,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ai::chat::ChatRole;
+use crate::constant::{
+    AI_RAG_CHAT_CAPABILITY, AI_RAG_CHAT_TIMEOUT_SECS, MAX_RAG_CITATIONS, MAX_RAG_CITATION_PAGES,
+};
 
 /// One `(sınıf, ders)` pair the question is scoped to.
 ///
@@ -125,6 +128,245 @@ pub struct RagChatReplyPayload {
     /// The passages the answer drew on, oldest first.
     #[serde(default)]
     pub citations: Vec<RagCitation>,
+}
+
+/// Ask a RAG service one question and resolve what came back.
+///
+/// The request is built from what the session already proves — `asker` and
+/// `asker_role` are read from the live session by the caller, never taken from
+/// a body, and `scope` from the asker's own memberships — and the reply is
+/// mapped into what a message row can hold: the answer text, the abstention,
+/// and the citations whose corpus `doc_id` resolves to a course-note file the
+/// asker may view.
+///
+/// `Err` is a short, stable code for the turn's `error_code` — a transport
+/// failure, the service's own `Response::Err` verdict, or `bad_reply` when the
+/// reply was unreadable or exceeded a storage cap. Two codes are special:
+/// `role_required` and `scope_mismatch` mean the **backend** built a request
+/// the service may not answer. The turn still fails — an answer is not safe to
+/// invent — but this side of the bridge is the bug, so it is logged as one.
+#[allow(clippy::too_many_arguments)] // the whole turn context, spelled once
+pub async fn answer(
+    db: &crate::database::Database,
+    bridge: &crate::ai::AiBridge,
+    slug: &crate::tenant::Slug,
+    thread: &crate::domain::rag_thread::RagThreadId,
+    fresh: &[crate::domain::rag_message::RagMessageId; 2],
+    prompt: String,
+    asker: &crate::domain::user::UserId,
+    asker_role: crate::domain::role::Role,
+    scope: Vec<RagScopePair>,
+    history: Vec<RagTurn>,
+) -> Result<(String, crate::domain::rag_message::RagReply), String> {
+    let scope_pairs = scope.len();
+    let payload = serde_json::to_value(RagChatRequestPayload {
+        message: prompt,
+        asker: asker.key(),
+        asker_role: asker_role.as_str().to_string(),
+        scope,
+        history,
+    })
+    .map_err(|err| {
+        tracing::error!("could not encode a rag.chat request: {err}");
+        "internal".to_string()
+    })?;
+    tracing::debug!(
+        "dispatching rag.chat for thread {} (answer {}): {scope_pairs} scope pairs",
+        thread.key(),
+        fresh[1].key()
+    );
+
+    let raw = bridge
+        .dispatch_with_timeout(
+            slug,
+            AI_RAG_CHAT_CAPABILITY,
+            payload,
+            std::time::Duration::from_secs(AI_RAG_CHAT_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(failure_code)?;
+    let reply: RagChatReplyPayload = serde_json::from_value(raw).map_err(|err| {
+        tracing::warn!("AI service answered with an unreadable rag.chat payload: {err}");
+        "bad_reply".to_string()
+    })?;
+
+    // The service is a trust boundary: a reply past a storage cap is refused
+    // whole rather than clipped. A half-cited answer reads as a complete one,
+    // and an unbounded answer is bytes a service chose to write into a
+    // school's database.
+    if reply.citations.len() > MAX_RAG_CITATIONS {
+        tracing::error!(
+            "rag.chat returned {} citations, over the {MAX_RAG_CITATIONS} cap",
+            reply.citations.len()
+        );
+        return Err("bad_reply".to_string());
+    }
+    if let Some(over) = reply
+        .citations
+        .iter()
+        .find(|citation| citation.pages.len() > MAX_RAG_CITATION_PAGES)
+    {
+        tracing::error!(
+            "rag.chat citation {} names {} pages, over the {MAX_RAG_CITATION_PAGES} cap",
+            over.n,
+            over.pages.len()
+        );
+        return Err("bad_reply".to_string());
+    }
+
+    // The two verdicts that mean the *backend* built a bad request: the scope
+    // or the asker's role it sent is not something the service may answer. The
+    // turn still fails, but this is a bug on this side of the bridge, so it is
+    // logged as one rather than as an ordinary service refusal.
+    if matches!(reply.reason.as_str(), "role_required" | "scope_mismatch") {
+        tracing::error!(
+            "rag.chat refused a request the backend built: {} (asker {})",
+            reply.reason,
+            asker.key()
+        );
+        return Err(reply.reason);
+    }
+
+    if reply.text.trim().is_empty() && !reply.abstained {
+        // Nothing to show, and the domain would refuse to store it anyway. A
+        // blank bubble is indistinguishable from a bug, so it is reported as
+        // one.
+        tracing::warn!("rag.chat answered with a blank, non-abstained reply");
+        return Err("empty_reply".to_string());
+    }
+
+    let citations = resolve_citations(db, asker, &reply.citations).await;
+    Ok((
+        reply.text,
+        crate::domain::rag_message::RagReply {
+            abstained: reply.abstained,
+            reason: reply.reason,
+            citations,
+        },
+    ))
+}
+
+/// Resolve each citation's corpus `doc_id` to the course-note file that owns
+/// it, keeping only a file whose course the asker may view.
+///
+/// One read per *distinct* `doc_id`: identical PDF bytes resolve to the same
+/// document, so one document may be claimed by several files — across courses,
+/// which is exactly why the visibility check is per candidate and not per
+/// document. The first visible candidate wins, in the store's own order, so two
+/// identical turns resolve a citation the same way. A citation whose document
+/// no visible file claims keeps every other field and stores `file: null` —
+/// the passage stays citable, only not openable.
+async fn resolve_citations(
+    db: &crate::database::Database,
+    asker: &crate::domain::user::UserId,
+    citations: &[RagCitation],
+) -> Vec<crate::domain::rag_message::RagCitedFile> {
+    let user = match crate::service::user::read(db, asker).await {
+        Ok(Some(user)) => Some(user),
+        // The asker vanished mid-turn (only reachable through a deleted
+        // account): nothing can be visible to them, so nothing resolves.
+        Ok(None) => {
+            tracing::warn!("the asker is gone; citations stay unresolved");
+            None
+        }
+        Err(err) => {
+            tracing::warn!("could not read the asker for citation resolution: {err}");
+            None
+        }
+    };
+
+    let mut candidates: std::collections::HashMap<&str, Vec<crate::domain::course_note_file::CourseNoteFile>> =
+        std::collections::HashMap::new();
+    for citation in citations {
+        if !candidates.contains_key(citation.doc_id.as_str()) {
+            let files =
+                match crate::db::course_note_file::find_by_rag_doc_id(db, &citation.doc_id).await {
+                    Ok(files) => files,
+                    Err(err) => {
+                        tracing::warn!("could not resolve doc {}: {err}", citation.doc_id);
+                        Vec::new()
+                    }
+                };
+            candidates.insert(citation.doc_id.as_str(), files);
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(citations.len());
+    for citation in citations {
+        let file = match &user {
+            Some(user) => {
+                let files = candidates
+                    .get(citation.doc_id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                first_visible_file(db, user, files).await
+            }
+            None => None,
+        };
+        resolved.push(crate::domain::rag_message::RagCitedFile {
+            n: citation.n,
+            file,
+            pages: citation.pages.clone(),
+            span_ids: citation.span_ids.clone(),
+            ders: citation.ders.clone(),
+        });
+    }
+    resolved
+}
+
+/// The first candidate file whose owning course `user` may view, in the
+/// store's order; `None` when the document is claimed by no file they can
+/// open. A read that fails mid-walk is treated like a file they cannot see —
+/// the citation still lands, only unresolved.
+async fn first_visible_file(
+    db: &crate::database::Database,
+    user: &crate::domain::user::User,
+    candidates: &[crate::domain::course_note_file::CourseNoteFile],
+) -> Option<String> {
+    for candidate in candidates {
+        let Some(note) = crate::db::course_note::read(db, candidate.get_course_note())
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(course) = crate::db::course::read(db, note.get_course()).await.ok().flatten()
+        else {
+            continue;
+        };
+        match crate::service::course::can_view_course(&course, user, db).await {
+            Ok(true) => return Some(candidate.get_id().key().to_string()),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!("could not check course visibility for a citation: {err}");
+            }
+        }
+    }
+    None
+}
+
+/// A dispatch failure as a short, stable code the frontend can branch on. The
+/// same mapping the chatbot nest applies to its own round trip.
+fn failure_code(err: crate::ai::AiError) -> String {
+    use crate::ai::AiError;
+    match err {
+        AiError::NoWorker(_) | AiError::Setup(_) => "unavailable".to_string(),
+        AiError::Busy(_) => "busy".to_string(),
+        AiError::Timeout(_) => "timed_out".to_string(),
+        AiError::Transport(_) => "transport".to_string(),
+        AiError::Protocol(_) | AiError::IdMismatch { .. } => "protocol".to_string(),
+        // The service's own verdict. Kept verbatim (the domain trims it) so a
+        // service can define codes the backend has never heard of.
+        AiError::Remote { code, message } => {
+            tracing::warn!("AI RAG service refused the request: {code}: {message}");
+            if code.trim().is_empty() {
+                "service_error".to_string()
+            } else {
+                code
+            }
+        }
+    }
 }
 
 #[cfg(test)]

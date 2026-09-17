@@ -20,9 +20,10 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::service;
+use crate::service::instance::can_manage_instance;
 use crate::state::AppState;
 
-use super::instances::{can_manage_instance, can_view_instance};
+use super::instances::can_view_instance;
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SessionResponse, check_not_past,
     check_time_range, person_map, set_or_clear,

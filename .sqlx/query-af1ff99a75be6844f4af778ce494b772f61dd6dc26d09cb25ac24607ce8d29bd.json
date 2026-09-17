@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: RagThreadId\", owner AS \"owner: UserId\", title AS \"title: RagThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM rag_thread WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RagThreadId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: RagThreadTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "af1ff99a75be6844f4af778ce494b772f61dd6dc26d09cb25ac24607ce8d29bd"
+}

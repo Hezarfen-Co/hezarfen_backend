@@ -11,10 +11,10 @@ use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::{AppError, ErrorResponse};
+use crate::service::course::{can_manage_course, can_view_course};
 use crate::service::subject;
 use crate::state::AppState;
 
-use super::courses::{can_manage_course, can_view_course};
 use super::{CurrentUser, RequireTeacher, SubjectResponse};
 
 pub fn routes() -> OpenApiRouter<AppState> {

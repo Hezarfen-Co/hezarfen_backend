@@ -53,6 +53,7 @@ async fn mem_app() -> (Router, Database, TempDir) {
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: None,

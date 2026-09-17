@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS threads FROM rag_thread WHERE owner = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "threads",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "deab46f003d9670e1d3ee565904ecbce26d35538acde51805415caa6f75d9e77"
+}

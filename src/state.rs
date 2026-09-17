@@ -35,6 +35,11 @@ pub struct AppState {
     /// caller is only known after `CurrentUser` has run, so handlers call it
     /// themselves.
     pub chatbot_limit: UserRateLimiter,
+    /// Per-user RAG limit (see [`UserRateLimiter`], built from
+    /// [`crate::config::Config::rag_per_minute`]). Not middleware: the
+    /// caller is only known after `CurrentUser` has run, so handlers call it
+    /// themselves.
+    pub rag_limit: UserRateLimiter,
     /// Who is inside which exam room right now (see [`ExamPresence`]).
     pub exam_presence: ExamPresence,
     /// Live stroke fan-out for the shared whiteboards (see [`BoardHub`]).

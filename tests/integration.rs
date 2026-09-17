@@ -199,6 +199,7 @@ async fn limits_still_answers_while_the_database_is_down() {
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: None,
@@ -433,7 +434,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 269;
+    const MIN_PROTECTED: usize = 318;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
@@ -6541,6 +6542,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: None,
@@ -6581,6 +6583,7 @@ async fn db_down_refuses_before_touching_the_database() {
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: None,
@@ -16924,6 +16927,7 @@ async fn chat_app_limited(
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit,
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai,

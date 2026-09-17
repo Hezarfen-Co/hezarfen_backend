@@ -30,11 +30,11 @@ use crate::domain::term::TermId;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::service;
+use crate::service::instance::can_manage_instance;
 use crate::service::karne::KarneReport;
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
-use super::instances::can_manage_instance;
 use super::{CourseResponse, CurrentUser, course_people, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
