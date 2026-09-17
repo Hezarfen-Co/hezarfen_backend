@@ -1006,6 +1006,30 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
     (app, db)
 }
 
+/// A router wired to `bridge` whose per-user RAG tier is metered: what
+/// `RATE_LIMIT_RAG_PER_MINUTE` configures in production, low enough to exhaust
+/// inside a test.
+async fn rag_app_limited(
+    bridge: &AiBridge,
+    rag_limit: hezarfen_backend::rate_limit::UserRateLimiter,
+) -> (Router, Database) {
+    let (tenants, db) = common::mem_deployment().await;
+    let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
+        db: tenants.control().clone(),
+        tenants,
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        rag_limit,
+        exam_presence: Default::default(),
+        board_hub: Default::default(),
+        ai: Some(bridge.clone()),
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
+    });
+    (app, db)
+}
+
 /// Register, log in, and open one thread. Returns (session cookie, thread id).
 async fn chat_user(app: &Router, name: &str) -> (String, String) {
     let cookie = common::login(app, name).await;
@@ -3058,4 +3082,275 @@ async fn a_rag_reply_past_the_citation_caps_fails_the_turn() {
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "bad_reply", "{turn}");
     assert_eq!(turn["content"], "", "nothing of the over-cap answer is stored");
+}
+
+/// The second axis of the same bound: **one** citation is under the
+/// citation-count cap, so only the per-citation page cap can refuse this reply.
+/// The turn fails whole — the answer text is dropped with it, and the thread's
+/// own read shows the failure, not only the polling read of that one turn.
+#[tokio::test]
+async fn a_rag_reply_past_the_pages_per_citation_cap_fails_the_turn() {
+    let bridge = bridge().await;
+    // 51 pages on one citation: one past `MAX_RAG_CITATION_PAGES`, and the
+    // citation count stays at 1 so the other arm cannot be what refused this.
+    let pages: Vec<i64> = (1..=51).collect();
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "cevap",
+            "abstained": false,
+            "reason": "",
+            "citations": [{ "n": 1, "doc_id": "d", "pages": pages, "span_ids": [], "ders": null }],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, thread) = rag_user(&app, "ali").await;
+
+    let mid = rag_ask(&app, &cookie, &thread, "soru").await;
+    let turn = rag_settled(&app, &cookie, &thread, &mid).await;
+    assert_eq!(turn["status"], "failed", "{turn}");
+    assert_eq!(turn["error_code"], "bad_reply", "{turn}");
+    assert_eq!(
+        turn["content"], "",
+        "nothing of the over-cap answer is stored"
+    );
+    assert_eq!(
+        turn["citations"],
+        json!([]),
+        "the over-cap citation is not stored either: {turn}"
+    );
+
+    // The thread walk agrees with the single-turn read: the failure is durable.
+    let res = common::send(
+        &app,
+        "GET",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let answer = common::items(&res.body)
+        .iter()
+        .find(|row| row["id"] == json!(mid))
+        .expect("the reserved assistant row is in the thread");
+    assert_eq!(answer["status"], "failed", "{answer}");
+    assert_eq!(answer["error_code"], "bad_reply", "{answer}");
+    assert_eq!(answer["content"], "", "{answer}");
+}
+
+/// The RAG nest's own per-user tier: charged before anything is written, so a
+/// refused question leaves the thread exactly as it was. The chatbot twin's
+/// tier is a different limiter — this asserts the RAG one is wired and metered
+/// on the send path, `429` with the advertised delay.
+#[tokio::test]
+async fn rag_rate_limit_refuses_before_anything_is_written() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "cevap",
+            "abstained": false,
+            "reason": "",
+            "citations": [],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = rag_app_limited(
+        &bridge,
+        hezarfen_backend::rate_limit::UserRateLimiter::per_user_minute(2),
+    )
+    .await;
+    let (cookie, thread) = rag_user(&app, "ali").await;
+
+    for n in 1..=2 {
+        let mid = rag_ask(&app, &cookie, &thread, &format!("soru {n}")).await;
+        let turn = rag_settled(&app, &cookie, &thread, &mid).await;
+        assert_eq!(turn["status"], "complete", "turn {n}: {turn}");
+    }
+    let res = common::send(
+        &app,
+        "GET",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let before = common::total(&res.body);
+    assert_eq!(
+        before, 4,
+        "two questions and their two answers: {}",
+        res.body
+    );
+
+    let (status, headers, _) = common::send_raw(
+        &app,
+        "POST",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(&cookie),
+        Some("application/json"),
+        json!({ "content": "ucuncu" }).to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = headers
+        .get("retry-after")
+        .expect("Retry-After tells the client when to come back")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .expect("whole seconds");
+    assert!((1..=60).contains(&retry_after), "{retry_after}");
+
+    let res = common::send(
+        &app,
+        "GET",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        common::total(&res.body),
+        before,
+        "a refused turn wrote rows: {}",
+        res.body
+    );
+}
+
+/// Parse a complete SSE body into `(event, data)` frames.
+///
+/// The framing is the thing to be careful about: frames are separated by a
+/// **blank line**, and the separator's line ending is not guaranteed to be the
+/// `\n` axum writes — a proxy on the path may hand back `\r\n` — so CRLF is
+/// folded first. A keep-alive arrives as a comment-only frame with no `event:`
+/// line and is skipped.
+fn sse_frames(body: &str) -> Vec<(String, Value)> {
+    body.replace("\r\n", "\n")
+        .split("\n\n")
+        .filter_map(|frame| {
+            let name = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event:"))
+                .map(|name| name.trim().to_string())?;
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data:"))
+                .expect("every rag event carries a data line")
+                .trim();
+            Some((
+                name,
+                serde_json::from_str(data).expect("event data is json"),
+            ))
+        })
+        .collect()
+}
+
+/// A late-connecting client's case: the turn already settled, the stream
+/// replays its `delta`s and a `done` whose message carries the whole DTO.
+/// The `done` payload is the **only** place a citation's wire shape crosses
+/// SSE, so a resolved `file` is asserted here and not only on the polling read.
+#[tokio::test]
+async fn a_rag_stream_replays_a_settled_turn_with_its_citations() {
+    let bridge = bridge().await;
+    let answer = "kuvvet kutle carpi ivmedir. ".repeat(8);
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": answer,
+            "abstained": false,
+            "reason": "",
+            "citations": [{ "n": 1, "doc_id": "01DOC", "pages": [7], "span_ids": ["s-1"], "ders": "Fizik" }],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    // A course-note file claims the corpus document, so the citation resolves
+    // to something openable — the asker (the course's own manager) may view it.
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let course = common::create_course(&app, &staff, "Fizik").await;
+    let author = common::me_id(&app, &staff).await;
+    let note = Uuid::now_v7();
+    let file = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO course_note (id, course, author, title, content, file_count) \
+         VALUES ($1, $2, $3, 'Notlar', 'Newton', 1)",
+    )
+    .bind(note)
+    .bind(Uuid::parse_str(&course).expect("course id"))
+    .bind(Uuid::parse_str(&author).expect("author id"))
+    .execute(&db)
+    .await
+    .expect("seed course note");
+    sqlx::query(
+        "INSERT INTO course_note_file (id, course_note, name, content_type, size, rag_doc_id) \
+         VALUES ($1, $2, 'recap.pdf', 'application/pdf', 12, '01DOC')",
+    )
+    .bind(file)
+    .bind(note)
+    .execute(&db)
+    .await
+    .expect("seed course note file");
+
+    let res = common::send(&app, "POST", "/rag/threads", Some(&staff), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let thread = common::id_of(&res.body);
+    let mid = rag_ask(&app, &staff, &thread, "kütle nedir?").await;
+    let turn = rag_settled(&app, &staff, &thread, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["citations"][0]["file"], file.to_string(), "{turn}");
+
+    let (status, headers, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/rag/threads/{thread}/messages/{mid}/stream"),
+        Some(&staff),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let content_type = headers
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    let body = String::from_utf8(bytes).expect("an SSE body is UTF-8");
+    let events = sse_frames(&body);
+    let (last, deltas) = events.split_last().expect("at least a terminal event");
+    assert_eq!(last.0, "done", "{events:?}");
+    assert!(!deltas.is_empty(), "no delta arrived: {events:?}");
+    assert!(deltas.iter().all(|(name, _)| name == "delta"), "{events:?}");
+    let streamed: String = deltas
+        .iter()
+        .map(|(_, data)| data["text"].as_str().expect("delta carries text"))
+        .collect();
+    assert_eq!(streamed, turn["content"].as_str().unwrap(), "{events:?}");
+
+    // The `done` message and the polling read are the same turn, field for
+    // field — including the resolved citation, which no `delta` carries.
+    let message = &last.1["message"];
+    assert_eq!(message, &turn, "the two reads must not disagree");
+    let citation = &message["citations"][0];
+    assert_eq!(citation["n"], 1, "{message}");
+    assert_eq!(citation["file"], file.to_string(), "{message}");
+    assert_eq!(citation["pages"], json!([7]), "{message}");
+    assert_eq!(citation["span_ids"], json!(["s-1"]), "{message}");
+    assert_eq!(citation["ders"], "Fizik", "{message}");
 }
