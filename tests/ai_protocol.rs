@@ -1016,6 +1016,89 @@ async fn a_chat_request_names_the_askers_school_role() {
     .await;
 }
 
+// ------------------------------------------------- rag.chat payload keys --
+//
+// `rag.chat` is the other capability whose payload is a published contract.
+// In this wave nothing in the HTTP surface builds one yet, so its payload is
+// pinned by putting the crate's own payload through the real bridge and reading
+// the bytes exactly as a foreign service would: raw frames, and the documented
+// key sets — never parsed back through the crate's payload structs.
+
+#[tokio::test]
+async fn rag_chat_payloads_carry_the_documented_wire_keys() {
+    use hezarfen_backend::ai::{
+        RagChatReplyPayload, RagChatRequestPayload, RagCitation, RagScopePair,
+    };
+
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("rag", "rag.chat")).await;
+    await_workers(&bridge, 1).await;
+
+    let request = serde_json::to_value(RagChatRequestPayload {
+        message: "ikinci yasa nedir?".into(),
+        asker: "01ASKER".into(),
+        asker_role: "student".into(),
+        scope: vec![RagScopePair {
+            sinif: Some("11".into()),
+            ders: "Fizik".into(),
+        }],
+        history: Vec::new(),
+    })
+    .unwrap();
+    let call = dispatch(&bridge, "rag.chat", request);
+
+    let (frame, bytes, send, _recv) = raw::take_request(&service.conn).await;
+    assert_eq!(frame["capability"], "rag.chat");
+    assert_eq!(
+        raw::keys(&frame["payload"]),
+        ["asker", "asker_role", "history", "message", "scope"],
+        "the documented rag.chat request payload keys"
+    );
+    assert_eq!(
+        raw::keys(&frame["payload"]["scope"][0]),
+        ["ders", "sinif"],
+        "a scope pair is routed by (sinif, ders)"
+    );
+    // Byte-level: the `(sinif, ders)` pair set, not a re-wrapped shape.
+    let text = String::from_utf8(bytes).expect("the frame body is UTF-8 JSON");
+    assert!(
+        text.contains(r#""scope":[{"sinif":"11","ders":"Fizik"}]"#),
+        "{text}"
+    );
+
+    let reply = serde_json::to_value(RagChatReplyPayload {
+        text: "F = m·a [1]".into(),
+        abstained: false,
+        reason: String::new(),
+        citations: vec![RagCitation {
+            n: 1,
+            doc_id: "01DOC".into(),
+            pages: vec![3],
+            span_ids: vec!["s-7".into()],
+            ders: Some("Fizik".into()),
+        }],
+    })
+    .unwrap();
+    let id = frame["id"].as_str().expect("trace id").to_string();
+    raw::answer(
+        send,
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{reply}}}"#).as_bytes(),
+    )
+    .await;
+
+    let answer = call.await.unwrap().unwrap();
+    assert_eq!(
+        raw::keys(&answer),
+        ["abstained", "citations", "reason", "text"],
+        "the documented rag.chat reply payload keys"
+    );
+    assert_eq!(
+        raw::keys(&answer["citations"][0]),
+        ["ders", "doc_id", "n", "pages", "span_ids"],
+        "the documented citation keys"
+    );
+}
+
 // ------------------------------------------------------------- api reads --
 //
 // The other direction: a service opens its own stream and asks the school API

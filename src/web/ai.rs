@@ -26,9 +26,11 @@ use crate::ai::tls;
 use crate::constant::AI_PROTOCOL;
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
+use crate::web::CurrentUser;
+use std::collections::BTreeMap;
 
 pub fn routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(bridge_certificate))
+    OpenApiRouter::new().routes(routes!(bridge_certificate, capabilities))
 }
 
 /// Everything a service needs to reach the bridge, except the shared token
@@ -80,6 +82,82 @@ async fn bridge_certificate(
         certificate_pem: to_pem(der.as_ref()),
         fingerprint_sha256: tls::fingerprint(&der),
     }))
+}
+
+/// What the bridge can currently do, grouped by capability.
+#[derive(Serialize, ToSchema)]
+pub struct CapabilitiesResponse {
+    /// Whether a bridge is listening at all (`AI_QUIC_ADDR` set). `false` here
+    /// is a discovery answer, not an error: the deployment simply runs no AI.
+    enabled: bool,
+    /// The wire protocol the bridge speaks, currently `hab/2`.
+    #[schema(example = "hab/2")]
+    protocol: String,
+    /// One entry per capability any connected worker serves, sorted by name.
+    capabilities: Vec<CapabilityWorkers>,
+}
+
+/// One capability's live fleet: how many workers serve it, and the work in
+/// flight across them.
+#[derive(Serialize, ToSchema)]
+pub struct CapabilityWorkers {
+    /// The capability string a service declared, e.g. `chat.reply` or
+    /// `rag.chat`.
+    #[schema(example = "chat.reply")]
+    capability: String,
+    /// How many connected workers have declared this capability.
+    workers: usize,
+    /// Requests currently being answered across those workers.
+    inflight: u64,
+}
+
+/// The capabilities connected AI services are serving right now, per
+/// capability, with the work in flight — a discovery read for an operator or a
+/// service deciding what it may ask this bridge to do.
+///
+/// **`200`, even with the bridge off.** This lists what is available rather
+/// than probing a dependency, so a disabled bridge answers `enabled: false`
+/// and an empty list, not a `503` — a caller learns *that* there is no AI
+/// fleet rather than that the request itself failed.
+#[utoipa::path(
+    get,
+    path = "/capabilities",
+    tag = "ai",
+    responses(
+        (status = 200, description = "Every capability a connected worker serves, grouped and sorted", body = CapabilitiesResponse),
+        (status = 401, description = "No authenticated session", body = ErrorResponse),
+    ),
+)]
+async fn capabilities(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+) -> Json<CapabilitiesResponse> {
+    let (enabled, workers) = match &state.ai {
+        Some(bridge) => (true, bridge.workers()),
+        None => (false, Vec::new()),
+    };
+    // A worker serving N capabilities counts once toward each of them, so the
+    // group totals are per-capability fleets, not a partition of the workers.
+    let mut by_capability: BTreeMap<String, (usize, u64)> = BTreeMap::new();
+    for worker in workers {
+        for capability in &worker.capabilities {
+            let entry = by_capability.entry(capability.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += worker.inflight as u64;
+        }
+    }
+    Json(CapabilitiesResponse {
+        enabled,
+        protocol: AI_PROTOCOL.to_string(),
+        capabilities: by_capability
+            .into_iter()
+            .map(|(capability, (workers, inflight))| CapabilityWorkers {
+                capability,
+                workers,
+                inflight,
+            })
+            .collect(),
+    })
 }
 
 /// Wrap DER bytes as a PEM certificate: base64 in 64-character lines between

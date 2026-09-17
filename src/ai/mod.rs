@@ -15,6 +15,7 @@
 //! * [`protocol`] — frames on the wire
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`rag`] — the `rag.index` payloads, and the course-note dispatch behind them
+//! * [`rag_chat`] — the `rag.chat` payloads: a scoped question and the citations behind its answer
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
 //! * [`registry`] — who is connected here, and who gets the next request
 //! * [`tls`] — the listener's certificate
@@ -28,6 +29,7 @@ pub mod chat;
 pub mod error;
 pub mod protocol;
 pub mod rag;
+pub mod rag_chat;
 pub mod registry;
 pub mod server;
 pub mod tls;
@@ -35,6 +37,9 @@ pub mod tls;
 pub use chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 pub use error::AiError;
 pub use rag::{RagFile, RagIndexPayload};
+pub use rag_chat::{
+    RagChatReplyPayload, RagChatRequestPayload, RagCitation, RagScopePair, RagTurn,
+};
 pub use registry::{AiRegistry, WorkerSnapshot};
 pub use server::{AiBridge, BridgeConfig};
 

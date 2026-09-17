@@ -2049,6 +2049,36 @@ async fn chat_stream_and_poll_agree_that_an_answer_was_truncated() {
 }
 
 #[tokio::test]
+async fn capabilities_reports_a_registered_chat_service() {
+    // A discovery read: once the fake `chat.reply` service has dialled in,
+    // `GET /ai/capabilities` lists that capability with its worker fleet.
+    let service = chat_service("F = ma").await;
+    let (base, _db) = spawn_server_with_ai(Some(service.bridge.clone())).await;
+    let ali = client();
+    register(&ali, &base, "ali").await;
+    login(&ali, &base, "ali").await;
+
+    let caps: Value = ali
+        .get(format!("{base}/ai/capabilities"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(caps["enabled"], json!(true));
+    assert_eq!(caps["protocol"], json!("hab/2"));
+    let row = caps["capabilities"]
+        .as_array()
+        .expect("a capabilities array")
+        .iter()
+        .find(|c| c["capability"] == json!("chat.reply"))
+        .expect("the fake service serves chat.reply");
+    assert_eq!(row["workers"], json!(1));
+    assert!(row["inflight"].is_u64(), "{row}");
+}
+
+#[tokio::test]
 async fn chat_stream_delivers_deltas_then_done_over_http() {
     let answer = long_answer();
     let service = chat_service(&answer).await;
