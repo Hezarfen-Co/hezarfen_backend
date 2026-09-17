@@ -180,7 +180,7 @@ async fn submit(
 ) -> Result<Response, AppError> {
     let bridge = match worker_for(&st, AI_PODCAST_SUBMIT_CAPABILITY) {
         Ok(bridge) => bridge,
-        Err(refusal) => return Ok(refusal),
+        Err(no_worker) => return Ok(no_worker.refusal()),
     };
 
     // Whitespace-only is empty: the service applies the same rule, so checking
@@ -226,7 +226,7 @@ async fn status(
 ) -> Result<Response, AppError> {
     let bridge = match worker_for(&st, AI_PODCAST_STATUS_CAPABILITY) {
         Ok(bridge) => bridge,
-        Err(refusal) => return Ok(refusal),
+        Err(no_worker) => return Ok(no_worker.refusal()),
     };
     match podcast::status(&bridge, &slug, PodcastStatusPayload { job_id: id }).await {
         Ok(reply) => Ok(Json(snapshot(reply)).into_response()),
@@ -259,7 +259,7 @@ async fn result(
 ) -> Result<Response, AppError> {
     let bridge = match worker_for(&st, AI_PODCAST_RESULT_CAPABILITY) {
         Ok(bridge) => bridge,
-        Err(refusal) => return Ok(refusal),
+        Err(no_worker) => return Ok(no_worker.refusal()),
     };
     match podcast::result(&bridge, &slug, PodcastResultPayload { job_id: id }).await {
         Ok(reply) => Ok(Json(artifacts(reply)).into_response()),
@@ -291,7 +291,7 @@ async fn cancel(
 ) -> Result<Response, AppError> {
     let bridge = match worker_for(&st, AI_PODCAST_CANCEL_CAPABILITY) {
         Ok(bridge) => bridge,
-        Err(refusal) => return Ok(refusal),
+        Err(no_worker) => return Ok(no_worker.refusal()),
     };
     match podcast::cancel(&bridge, &slug, PodcastCancelPayload { job_id: id }).await {
         Ok(reply) => Ok(Json(verdict(reply)).into_response()),
@@ -468,19 +468,39 @@ fn pump(file: tokio::fs::File) -> impl Stream<Item = Result<Bytes, std::io::Erro
     ReceiverStream::new(rx)
 }
 
+/// Why a dispatching door has no worker to talk to. Deliberately small: the
+/// refusal is not a response — the caller builds the `503` at its own call
+/// site, so a large, rarely-taken `Response` never rides the `Result` type of
+/// a hot path.
+enum NoWorker {
+    /// No AI service is configured on this deployment at all.
+    Disabled,
+    /// A bridge is configured, but no connected worker declares this door's
+    /// capability.
+    Unconnected,
+}
+
+impl NoWorker {
+    /// The `503` the caller returns for this refusal.
+    fn refusal(self) -> Response {
+        ai_unavailable(match self {
+            NoWorker::Disabled => "the AI service is not enabled on this deployment",
+            NoWorker::Unconnected => "no AI service is connected right now",
+        })
+    }
+}
+
 /// The 503 gate every dispatching door shares: no bridge configured, or no
 /// worker declaring this door's capability. `has_capability` is documented
 /// racy — fine here: it never guards a write, and the dispatch that follows
 /// re-checks for real; this only spares a caller a round trip into a service
 /// that cannot answer.
-fn worker_for(st: &AppState, capability: &str) -> Result<AiBridge, Response> {
+fn worker_for(st: &AppState, capability: &str) -> Result<AiBridge, NoWorker> {
     let Some(bridge) = st.ai.clone() else {
-        return Err(ai_unavailable(
-            "the AI service is not enabled on this deployment",
-        ));
+        return Err(NoWorker::Disabled);
     };
     if !bridge.has_capability(capability) {
-        return Err(ai_unavailable("no AI service is connected right now"));
+        return Err(NoWorker::Unconnected);
     }
     Ok(bridge)
 }

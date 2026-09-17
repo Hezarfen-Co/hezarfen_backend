@@ -692,7 +692,7 @@ async fn cards_of(
             // ever set it — so the value is dropped for a student caller, not
             // merely absent.
             about: (role != Role::Student)
-                .then(|| row.about)
+                .then_some(row.about)
                 .flatten()
                 .map(|about| about.key().to_string()),
             audience_role: row.audience_role,
