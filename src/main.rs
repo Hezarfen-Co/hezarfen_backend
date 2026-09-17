@@ -25,8 +25,10 @@ async fn main() -> anyhow::Result<()> {
     // one request that pays for it (see `PasswordHash::prewarm_decoy`).
     hezarfen_backend::domain::user::PasswordHash::prewarm_decoy();
     // Connects to the control database, migrates it and seeds the builder —
-    // all of it idempotent and unconditional on every boot. School databases
-    // come up lazily, one connection each, on first use.
+    // all of it idempotent and unconditional on every boot. Every registered
+    // school is brought to the school-schema head here too (see
+    // `Tenants::sweep_school_schemas`); school pools themselves come up
+    // lazily, one connection each, on first use.
     let tenants = database::init(&cfg).await?;
     tokio::fs::create_dir_all(&cfg.files_path)
         .await

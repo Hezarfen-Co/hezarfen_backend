@@ -18,11 +18,12 @@ use hezarfen_backend::tenant::{Slug, Tenants};
 use hezarfen_backend::{build_router, database};
 use serde_json::json;
 
-/// Re-apply the school schema to the live school database and hand back a
-/// fresh router over the same deployment — a second boot in every way that
-/// matters to these tests.
+/// Re-apply the school schema to the live school database, run the boot's
+/// sweep over every registered school, and hand back a fresh router over the
+/// same deployment — a second boot in every way that matters to these tests.
 async fn reboot(db: &Database, tenants: &Tenants) -> Router {
     database::migrate_school(db).await.expect("re-migration");
+    tenants.sweep_school_schemas().await;
     build_router(AppState {
         db: tenants.control().clone(),
         tenants: tenants.clone(),
@@ -988,6 +989,76 @@ async fn a_half_made_school_is_finished_by_the_next_boot() {
         .drop(&slug)
         .await
         .expect("clean up the minted school");
+}
+
+/// A school database that is behind the school-schema head is brought forward
+/// by the next boot — the invariant `sweep_school_schemas` exists for: a
+/// school database is migrated at mint and never again, so one minted before
+/// a migration landed keeps yesterday's tables for good unless the boot
+/// re-applies the schema to it.
+///
+/// The drift is the live deployment's, simulated end to end: a school created
+/// through the normal path (registry row, database, schema at head), then
+/// rolled back to what an older head left behind — the table a later
+/// migration created is dropped and that migration's tracking row is deleted,
+/// so sqlx believes it was never applied. Before the sweep that school stayed
+/// exactly like that: the row is `active`, which is past
+/// `reconcile_provisioning`, and a re-dial applies no migrations. Its podcast
+/// routes answered `500` (`relation "podcast_job" does not exist`), which is
+/// why this asserts on a query over the table and not on the catalogue alone.
+#[tokio::test]
+async fn a_school_behind_the_schema_head_is_migrated_by_the_next_boot() {
+    let tenants = database::init_test_tenants().await;
+    let slug = Slug::try_new("behind-the-head").unwrap();
+    let school = tenants
+        .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
+            &slug,
+            "Behind The Head",
+            ModuleSet::all(),
+        )
+        .await
+        .expect("a school through the normal path — its database is at head");
+
+    // The drift: exactly what a school minted before the podcast migration
+    // carries — no table and no tracking row for it.
+    sqlx::query("DROP TABLE podcast_job")
+        .execute(&school)
+        .await
+        .expect("drop the table a later school migration created");
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20260917000003")
+        .execute(&school)
+        .await
+        .expect("forget the migration that created it");
+    let err = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM podcast_job")
+        .fetch_one(&school)
+        .await
+        .expect_err("a school behind the head cannot read the table yet");
+    assert!(
+        err.to_string().contains("does not exist"),
+        "the drift is the missing relation, not something else: {err}"
+    );
+
+    // The boot: the sweep `database::init` runs before the server serves.
+    tenants.sweep_school_schemas().await;
+
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM podcast_job")
+        .fetch_one(&school)
+        .await
+        .expect("the boot swept the school up to the schema head");
+    assert_eq!(jobs, 0, "the re-created table starts empty");
+
+    // And the pending migration is recorded as applied, so the next boot's
+    // sweep is a no-op rather than a re-run.
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 20260917000003")
+            .fetch_one(&school)
+            .await
+            .expect("the tracking table");
+    assert_eq!(
+        applied, 1,
+        "the swept migration is recorded, keeping the next boot a no-op"
+    );
 }
 
 /// One school's stored status, straight off the registry row.

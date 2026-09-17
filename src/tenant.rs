@@ -26,7 +26,8 @@ use crate::constant::{MAX_SLUG_LEN, MIN_SLUG_LEN};
 use uuid::Uuid;
 
 use crate::database::{
-    Database, create_database_sql, ensure_database, migrate_school, school_pool, unique_violation,
+    Database, applied_versions, create_database_sql, ensure_database, migrate_school,
+    pending_school_migrations, school_pool, unique_violation,
 };
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
@@ -711,6 +712,99 @@ impl Tenants {
             }
         }
         Ok(())
+    }
+
+    /// Apply the school schema to every school database in the registry.
+    ///
+    /// The invariant this restores: **every school database in the control
+    /// database is at the school-schema head after boot**, because a school
+    /// database is only ever migrated at mint or at boot. A school is minted
+    /// through `bring_up` — the create path and
+    /// [`Tenants::reconcile_provisioning`] both — with whatever schema head
+    /// the process that minted it carried, and nothing afterwards ever touches
+    /// its schema: a re-dial applies no migrations (see
+    /// `crate::database::school_pool`), and `reconcile_provisioning` only
+    /// reaches rows still marked `provisioning`. A school minted before a
+    /// migration landed therefore keeps yesterday's tables for good, and its
+    /// routes answer `500` on whatever that migration added — the live
+    /// deployment served `relation "podcast_job" does not exist` on
+    /// `POST /podcast/jobs` for exactly this reason.
+    ///
+    /// Failure policy: **one school must never take the boot down.** A school
+    /// that fails to migrate is logged at ERROR with its id and slug and left
+    /// exactly as it stood — no registry row and no status is written here, so
+    /// a failed school stays as usable (or unusable) as it was before the
+    /// sweep, and the next boot retries it. sqlx's tracking table is what
+    /// makes the retry safe: a migration that died mid-flight is re-run, not
+    /// half-believed.
+    pub async fn sweep_school_schemas(&self) {
+        let rows: Vec<(Uuid, String)> =
+            match sqlx::query_as("SELECT id, slug FROM school ORDER BY created_at")
+                .fetch_all(&self.control)
+                .await
+            {
+                Ok(rows) => rows,
+                // The control database was migrated moments ago in this same
+                // boot, so this is a surprise and not a state — but a boot
+                // that refuses to serve over it would be down for every school
+                // at once, which the failure policy above will not have.
+                Err(err) => {
+                    tracing::error!("school schema sweep could not list the registry: {err}");
+                    return;
+                }
+            };
+        let total = rows.len();
+        let mut migrated = 0usize;
+        for (id, slug) in rows {
+            let id = SchoolId(id);
+            match self.sweep_school(id).await {
+                Ok(pending) if pending > 0 => {
+                    migrated += 1;
+                    tracing::info!(
+                        school = %id.uuid(),
+                        slug = %slug,
+                        "school schema sweep applied {pending} migration(s) to a school behind the head"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!(
+                    school = %id.uuid(),
+                    slug = %slug,
+                    "school schema sweep failed — this school is left as it was and the next boot \
+                     retries it: {err}"
+                ),
+            }
+        }
+        tracing::info!("school schema sweep: {total} schools, {migrated} migrated");
+    }
+
+    /// One school's step of [`Tenants::sweep_school_schemas`]: dial it, bring
+    /// it to head, close the pool. The pool is made and closed inside this
+    /// call — a school this boot never serves must not leave one behind (the
+    /// cache is what keeps a served school's pool, and the sweep is not a
+    /// serve), and the close has to sit outside [`Tenants::bring_to_head`] so
+    /// no `?` on its error path can skip it.
+    async fn sweep_school(&self, id: SchoolId) -> Result<usize, AppError> {
+        let db_name = school_db_name(&self.control_db, id.uuid());
+        let pool = school_pool(&self.base, &db_name).await?;
+        let swept = Self::bring_to_head(&pool).await;
+        pool.close().await;
+        swept
+    }
+
+    /// Apply whatever the school schema has that `pool` has not — idempotent,
+    /// so a school already at head costs one `_sqlx_migrations` read and a
+    /// no-op migrator run. Returns how many migrations were pending, which is
+    /// what the sweep's per-school line reports.
+    ///
+    /// [`crate::database::migrate_school`], not the bare migrator: it also
+    /// sweeps the chatbot and RAG turns the previous process owed an answer,
+    /// which is exactly as due on a school being swept as on one being minted.
+    async fn bring_to_head(pool: &Database) -> Result<usize, AppError> {
+        let applied = applied_versions(pool).await?;
+        let pending = pending_school_migrations(&applied).await?;
+        migrate_school(pool).await?;
+        Ok(pending)
     }
 
     /// Forget a school's pool and close it. The next request dials a fresh

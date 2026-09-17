@@ -40,7 +40,9 @@ pub type Database = sqlx::PgPool;
 
 /// Connect to the **control** database, apply the control schema, seed the
 /// builder account and ensure the school-template database. School databases
-/// are brought up separately, one per school, by [`crate::tenant::Tenants`].
+/// are brought up separately, one per school, by [`crate::tenant::Tenants`] —
+/// which also sweeps every registered one to the school-schema head before
+/// this returns.
 ///
 /// The dial is retried forever (one-second cadence): the database is normally
 /// a sibling container booting in parallel, and a process that exits on the
@@ -88,6 +90,12 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
     // Schools a previous boot left half-made (its registry row committed, its
     // database not yet there) are finished before this one serves anything.
     tenants.reconcile_provisioning().await?;
+    // Then every school database in the registry is brought to the school
+    // schema head — the one step that keeps a school minted under an older
+    // head from serving `500`s on whatever a later migration added, a re-dial
+    // applying no migrations of its own. A school that fails is logged and
+    // skipped, never fatal: see [`Tenants::sweep_school_schemas`].
+    tenants.sweep_school_schemas().await;
 
     Ok(tenants)
 }
@@ -125,8 +133,9 @@ fn pool_options(max_connections: u32) -> PgPoolOptions {
 }
 
 /// A pool over one school database with the school pool sizing. The schema is
-/// the caller's business — [`migrate_school`] for a mint, nothing for a
-/// re-dial of an existing school.
+/// the caller's business — [`migrate_school`] for a mint or the boot's
+/// [`crate::tenant::Tenants::sweep_school_schemas`], nothing for a re-dial of
+/// a school being served.
 pub(crate) async fn school_pool(
     base: &PgConnectOptions,
     db_name: &str,
@@ -271,9 +280,10 @@ pub async fn migrate_control(pool: &PgPool) -> Result<(), AppError> {
 }
 
 /// Apply the school schema to a school database — the template at boot, every
-/// newly minted school at create — then sweep the chatbot and RAG turns the
-/// previous process owed an answer. Idempotent: an already-migrated database
-/// runs only the sweep.
+/// newly minted school at create, and every registered school in the boot's
+/// [`crate::tenant::Tenants::sweep_school_schemas`] — then sweep the chatbot
+/// and RAG turns the previous process owed an answer. Idempotent: an
+/// already-migrated database runs only the sweep.
 pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     migrator("school")
         .await?
@@ -313,6 +323,34 @@ pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// The migration versions a database records as applied, off sqlx's own
+/// `_sqlx_migrations`. A database that has never run a migration has no
+/// tracking table at all, and that is "nothing applied", not a failure: the
+/// boot sweep reads this of every school database, a database whose create
+/// died before its first migration included.
+pub(crate) async fn applied_versions(pool: &PgPool) -> Result<HashSet<i64>, sqlx::Error> {
+    match sqlx::query_scalar::<_, i64>("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(versions) => Ok(versions.into_iter().collect()),
+        Err(err) if is_undefined_table(&err) => Ok(HashSet::new()),
+        Err(err) => Err(err),
+    }
+}
+
+/// How many of the school schema's migrations `applied` does not carry — the
+/// boot sweep's "does this school need anything" read, and the count its
+/// per-school line reports. Zero means the database is at head, so the
+/// [`migrate_school`] run that follows is a pure no-op.
+pub(crate) async fn pending_school_migrations(applied: &HashSet<i64>) -> Result<usize, AppError> {
+    let migrator = migrator("school").await?;
+    Ok(migrator
+        .iter()
+        .filter(|migration| !applied.contains(&migration.version))
+        .count())
 }
 
 /// The advisory-lock key [`ensure_template`] holds while it creates and
@@ -389,6 +427,15 @@ pub(crate) fn is_duplicate_database(err: &sqlx::Error) -> bool {
 /// `42P04`-only guard is too narrow for the very race it exists for.
 pub(crate) fn is_database_exists(err: &sqlx::Error) -> bool {
     is_duplicate_database(err) || unique_violation(err) == Some("pg_database_datname_index")
+}
+
+/// `42P01` — the relation is not there. The one catalogue miss the boot's
+/// school sweep reads as an answer rather than a failure: a database that has
+/// never run a migration carries no `_sqlx_migrations` at all, which is
+/// "nothing applied", not a broken school.
+pub(crate) fn is_undefined_table(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .is_some_and(|db| db.code().as_deref() == Some("42P01"))
 }
 
 /// The violated `UNIQUE` constraint's name, when `err` is a unique violation
