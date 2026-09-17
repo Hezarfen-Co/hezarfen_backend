@@ -376,12 +376,36 @@ jobs:
             exit 1
           fi
           chmod 0600 -- "$env_file"
-          for key in POSTGRES_PASSWORD BUILDER_PASSWORD ZO_ROOT_USER_EMAIL ZO_ROOT_USER_PASSWORD; do
+          for key in POSTGRES_PASSWORD BUILDER_PASSWORD ZO_ROOT_USER_EMAIL ZO_ROOT_USER_PASSWORD AI_SHARED_TOKEN AI_QUIC_ADDR; do
             grep -Eq "^${key}=.+" "$env_file" || {
               echo "no non-empty ${key}= line in $env_file — prod must not run on the compose defaults" >&2
               exit 1
             }
           done
+
+          # OPERATOR ORTAMI SURECE ALINIR. podman-compose interpolasyonu ORTAM
+          # DEGISKENLERINE bakar ve `--env-file` YALNIZ SON dosyayi cozer
+          # (podman_compose.py:2941-2946, :2559): iki dosyali cagri operator
+          # dosyasini tamamen dusurur ve stack SESSIZCE compose
+          # varsayilanlariyla kosar (DATABASE_URL parolasi `hezarfen`, kopru
+          # tokeni `change-me`) — yukaridaki "bos olamaz" kapisi bunu
+          # yakalamaz, cunku o dosyayi denetler, compose'un onu kullanip
+          # kullanmadigini degil (canlida yasandi, 2026-09-17). Bu yuzden
+          # dosya satir satir okunur: kabuk genisletmesi YOK (deger icindeki
+          # `$` oldugu gibi kalir), bicim duz KEY=value oldugu icin
+          # tirnak/`export` aranmaz.
+          while IFS= read -r satir || [ -n "$satir" ]; do
+            case "$satir" in ''|'#'*) continue ;; esac
+            anahtar=${satir%%=*}
+            deger=${satir#*=}
+            case "$anahtar" in
+              ''|*[!A-Za-z0-9_]*)
+                echo "operator env: gecersiz anahtar adi -- harf/rakam/alt cizgi beklenirdi" >&2
+                exit 1
+                ;;
+            esac
+            export "$anahtar=$deger"
+          done < "$env_file"
 
           # Rootless podman plus a compose provider; fail with the fix, not
           # a bare command-not-found three steps in.
@@ -407,8 +431,10 @@ jobs:
           printf '%s\n' "$tag" > "$deploy_path/current_tag"
 
           # stack.env is deploy-owned (unlike the secrets file): it carries
-          # only the image tag, and --env-file order makes it win over the
-          # operator's file for HEZARFEN_TAG.
+          # only the image tag, and it is the ONE `--env-file` compose gets —
+          # the operator's values are in the process environment (above). A
+          # two-file call would drop the operator file entirely
+          # (podman_compose.py:2941-2946, :2559).
           printf 'HEZARFEN_TAG=%s\n' "$tag" > "$deploy_path/stack.env"
 
           # The freshly extracted bundle: compose file and unit are
@@ -420,7 +446,7 @@ jobs:
           rm -f -- "$deploy_path/hezarfen_backend.tar.gz"
 
           compose_up() {
-            podman compose --env-file "$env_file" --env-file "$deploy_path/stack.env" up -d --no-build
+            podman compose --env-file "$deploy_path/stack.env" up -d --no-build
           }
           rollback() {
             if [ -f "$deploy_path/previous_tag" ]; then
@@ -433,7 +459,7 @@ jobs:
               # First deploy: nothing to roll back to, so stop the
               # half-brought-up stack. Plain down — the volumes hold the
               # operator's data and postgres's first-boot password.
-              podman compose --env-file "$env_file" --env-file "$deploy_path/stack.env" down
+              podman compose --env-file "$deploy_path/stack.env" down
               echo 'first deploy failed; stack stopped, volumes kept' >&2
             fi
           }
@@ -488,6 +514,24 @@ jobs:
               exit 1
               ;;
           esac
+          # OPERATOR SIRLARI KONTEYNERDE MI -- bu iddia olmadan iki dosyali
+          # `--env-file` sinifi sessizce geri gelebilir: stack compose
+          # varsayilanlariyla ayaga kalkar ve hicbir sey kirmizi olmaz. En
+          # guclu hal: konteynerin ortamindaki DEGER, operator dosyasindaki
+          # DEGERLE birebir ayni olmali. Deger YAZDIRILMAZ.
+          container_env=$(podman inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container")
+          for cift in "AI_SHARED_TOKEN=$AI_SHARED_TOKEN" "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" "AI_QUIC_ADDR=$AI_QUIC_ADDR" "BUILDER_USERNAME=$BUILDER_USERNAME"; do
+            ad=${cift%%=*}
+            case "$container_env" in
+              *"$cift"*) ;;
+              *)
+                echo "container env: $ad operator dosyasindaki degeri TASIMIYOR -- operator env compose'a ulasmamis; rolling back" >&2
+                rollback
+                exit 1
+                ;;
+            esac
+          done
+          echo 'ok: operator sirlari konteynerde (AI_SHARED_TOKEN / POSTGRES_PASSWORD / AI_QUIC_ADDR / BUILDER_USERNAME birebir)'
           echo 'hezarfen_backend_compose is up'
           REMOTE
 

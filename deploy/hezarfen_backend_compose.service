@@ -36,11 +36,29 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=%h/hezarfen_backend
-# Later --env-file wins for duplicate keys: the operator's secrets file
-# first, the deploy-owned stack.env (HEZARFEN_TAG) second.
-ExecStart=/usr/bin/podman compose --env-file %h/hezarfen_backend/hezarfen_backend.env --env-file %h/hezarfen_backend/stack.env up -d --no-build
-# No -v: named volumes must survive stop.
-ExecStop=/usr/bin/podman compose down
+# ORTAM IKI KANALDAN GELIR -- bu bir tercih degil, saglayicinin siniridir:
+#   * operatorun ayar dosyasi -> `EnvironmentFile=` (systemd dosyayi unit'in
+#     ORTAMINA koyar; compose interpolasyonu ORTAM DEGISKENLERINE bakar)
+#   * deploy sahipli stack.env (HEZARFEN_TAG) -> tek `--env-file`
+#
+# NEDEN: `podman compose --env-file A --env-file B` bu saglayicida A'yi HIC
+# OKUMAZ. `--env-file` tek degerli bir argumandir (podman_compose.py:2941-2946)
+# ve yalniz SON dosya cozulur (:2559 `dotenv_path = os.path.realpath(args.env_file)`).
+# Iki dosyali eski cagri operator dosyasini tamamen dusuruyordu: stack compose
+# varsayilanlariyla kosuyordu (`DATABASE_URL` parolasi `hezarfen`, kopru tokeni
+# `change-me`) ve dosyadaki degerler HIC okunmuyordu -- deploy'un
+# "POSTGRES_PASSWORD bos olamaz" kapisi dosyayi denetlerken compose onu
+# kullanmadigi icin bu sessiz kaliyordu (canlida yasandi, 2026-09-17). Docker
+# Compose v2'nin "sonraki dosya cakisan anahtarda kazanir" davranisi bu
+# saglayici icin GECERLI DEGIL. Ortam degiskeni --env-file degerlerini EZER
+# (:2562), yani iki kanal cakismaz.
+EnvironmentFile=%h/hezarfen_backend/hezarfen_backend.env
+# Tek --env-file: yalniz deploy sahipli stack.env (HEZARFEN_TAG).
+ExecStart=/usr/bin/podman compose --env-file %h/hezarfen_backend/stack.env up -d --no-build
+# No -v: named volumes must survive stop. (`EnvironmentFile=` yukarida oldugu
+# icin burada da gerekli degiskenler ortamdadir; saglayici eksik env dosyasini
+# bos sozluk sayar -- podman_compose.py:2247-2250.)
+ExecStop=/usr/bin/podman compose --env-file %h/hezarfen_backend/stack.env down
 TimeoutStartSec=180
 
 [Install]
