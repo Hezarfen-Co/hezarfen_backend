@@ -598,7 +598,9 @@ pub const AI_RAG_CHAT_TIMEOUT_SECS: u64 = 90;
 /// `hezarfen_zeka`). It is the on-demand half of ZEKA — the service also
 /// recomputes on its own schedule — and it is what a teacher's "hesapla" is
 /// routed to. The service reads the student's own data back through the
-/// bridge's api reads and writes nothing but its `zeka_*` rows.
+/// bridge's api reads and has the backend write its `zeka_*` rows — no AI
+/// service holds a school database credential here (see the storage-surface
+/// constants below).
 pub const AI_INSIGHT_STUDENT_CAPABILITY: &str = "insight.student";
 
 /// Deadline on one `insight.student` round trip. Computing one student reads
@@ -619,7 +621,7 @@ pub const AI_INSIGHT_CLASS_CAPABILITY: &str = "insight.class";
 
 /// The capability an AI service declares to recompute a whole school's
 /// insights. A batch job: the service works through its configured student
-/// list under its own time budget and writes a run ledger. Like ZEKA's own
+/// list under its own time budget and has the backend write its run ledger. Like ZEKA's own
 /// schedule, this is optional on top of the service's own cadence — it is
 /// what lets the office trigger a sweep from the UI.
 pub const AI_INSIGHT_REFRESH_CAPABILITY: &str = "insight.refresh";
@@ -633,6 +635,81 @@ pub const AI_INSIGHT_REFRESH_CAPABILITY: &str = "insight.refresh";
 /// summary.
 pub const AI_INSIGHT_REFRESH_TIMEOUT_SECS: u64 = 300;
 
+// ---- zeka's storage surface (capabilities the *backend* serves) ------------
+//
+// The three constants above are capabilities an AI service *declares*: the
+// backend dispatches `insight.student`/`insight.refresh` to ZEKA and ZEKA
+// answers. The nine below run the other way and are the reason this section
+// exists: no AI service may touch a school database directly, so every read
+// and write ZEKA needs against its own `zeka_*` tables is a named operation
+// the backend performs on its behalf, on the same bridge, on a
+// client-initiated stream (`src/ai/server.rs::serve_client_stream`).
+//
+// They are deliberately *not* declared here as worker capabilities: a worker
+// never announces them, and `AiBridge::dispatch` never routes them. They are
+// the backend's own surface, dispatched by capability name against
+// `crate::ai::insight`'s table — an operation, never a query: no capability
+// takes a database, a schema, a table or a SQL fragment, and the school is
+// the frame's own field, resolved to that school's database before any
+// statement runs.
+
+/// ZEKA stores one student's computed summary (and that student's attention
+/// items, replaced wholesale) for one school.
+pub const AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY: &str = "insight.summary.upsert";
+
+/// ZEKA stores the recommendation cards a run produced. The backend mints the
+/// rows' ids — an id is the writer's, and the writer is now the backend.
+pub const AI_INSIGHT_RECOMMENDATION_UPSERT_CAPABILITY: &str = "insight.recommendation.upsert";
+
+/// ZEKA stores its question-segment labels (and each question's dimension
+/// split, replaced wholesale).
+pub const AI_INSIGHT_SEGMENT_UPSERT_CAPABILITY: &str = "insight.segment.upsert";
+
+/// ZEKA stores a student's per-dimension segment profile.
+pub const AI_INSIGHT_PROFILE_UPSERT_CAPABILITY: &str = "insight.profile.upsert";
+
+/// ZEKA stores one compute run's ledger row (and the run's pending students
+/// and failed modules, both replaced wholesale).
+pub const AI_INSIGHT_RUN_UPSERT_CAPABILITY: &str = "insight.run.upsert";
+
+/// ZEKA reads back the students the freshest run left pending — where the
+/// next run starts.
+pub const AI_INSIGHT_PENDING_LIST_CAPABILITY: &str = "insight.pending.list";
+
+/// ZEKA asks the backend to sweep every `zeka_*` table of rows whose
+/// retention window has closed.
+pub const AI_INSIGHT_RETENTION_SWEEP_CAPABILITY: &str = "insight.retention.sweep";
+
+/// ZEKA asks the backend to delete the derived rows of students who are no
+/// longer enrolled.
+pub const AI_INSIGHT_DEPARTED_PURGE_CAPABILITY: &str = "insight.departed.purge";
+
+/// The one deployment-scoped operation: the active schools a shared AI fleet
+/// schedules over. The frame carries no school because its answer is the
+/// directory itself — the same reason [`crate::ai::protocol::Hello`] carries
+/// none.
+pub const AI_INSIGHT_SCHOOLS_LIST_CAPABILITY: &str = "insight.schools.list";
+
+/// The most rows one of the four bulk writes may carry in a single call. The
+/// service's own batch size (`store.BATCH_SIZE` in `hezarfen_zeka`) — it
+/// chunks its nightly output at exactly this, and a call one row past it is
+/// refused (`too_many_rows`) rather than truncated, because a silently
+/// shortened batch would read as a written student.
+pub const MAX_INSIGHT_BATCH_ROWS: usize = 500;
+
+/// The most students `insight.pending.list` will answer with. The list is
+/// handed over whole — the service resumes its next run from it, so a
+/// clipped list would silently drop students — and a school past this bound
+/// is refused (`too_many_rows`) instead.
+pub const MAX_INSIGHT_PENDING_STUDENTS: usize = 20_000;
+
+/// The most students one `insight.departed.purge` call may name. Same shape
+/// as [`MAX_INSIGHT_PENDING_STUDENTS`]: over it the call is refused, and the
+/// empty list is refused too — an empty roster is a fetch that failed, and
+/// deleting every derived row on that reading would be the worst available
+/// mistake.
+pub const MAX_INSIGHT_PURGE_STUDENTS: usize = 20_000;
+
 /// How long a `rag.chat` turn may sit `pending` before a reader projects it as
 /// failed. The RAG nest mirrors the chatbot's asynchronous send
 /// ([`CHATBOT_PENDING_STALE_SECS`]): the round trip outlives the request that
@@ -643,31 +720,69 @@ pub const RAG_PENDING_STALE_SECS: i64 = CHATBOT_PENDING_STALE_SECS;
 // ---- podcast ---------------------------------------------------------------
 //
 // The podcast service turns one stored source into an audio episode, which is
-// a *job*: submitted, polled, collected, and maybe cancelled — the service
-// owns the record, and the backend relays each HTTP call to the worker that
-// declares the matching capability. All four capabilities answer immediately
-// (the pipeline runs in the service's own pool), so unlike `rag.index` and
-// `rag.chat` none of them needs a per-capability deadline: the bridge's
-// ordinary request timeout already covers a job-store read.
+// a *job*. The backend owns the job's record: `POST /podcast/jobs` mints the
+// id, writes the `podcast_job` row, and dispatches `podcast.submit`; the
+// service reports every transition back through the client-initiated
+// `podcast.report` capability and uploads the finished mp3 as raw bytes. The
+// read doors (`GET /podcast/jobs/{id}`, `.../result`, `.../audio`) answer from
+// the row, so a service restart or a wiped service volume costs liveness at
+// most. Only submit and cancel are dispatched to a worker, and both answer
+// immediately — the pipeline runs in the service's own pool — so neither needs
+// a per-capability deadline: the bridge's ordinary request timeout covers a
+// job-store write.
 
 /// The capability an AI service declares to accept a podcast job. The backend
-/// dispatches on it from `POST /podcast/jobs`, and the service mints the job
-/// id every other `podcast.*` call then names.
+/// dispatches on it from `POST /podcast/jobs`, and the payload carries the
+/// **backend-minted** job id — the id the row, the service's own record, and
+/// the audio blob are all keyed by.
 pub const AI_PODCAST_SUBMIT_CAPABILITY: &str = "podcast.submit";
 
-/// The capability an AI service declares to report one podcast job's state,
-/// read back by `GET /podcast/jobs/{id}`.
-pub const AI_PODCAST_STATUS_CAPABILITY: &str = "podcast.status";
-
-/// The capability an AI service declares to hand back a finished job's
-/// artifacts — above all the `audio_id` the `/podcast/audio` door streams.
-pub const AI_PODCAST_RESULT_CAPABILITY: &str = "podcast.result";
+/// The capability the **backend** serves for one podcast job's state reports.
+/// The service calls it — on a client-initiated stream, the same shape as
+/// ZEKA's storage surface — once per transition, echoing the job's identity
+/// (`job_id`, `source_id`, `user_id`) and the state it moved to. The backend
+/// validates the echo, the transition and the retention window, and writes its
+/// own row; there is no state the service holds that the backend does not.
+pub const AI_PODCAST_REPORT_CAPABILITY: &str = "podcast.report";
 
 /// The capability an AI service declares to cancel one podcast job. Its own
 /// capability rather than a flag on submit: the cancel is a write on the
 /// service's queue, and the capability is what decides whether a deployment
 /// can offer the door at all.
 pub const AI_PODCAST_CANCEL_CAPABILITY: &str = "podcast.cancel";
+
+/// The largest episode the backend will ingest from a service
+/// (`BlobUploadRequest`). A ceiling, not a quota: a two-hour episode at a
+/// generous bitrate is well under it, and anything above is refused before a
+/// byte reaches disk — a service bug must not be able to fill the host.
+pub const PODCAST_AUDIO_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// How long a finished podcast job's record and audio stay readable. Past it
+/// the doors answer `410` — the record is history, and the blob is no longer
+/// served. Sized like the RAG outputs' retention window: long enough for a
+/// listener to come back for yesterday's episode, short enough that a shared
+/// host does not accumulate every episode ever made.
+pub const PODCAST_JOB_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The floor of the read-side staleness window: a `queued`/`running` job
+/// nobody has updated for at least this long is presented as
+/// `failed`/`interrupted`. The window is
+/// `max(PODCAST_JOB_STALE_FLOOR_SECS, eta_secs × PODCAST_JOB_STALE_ETA_FACTOR)`
+/// so a queue wait the service itself estimated as long is never declared
+/// dead mid-flight.
+pub const PODCAST_JOB_STALE_FLOOR_SECS: i64 = 600;
+
+/// How many times a job's own ETA the service may exceed before the read side
+/// stops believing it is still running. Three: past three times its own
+/// estimate, the honest reading is that the process that owned it is gone.
+pub const PODCAST_JOB_STALE_ETA_FACTOR: i64 = 3;
+
+/// The `error_code` a job carries when *this backend* concluded it died: a
+/// dispatch that never reached a worker, a cancel of a job the service no
+/// longer has, or a read-side projection of a stale row. Deliberately the
+/// service's own word for the same fact (its restart sweep writes it too), so
+/// a client sees one vocabulary however the job died.
+pub const PODCAST_INTERRUPTED_CODE: &str = "interrupted";
 
 /// The most `(sınıf, ders)` scope pairs one `rag.chat` request may carry. The
 /// corpus is routed by the **pair** — a grade and a subject list sent

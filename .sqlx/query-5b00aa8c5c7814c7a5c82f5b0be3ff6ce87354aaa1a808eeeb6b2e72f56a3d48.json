@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM zeka_question_segment_dimension WHERE question = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5b00aa8c5c7814c7a5c82f5b0be3ff6ce87354aaa1a808eeeb6b2e72f56a3d48"
+}

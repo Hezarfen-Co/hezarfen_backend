@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM zeka_run_failed_module WHERE run = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5c4295befb79370b86726cfc5ce5d4474062400acdf4d6b10f4ec9fb2408808a"
+}

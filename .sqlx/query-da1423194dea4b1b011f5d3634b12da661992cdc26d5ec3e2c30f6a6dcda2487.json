@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO zeka_student_segment_profile\n               (student, dimension, label, n_answers, n_correct, accuracy,\n                overall_n_answers, overall_accuracy, contrast, confidence,\n                computed_at, retain_until)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)\n             ON CONFLICT (student, dimension, label) DO UPDATE SET\n               n_answers = EXCLUDED.n_answers, n_correct = EXCLUDED.n_correct,\n               accuracy = EXCLUDED.accuracy,\n               overall_n_answers = EXCLUDED.overall_n_answers,\n               overall_accuracy = EXCLUDED.overall_accuracy,\n               contrast = EXCLUDED.contrast, confidence = EXCLUDED.confidence,\n               computed_at = EXCLUDED.computed_at, retain_until = EXCLUDED.retain_until",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Float8",
+        "Int8",
+        "Float8",
+        "Float8",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da1423194dea4b1b011f5d3634b12da661992cdc26d5ec3e2c30f6a6dcda2487"
+}

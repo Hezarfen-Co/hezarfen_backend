@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO zeka_run\n           (run_day, started_at, finished_at, status, duration_ms, students_total,\n            students_ok, students_failed, students_skipped, rows_written,\n            budget_exceeded, budget_ms, retain_until)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\n         ON CONFLICT (run_day) DO UPDATE SET\n           started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,\n           status = EXCLUDED.status, duration_ms = EXCLUDED.duration_ms,\n           students_total = EXCLUDED.students_total, students_ok = EXCLUDED.students_ok,\n           students_failed = EXCLUDED.students_failed,\n           students_skipped = EXCLUDED.students_skipped,\n           rows_written = EXCLUDED.rows_written,\n           budget_exceeded = EXCLUDED.budget_exceeded, budget_ms = EXCLUDED.budget_ms,\n           retain_until = EXCLUDED.retain_until",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Bool",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a090ce70a604c900d6a516bf14844918826d27c938b536063b8c526f1133d620"
+}

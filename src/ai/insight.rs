@@ -1,21 +1,20 @@
-//! Payload contract for the `insight.*` capabilities, and the dispatch behind
-//! the two the backend can route today.
+//! Payload contract for the `insight.*` capabilities, in both directions.
 //!
 //! ZEKA (`hezarfen_zeka`) computes student and class insights from a school's
-//! own data. Unlike the chatbot and the RAG nests, whose answers the backend
-//! stores, ZEKA **writes its own rows**: the `zeka_*` tables in each school
-//! database, created by the school migrator
-//! (`migrations/school/20260917000002_zeka.sql`). This module only carries the
-//! frames; [`crate::web::insights`] is the reader of what lands.
+//! own data. The family has two halves and they travel opposite ways:
 //!
-//! That split is why the dispatches here return the service's answer rather
-//! than store it — the answer is a receipt, and the rows are the product. A
-//! dispatch that times out, or a service that refuses, leaves the previously
-//! computed rows exactly as they are: a stale insight beats a hole. The two
-//! capabilities this module dispatches:
-//!
-//! * [`AI_INSIGHT_STUDENT_CAPABILITY`] — one student, on demand;
-//! * [`AI_INSIGHT_REFRESH_CAPABILITY`] — a school-wide sweep, on demand.
+//! * **Outbound** (the backend dispatches to the service):
+//!   [`AI_INSIGHT_STUDENT_CAPABILITY`] — one student, on demand;
+//!   [`AI_INSIGHT_REFRESH_CAPABILITY`] — a school-wide sweep, on demand. The
+//!   dispatches below carry them ([`compute_student`], [`refresh`]).
+//! * **Inbound** (the service calls the backend): the nine operations of
+//!   [`AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY`]'s family — the storage surface
+//!   ZEKA's `zeka_*` rows are written and read through, because **no AI
+//!   service may touch a school database**. [`serve`] runs them; the SQL
+//!   lives in [`crate::db::insight`], and [`crate::web::insights`] mounts the
+//!   same functions as HTTP doors. This is the shape the whole family exists
+//!   for: an operation named on the wire, scoped to the frame's school, with
+//!   no path, no table and no query any caller can name.
 //!
 //! [`AI_INSIGHT_CLASS_CAPABILITY`] is declared (the service announces it) but
 //! deliberately not dispatched: its request names a course the service would
@@ -27,7 +26,9 @@
 //! Every payload member is optional on the response side on purpose: the
 //! service's TypedDicts are `total=False`, so a partial answer is a legal
 //! answer, and a strict struct here would turn a service update into a
-//! backend error.
+//! backend error. The inbound rows are the opposite: they are a *write*
+//! contract, so a missing field is refused rather than defaulted — except
+//! where this module says an omission is meaningful.
 
 use std::time::Duration;
 
@@ -219,6 +220,201 @@ where
 
 fn malformed(err: serde_json::Error) -> AiError {
     AiError::Protocol(FrameError::Malformed(err))
+}
+
+// ---- the operations the backend serves -------------------------------------
+//
+// The half of this module that runs *towards* the backend. ZEKA computes, but
+// it may not write: no AI service holds a school database credential on this
+// deployment, so its `zeka_*` rows are written and read here, by name, over
+// the same bridge — one operation per call, each scoped to the school the
+// frame named. [`crate::db::insight`] is the SQL; this is the contract: which
+// names exist, what each payload is, and how a refusal reads.
+
+pub use crate::db::insight::{
+    AttentionRow, PendingList, ProfileRow, ProfileWriteRequest, PurgeRequest, RecommendationRow,
+    RecommendationWriteRequest, RunRow, RunWriteRequest, SchoolDirectory, SegmentConfidences,
+    SegmentLabels, SegmentRow, SegmentWriteRequest, SummaryRow, SummaryWriteRequest,
+    TableVerdicts, WriteReceipt,
+};
+
+use crate::constant::{
+    AI_INSIGHT_DEPARTED_PURGE_CAPABILITY, AI_INSIGHT_PENDING_LIST_CAPABILITY,
+    AI_INSIGHT_PROFILE_UPSERT_CAPABILITY, AI_INSIGHT_RECOMMENDATION_UPSERT_CAPABILITY,
+    AI_INSIGHT_RETENTION_SWEEP_CAPABILITY, AI_INSIGHT_RUN_UPSERT_CAPABILITY,
+    AI_INSIGHT_SCHOOLS_LIST_CAPABILITY, AI_INSIGHT_SEGMENT_UPSERT_CAPABILITY,
+    AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+};
+use crate::database::Database;
+use crate::db;
+use crate::domain::timestamp::Timestamp;
+use crate::error::AppError;
+use crate::module::Module;
+use crate::tenant::ResolvedTenant;
+
+/// A refusal headed for a [`CapabilityResponse::Err`](crate::ai::protocol::CapabilityResponse::Err):
+/// the documented code, and a message that names the field a caller can fix.
+pub type Refusal = (&'static str, String);
+
+/// What a served capability is scoped to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// It runs against the school the frame named, and nothing else.
+    School,
+    /// Its answer does not come from a school's database at all — the
+    /// directory the fleet schedules over. The frame sends no school.
+    Deployment,
+}
+
+/// Every capability the backend serves, and its scope. Matched exactly: a
+/// name that is not here is `unknown_capability`, with no prefix match and no
+/// fallback — an operation a caller cannot name is one it cannot run.
+pub const SERVED: &[(&str, Scope)] = &[
+    (AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY, Scope::School),
+    (
+        AI_INSIGHT_RECOMMENDATION_UPSERT_CAPABILITY,
+        Scope::School,
+    ),
+    (AI_INSIGHT_SEGMENT_UPSERT_CAPABILITY, Scope::School),
+    (AI_INSIGHT_PROFILE_UPSERT_CAPABILITY, Scope::School),
+    (AI_INSIGHT_RUN_UPSERT_CAPABILITY, Scope::School),
+    (AI_INSIGHT_PENDING_LIST_CAPABILITY, Scope::School),
+    (AI_INSIGHT_RETENTION_SWEEP_CAPABILITY, Scope::School),
+    (AI_INSIGHT_DEPARTED_PURGE_CAPABILITY, Scope::School),
+    (AI_INSIGHT_SCHOOLS_LIST_CAPABILITY, Scope::Deployment),
+];
+
+/// The scope of one served capability, or `None` if the backend serves no
+/// operation by that name.
+pub fn scope_of(capability: &str) -> Option<Scope> {
+    SERVED
+        .iter()
+        .find(|(name, _)| *name == capability)
+        .map(|(_, scope)| *scope)
+}
+
+/// Run one capability call and hand back its payload.
+///
+/// `school` is the tenant the bridge resolved for the frame — `None` only for
+/// a [`Scope::Deployment`] capability, whose frame names no school. The
+/// school's own feature set is checked here as well as at the HTTP nest: a
+/// school that is not being served insights should not be accumulating rows
+/// for them either.
+pub async fn serve(
+    capability: &str,
+    school: Option<&ResolvedTenant>,
+    control: &Database,
+    payload: &Value,
+) -> Result<Value, Refusal> {
+    if scope_of(capability).is_none() {
+        return Err((
+            "unknown_capability",
+            format!("the backend serves no `{capability}` operation"),
+        ));
+    }
+    if capability == AI_INSIGHT_SCHOOLS_LIST_CAPABILITY {
+        let directory = db::insight::active_schools(control).await.map_err(refusal)?;
+        return encode(&directory);
+    }
+    let Some(tenant) = school else {
+        return Err((
+            "unknown_school",
+            "this operation runs against a school and the frame named none".to_string(),
+        ));
+    };
+    if !tenant.modules.contains(Module::Chatbot) {
+        return Err((
+            "not_permitted",
+            "this school does not have the insights module enabled".to_string(),
+        ));
+    }
+    let db = &tenant.db;
+    let answer = match capability {
+        AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY => {
+            let request: SummaryWriteRequest = decode(payload)?;
+            encode(&db::insight::write_summaries(db, request.rows).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_RECOMMENDATION_UPSERT_CAPABILITY => {
+            let request: RecommendationWriteRequest = decode(payload)?;
+            encode(
+                &db::insight::write_recommendations(db, request.rows)
+                    .await
+                    .map_err(refusal)?,
+            )
+        }
+        AI_INSIGHT_SEGMENT_UPSERT_CAPABILITY => {
+            let request: SegmentWriteRequest = decode(payload)?;
+            encode(&db::insight::write_segments(db, request.rows).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_PROFILE_UPSERT_CAPABILITY => {
+            let request: ProfileWriteRequest = decode(payload)?;
+            encode(&db::insight::write_profiles(db, request.rows).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_RUN_UPSERT_CAPABILITY => {
+            let request: RunWriteRequest = decode(payload)?;
+            encode(&db::insight::write_run(db, request.run).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_PENDING_LIST_CAPABILITY => {
+            encode(&db::insight::last_pending(db).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_RETENTION_SWEEP_CAPABILITY => {
+            // The backend's own clock decides expiry — a service's clock is
+            // not a second authority on when a row's retention has closed.
+            let now_ms = Timestamp::now().as_millis();
+            encode(&db::insight::sweep(db, now_ms).await.map_err(refusal)?)
+        }
+        AI_INSIGHT_DEPARTED_PURGE_CAPABILITY => {
+            let request: PurgeRequest = decode(payload)?;
+            encode(
+                &db::insight::purge_departed(db, request.students)
+                    .await
+                    .map_err(refusal)?,
+            )
+        }
+        // `scope_of` matched above, so the table and this match agree; the
+        // arm exists so a table entry without an operation is a compile-time
+        // miss instead of a runtime surprise.
+        other => {
+            return Err((
+                "unknown_capability",
+                format!("the backend serves no `{other}` operation"),
+            ));
+        }
+    };
+    answer
+}
+
+/// Decode one payload into the operation's own type. A payload that does not
+/// fit is `invalid_payload`, never `malformed`: the frame was a capability
+/// call, the body was not this operation's body, and the caller can fix it.
+fn decode<T: DeserializeOwned>(payload: &Value) -> Result<T, Refusal> {
+    serde_json::from_value(payload.clone())
+        .map_err(|err| ("invalid_payload", format!("payload: {err}")))
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Value, Refusal> {
+    serde_json::to_value(value).map_err(|err| ("internal", format!("could not encode the answer: {err}")))
+}
+
+/// [`AppError`] as the protocol's refusal vocabulary. The mapping is the
+/// whole reason the db layer returns `AppError` rather than its own type:
+/// HTTP answers these through [`crate::error`], and a capability call answers
+/// the same verdict with the code a service branches on.
+fn refusal(err: AppError) -> Refusal {
+    match err {
+        AppError::Validation(err) => ("invalid_payload", err.to_string()),
+        AppError::PayloadTooLarge(message) => ("too_many_rows", message),
+        AppError::ModuleDisabled(module) => (
+            "not_permitted",
+            format!("this school does not have the `{module}` module enabled"),
+        ),
+        AppError::NotFound => ("not_found", "the named row does not exist".to_string()),
+        AppError::DbUnavailable | AppError::DbTimeout => (
+            "unavailable",
+            "this school's database could not be reached".to_string(),
+        ),
+        other => ("internal", other.to_string()),
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO zeka_run_failed_module (run, module, ord) VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16da7d91af8ef555b98bdf14cc418cdd618f48caa4f3c49dc5ecbdffcfafccc6"
+}

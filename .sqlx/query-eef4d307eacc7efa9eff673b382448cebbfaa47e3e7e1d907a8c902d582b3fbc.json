@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM zeka_run_pending WHERE student <> ALL($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eef4d307eacc7efa9eff673b382448cebbfaa47e3e7e1d907a8c902d582b3fbc"
+}

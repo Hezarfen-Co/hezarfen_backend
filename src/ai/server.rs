@@ -15,8 +15,9 @@ use tracing::Instrument;
 
 use crate::ai::error::AiError;
 use crate::ai::protocol::{
-    ApiRequest, ApiResponse, BlobRequest, BlobResponse, FrameError, Greeting, Hello, RejectCode,
-    Request, Response, protocol_matches, read_frame, write_frame,
+    ApiRequest, ApiResponse, BlobRequest, BlobResponse, BlobUploadRequest, BlobUploadResponse,
+    CapabilityRequest, CapabilityResponse, FrameError, Greeting, Hello, RejectCode, Request,
+    Response, protocol_matches, read_frame, write_frame,
 };
 use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
@@ -495,6 +496,42 @@ async fn serve_client_stream(
         }
         return;
     }
+    // The third client-initiated shape: a call of a capability the *backend*
+    // serves (ZEKA's storage surface). Routed on `capability`, which neither
+    // of the shapes above carries.
+    if raw.get("capability").is_some() {
+        match serde_json::from_value::<CapabilityRequest>(raw) {
+            Ok(request) => {
+                let response = serve_capability(&inner, request).await;
+                answer_capability(&mut send, response).await;
+            }
+            Err(e) => {
+                answer_capability(
+                    &mut send,
+                    capability_refusal(&id, &school, "malformed", e.to_string()),
+                )
+                .await;
+            }
+        }
+        return;
+    }
+    // The fourth client-initiated shape: an artifact's bytes coming *in* (the
+    // podcast service's finished mp3). Routed on `upload`, the marker neither
+    // of the shapes above carries; the `size` raw bytes follow the frame on
+    // this same stream.
+    if raw.get("upload").is_some() {
+        match serde_json::from_value::<BlobUploadRequest>(raw) {
+            Ok(request) => serve_upload(&inner, &mut send, recv, request).await,
+            Err(e) => {
+                let refused = upload_refusal(id, school, "malformed", e.to_string());
+                if let Err(e) = write_frame(&mut send, &refused).await {
+                    tracing::warn!("could not refuse an AI service's malformed upload: {e}");
+                }
+                let _ = send.finish();
+            }
+        }
+        return;
+    }
     // Neither shape. Reported as the api-read refusal it has always been —
     // `path` is the field a frame this far off most likely meant to carry.
     let api_err = serde_json::from_value::<ApiRequest>(raw)
@@ -577,6 +614,107 @@ async fn write_blob_body(
                 format!("no progress for {AI_BLOB_WRITE_STALL_SECS}s"),
             )
         })??;
+    }
+}
+
+/// Serve one artifact upload: validate the frame, store exactly `size` bytes
+/// under the school's blob root, stamp the job's row, and answer one
+/// [`BlobUploadResponse`] frame. Nothing follows the answer — the artifact
+/// travels one way only.
+///
+/// A refusal answers the frame and resets the read side: the service may still
+/// be writing its bytes, and none of them will be stored, so letting the
+/// stream drain would only spend the sender's bandwidth on a file that is
+/// already refused.
+async fn serve_upload(
+    inner: &Inner,
+    send: &mut quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    request: BlobUploadRequest,
+) {
+    let id = request.id.clone();
+    let school = request.school.clone();
+    let response = match ingest_upload(inner, &request, &mut recv).await {
+        Ok((key, size)) => BlobUploadResponse::Ok {
+            id,
+            school,
+            key,
+            size,
+        },
+        Err((code, message)) => {
+            // The bytes that would have followed are not wanted; tell the
+            // sender so its write stops rather than filling a stream nobody
+            // reads.
+            let _ = recv.stop(1u32.into());
+            upload_refusal(
+                request.id.clone(),
+                request.school.clone(),
+                &code,
+                message,
+            )
+        }
+    };
+    if let Err(e) = write_frame(send, &response).await {
+        tracing::warn!("could not answer an AI service's blob upload {}: {e}", request.id);
+    }
+    let _ = send.finish();
+}
+
+/// The body of an upload: resolve the school, check the job, stream exactly
+/// `size` bytes into a temp file under the school's own blob root, rename it
+/// into place, and stamp the row. `Err` is the refusal `(code, message)`.
+///
+/// The order is the point: metadata and the job's existence are checked before
+/// a byte is read (a refusal must not cost the sender the whole file), and the
+/// bytes are complete on disk — renamed, not half-written — before the row
+/// names them. A row write that finds the job gone deletes the file it just
+/// stored rather than leaving an orphan.
+async fn ingest_upload(
+    inner: &Inner,
+    request: &BlobUploadRequest,
+    body: &mut quinn::RecvStream,
+) -> Result<(String, u64), (&'static str, String)> {
+    if !request.upload {
+        return Err((
+            "malformed",
+            "`upload` must be true on a blob upload".to_string(),
+        ));
+    }
+    let api = inner.api.get().ok_or((
+        "unavailable",
+        "the api is not serving yet — retry".to_string(),
+    ))?;
+    let tenant = api.school(&request.school).await?;
+    let (slug, db) = (tenant.slug, tenant.db);
+    // This stream bypasses the router, so it also bypasses the route_layer the
+    // module gate is — the entitlement is checked here by hand instead. The
+    // podcast nest is the `chatbot` module's, exactly as it is over HTTP.
+    if !tenant.modules.contains(Module::Chatbot) {
+        return Err((
+            "not_permitted",
+            format!("the `{slug}` school has no `chatbot` module"),
+        ));
+    }
+    let refusal = crate::ai::podcast::refusal;
+    let root = api.files_dir(&slug);
+    let (key, size) = crate::ai::podcast::ingest(&db, &root, request, body)
+        .await
+        .map_err(|r| refusal(&r))?;
+    Ok((key, size))
+}
+
+/// One upload refusal frame. The school is echoed as the caller spelled it.
+fn upload_refusal(
+    id: String,
+    school: String,
+    code: &str,
+    message: String,
+) -> BlobUploadResponse {
+    BlobUploadResponse::Err {
+        id,
+        school,
+        code: code.to_string(),
+        message,
     }
 }
 
@@ -900,6 +1038,123 @@ async fn write_answer<W: tokio::io::AsyncWrite + Unpin>(
             &refusal(
                 id.clone(),
                 school.clone(),
+                "too_large",
+                format!("the answer exceeds the {AI_MAX_FRAME_BYTES}-byte frame limit"),
+            ),
+        )
+        .await;
+    }
+    written
+}
+
+/// Run one capability the backend serves, and frame its answer.
+///
+/// The school is resolved the same way an api read's is — through the same
+/// registry, with the same three refusals — because it decides *which
+/// database* the operation runs against; a deployment-scoped capability
+/// (the school directory) resolves none, and is the only one that may.
+/// The work is bounded by the bridge's own request deadline: past it the
+/// service gets `timed_out` and decides for itself whether to retry, which is
+/// the honest answer, since the statement may well have landed.
+async fn serve_capability(inner: &Inner, request: CapabilityRequest) -> CapabilityResponse {
+    // The backend-served families walk one composed table
+    // ([`crate::ai::capability`]): ZEKA's storage surface and the podcast
+    // job's state reports. The scope decides whether the frame's school is
+    // resolved below — it is, for every family today.
+    use crate::ai::capability::{self, Scope};
+
+    let Some(api) = inner.api.get() else {
+        return capability_refusal(
+            &request.id,
+            &request.school,
+            "unavailable",
+            "this process has no api surface to run capabilities against".to_string(),
+        );
+    };
+    let tenant = match capability::scope_of(&request.capability) {
+        Some(Scope::Deployment) => None,
+        Some(Scope::School) => match api.school(&request.school).await {
+            Ok(tenant) => Some(tenant),
+            Err((code, message)) => {
+                return capability_refusal(&request.id, &request.school, code, message);
+            }
+        },
+        None => {
+            return capability_refusal(
+                &request.id,
+                &request.school,
+                "unknown_capability",
+                format!("the backend serves no `{}` operation", request.capability),
+            );
+        }
+    };
+    let control = api.tenants.control();
+    let call = capability::serve(
+        &request.capability,
+        tenant.as_ref(),
+        &control,
+        &request.payload,
+    );
+    match tokio::time::timeout(inner.request_timeout, call).await {
+        Ok(Ok(payload)) => CapabilityResponse::Ok {
+            id: request.id,
+            school: request.school,
+            payload,
+        },
+        Ok(Err((code, message))) => {
+            capability_refusal(&request.id, &request.school, code, message)
+        }
+        Err(_) => capability_refusal(
+            &request.id,
+            &request.school,
+            "timed_out",
+            format!(
+                "the operation did not finish within {}s",
+                inner.request_timeout.as_secs()
+            ),
+        ),
+    }
+}
+
+/// One refusal frame, with the school echoed as the caller spelled it.
+fn capability_refusal(
+    id: &str,
+    school: &str,
+    code: &str,
+    message: String,
+) -> CapabilityResponse {
+    CapabilityResponse::Err {
+        id: id.to_string(),
+        school: school.to_string(),
+        code: code.to_string(),
+        message,
+    }
+}
+
+async fn answer_capability(send: &mut quinn::SendStream, response: CapabilityResponse) {
+    if let Err(e) = write_capability_answer(send, &response).await {
+        tracing::warn!("could not answer an AI service's capability call: {e}");
+    }
+    let _ = send.finish();
+}
+
+/// Frame one capability answer, downgrading an oversize `Ok` exactly as
+/// [`write_answer`] does for an api read: an answer too big to frame becomes a
+/// `too_large` refusal rather than silence, since a caller that got no frame
+/// at all would wait out its own deadline to learn nothing.
+async fn write_capability_answer<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    response: &CapabilityResponse,
+) -> Result<(), FrameError> {
+    let written = write_frame(w, response).await;
+    if let (Err(FrameError::TooLarge(_)), CapabilityResponse::Ok { id, school, .. }) =
+        (&written, response)
+    {
+        return write_frame(
+            w,
+            &capability_refusal(
+                id,
+                school,
                 "too_large",
                 format!("the answer exceeds the {AI_MAX_FRAME_BYTES}-byte frame limit"),
             ),

@@ -145,21 +145,100 @@ const EXCLUDED: &[(&str, &str)] = &[
         "deadline on one school-wide recompute; the run's own ledger is \
          `zeka_run`, which the client polls",
     ),
+    // The storage surface ZEKA's rows are written through (the service calls
+    // these; the backend runs them). A browser never speaks the bridge, and
+    // the HTTP doors that mirror them publish what a client can act on.
+    (
+        "AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_RECOMMENDATION_UPSERT_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_SEGMENT_UPSERT_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_PROFILE_UPSERT_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_RUN_UPSERT_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_PENDING_LIST_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_RETENTION_SWEEP_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_DEPARTED_PURGE_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "AI_INSIGHT_SCHOOLS_LIST_CAPABILITY",
+        "capability string the backend serves to an AI service",
+    ),
+    (
+        "MAX_INSIGHT_BATCH_ROWS",
+        "rows per bridge call: the AI service's own batch size, enforced by the \
+         doors as a 413 and by the bridge as `too_many_rows`; a client of \
+         neither cannot act on it",
+    ),
+    (
+        "MAX_INSIGHT_PENDING_STUDENTS",
+        "students one bridge answer may carry; over it the call is refused \
+         (`too_many_rows`) rather than clipped, so there is no client-side \
+         value to size against",
+    ),
+    (
+        "MAX_INSIGHT_PURGE_STUDENTS",
+        "students one bridge purge call may name; the roster is the AI \
+         service's own list, not something a browser assembles",
+    ),
     (
         "AI_PODCAST_SUBMIT_CAPABILITY",
         "capability string an AI service declares",
     ),
     (
-        "AI_PODCAST_STATUS_CAPABILITY",
-        "capability string an AI service declares",
-    ),
-    (
-        "AI_PODCAST_RESULT_CAPABILITY",
-        "capability string an AI service declares",
+        "AI_PODCAST_REPORT_CAPABILITY",
+        "capability string the backend serves; the AI service calls it",
     ),
     (
         "AI_PODCAST_CANCEL_CAPABILITY",
         "capability string an AI service declares",
+    ),
+    (
+        "PODCAST_AUDIO_MAX_BYTES",
+        "the largest episode the backend ingests from a service; a service-side \
+         ingest bound a browser never assembles a body for",
+    ),
+    (
+        "PODCAST_JOB_RETENTION_SECS",
+        "how long a finished podcast job stays readable; the doors answer 410 \
+         past it, which is the whole client-visible behavior — the number is \
+         the operator's policy, not a value a client sizes against",
+    ),
+    (
+        "PODCAST_JOB_STALE_FLOOR_SECS",
+        "floor of the read-side staleness window a dead job is projected \
+         failed in; a client reads the projected state, never sets this",
+    ),
+    (
+        "PODCAST_JOB_STALE_ETA_FACTOR",
+        "how many times its own ETA a podcast job may exceed before the read \
+         side stops believing it runs; same as the floor — the projection is \
+         the visible behavior",
+    ),
+    (
+        "PODCAST_INTERRUPTED_CODE",
+        "error_code value the backend writes for a job it concluded died; a \
+         client reads it off the job, it is not a tunable",
     ),
     (
         "CHAT_STREAM_POLL_MS",
@@ -436,7 +515,12 @@ fn moved_value_tables_are_still_published_or_deliberately_excluded() {
 /// constant: every former entry now lives there and is excused (or published)
 /// through `EXCLUDED` above instead. A new name here is a claim that a bound
 /// belongs somewhere else, which needs an argument.
-const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[];
+const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[(
+    "MAX_CODE_LEN",
+    "bound on the length of a podcast report's `stage`/`error_code` — values \
+     the AI *service* writes onto the job row; a browser reads the stored \
+     string back, it never sizes one against this",
+)];
 
 #[test]
 fn validation_bounds_live_in_constant_rs() {

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM zeka_student_segment_profile WHERE student <> ALL($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "744065e06ac54db230fdfe81656769f2f96ef594e3b147de6a86dd3c4fdd25e4"
+}

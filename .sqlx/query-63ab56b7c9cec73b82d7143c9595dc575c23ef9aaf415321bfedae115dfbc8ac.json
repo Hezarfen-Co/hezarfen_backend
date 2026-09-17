@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO zeka_student_summary\n               (student, marks, attendance, submission, study, confidence,\n                computed_at, retain_until)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n             ON CONFLICT (student) DO UPDATE SET\n               marks = EXCLUDED.marks, attendance = EXCLUDED.attendance,\n               submission = EXCLUDED.submission, study = EXCLUDED.study,\n               confidence = EXCLUDED.confidence, computed_at = EXCLUDED.computed_at,\n               retain_until = EXCLUDED.retain_until",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "63ab56b7c9cec73b82d7143c9595dc575c23ef9aaf415321bfedae115dfbc8ac"
+}

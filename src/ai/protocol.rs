@@ -30,8 +30,48 @@
 //!   and then the stream is finished. That is how a service gets a course
 //!   note's file bytes, which no JSON frame could carry.
 //!
-//!   The two client-initiated request shapes are told apart by their required
-//!   field: an [`ApiRequest`] has `path`, a [`BlobRequest`] has `file`.
+//! * Each **capability call** also goes the service's way, on its own
+//!   client-initiated bidirectional stream: the service writes one
+//!   [`CapabilityRequest`], finishes its send side, and reads one
+//!   [`CapabilityResponse`]. This is the reverse of the [`Request`]/
+//!   [`Response`] pair above, and it exists for the same reason the api read
+//!   does: capabilities live on both sides. The backend *dispatches*
+//!   `chat.reply` and `insight.student` to a service; a service *calls*
+//!   `insight.summary.upsert` and the rest of the backend's storage surface
+//!   to have the backend write rows an AI service may not write itself.
+//!
+//!   The three client-initiated request shapes are told apart by their
+//!   required field: an [`ApiRequest`] has `path`, a [`BlobRequest`] has
+//!   `file`, a [`CapabilityRequest`] has `capability`.
+//!
+//! * Each **blob upload** is the blob read's mirror image: the service writes
+//!   one [`BlobUploadRequest`], then exactly `size` **raw** bytes — again not a
+//!   frame — and finishes its send side; the backend stores them and answers
+//!   one [`BlobUploadResponse`] header frame. That is how a service hands back
+//!   an artifact it produced (today the podcast service's finished mp3), which
+//!   no JSON frame could carry. Distinguished from a [`BlobRequest`] by its
+//!   required `upload` marker and `job_id`.
+//!
+//! # Refusal codes
+//!
+//! [`ApiResponse::Err`], [`BlobResponse::Err`] and [`CapabilityResponse::Err`]
+//! all carry a `code`: a stable, machine-readable string a service branches
+//! on, never a message. The vocabulary, in one place:
+//!
+//! * `malformed` — the frame is not this shape (a missing or mistyped field).
+//! * `unknown_capability` — no operation this backend serves has that name.
+//! * `unknown_school` — the named slug is not a school on this deployment.
+//! * `school_suspended` — it exists and is switched off; worth retrying later.
+//! * `not_permitted` — the school's own feature set refuses the operation.
+//! * `invalid_payload` — the payload does not fit the operation's contract
+//!   (`message` names the field).
+//! * `too_many_rows` — a count bound was exceeded (`message` names it); the
+//!   operation was refused whole, never applied in part.
+//! * `unavailable` — the school's database could not be reached.
+//! * `timed_out` — the operation outlived the bridge's deadline; whether it
+//!   landed is unknown, so retrying is the caller's decision.
+//! * `internal` — the backend failed while doing the work.
+//! * `path_not_allowed`, `unknown_user`, `method_not_allowed` — api-read only.
 //!
 //! # School scoping
 //!
@@ -264,6 +304,124 @@ pub enum BlobResponse {
     },
 }
 
+/// A call of one capability the *backend* serves, written by the service on a
+/// fresh client-initiated stream. The mirror image of [`Request`], which the
+/// backend writes when it calls a capability the *service* serves.
+///
+/// Distinguished from an [`ApiRequest`] by its required `capability` field and
+/// from a [`BlobRequest`] by its required `school` and `payload`. There is no
+/// path and no method: an operation is named, never addressed — the backend's
+/// storage surface is a list of operations, and a frame that could name a
+/// table, a schema or a query would be the door this shape exists to not have.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityRequest {
+    /// Trace id (ULID). Not used for correlation — the stream does that.
+    pub id: String,
+    /// Slug of the school the call is scoped to. Required, exactly as on
+    /// every other frame — one capability is deployment-scoped
+    /// (`insight.schools.list`, whose answer *is* the school directory) and
+    /// sends the empty string there.
+    pub school: String,
+    /// The operation to run. Matched exactly against the backend's served
+    /// capabilities; anything else is `unknown_capability`.
+    pub capability: String,
+    /// Operation-specific body, opaque to the transport.
+    pub payload: Value,
+}
+
+/// The backend's single answer frame, mirroring [`Response`] field for field:
+/// `status` is the discriminator, and both variants echo the school the call
+/// named so a service can tell which of its in-flight calls was answered.
+///
+/// `Err` is a *handled* refusal (unknown capability, a payload that does not
+/// fit, the school's database unreachable). A service that dies mid-call just
+/// drops the stream, which surfaces as a transport error instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CapabilityResponse {
+    Ok {
+        /// Echo of [`CapabilityRequest::id`].
+        id: String,
+        /// Echo of [`CapabilityRequest::school`].
+        school: String,
+        payload: Value,
+    },
+    Err {
+        /// Echo of [`CapabilityRequest::id`].
+        id: String,
+        /// Echo of [`CapabilityRequest::school`], as sent.
+        school: String,
+        /// One of this module's documented refusal codes.
+        code: String,
+        message: String,
+    },
+}
+
+/// A write of one produced artifact's *bytes*, written by the *service* on a
+/// fresh client-initiated stream. The mirror image of [`BlobRequest`]: the
+/// service names what it is handing over, exactly `size` raw bytes follow this
+/// frame, and the backend stores them somewhere that belongs to the school —
+/// never to the service's own volume.
+///
+/// Distinguished from a [`BlobRequest`] (the read) by the required `upload`
+/// marker and its `job_id`: an upload is always *about* one backend-minted
+/// job, and the backend links the stored blob to that job's row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobUploadRequest {
+    /// Trace id (ULID). Not used for correlation — the stream does that.
+    pub id: String,
+    /// The shape marker. Must be `true`; any other value is `malformed`.
+    pub upload: bool,
+    /// Slug of the school the artifact belongs to. Required — the bytes land
+    /// in that school's own blob directory, never anywhere else.
+    pub school: String,
+    /// The backend-minted podcast job the artifact belongs to.
+    pub job_id: String,
+    /// The artifact's display name (an episode's file name). Stored as
+    /// metadata; never used to build a path.
+    pub name: String,
+    /// The artifact's MIME type. Must be an `audio/*` type today.
+    pub content_type: String,
+    /// Exactly how many raw bytes follow this frame.
+    pub size: u64,
+    /// The episode's length, when the producer knows it. Metadata for the
+    /// read doors; `None` is allowed.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+}
+
+/// The single answer frame an upload gets. There are no bytes after it: the
+/// artifact travels service → backend only, and `Ok.key` is the handle the
+/// read doors publish (`GET /podcast/jobs/{id}/audio` resolves it). A refusal
+/// carries nothing after the frame, and the backend resets the stream rather
+/// than reading a body it will not store.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BlobUploadResponse {
+    Ok {
+        /// Echo of [`BlobUploadRequest::id`].
+        id: String,
+        /// Echo of [`BlobUploadRequest::school`].
+        school: String,
+        /// The key the bytes were stored under, relative to the school's blob
+        /// root (`podcast/<job-id>.<ext>`).
+        key: String,
+        /// How many bytes were written — always the request's `size`.
+        size: u64,
+    },
+    Err {
+        /// Echo of [`BlobUploadRequest::id`].
+        id: String,
+        /// Echo of [`BlobUploadRequest::school`], as sent.
+        school: String,
+        /// This module's documented refusal codes, plus the operation's own
+        /// (`unknown_job`, `expired`, `audio_missing`, …) — flat and stable,
+        /// never nested.
+        code: String,
+        message: String,
+    },
+}
+
 /// Write one length-prefixed JSON frame.
 pub async fn write_frame<W, T>(w: &mut W, message: &T) -> Result<(), FrameError>
 where
@@ -466,6 +624,89 @@ mod tests {
         .unwrap();
         assert_eq!(err["outcome"], "err");
         assert_eq!(err["code"], "path_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn capability_frame_tags_are_the_documented_wire_names() {
+        // The answer mirrors `Response` exactly — same `status` discriminator,
+        // same field names — so a service decodes both with one function.
+        // Pinned because other-language services match these literals.
+        let ok = serde_json::to_value(CapabilityResponse::Ok {
+            id: "1".into(),
+            school: "demo".into(),
+            payload: json!({ "written": 2 }),
+        })
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["id"], "1");
+        assert_eq!(ok["school"], "demo");
+        assert_eq!(ok["payload"]["written"], 2);
+        let err = serde_json::to_value(CapabilityResponse::Err {
+            id: "1".into(),
+            school: "demo".into(),
+            code: "unknown_capability".into(),
+            message: "nope".into(),
+        })
+        .unwrap();
+        assert_eq!(err["status"], "err");
+        assert_eq!(err["code"], "unknown_capability");
+        assert_eq!(err["school"], "demo");
+        // A refusal carries no payload: there is no half-answer to read.
+        assert!(err.get("payload").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_capability_request_needs_an_id_a_school_a_capability_and_a_payload() {
+        let call: CapabilityRequest = serde_json::from_value(json!({
+            "id": "01J",
+            "school": "demo",
+            "capability": "insight.summary.upsert",
+            "payload": { "rows": [] },
+        }))
+        .unwrap();
+        assert_eq!(call.capability, "insight.summary.upsert");
+        // Each of the three fields is required: a frame missing its
+        // capability names no operation to run, and a frame missing its
+        // school could only be answered out of a database nobody named.
+        for missing in ["id", "school", "capability", "payload"] {
+            let mut frame = json!({
+                "id": "01J",
+                "school": "demo",
+                "capability": "insight.pending.list",
+                "payload": {},
+            });
+            frame.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<CapabilityRequest>(frame).is_err(),
+                "a frame without `{missing}` must not parse"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_initiated_shapes_do_not_parse_as_each_other() {
+        // Routing is by required field (`path` / `file` / `capability`), so
+        // this is the property that keeps a capability call from being
+        // mistaken for an api read — or for a blob read, which is what the
+        // frame would look like if `capability` were ever optional.
+        let call = json!({
+            "id": "01J",
+            "school": "demo",
+            "capability": "insight.pending.list",
+            "payload": {},
+        });
+        assert!(
+            serde_json::from_value::<CapabilityRequest>(call.clone()).is_ok(),
+            "the capability frame must parse as a capability call"
+        );
+        assert!(
+            serde_json::from_value::<ApiRequest>(call.clone()).is_err(),
+            "a capability call must not parse as an api read"
+        );
+        assert!(
+            serde_json::from_value::<BlobRequest>(call).is_err(),
+            "a capability call must not parse as a blob read"
+        );
     }
 
     #[tokio::test]

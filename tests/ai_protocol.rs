@@ -1631,3 +1631,110 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
     assert_eq!(answer["code"], "malformed");
     assert_eq!(answer["id"], "t-neither");
 }
+
+// ---------------------------------------------------- capability calls --
+//
+// The third client-initiated shape: a service calling an operation the
+// *backend* serves (ZEKA's storage surface — no AI service holds a school
+// database credential here). Nothing about the two shapes that existed before
+// may move: an api read is still routed on `path`, a blob read on `file`, and
+// a service that never calls a capability never receives one — the new frame
+// only ever appears on a stream the service itself opened, so a client that
+// does not speak it cannot be surprised by it. These tests pin the shape the
+// way a foreign service reads it: bytes in, untyped JSON out.
+
+#[tokio::test]
+async fn a_capability_call_carries_exactly_the_published_keys() {
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("zeka", "insight.refresh")).await;
+    await_workers(&bridge, 1).await;
+    // The storage surface runs against a real school database, so the bridge
+    // needs the api handle armed (`app_with_ai`) and a student that exists.
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let _ = db;
+    let ayse = common::login(&app, "ayse").await;
+    let student = common::me_id(&app, &ayse).await;
+
+    let body = format!(
+        r#"{{"id":"t-cap","school":"{SCHOOL}","capability":"insight.summary.upsert","payload":{{"rows":[{{"student":"{student}","marks":{{"ortalama":72}},"confidence":"stable","computed_at":1700000000000,"retain_until":1800000000000}}]}}}}"#
+    );
+    let (answer, _) = raw::api_read(&service.conn, body.as_bytes()).await;
+
+    assert_eq!(
+        raw::keys(&answer),
+        ["id", "payload", "school", "status"],
+        "capability answer shape changed: {answer}"
+    );
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert_eq!(answer["id"], "t-cap");
+    assert_eq!(
+        answer["school"], SCHOOL,
+        "the answer echoes the school the call named"
+    );
+    assert_eq!(answer["payload"]["written"], 1, "{answer}");
+}
+
+#[tokio::test]
+async fn a_capability_refusal_is_flat_and_never_reports_ok() {
+    // A service branches on `status` first and on `code` second; both are
+    // pinned literals, and a refusal carries no payload — there is no
+    // half-answer to read.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("zeka", "insight.refresh")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, _db) = common::app_with_ai(Some(bridge.clone())).await;
+
+    let body = format!(
+        r#"{{"id":"t-nope","school":"{SCHOOL}","capability":"insight.database.query","payload":{{"sql":"select 1"}}}}"#
+    );
+    let (answer, _) = raw::api_read(&service.conn, body.as_bytes()).await;
+    assert_eq!(
+        raw::keys(&answer),
+        ["code", "id", "message", "school", "status"],
+        "capability refusal shape changed: {answer}"
+    );
+    assert_eq!(answer["status"], "err", "{answer}");
+    assert_eq!(answer["code"], "unknown_capability", "{answer}");
+    assert_eq!(answer["id"], "t-nope");
+    assert_eq!(answer["school"], SCHOOL);
+    assert!(
+        answer["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message must be a string a service can log"
+    );
+}
+
+#[tokio::test]
+async fn the_capability_shape_does_not_steal_the_shapes_that_existed_before() {
+    // Precedence, pinned: `path` wins over `file` wins over `capability`, so
+    // every frame that parsed as one of the older shapes still parses as it
+    // did — the capability branch is only reached when neither is present.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = common::app_with_ai(Some(bridge.clone())).await;
+    let ayse = common::login(&app, "ayse").await;
+    let student = common::me_id(&app, &ayse).await;
+
+    // A frame carrying both: still the api read it has always been.
+    let body = format!(
+        r#"{{"id":"t-both","school":"{SCHOOL}","path":"/auth/me","capability":"insight.pending.list","payload":{{}},"on_behalf_of":"{student}"}}"#
+    );
+    let (answer, _) = raw::api_read(&service.conn, body.as_bytes()).await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+    assert_eq!(answer["status"], 200, "{answer}");
+
+    // A capability-only frame: the capability call, and a read the service
+    // asked for comes back in its own envelope.
+    let body = format!(
+        r#"{{"id":"t-pending","school":"{SCHOOL}","capability":"insight.pending.list","payload":{{}}}}"#
+    );
+    let (answer, _) = raw::api_read(&service.conn, body.as_bytes()).await;
+    assert_eq!(answer["status"], "ok", "{answer}");
+    assert_eq!(answer["payload"]["students"], json!([]), "{answer}");
+
+    // Neither: the same api-read refusal as before this shape existed.
+    let (answer, _) =
+        raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
+    assert_eq!(answer["outcome"], "err", "{answer}");
+    assert_eq!(answer["code"], "malformed");
+}

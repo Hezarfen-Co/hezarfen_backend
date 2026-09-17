@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM zeka_recommendation\n          WHERE about IS NOT NULL AND about <> ALL($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "64a0ae377768cc932bb3751b6d8857924536cb9eae45bb42ac5ddf8b37ef5702"
+}

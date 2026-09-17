@@ -1,0 +1,214 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE podcast_job SET audio_key = $2, audio_name = $3, audio_type = $4, audio_bytes = $5, duration_secs = $6, updated_at = $7 WHERE id = $1 RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PodcastJobId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "source_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "source_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "format",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "format"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "state: PodcastJobState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "stage",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "stage"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "progress",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "progress"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "error_code",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "error_code"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "audio_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "audio_key"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "audio_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "audio_name"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "audio_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "audio_type"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "audio_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "audio_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "duration_secs",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "duration_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "eta_secs",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "eta_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f1a079e6c5978b7d9458172705e0c66f070d71e3435dc8f359d09675c5fcccdc"
+}

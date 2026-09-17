@@ -1,11 +1,15 @@
-//! The insight nest: the read surface over ZEKA's own tables, plus the two
-//! doors that ask ZEKA to compute.
+//! The insight nest: the read surface over ZEKA's tables, the doors that ask
+//! ZEKA to compute, and the storage doors its rows are written through.
 //!
-//! ZEKA (`hezarfen_zeka`) is an AI service that dials in over the QUIC bridge
-//! and **writes its own rows** into each school database — the `zeka_*`
-//! tables created by the school migrator. The backend never composes those
-//! rows; it reads them here and, on request, asks the service to compute
-//! (the dispatch contract lives in [`crate::ai::insight`]).
+//! ZEKA (`hezarfen_zeka`) is an AI service that dials in over the QUIC bridge.
+//! It **does not touch a school database** — no AI service on this deployment
+//! does — so the `zeka_*` tables, created by the school migrator, are written
+//! and read only by this process. Two surfaces, one implementation each: the
+//! service calls the backend over the bridge (`insight.summary.upsert` and
+//! the rest of the family — the wire contract is [`crate::ai::insight`], the
+//! statements are [`crate::db::insight`]), and the same operations are
+//! mounted here as HTTP doors for tooling. The backend never composes an
+//! insight row; it stores what the service computed and hands it back.
 //!
 //! Reading is authorized the way every per-student report in this API is:
 //! [`service::parent_link::ensure_can_observe`] decides whether the caller
@@ -49,9 +53,14 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::ai::insight::{self, RefreshRequest, StudentRequest};
+use crate::ai::insight::{
+    self, PendingList, ProfileWriteRequest, PurgeRequest, RecommendationWriteRequest,
+    RefreshRequest, RunWriteRequest, SchoolDirectory, SegmentWriteRequest, StudentRequest,
+    SummaryWriteRequest, TableVerdicts, WriteReceipt,
+};
 use crate::constant::{AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY};
 use crate::database::Database;
+use crate::db;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::role::Role;
@@ -63,7 +72,7 @@ use crate::state::AppState;
 use crate::tenant::ResolvedTenant;
 use crate::web::tenant_state::State;
 
-use super::{CurrentUser, Page, PageParams, RequireManager, ai_unavailable, paginate};
+use super::{CurrentUser, Page, PageParams, RequireBuilder, RequireManager, ai_unavailable, paginate};
 
 /// The single `now` every card read is filtered against. ZEKA stores unix
 /// milliseconds, so "expired" is a comparison, not a projection.
@@ -76,7 +85,28 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(refresh))
         .routes(routes!(my_insight))
         .routes(routes!(student_insight, compute_student))
-        .routes(routes!(list_runs))
+        .routes(routes!(list_runs, write_run))
+        .routes(routes!(write_summaries))
+        .routes(routes!(write_recommendations))
+        .routes(routes!(write_segments))
+        .routes(routes!(write_profiles))
+        .routes(routes!(pending_students))
+        .routes(routes!(sweep_retention))
+        .routes(routes!(purge_departed))
+}
+
+/// The one door of this nest that is **not** school-scoped: the deployment's
+/// active-school directory.
+///
+/// ZEKA's storage operations are all scoped to the school a session belongs
+/// to, and so are these doors — but the directory is not: it names every
+/// customer. A school session must therefore never reach it, which is why
+/// this route is mounted *outside* the school-scoped gate, on the builder
+/// principal (the deployment operator), exactly like the vendor surface's own
+/// `GET /schools`. A school cookie answers `401` here, as it does everywhere
+/// the builder principal is required.
+pub fn school_directory_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(active_schools))
 }
 
 // ---- the compute doors -----------------------------------------------------
@@ -242,6 +272,280 @@ fn accepted() -> Response {
         }),
     )
         .into_response()
+}
+
+// ---- the storage doors -----------------------------------------------------
+//
+// ZEKA's own tables are written and read by the backend, never by the service
+// (`crate::db::insight` holds the statements, `src/ai/insight.rs` the bridge
+// contract). These are the same nine operations over HTTP — one service
+// function, two surfaces — so a deployment's tooling can seed, inspect and
+// maintain what the service computed without holding a bridge connection.
+//
+// Manager+ on all of them: every one reads or writes rows about students
+// school-wide, which is the same floor `GET /insights/runs` and the refresh
+// door carry. The school is the caller's own, resolved by the nest's own
+// extractors; no door here takes a school, a database or a query in its body.
+
+/// Store a batch of ZEKA's student summaries (and their attention items).
+///
+/// This is what the AI service calls over the bridge as
+/// `insight.summary.upsert`. One call is one batch and one transaction: the
+/// batch lands whole or not at all, so a caller that retries cannot
+/// half-apply it. Each student's attention items are **replaced**, never
+/// merged — a fact the service stopped producing must not stay on screen.
+/// At most [`MAX_INSIGHT_BATCH_ROWS`](crate::constant::MAX_INSIGHT_BATCH_ROWS)
+/// rows per call.
+#[utoipa::path(
+    post,
+    path = "/summaries",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = SummaryWriteRequest,
+    responses(
+        (status = 200, description = "The rows were written", body = WriteReceipt),
+        (status = 400, description = "The payload does not fit the operation: a field is malformed, or a referenced row is not in this school", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More rows than one call may carry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn write_summaries(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<SummaryWriteRequest>,
+) -> Result<Json<WriteReceipt>, AppError> {
+    Ok(Json(db::insight::write_summaries(&st.db, body.rows).await?))
+}
+
+/// Store a batch of ZEKA's recommendation cards.
+///
+/// The bridge capability is `insight.recommendation.upsert`. The backend
+/// mints each row's id. A row whose evidence carries nothing but a
+/// `limitation` is **not written** and is counted `rejected` in the receipt —
+/// the service's own rule, applied where the write happens instead of being
+/// trusted to the writer.
+#[utoipa::path(
+    post,
+    path = "/recommendations",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = RecommendationWriteRequest,
+    responses(
+        (status = 200, description = "The rows were written; `rejected` counts the cards the evidence rule kept out", body = WriteReceipt),
+        (status = 400, description = "The payload does not fit the operation: a field is malformed, or a referenced row is not in this school", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More rows than one call may carry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn write_recommendations(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<RecommendationWriteRequest>,
+) -> Result<Json<WriteReceipt>, AppError> {
+    Ok(Json(
+        db::insight::write_recommendations(&st.db, body.rows).await?,
+    ))
+}
+
+/// Store a batch of ZEKA's question-segment labels (and each question's
+/// dimension split).
+///
+/// The bridge capability is `insight.segment.upsert`; the dimension rows are
+/// replaced with the payload, like the attention items above.
+#[utoipa::path(
+    post,
+    path = "/segments",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = SegmentWriteRequest,
+    responses(
+        (status = 200, description = "The rows were written", body = WriteReceipt),
+        (status = 400, description = "The payload does not fit the operation: a field is malformed, or a referenced row is not in this school", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More rows than one call may carry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn write_segments(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<SegmentWriteRequest>,
+) -> Result<Json<WriteReceipt>, AppError> {
+    Ok(Json(db::insight::write_segments(&st.db, body.rows).await?))
+}
+
+/// Store a batch of ZEKA's student segment profiles.
+///
+/// The bridge capability is `insight.profile.upsert`. `contrast` is the field
+/// the service's rules fire on — the raw `accuracy` mostly measures a
+/// student's general level and is stored for the evidence panel only.
+#[utoipa::path(
+    post,
+    path = "/profiles",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = ProfileWriteRequest,
+    responses(
+        (status = 200, description = "The rows were written", body = WriteReceipt),
+        (status = 400, description = "The payload does not fit the operation: a field is malformed, or a referenced row is not in this school", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More rows than one call may carry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn write_profiles(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<ProfileWriteRequest>,
+) -> Result<Json<WriteReceipt>, AppError> {
+    Ok(Json(db::insight::write_profiles(&st.db, body.rows).await?))
+}
+
+/// Store one compute run's ledger row (with its pending students and failed
+/// modules, both replaced).
+///
+/// The bridge capability is `insight.run.upsert`; the run is keyed by
+/// `run_day` (`YYYY-MM-DD`), so a re-run of the same night overwrites rather
+/// than duplicating. `GET /insights/runs` reads the ledger back.
+#[utoipa::path(
+    post,
+    path = "/runs",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = RunWriteRequest,
+    responses(
+        (status = 200, description = "The run's ledger row was written", body = WriteReceipt),
+        (status = 400, description = "The payload does not fit the operation: `run_day` is not `YYYY-MM-DD`, or a referenced row is not in this school", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn write_run(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<RunWriteRequest>,
+) -> Result<Json<WriteReceipt>, AppError> {
+    Ok(Json(db::insight::write_run(&st.db, body.run).await?))
+}
+
+/// The students the freshest compute run left pending — where the next run
+/// starts.
+///
+/// Manager+ only, like `GET /insights/runs`: `pending_students` is a list of
+/// people, and this is the same list unpaged. The bridge capability is
+/// `insight.pending.list`; the list is answered whole or refused past
+/// [`MAX_INSIGHT_PENDING_STUDENTS`](crate::constant::MAX_INSIGHT_PENDING_STUDENTS),
+/// never clipped, because the service resumes its next run from it.
+#[utoipa::path(
+    get,
+    path = "/pending",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The freshest run's pending students, in the run's own order", body = PendingList),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More pending students than one answer may carry", body = ErrorResponse),
+    ),
+)]
+async fn pending_students(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+) -> Result<Json<PendingList>, AppError> {
+    Ok(Json(db::insight::last_pending(&st.db).await?))
+}
+
+/// Delete every `zeka_*` row whose retention window has closed.
+///
+/// The bridge capability is `insight.retention.sweep`. Children go before
+/// their parents (the foreign keys are `ON DELETE NO ACTION`), the backend's
+/// own clock decides expiry, and each table answers its own verdict — a table
+/// that could not be swept is reported `false` while the rest proceed, since
+/// housekeeping must not lose a whole run over one locked table.
+#[utoipa::path(
+    post,
+    path = "/sweep",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "One verdict per table: whether its expired rows were deleted", body = TableVerdicts),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+    ),
+)]
+async fn sweep_retention(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+) -> Result<Json<TableVerdicts>, AppError> {
+    let now_ms = crate::domain::timestamp::Timestamp::now().as_millis();
+    Ok(Json(db::insight::sweep(&st.db, now_ms).await?))
+}
+
+/// Delete the derived rows of every student who is no longer on the roster.
+///
+/// The bridge capability is `insight.departed.purge`; `students` is the
+/// **active** roster, and every student not named loses their summaries,
+/// profiles, attention items, cards about them, and pending-run entries. One
+/// transaction, so the verdicts move together. An empty list is refused: an
+/// empty roster is a fetch that failed, and obeying it would delete the whole
+/// school's derived data.
+#[utoipa::path(
+    post,
+    path = "/purge",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    request_body = PurgeRequest,
+    responses(
+        (status = 200, description = "One verdict per table: whether the departed students' rows were deleted", body = TableVerdicts),
+        (status = 400, description = "The payload does not fit the operation: the roster is empty", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 413, description = "More students than one call may name", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn purge_departed(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Json(body): Json<PurgeRequest>,
+) -> Result<Json<TableVerdicts>, AppError> {
+    Ok(Json(
+        db::insight::purge_departed(&st.db, body.students).await?,
+    ))
+}
+
+/// The deployment's active schools, by slug — the directory a shared AI fleet
+/// schedules over.
+///
+/// This is the one operation of the family that is not school-scoped, and the
+/// one door of this nest that is not a school's: it names every customer, so
+/// it runs on the **builder** principal (the deployment operator), mounted
+/// outside the school gate exactly like the vendor surface's `GET /schools`.
+/// A school session gets `401` here. The bridge capability is
+/// `insight.schools.list`, which is the service's own deployment-scoped call:
+/// the same function, two surfaces, and a school-scoped caller on neither.
+#[utoipa::path(
+    get,
+    path = "/insights/schools",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Every active school on this deployment, by slug", body = SchoolDirectory),
+        (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
+    ),
+)]
+async fn active_schools(
+    axum::extract::State(st): axum::extract::State<AppState>,
+    RequireBuilder(_builder): RequireBuilder,
+) -> Result<Json<SchoolDirectory>, AppError> {
+    Ok(Json(db::insight::active_schools(st.tenants.control()).await?))
 }
 
 /// Canonicalize the ids a refresh body names — through the same parser every

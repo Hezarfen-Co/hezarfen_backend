@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.student FROM zeka_run_pending p\n           JOIN zeka_run r ON r.run_day = p.run\n          WHERE r.run_day = (SELECT run_day FROM zeka_run\n                              ORDER BY started_at DESC, run_day DESC LIMIT 1)\n          ORDER BY p.ord\n          LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "student",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_run_pending",
+            "name": "student"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8378e48dd68785c1caccc7e7be489d93fbb51942736383921d200584eb202d32"
+}

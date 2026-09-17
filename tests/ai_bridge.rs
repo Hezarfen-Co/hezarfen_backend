@@ -3501,3 +3501,454 @@ async fn no_insight_refresh_worker_means_503_and_nothing_is_dispatched() {
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 }
+
+// ------------------------------------------- the backend-served capabilities --
+//
+// The other direction: a service calling the *backend*. ZEKA's storage
+// surface is nine `insight.*` operations the backend executes against the
+// school the frame names — no AI service holds a school database credential
+// on this deployment, so these calls are the only way its rows are written.
+// Everything below rides a real client-initiated QUIC stream, like the api
+// read it is shaped after.
+
+use hezarfen_backend::ai::protocol::{CapabilityRequest, CapabilityResponse};
+use hezarfen_backend::constant::{
+    AI_INSIGHT_PENDING_LIST_CAPABILITY, AI_INSIGHT_RETENTION_SWEEP_CAPABILITY,
+    AI_INSIGHT_RUN_UPSERT_CAPABILITY, AI_INSIGHT_SCHOOLS_LIST_CAPABILITY,
+    AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+};
+use hezarfen_backend::domain::user::{Password, Username};
+use hezarfen_backend::service::builder;
+use hezarfen_backend::tenant::SchoolId;
+
+/// One capability call: a fresh client-initiated stream, one frame out, one
+/// back, stream dropped — the same lifecycle as `api_read` above.
+async fn capability_call(
+    conn: &quinn::Connection,
+    request: CapabilityRequest,
+) -> CapabilityResponse {
+    let (mut send, mut recv) = conn.open_bi().await.expect("capability stream");
+    write_frame(&mut send, &request).await.expect("write CapabilityRequest");
+    let _ = send.finish();
+    read_frame(&mut recv).await.expect("read CapabilityResponse")
+}
+
+fn insight_call(capability: &str, school: &str, payload: Value) -> CapabilityRequest {
+    CapabilityRequest {
+        id: format!("trace-{capability}"),
+        school: school.to_string(),
+        capability: capability.to_string(),
+        payload,
+    }
+}
+
+fn ok_capability(answer: CapabilityResponse) -> Value {
+    match answer {
+        CapabilityResponse::Ok { payload, .. } => payload,
+        CapabilityResponse::Err { code, message, .. } => {
+            panic!("expected the backend to run the operation, got {code}: {message}")
+        }
+    }
+}
+
+fn refused_capability(answer: CapabilityResponse) -> (String, String) {
+    match answer {
+        CapabilityResponse::Err { code, message, .. } => (code, message),
+        CapabilityResponse::Ok { payload, .. } => {
+            panic!("expected a refusal, got {payload}")
+        }
+    }
+}
+
+/// A summary row as the service sends it, for one student.
+fn summary_payload(student: &str, retain_until: i64) -> Value {
+    json!({ "rows": [{
+        "student": student,
+        "marks": { "ortalama": 72 },
+        "confidence": "stable",
+        "computed_at": 1_700_000_000_000i64,
+        "retain_until": retain_until,
+        "attention": [{
+            "trigger": "not_egilimi_dusuyor",
+            "fact": "Son üç sınavda ortalama 12 puan düştü.",
+            "window_from": 1_690_000_000_000i64,
+            "window_to": 1_700_000_000_000i64,
+            "evidence": { "delta": -12 },
+        }],
+    }] })
+}
+
+/// The demo school, an app with the bridge armed, a manager cookie and one
+/// student's id — the fixture every test below needs.
+async fn insight_fixture(
+    bridge: &AiBridge,
+) -> (FakeService, Router, hezarfen_backend::database::Database, String, String) {
+    let service =
+        connect_service(bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
+    await_workers(bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let mudur = common::login_as(&app, &db, "mudur", "manager").await;
+    let ayse = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &ayse).await;
+    (service, app, db, mudur, student)
+}
+
+#[tokio::test]
+async fn a_capability_call_writes_the_row_the_schools_own_read_door_serves() {
+    let bridge = bridge().await;
+    let (service, app, _db, mudur, student) = insight_fixture(&bridge).await;
+
+    let answer = capability_call(
+        &service.conn,
+        insight_call(
+            AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+            DEMO_SLUG,
+            summary_payload(&student, 1_800_000_000_000i64),
+        ),
+    )
+    .await;
+    let CapabilityResponse::Ok { payload, school, id } = answer else {
+        panic!("expected the write to land: {answer:?}");
+    };
+    assert_eq!(id, format!("trace-{AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY}"));
+    assert_eq!(school, DEMO_SLUG, "the answer echoes the school the frame named");
+    assert_eq!(payload["written"], 1);
+
+    // The same row is what the nest's own read door serves the school's staff
+    // — one function behind the write, one behind the read, neither school
+    // able to see the other's row.
+    let res = common::send(
+        &app,
+        "GET",
+        &format!("/insights/students/{student}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["summary"]["marks"]["ortalama"], 72);
+    assert_eq!(res.body["summary"]["confidence"], "stable");
+    assert_eq!(res.body["attention"].as_array().map(Vec::len), Some(1));
+    assert_eq!(res.body["attention"][0]["trigger"], "not_egilimi_dusuyor");
+}
+
+#[tokio::test]
+async fn the_insight_ledger_and_pending_list_round_trip_over_the_bridge() {
+    let bridge = bridge().await;
+    let (service, _app, _db, _mudur, student) = insight_fixture(&bridge).await;
+
+    let run = insight_call(
+        AI_INSIGHT_RUN_UPSERT_CAPABILITY,
+        DEMO_SLUG,
+        json!({ "run": {
+            "run_day": "2026-09-17",
+            "started_at": 1_700_000_000_000i64,
+            "status": "partial",
+            "students_total": 3,
+            "students_ok": 2,
+            "students_failed": 0,
+            "students_skipped": 1,
+            "rows_written": 2,
+            "budget_exceeded": true,
+            "budget_ms": 60_000,
+            "retain_until": 1_800_000_000_000i64,
+            "pending_students": [student],
+            "failed_modules": ["segment"],
+        } }),
+    );
+    assert_eq!(ok_capability(capability_call(&service.conn, run).await)["written"], 1);
+
+    let pending = ok_capability(
+        capability_call(
+            &service.conn,
+            insight_call(AI_INSIGHT_PENDING_LIST_CAPABILITY, DEMO_SLUG, json!({})),
+        )
+        .await,
+    );
+    assert_eq!(pending["students"], json!([student]));
+
+    // A run day that is not `YYYY-MM-DD` is the caller's payload error, not a
+    // CHECK violation dressed as a server fault.
+    let bad_day = insight_call(
+        AI_INSIGHT_RUN_UPSERT_CAPABILITY,
+        DEMO_SLUG,
+        json!({ "run": {
+            "run_day": "17.09.2026",
+            "started_at": 1,
+            "status": "running",
+            "students_total": 0, "students_ok": 0, "students_failed": 0,
+            "students_skipped": 0, "rows_written": 0,
+            "budget_exceeded": false, "budget_ms": 1,
+            "retain_until": 1,
+        } }),
+    );
+    let (code, message) = refused_capability(capability_call(&service.conn, bad_day).await);
+    assert_eq!(code, "invalid_payload");
+    assert!(message.contains("run_day"), "names the field: {message}");
+}
+
+#[tokio::test]
+async fn the_sweep_and_purge_capabilities_answer_per_table_verdicts() {
+    let bridge = bridge().await;
+    let (service, _app, _db, _mudur, student) = insight_fixture(&bridge).await;
+
+    // An expired row: the sweep's own clock decides, so it must go.
+    let answer = capability_call(
+        &service.conn,
+        insight_call(
+            AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+            DEMO_SLUG,
+            summary_payload(&student, 1), // long past
+        ),
+    )
+    .await;
+    assert_eq!(ok_capability(answer)["written"], 1);
+
+    let verdicts = ok_capability(
+        capability_call(
+            &service.conn,
+            insight_call(AI_INSIGHT_RETENTION_SWEEP_CAPABILITY, DEMO_SLUG, json!({})),
+        )
+        .await,
+    );
+    assert_eq!(verdicts["tables"]["zeka_student_summary"], true);
+    assert_eq!(verdicts["tables"].as_object().map(|t| t.len()), Some(9));
+
+    // An empty roster is a fetch that failed, never "nobody is enrolled":
+    // obeyed, it would delete every student's derived rows in one call.
+    let empty = insight_call(
+        "insight.departed.purge",
+        DEMO_SLUG,
+        json!({ "students": [] }),
+    );
+    let (code, _) = refused_capability(capability_call(&service.conn, empty).await);
+    assert_eq!(code, "invalid_payload");
+}
+
+#[tokio::test]
+async fn a_capability_call_cannot_touch_another_schools_rows() {
+    let bridge = bridge().await;
+    let service =
+        connect_service(&bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
+    await_workers(&bridge, 1).await;
+    let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let _mudur = common::login_as(&app, &demo_db, "mudur", "manager").await;
+    let ayse = common::login_as(&app, &demo_db, "ayse", "student").await;
+    let student = common::me_id(&app, &ayse).await;
+    let beta = Slug::try_new("beta").unwrap();
+    let beta_db = tenants
+        .create(SchoolId::generate(), &beta, "Beta College", ModuleSet::all())
+        .await
+        .expect("beta");
+
+    // Same payload the demo school accepts, sent for beta: beta's database
+    // has no such student, so the foreign key refuses it. That refusal is the
+    // proof the statement ran inside *beta's* database — run against the
+    // demo school it would have landed, which is exactly what must not
+    // happen when a frame names another school.
+    let cross = insight_call(
+        AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+        beta.as_str(),
+        summary_payload(&student, 1_800_000_000_000i64),
+    );
+    let (code, message) = refused_capability(capability_call(&service.conn, cross).await);
+    assert_eq!(code, "invalid_payload");
+    assert!(message.contains("referenced row"), "{message}");
+
+    // Nothing landed in beta, and nothing leaked into the demo school either.
+    let beta_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM zeka_student_summary")
+        .fetch_one(&beta_db)
+        .await
+        .expect("beta count");
+    assert_eq!(beta_rows, 0);
+    let demo_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM zeka_student_summary")
+        .fetch_one(&demo_db)
+        .await
+        .expect("demo count");
+    assert_eq!(demo_rows, 0, "the refused call wrote nothing anywhere");
+}
+
+#[tokio::test]
+async fn a_capability_call_refuses_unknown_names_and_payloads_that_do_not_fit() {
+    let bridge = bridge().await;
+    let (service, _app, _db, _mudur, student) = insight_fixture(&bridge).await;
+
+    // A name nobody serves — no prefix match, no fallback: the shape that
+    // would make this a generic door is the shape that is missing.
+    let unknown = insight_call("insight.database.query", DEMO_SLUG, json!({ "sql": "SELECT 1" }));
+    let (code, message) = refused_capability(capability_call(&service.conn, unknown).await);
+    assert_eq!(code, "unknown_capability");
+    assert!(message.contains("insight.database.query"), "{message}");
+
+    // A payload that does not fit the operation's contract.
+    let bad = insight_call(
+        AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+        DEMO_SLUG,
+        json!({ "rows": [{ "student": "not-a-uuid", "confidence": "stable",
+                           "computed_at": 1, "retain_until": 2 }] }),
+    );
+    let (code, message) = refused_capability(capability_call(&service.conn, bad).await);
+    assert_eq!(code, "invalid_payload");
+    assert!(message.contains("student"), "names the field: {message}");
+
+    // A frame that names a school nobody deploys.
+    let stranger = insight_call(
+        AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+        "nowhere",
+        summary_payload(&student, 1),
+    );
+    let (code, _) = refused_capability(capability_call(&service.conn, stranger).await);
+    assert_eq!(code, "unknown_school");
+}
+
+#[tokio::test]
+async fn the_school_directory_is_the_one_deployment_scoped_operation() {
+    let bridge = bridge().await;
+    let service =
+        connect_service(&bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
+    await_workers(&bridge, 1).await;
+    let (app, _db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let beta = Slug::try_new("beta").unwrap();
+    tenants
+        .create(SchoolId::generate(), &beta, "Beta College", ModuleSet::all())
+        .await
+        .expect("beta");
+
+    // The frame names no school (there is none to name: this is how a shared
+    // fleet learns which schools exist).
+    let answer = capability_call(
+        &service.conn,
+        insight_call(AI_INSIGHT_SCHOOLS_LIST_CAPABILITY, "", json!({})),
+    )
+    .await;
+    let payload = ok_capability(answer);
+    let schools: Vec<&str> = payload["schools"]
+        .as_array()
+        .expect("schools")
+        .iter()
+        .map(|s| s.as_str().expect("slug"))
+        .collect();
+    assert_eq!(schools, vec!["beta", DEMO_SLUG], "active schools, sorted");
+
+    // Over HTTP the same operation is the builder's: a school session must
+    // not be able to enumerate the deployment's other customers.
+    let ayse = common::login(&app, "ayse").await;
+    let refused = common::send(&app, "GET", "/insights/schools", Some(&ayse), None).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+    let anonymous = common::send(&app, "GET", "/insights/schools", None, None).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // And the builder — the deployment operator — reads the same directory.
+    builder::ensure(
+        tenants.control(),
+        Username::try_new("operator").unwrap(),
+        Password::try_new("secret1").unwrap(),
+    )
+    .await
+    .expect("seed the builder");
+    let login = common::send(
+        &app,
+        "POST",
+        "/builder/login",
+        None,
+        Some(json!({ "username": "operator", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.body);
+    let cookie = login.cookie.expect("builder cookie");
+    let listed = common::send(&app, "GET", "/insights/schools", Some(&cookie), None).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(listed.body, payload);
+}
+
+#[tokio::test]
+async fn the_storage_doors_are_manager_only_and_write_the_callers_own_school() {
+    let bridge = bridge().await;
+    let (service, app, db, mudur, student) = insight_fixture(&bridge).await;
+    let _ = service;
+
+    // A teacher may read insights, but these doors write rows about students
+    // school-wide: manager+ is the floor, as it is on the ledger read.
+    let ogretmen = common::login_as(&app, &db, "ogretmen", "teacher").await;
+    let body = summary_payload(&student, 1_800_000_000_000i64);
+    let refused = common::send(
+        &app,
+        "POST",
+        "/insights/summaries",
+        Some(&ogretmen),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    let anonymous = common::send(&app, "POST", "/insights/summaries", None, Some(body.clone())).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // The same operation the bridge serves, on the caller's own school.
+    let written = common::send(
+        &app,
+        "POST",
+        "/insights/summaries",
+        Some(&mudur),
+        Some(body),
+    )
+    .await;
+    assert_eq!(written.status, StatusCode::OK, "{}", written.body);
+    assert_eq!(written.body["written"], 1);
+
+    // 413 for a batch past the ceiling, refused whole — never narrowed.
+    let over: Vec<Value> = (0..501)
+        .map(|_| {
+            json!({ "student": student, "confidence": "stable",
+                    "computed_at": 1_700_000_000_000i64,
+                    "retain_until": 1_800_000_000_000i64 })
+        })
+        .collect();
+    let too_many = common::send(
+        &app,
+        "POST",
+        "/insights/summaries",
+        Some(&mudur),
+        Some(json!({ "rows": over })),
+    )
+    .await;
+    assert_eq!(too_many.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", too_many.body);
+
+    // The run ledger's POST and the existing GET share one path.
+    let run = common::send(
+        &app,
+        "POST",
+        "/insights/runs",
+        Some(&mudur),
+        Some(json!({ "run": {
+            "run_day": "2026-09-18",
+            "started_at": 1_700_000_000_000i64,
+            "status": "ok",
+            "students_total": 1, "students_ok": 1, "students_failed": 0,
+            "students_skipped": 0, "rows_written": 1,
+            "budget_exceeded": false, "budget_ms": 60_000,
+            "retain_until": 1_800_000_000_000i64,
+        } })),
+    )
+    .await;
+    assert_eq!(run.status, StatusCode::OK, "{}", run.body);
+    let ledger = common::send(&app, "GET", "/insights/runs", Some(&mudur), None).await;
+    assert_eq!(ledger.status, StatusCode::OK, "{}", ledger.body);
+    assert_eq!(ledger.body["items"][0]["run_day"], "2026-09-18");
+    assert_eq!(ledger.body["items"][0]["status"], "ok");
+
+    // The sweep is a bodyless action route and answers one verdict per table.
+    let swept = common::send(&app, "POST", "/insights/sweep", Some(&mudur), None).await;
+    assert_eq!(swept.status, StatusCode::OK, "{}", swept.body);
+    assert_eq!(swept.body["tables"].as_object().map(|t| t.len()), Some(9));
+    // The retention the payload named is honoured: this row lives on.
+    let kept = common::send(
+        &app,
+        "GET",
+        &format!("/insights/students/{student}"),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(kept.status, StatusCode::OK);
+    assert_eq!(kept.body["summary"]["marks"]["ortalama"], 72);
+}

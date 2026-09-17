@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO zeka_question_segment_dimension\n                       (question, dimension, role, ord)\n                     VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0f040f8c3044894f49702f9918b672f5b07587db6047f00cfda9c2effe7af56"
+}
