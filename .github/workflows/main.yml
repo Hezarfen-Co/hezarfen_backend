@@ -637,24 +637,25 @@ jobs:
               exit 1
               ;;
           esac
-          # OPERATOR SIRLARI KONTEYNERDE MI -- bu iddia olmadan iki dosyali
-          # `--env-file` sinifi sessizce geri gelebilir: stack compose
-          # varsayilanlariyla ayaga kalkar ve hicbir sey kirmizi olmaz. En
-          # guclu hal: konteynerin ortamindaki DEGER, operator dosyasindaki
-          # DEGERLE birebir ayni olmali. Deger YAZDIRILMAZ.
+          # ARE THE OPERATOR SECRETS IN THE CONTAINER? Without this claim the
+          # two-file `--env-file` class can silently come back: the stack comes
+          # up on the compose defaults and nothing turns red. The strongest
+          # form: the VALUE in the container's environment must equal the VALUE
+          # in the operator file byte for byte. No value is ever printed.
+          container=hezarfen_backend
           container_env=$(podman inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$container")
           for cift in "AI_SHARED_TOKEN=$AI_SHARED_TOKEN" "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" "AI_QUIC_ADDR=$AI_QUIC_ADDR" "BUILDER_USERNAME=$BUILDER_USERNAME"; do
             ad=${cift%%=*}
             case "$container_env" in
               *"$cift"*) ;;
               *)
-                echo "container env: $ad operator dosyasindaki degeri TASIMIYOR -- operator env compose'a ulasmamis; rolling back" >&2
+                echo "container env: $ad does not carry the operator value -- the operator env never reached compose; rolling back" >&2
                 rollback
                 exit 1
                 ;;
             esac
           done
-          echo 'ok: operator sirlari konteynerde (AI_SHARED_TOKEN / POSTGRES_PASSWORD / AI_QUIC_ADDR / BUILDER_USERNAME birebir)'
+          echo 'ok: the operator secrets are in the container (AI_SHARED_TOKEN / POSTGRES_PASSWORD / AI_QUIC_ADDR / BUILDER_USERNAME byte for byte)'
           echo 'hezarfen_backend_compose is up'
           REMOTE
 
