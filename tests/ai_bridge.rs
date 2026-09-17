@@ -116,15 +116,40 @@ async fn shake_hands(
     Greeting,
 ) {
     let endpoint = client_endpoint(bridge);
-    let conn = endpoint
-        .connect(bridge.local_addr().unwrap(), "localhost")
-        .expect("dial")
-        .await
-        .expect("QUIC handshake");
+    let conn = connect_or_fail(&endpoint, bridge.local_addr().unwrap()).await;
     let (mut send, mut recv) = conn.open_bi().await.expect("control stream");
     write_frame(&mut send, &hello).await.expect("send Hello");
-    let greeting: Greeting = read_frame(&mut recv).await.expect("read Greeting");
+    let greeting: Greeting = frame_or_fail(&mut recv, "read Greeting").await;
     (endpoint, conn, send, recv, greeting)
+}
+
+/// One answer frame, **bounded**: a bridge that never answers must fail this
+/// test with a name in seconds, not hang the run. A hanging test holds the
+/// whole Test step, and Deploy is serialized behind it, so one unbounded
+/// `await` here can stall every later push (observed on CI).
+async fn frame_or_fail<T: serde::de::DeserializeOwned>(
+    recv: &mut quinn::RecvStream,
+    what: &str,
+) -> T {
+    match tokio::time::timeout(Duration::from_secs(10), read_frame(recv)).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => panic!("{what}: the frame could not be read: {err}"),
+        Err(_) => panic!("{what}: no frame arrived within 10s — the bridge did not answer"),
+    }
+}
+
+/// The same bound for a client-side handshake: dialling a listener that never
+/// completes its QUIC handshake must name itself too.
+async fn connect_or_fail(
+    endpoint: &quinn::Endpoint,
+    addr: std::net::SocketAddr,
+) -> quinn::Connection {
+    let connecting = endpoint.connect(addr, "localhost").expect("dial");
+    match tokio::time::timeout(Duration::from_secs(10), connecting).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(err)) => panic!("the QUIC handshake failed: {err}"),
+        Err(_) => panic!("the QUIC handshake did not complete within 10s"),
+    }
 }
 
 /// What the fake service does with each request it receives.
@@ -483,7 +508,7 @@ async fn an_unreadable_hello_is_rejected_as_malformed() {
         .unwrap();
     send.write_all(body).await.unwrap();
 
-    let greeting: Greeting = read_frame(&mut recv).await.expect("a rejection came back");
+    let greeting: Greeting = frame_or_fail(&mut recv, "a rejection came back").await;
     assert!(
         matches!(
             greeting,
@@ -819,7 +844,12 @@ async fn closing_the_bridge_stops_accepting_services() {
     bridge.close();
 
     let endpoint = client_endpoint(&bridge);
-    let result = endpoint.connect(addr, "localhost").unwrap().await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        endpoint.connect(addr, "localhost").unwrap(),
+    )
+    .await
+    .expect("the handshake must settle within 10s");
     assert!(result.is_err(), "a closed bridge accepts nothing");
 }
 
@@ -933,7 +963,8 @@ async fn the_certificate_endpoint_publishes_a_usable_trust_anchor() {
     write_frame(&mut send, &hello("ocr", &["ocr.extract"]))
         .await
         .unwrap();
-    let greeting: Greeting = read_frame(&mut recv).await.unwrap();
+    let greeting: Greeting =
+        frame_or_fail(&mut recv, "read Greeting after the certificate was fetched").await;
     assert!(matches!(greeting, Greeting::Welcome { .. }), "{greeting:?}");
 }
 
@@ -983,7 +1014,9 @@ fn payloads_are_opaque(v: Value) -> Value {
 
 use axum::Router;
 use axum::http::StatusCode;
-use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, AI_RAG_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN};
+use hezarfen_backend::constant::{
+    AI_CHAT_CAPABILITY, AI_RAG_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN,
+};
 use hezarfen_backend::database::Database;
 use uuid::Uuid;
 
@@ -1481,7 +1514,7 @@ async fn api_read(conn: &quinn::Connection, request: ApiRequest) -> ApiResponse 
         .await
         .expect("write ApiRequest");
     let _ = send.finish();
-    read_frame(&mut recv).await.expect("read ApiResponse")
+    frame_or_fail(&mut recv, "read ApiResponse").await
 }
 
 /// A `GET` of `path` as `on_behalf_of` (or as the service itself).
@@ -2128,7 +2161,7 @@ async fn blob_read(conn: &quinn::Connection, request: BlobRequest) -> (BlobRespo
         .await
         .expect("write BlobRequest");
     let _ = send.finish();
-    let header: BlobResponse = read_frame(&mut recv).await.expect("read BlobResponse");
+    let header: BlobResponse = frame_or_fail(&mut recv, "read BlobResponse").await;
     let bytes = recv
         .read_to_end(16 * 1024 * 1024)
         .await
@@ -2343,7 +2376,7 @@ async fn a_body_nobody_reads_is_reset_rather_than_left_streaming_forever() {
         .await
         .expect("write BlobRequest");
     let _ = send.finish();
-    let header: BlobResponse = read_frame(&mut recv).await.expect("read BlobResponse");
+    let header: BlobResponse = frame_or_fail(&mut recv, "read BlobResponse").await;
     assert!(
         matches!(header, BlobResponse::Ok { .. }),
         "the read was authorized: {}",
@@ -2770,7 +2803,6 @@ async fn a_dispatch_is_traced_by_capability_and_a_refused_handshake_is_counted()
     );
 }
 
-
 // ---------------------------------------------------------------- rag -----
 
 /// Open a RAG thread for a fresh user. Returns (session cookie, thread id).
@@ -2829,7 +2861,9 @@ async fn the_rag_request_carries_the_askers_scope_and_role() {
     let service = connect_service(
         &bridge,
         hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
-        Behaviour::Answer(json!({ "text": "cevap", "abstained": false, "reason": "", "citations": [] })),
+        Behaviour::Answer(
+            json!({ "text": "cevap", "abstained": false, "reason": "", "citations": [] }),
+        ),
     )
     .await;
     await_workers(&bridge, 1).await;
@@ -3081,7 +3115,10 @@ async fn a_rag_reply_past_the_citation_caps_fails_the_turn() {
     let turn = rag_settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "bad_reply", "{turn}");
-    assert_eq!(turn["content"], "", "nothing of the over-cap answer is stored");
+    assert_eq!(
+        turn["content"], "",
+        "nothing of the over-cap answer is stored"
+    );
 }
 
 /// The second axis of the same bound: **one** citation is under the
@@ -3530,9 +3567,11 @@ async fn capability_call(
     request: CapabilityRequest,
 ) -> CapabilityResponse {
     let (mut send, mut recv) = conn.open_bi().await.expect("capability stream");
-    write_frame(&mut send, &request).await.expect("write CapabilityRequest");
+    write_frame(&mut send, &request)
+        .await
+        .expect("write CapabilityRequest");
     let _ = send.finish();
-    read_frame(&mut recv).await.expect("read CapabilityResponse")
+    frame_or_fail(&mut recv, "read CapabilityResponse").await
 }
 
 fn insight_call(capability: &str, school: &str, payload: Value) -> CapabilityRequest {
@@ -3584,7 +3623,13 @@ fn summary_payload(student: &str, retain_until: i64) -> Value {
 /// student's id — the fixture every test below needs.
 async fn insight_fixture(
     bridge: &AiBridge,
-) -> (FakeService, Router, hezarfen_backend::database::Database, String, String) {
+) -> (
+    FakeService,
+    Router,
+    hezarfen_backend::database::Database,
+    String,
+    String,
+) {
     let service =
         connect_service(bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
     await_workers(bridge, 1).await;
@@ -3609,11 +3654,19 @@ async fn a_capability_call_writes_the_row_the_schools_own_read_door_serves() {
         ),
     )
     .await;
-    let CapabilityResponse::Ok { payload, school, id } = answer else {
+    let CapabilityResponse::Ok {
+        payload,
+        school,
+        id,
+    } = answer
+    else {
         panic!("expected the write to land: {answer:?}");
     };
     assert_eq!(id, format!("trace-{AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY}"));
-    assert_eq!(school, DEMO_SLUG, "the answer echoes the school the frame named");
+    assert_eq!(
+        school, DEMO_SLUG,
+        "the answer echoes the school the frame named"
+    );
     assert_eq!(payload["written"], 1);
 
     // The same row is what the nest's own read door serves the school's staff
@@ -3658,7 +3711,10 @@ async fn the_insight_ledger_and_pending_list_round_trip_over_the_bridge() {
             "failed_modules": ["segment"],
         } }),
     );
-    assert_eq!(ok_capability(capability_call(&service.conn, run).await)["written"], 1);
+    assert_eq!(
+        ok_capability(capability_call(&service.conn, run).await)["written"],
+        1
+    );
 
     let pending = ok_capability(
         capability_call(
@@ -3730,8 +3786,12 @@ async fn the_sweep_and_purge_capabilities_answer_per_table_verdicts() {
 #[tokio::test]
 async fn a_capability_call_cannot_touch_another_schools_rows() {
     let bridge = bridge().await;
-    let service =
-        connect_service(&bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &["insight.refresh"]),
+        Behaviour::Echo,
+    )
+    .await;
     await_workers(&bridge, 1).await;
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let _mudur = common::login_as(&app, &demo_db, "mudur", "manager").await;
@@ -3739,7 +3799,12 @@ async fn a_capability_call_cannot_touch_another_schools_rows() {
     let student = common::me_id(&app, &ayse).await;
     let beta = Slug::try_new("beta").unwrap();
     let beta_db = tenants
-        .create(SchoolId::generate(), &beta, "Beta College", ModuleSet::all())
+        .create(
+            SchoolId::generate(),
+            &beta,
+            "Beta College",
+            ModuleSet::all(),
+        )
         .await
         .expect("beta");
 
@@ -3777,7 +3842,11 @@ async fn a_capability_call_refuses_unknown_names_and_payloads_that_do_not_fit() 
 
     // A name nobody serves — no prefix match, no fallback: the shape that
     // would make this a generic door is the shape that is missing.
-    let unknown = insight_call("insight.database.query", DEMO_SLUG, json!({ "sql": "SELECT 1" }));
+    let unknown = insight_call(
+        "insight.database.query",
+        DEMO_SLUG,
+        json!({ "sql": "SELECT 1" }),
+    );
     let (code, message) = refused_capability(capability_call(&service.conn, unknown).await);
     assert_eq!(code, "unknown_capability");
     assert!(message.contains("insight.database.query"), "{message}");
@@ -3806,13 +3875,22 @@ async fn a_capability_call_refuses_unknown_names_and_payloads_that_do_not_fit() 
 #[tokio::test]
 async fn the_school_directory_is_the_one_deployment_scoped_operation() {
     let bridge = bridge().await;
-    let service =
-        connect_service(&bridge, hello("zeka", &["insight.refresh"]), Behaviour::Echo).await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &["insight.refresh"]),
+        Behaviour::Echo,
+    )
+    .await;
     await_workers(&bridge, 1).await;
     let (app, _db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta = Slug::try_new("beta").unwrap();
     tenants
-        .create(SchoolId::generate(), &beta, "Beta College", ModuleSet::all())
+        .create(
+            SchoolId::generate(),
+            &beta,
+            "Beta College",
+            ModuleSet::all(),
+        )
         .await
         .expect("beta");
 
@@ -3882,7 +3960,14 @@ async fn the_storage_doors_are_manager_only_and_write_the_callers_own_school() {
     )
     .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
-    let anonymous = common::send(&app, "POST", "/insights/summaries", None, Some(body.clone())).await;
+    let anonymous = common::send(
+        &app,
+        "POST",
+        "/insights/summaries",
+        None,
+        Some(body.clone()),
+    )
+    .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 
     // The same operation the bridge serves, on the caller's own school.
@@ -3913,7 +3998,12 @@ async fn the_storage_doors_are_manager_only_and_write_the_callers_own_school() {
         Some(json!({ "rows": over })),
     )
     .await;
-    assert_eq!(too_many.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", too_many.body);
+    assert_eq!(
+        too_many.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        too_many.body
+    );
 
     // The run ledger's POST and the existing GET share one path.
     let run = common::send(
@@ -4062,7 +4152,7 @@ async fn podcast_upload(
         .expect("write BlobUploadRequest");
     send.write_all(body).await.expect("write the bytes");
     let _ = send.finish();
-    read_frame(&mut recv).await.expect("read BlobUploadResponse")
+    frame_or_fail(&mut recv, "read BlobUploadResponse").await
 }
 
 fn upload_key(answer: BlobUploadResponse) -> (String, u64) {
@@ -4112,7 +4202,11 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     // `done` means a stored episode: a report that claims one before the
     // upload is refused, and nothing about the row moves.
     let (code, _) = refused_capability(
-        capability_call(conn, report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)).await,
+        capability_call(
+            conn,
+            report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0),
+        )
+        .await,
     );
     assert_eq!(code, "audio_missing");
     assert_eq!(podcast_row(&db, &job).await.0, "running");
@@ -4143,9 +4237,8 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     // The upload: bytes on disk exactly as sent, key keyed by the job id, row
     // stamped with the reference and the duration.
     let body = blob_bytes(200 * 1024);
-    let (key, size) = upload_key(
-        podcast_upload(conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await,
-    );
+    let (key, size) =
+        upload_key(podcast_upload(conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await);
     assert_eq!(size, body.len() as u64);
     assert_eq!(key, format!("podcast/{job}.mp3"));
     let stored = common::files_dir().join(DEMO_SLUG).join(&key);
@@ -4157,7 +4250,11 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     // Now — and only now — `done` is accepted.
     assert_eq!(
         ok_capability(
-            capability_call(conn, report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)).await
+            capability_call(
+                conn,
+                report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)
+            )
+            .await
         )["stored"],
         true
     );
@@ -4166,8 +4263,11 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     // And a job the backend never minted is `unknown_job`.
     let stranger = hezarfen_backend::domain::monotonic_id::next_uuid().to_string();
     let (code, _) = refused_capability(
-        capability_call(conn, report_call(DEMO_SLUG, &stranger, &user, "running", "ocr", 0.1))
-            .await,
+        capability_call(
+            conn,
+            report_call(DEMO_SLUG, &stranger, &user, "running", "ocr", 0.1),
+        )
+        .await,
     );
     assert_eq!(code, "unknown_job");
 }
@@ -4213,7 +4313,15 @@ async fn a_report_or_upload_cannot_reach_another_schools_job() {
 
     let body = blob_bytes(4096);
     let (code, _) = upload_refusal(
-        podcast_upload(&service.conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await,
+        podcast_upload(
+            &service.conn,
+            DEMO_SLUG,
+            &job,
+            "bolum.mp3",
+            "audio/mpeg",
+            &body,
+        )
+        .await,
     );
     assert_eq!(code, "unknown_job");
     let leaked = common::files_dir()
@@ -4256,13 +4364,18 @@ async fn an_upload_past_the_audio_ceiling_is_refused_before_a_byte_is_read() {
         size: PODCAST_AUDIO_MAX_BYTES as u64 + 1,
         duration_secs: None,
     };
-    write_frame(&mut send, &request).await.expect("write the frame");
-    let answer: BlobUploadResponse = read_frame(&mut recv).await.expect("read the answer");
+    write_frame(&mut send, &request)
+        .await
+        .expect("write the frame");
+    let answer: BlobUploadResponse = frame_or_fail(&mut recv, "read the upload answer").await;
     let (code, _) = upload_refusal(answer);
     assert_eq!(code, "invalid_payload");
     let _ = send.finish();
 
-    assert!(podcast_row(&db, &job).await.3.is_none(), "the row names no audio");
+    assert!(
+        podcast_row(&db, &job).await.3.is_none(),
+        "the row names no audio"
+    );
     let stored = common::files_dir().join(format!("podcast/{job}.mp3"));
     assert!(!stored.exists(), "an oversize upload stores nothing");
 }

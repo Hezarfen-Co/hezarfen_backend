@@ -39,6 +39,22 @@ use uuid::Uuid;
 
 const TOKEN: &str = "shared-ai-token";
 
+/// One answer frame, **bounded**: the podcast service's ingest waits on a
+/// reporter/uploader handshake, and a bridge that never answers must fail
+/// this test by name in seconds rather than hang the run — a hung Test step
+/// holds the serialized deploy lock behind it.
+async fn frame_or_fail<T: serde::de::DeserializeOwned>(
+    recv: &mut quinn::RecvStream,
+    what: &str,
+) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(recv)).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => panic!("{what}: the frame could not be read: {err}"),
+        Err(_) => panic!("{what}: no frame arrived within 10s — the bridge did not answer"),
+    }
+}
+
+
 /// The two capabilities a live podcast worker offers. Status and result are
 /// not capabilities any more — the backend answers those from its own row — so
 /// a service declaring only these serves every reading door.
@@ -150,7 +166,7 @@ async fn connect_service(bridge: &AiBridge, hello: Hello, behaviour: Behaviour) 
         .expect("QUIC handshake");
     let (mut send, mut recv) = conn.open_bi().await.expect("control stream");
     write_frame(&mut send, &hello).await.expect("send Hello");
-    let greeting: Greeting = read_frame(&mut recv).await.expect("read Greeting");
+    let greeting: Greeting = frame_or_fail(&mut recv, "read Greeting").await;
     match greeting {
         Greeting::Welcome { protocol, .. } => assert_eq!(protocol, AI_PROTOCOL),
         other => panic!("expected a welcome, got {other:?}"),
@@ -380,7 +396,7 @@ async fn capability_call(conn: &quinn::Connection, request: Value) -> Value {
     let (mut send, mut recv) = conn.open_bi().await.expect("client-initiated stream");
     write_frame(&mut send, &request).await.expect("write the call");
     let _ = send.finish();
-    read_frame::<_, Value>(&mut recv).await.expect("read the answer")
+    frame_or_fail::<Value>(&mut recv, "read the answer").await
 }
 
 /// One audio upload on a fresh client-initiated stream: the header frame,
@@ -392,9 +408,7 @@ async fn blob_upload(conn: &quinn::Connection, frame: Value, body: &[u8]) -> Val
         .expect("write the upload frame");
     send.write_all(body).await.expect("write the audio bytes");
     let _ = send.finish();
-    read_frame::<_, Value>(&mut recv)
-        .await
-        .expect("read the upload answer")
+    frame_or_fail::<Value>(&mut recv, "read the upload answer").await
 }
 
 /// Assert one report was stored: the answer's payload echoes the job and says

@@ -138,7 +138,7 @@ mod raw {
         send.write_all(&frame(hello_body))
             .await
             .expect("write Hello");
-        let (greeting, _) = read_frame(&mut recv).await.expect("read Greeting");
+        let (greeting, _) = frame_or_fail(&mut recv, "read Greeting").await;
         Service {
             _endpoint: endpoint,
             conn,
@@ -164,7 +164,7 @@ mod raw {
             .accept_bi()
             .await
             .expect("bridge opened a request stream");
-        let (request, bytes) = read_frame(&mut recv).await.expect("read Request");
+        let (request, bytes) = frame_or_fail(&mut recv, "read Request").await;
         (request, bytes, send, recv)
     }
 
@@ -185,7 +185,7 @@ mod raw {
             .await
             .expect("write ApiRequest");
         let _ = send.finish();
-        read_frame(&mut recv).await.expect("read ApiResponse")
+        frame_or_fail(&mut recv, "read ApiResponse").await
     }
 
     /// Send one frame verbatim on a fresh *client*-initiated stream, read the
@@ -198,7 +198,7 @@ mod raw {
             .await
             .expect("write BlobRequest");
         let _ = send.finish();
-        let (header, bytes) = read_frame(&mut recv).await.expect("read BlobResponse");
+        let (header, bytes) = frame_or_fail(&mut recv, "read BlobResponse").await;
         // Deliberately asks for more than the header promised: a stream that
         // wrote one byte too many would show up here, not as a silent pass.
         let body = recv
@@ -206,6 +206,17 @@ mod raw {
             .await
             .expect("read to EOF after the header");
         (header, bytes, body)
+    }
+
+    /// One frame, **bounded**: the raw client must fail a stalled bridge by
+    /// name in seconds rather than hang the run (and the serialized deploy
+    /// behind it). `what` is the wait this call is doing, for the panic.
+    pub async fn frame_or_fail(recv: &mut quinn::RecvStream, what: &str) -> (Value, Vec<u8>) {
+        match tokio::time::timeout(Duration::from_secs(10), read_frame(recv)).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(err)) => panic!("{what}: the frame could not be read: {err}"),
+            Err(_) => panic!("{what}: no frame arrived within 10s — the bridge did not answer"),
+        }
     }
 
     /// The set of top-level keys of a JSON object, sorted.
@@ -326,7 +337,7 @@ async fn a_frame_split_across_many_writes_is_reassembled() {
         tokio::task::yield_now().await;
     }
 
-    let (greeting, _) = raw::read_frame(&mut recv).await.expect("still welcomed");
+    let (greeting, _) = raw::frame_or_fail(&mut recv, "still welcomed").await;
     assert_eq!(greeting["type"], "welcome");
     await_workers(&bridge, 1).await;
 }
@@ -1733,8 +1744,7 @@ async fn the_capability_shape_does_not_steal_the_shapes_that_existed_before() {
     assert_eq!(answer["payload"]["students"], json!([]), "{answer}");
 
     // Neither: the same api-read refusal as before this shape existed.
-    let (answer, _) =
-        raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
+    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "malformed");
 }

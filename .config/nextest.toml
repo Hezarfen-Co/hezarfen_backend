@@ -1,3 +1,17 @@
 # One flake must not hide the rest. Deploy still requires the job to be green.
 [profile.default]
 fail-fast = false
+
+# A hang must name itself. Without this, one test stuck on an unbounded
+# `await` holds the whole Test step — and, because Deploy is serialized behind
+# it, every later push queues behind a job that will never finish (observed:
+# 3h38m on run 35251780342, `1bc23aa`). With it, a test that makes no progress
+# for one period is *marked slow* and after two periods is terminated and
+# reported by name as a timeout, so the run ends in minutes with the culprit
+# in the log instead of hanging until somebody cancels it.
+#
+# The period is 120s: the slowest honest test in this suite is a bridge round
+# trip on a loaded CI box (a handful of seconds), so 2x120s of no progress is
+# a hang, not slowness. A test that legitimately needs longer raises this
+# deliberately, with the reason in its own comment.
+slow-timeout = { period = "120s", terminate-after = 2 }
