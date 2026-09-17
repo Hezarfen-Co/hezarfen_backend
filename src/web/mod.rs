@@ -30,6 +30,7 @@ pub mod module_gate;
 pub mod modules;
 pub mod notes;
 pub mod payments;
+pub mod podcast;
 pub mod pomodoro;
 pub mod questions;
 pub mod rag;
