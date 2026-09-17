@@ -25,11 +25,11 @@ use crate::domain::course::CourseId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::course::can_manage_course;
 use crate::service::parent_link::ensure_can_observe;
 use crate::service::{academic_year, class_blueprint, class_course, class_group, class_member};
 use crate::state::AppState;
 
-use super::courses::can_manage_course;
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, person_map,
     remove_blob, set_or_clear, undo_if_demoted,

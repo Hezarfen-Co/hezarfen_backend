@@ -14,6 +14,7 @@ use crate::domain::subject::{SubjectDescription, SubjectName};
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::service;
+use crate::service::course::{can_manage_course, can_view_course};
 use crate::state::AppState;
 
 use super::{
@@ -105,60 +106,12 @@ struct UpdateCourse {
     kind: Option<String>,
 }
 
-/// Who may write the **catalog** row (edit it, delete it, write its
-/// subjects): its creator, or anyone `manager` and above — and in every case
-/// only while the caller is *still* `teacher` or above.
-///
-/// The `teacher` floor is enforced here rather than left to the callers: half
-/// of them extract `CurrentUser`, not `RequireTeacher`, so a creator demoted
-/// to `student` or `parent` would otherwise keep catalog rights forever (the
-/// `creator` column is a historical fact and is never swept).
-///
-/// The teacher *assignment* list is gone from this row (D6): who teaches is
-/// per instance now, and being assigned to one grants rights inside it — via
-/// [`super::instances::can_manage_instance`] — never over the catalog.
-pub(crate) fn can_manage_course(course: &Course, user: &User) -> bool {
-    user.get_role().at_least(Role::Teacher)
-        && (course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager))
-}
-
 /// Who may destroy a catalog row: its creator, or anyone `manager` and above.
-/// Carries the same live-`teacher` floor as [`can_manage_course`], and for the
-/// same reason: a demoted creator owns nothing.
+/// Carries the same live-`teacher` floor as
+/// [`crate::service::course::can_manage_course`], and for the same reason: a
+/// demoted creator owns nothing.
 fn owns_course(course: &Course, user: &User) -> bool {
     can_manage_course(course, user)
-}
-
-/// Who may read a catalog course (its details, its curriculum subjects):
-/// anyone who can manage it, a teacher assigned to one of its **instances**,
-/// and anyone the course reaches — a student enrolled in any of its instances,
-/// or a member of the course itself. Other teachers and unenrolled students see
-/// nothing.
-///
-/// The assigned-teacher arm is what keeps the catalog honest about the
-/// instance layer: those teachers author homework and exam questions *inside*
-/// the instance (D10 lets them), and every one of those routes needs a
-/// `subject_id` belonging to this very course — so a `403` here would hand them
-/// a picker they cannot fill. At HEAD the assignment list lived on the catalog
-/// row and the arm came for free; after D6 it is read through the instances
-/// they teach ([`crate::service::course::list_for_teacher`]).
-pub(crate) async fn can_view_course(
-    course: &Course,
-    user: &User,
-    db: &Database,
-) -> Result<bool, AppError> {
-    if can_manage_course(course, user) {
-        return Ok(true);
-    }
-    if user.get_role().at_least(Role::Teacher)
-        && crate::service::course::list_for_teacher(db, user.get_id())
-            .await?
-            .iter()
-            .any(|taught| taught.get_id() == course.get_id())
-    {
-        return Ok(true);
-    }
-    crate::db::enrollment::user_is_in_course(db, course.get_id(), user.get_id()).await
 }
 
 /// The catalog as one user sees it: every course for manager+, otherwise the
@@ -166,11 +119,12 @@ pub(crate) async fn can_view_course(
 /// in, newest first.
 ///
 /// The taught half carries the same live-`teacher` floor as
-/// [`can_manage_course`], and for the same reason: `creator` is a historical
-/// column no demotion sweeps, so without it a demoted creator kept seeing the
-/// course — and, through the `/exams` and `/homework` catalogs that build on
-/// this list, its published exams and homework. Below `teacher` a course is
-/// visible only the way it is to any other student: by enrollment.
+/// [`crate::service::course::can_manage_course`], and for the same reason:
+/// `creator` is a historical column no demotion sweeps, so without it a
+/// demoted creator kept seeing the course — and, through the `/exams` and
+/// `/homework` catalogs that build on this list, its published exams and
+/// homework. Below `teacher` a course is visible only the way it is to any
+/// other student: by enrollment.
 pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Course>, AppError> {
     if user.get_role().at_least(Role::Manager) {
         return service::course::list_all(db).await;

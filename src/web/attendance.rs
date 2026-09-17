@@ -28,10 +28,10 @@ use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::term::Term;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
+use crate::service::instance::can_manage_instance;
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
-use super::instances::can_manage_instance;
 use super::{CourseResponse, CurrentUser, course_people, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {

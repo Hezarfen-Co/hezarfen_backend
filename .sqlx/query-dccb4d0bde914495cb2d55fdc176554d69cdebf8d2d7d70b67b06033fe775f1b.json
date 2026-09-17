@@ -1,0 +1,146 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH touch AS (\n             UPDATE rag_thread SET updated_at = GREATEST($2, updated_at + 1)\n             WHERE id = $1\n             RETURNING 1)\n         INSERT INTO rag_message (id, thread, user_id, role, content, status, reply, error_code, created_at, completed_at)\n         SELECT $3, $1, $4, $5, $6, $7, $8, $9, $10, $11\n         WHERE EXISTS (SELECT 1 FROM touch)\n         RETURNING id AS \"id: RagMessageId\", thread AS \"thread: RagThreadId\", user_id AS \"user_id: UserId\", role AS \"role: RagMessageRole\", content AS \"content: RagContent\", status AS \"status: RagMessageStatus\", reply AS \"reply: Json<RagReply>\", error_code AS \"error_code: String\", created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RagMessageId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "thread: RagThreadId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "thread"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "role: RagMessageRole",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "content: RagContent",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "content"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "status: RagMessageStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "reply: Json<RagReply>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "reply"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "error_code: String",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "error_code"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "completed_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "completed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "dccb4d0bde914495cb2d55fdc176554d69cdebf8d2d7d70b67b06033fe775f1b"
+}

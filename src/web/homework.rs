@@ -34,10 +34,11 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
+use crate::service::instance::{can_manage_instance, visible_instances};
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
-use super::instances::{can_manage_instance, can_view_instance, visible_instances};
+use super::instances::can_view_instance;
 use super::notes::content_disposition;
 use super::{
     CurrentUser, HomeworkResponse, Page, PageParams, RequireTeacher, UploadFileForm, blob_path,

@@ -30,9 +30,9 @@ use crate::domain::rag_output::{RagOutput, RagOutputId};
 use crate::error::{AppError, ErrorResponse};
 use crate::module::Module;
 use crate::service;
+use crate::service::course::{can_manage_course, can_view_course};
 use crate::state::AppState;
 
-use super::courses::{can_manage_course, can_view_course};
 use super::notes::content_disposition;
 use super::{
     CurrentUser, Page, PageParams, RequireTeacher, UploadFileForm, ai_unavailable, blob_path,

@@ -37,11 +37,11 @@ use crate::domain::event::EventId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::course::can_manage_course;
 use crate::service::{board, board_stroke};
 use crate::state::AppState;
 use crate::tenant::Slug;
 
-use super::courses::can_manage_course;
 use super::{CurrentUser, Page, PageParams, RequireStudent, paginate, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {

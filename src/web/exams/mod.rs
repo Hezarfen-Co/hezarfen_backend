@@ -29,10 +29,11 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
+use crate::service::instance::{can_manage_instance, visible_instances};
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
-use super::instances::{can_manage_instance, can_view_instance, visible_instances};
+use super::instances::can_view_instance;
 use super::{
     ChoiceBody, CurrentUser, ExamResponse, ImageUpload, Page, PageParams, PersonRef,
     RequireTeacher, Scheduled, UploadFileForm, WindowParams, blob_path, check_not_past, paginate,

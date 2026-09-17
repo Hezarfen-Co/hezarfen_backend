@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM rag_message WHERE thread = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6dbd932d776c792c2f44d8c05f52decc9e249bca5f40e7c05ad0501bd7a01199"
+}

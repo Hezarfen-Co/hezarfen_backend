@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET rag_thread_count = GREATEST(rag_thread_count - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0e320bd4fbd99b17fabf93fc9f54f6162a792c3c84b3b6ec8c8abbf44a7452a"
+}

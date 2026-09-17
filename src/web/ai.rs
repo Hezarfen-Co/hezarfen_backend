@@ -132,6 +132,7 @@ pub struct CapabilityWorkers {
     get,
     path = "/capabilities",
     tag = "ai",
+    security(("session_cookie" = [])),
     responses(
         (status = 200, description = "Every capability a connected worker serves, grouped and sorted", body = CapabilitiesResponse),
         (status = 401, description = "No authenticated session", body = ErrorResponse),

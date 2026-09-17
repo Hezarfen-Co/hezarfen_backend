@@ -47,6 +47,7 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.
         rate_limit: RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai,

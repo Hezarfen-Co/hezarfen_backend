@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n             UPDATE app_user SET rag_thread_count = rag_thread_count + 1\n             WHERE id = $1\n               AND rag_thread_count < COALESCE(\n                     (SELECT max_chatbot_threads FROM settings WHERE id = 'school'),\n                     $2)\n             RETURNING 1)\n         INSERT INTO rag_thread (id, owner, title, created_at, updated_at)\n         SELECT $3, $1, $4, $5, $5\n         WHERE EXISTS (SELECT 1 FROM seat)\n         RETURNING id AS \"id: RagThreadId\", owner AS \"owner: UserId\", title AS \"title: RagThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RagThreadId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: RagThreadTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_thread",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "49f0e5053651cadafecb57ae7f2767887f635fda35c75c3d8fc1f884542db30f"
+}

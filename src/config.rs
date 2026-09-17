@@ -2,7 +2,7 @@ use std::env;
 
 use crate::constant::{
     AI_DEFAULT_REQUEST_TIMEOUT_SECS, AI_MAX_REQUEST_TIMEOUT_SECS, DEFAULT_API_RATE_LIMIT,
-    DEFAULT_AUTH_RATE_LIMIT, DEFAULT_CHATBOT_RATE_LIMIT,
+    DEFAULT_AUTH_RATE_LIMIT, DEFAULT_CHATBOT_RATE_LIMIT, DEFAULT_RAG_RATE_LIMIT,
 };
 use crate::rate_limit::RateLimitConfig;
 use crate::telemetry::{LogFormat, TelemetryConfig, TelemetryError};
@@ -30,6 +30,11 @@ pub struct Config {
     /// [`RateLimitConfig`], which is the per-IP middleware bundle: this tier is
     /// keyed by user and is enforced inside the handler.
     pub chatbot_per_minute: u32,
+    /// RAG messages one user may send per minute
+    /// (`RATE_LIMIT_RAG_PER_MINUTE`). `0` disables the tier. Kept out of
+    /// [`RateLimitConfig`], which is the per-IP middleware bundle: this tier is
+    /// keyed by user and is enforced inside the handler.
+    pub rag_per_minute: u32,
     /// Startup builder seed (`BUILDER_USERNAME` + `BUILDER_PASSWORD`). When
     /// both are set, a builder account with these credentials is created in the
     /// control database at boot if the username doesn't exist yet. Blank values
@@ -78,6 +83,10 @@ impl Config {
             chatbot_per_minute: parse_limit(
                 env::var("RATE_LIMIT_CHATBOT_PER_MINUTE").ok(),
                 DEFAULT_CHATBOT_RATE_LIMIT,
+            ),
+            rag_per_minute: parse_limit(
+                env::var("RATE_LIMIT_RAG_PER_MINUTE").ok(),
+                DEFAULT_RAG_RATE_LIMIT,
             ),
             builder_username: parse_optional(env::var("BUILDER_USERNAME").ok()),
             builder_password: parse_optional(env::var("BUILDER_PASSWORD").ok()),

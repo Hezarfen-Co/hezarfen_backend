@@ -354,6 +354,43 @@ struct ChatbotLimits {
     default_max_threads: i64,
 }
 
+/// The RAG nest: a tier of its own — every message spends a retrieval over the
+/// whole course-note corpus before it generates anything — plus the school
+/// knobs it reuses from the chatbot. One `rag.chat` message is a chat message
+/// in every way the newtypes check, so message length, thread titles, history
+/// depth and the thread cap come from the same `/settings` fields; their fixed
+/// ranges are published here a second time so a RAG client need not read the
+/// chatbot group to bound its input.
+#[derive(Serialize, ToSchema)]
+struct RagLimits {
+    /// Hard ceiling on the `(sınıf, ders)` scope pairs one ask may carry. The
+    /// corpus is routed by the pair, so this bounds what one question can ask
+    /// a retrieval to sweep.
+    max_scope_pairs: usize,
+    /// Hard ceiling on the citations one answer may store in its message row.
+    max_citations: usize,
+    /// Pages one citation may span. A citation names a page range, and an
+    /// answer that could name every page of every document would be a copy of
+    /// the corpus, not a citation.
+    max_citation_pages: usize,
+    /// The chatbot's message bound, reused.
+    max_message_len: usize,
+    /// The chatbot's thread-title bound, reused.
+    max_thread_title_len: usize,
+    /// The school-owned message-length setting's fixed range, reused.
+    min_max_message_len: i64,
+    max_max_message_len: i64,
+    default_max_message_len: i64,
+    /// The school-owned history-depth setting's fixed range, reused.
+    min_history_turns: i64,
+    max_history_turns: i64,
+    default_history_turns: i64,
+    /// The school-owned thread-cap setting's fixed range, reused.
+    min_max_threads: i64,
+    max_max_threads: i64,
+    default_max_threads: i64,
+}
+
 /// What a finished pomodoro stint must be to *count* — to move the lifetime
 /// counters the badges and the study streak read. Not a validation bound:
 /// `POST /pomodoro/finish` never refuses a stint over these, it records it and
@@ -441,6 +478,9 @@ struct RateLimits {
     /// address, so it survives a changing IP).
     #[schema(example = 20)]
     chatbot_per_minute: u32,
+    /// Per-*user* budget for sending RAG messages, keyed the same way.
+    #[schema(example = 6)]
+    rag_per_minute: u32,
 }
 
 /// Rules that hold across every endpoint.
@@ -477,6 +517,7 @@ struct LimitsResponse {
     meal: MealLimits,
     payment: PaymentLimits,
     chatbot: ChatbotLimits,
+    rag: RagLimits,
     pomodoro: PomodoroLimits,
     board: BoardLimits,
     settings: SettingsLimits,
@@ -643,6 +684,22 @@ impl LimitsResponse {
                 max_max_threads: MAX_MAX_CHATBOT_THREADS,
                 default_max_threads: DEFAULT_MAX_CHATBOT_THREADS,
             },
+            rag: RagLimits {
+                max_scope_pairs: MAX_RAG_SCOPE_PAIRS,
+                max_citations: MAX_RAG_CITATIONS,
+                max_citation_pages: MAX_RAG_CITATION_PAGES,
+                max_message_len: MAX_CHATBOT_MESSAGE_LEN,
+                max_thread_title_len: MAX_CHATBOT_THREAD_TITLE_LEN,
+                min_max_message_len: MIN_MAX_CHATBOT_MESSAGE_LEN,
+                max_max_message_len: MAX_MAX_CHATBOT_MESSAGE_LEN,
+                default_max_message_len: DEFAULT_MAX_CHATBOT_MESSAGE_LEN,
+                min_history_turns: MIN_CHATBOT_HISTORY_TURNS,
+                max_history_turns: MAX_CHATBOT_HISTORY_TURNS,
+                default_history_turns: DEFAULT_CHATBOT_HISTORY_TURNS,
+                min_max_threads: MIN_MAX_CHATBOT_THREADS,
+                max_max_threads: MAX_MAX_CHATBOT_THREADS,
+                default_max_threads: DEFAULT_MAX_CHATBOT_THREADS,
+            },
             pomodoro: PomodoroLimits {
                 min_counted_ms: MIN_COUNTED_POMODORO_MS,
                 max_counted_per_day: MAX_COUNTED_POMODORO_PER_DAY,
@@ -673,6 +730,7 @@ impl LimitsResponse {
                 auth_per_minute: st.rate_limit.auth_per_minute,
                 api_per_minute: st.rate_limit.api_per_minute,
                 chatbot_per_minute: st.chatbot_limit.max_per_window(),
+                rag_per_minute: st.rag_limit.max_per_window(),
             },
             request: RequestLimits {
                 max_page_limit: MAX_PAGE_LIMIT,

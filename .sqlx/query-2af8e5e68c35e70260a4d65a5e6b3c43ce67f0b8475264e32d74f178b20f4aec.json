@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: RagMessageId\", thread AS \"thread: RagThreadId\", user_id AS \"user_id: UserId\", role AS \"role: RagMessageRole\", content AS \"content: RagContent\", status AS \"status: RagMessageStatus\", reply AS \"reply: Json<RagReply>\", error_code AS \"error_code: String\", created_at AS \"created_at: Timestamp\", completed_at AS \"completed_at: Timestamp\" FROM rag_message WHERE thread = $1 AND status = 'complete' AND content <> '' ORDER BY created_at DESC, id DESC LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RagMessageId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "thread: RagThreadId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "thread"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "role: RagMessageRole",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "content: RagContent",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "content"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "status: RagMessageStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "reply: Json<RagReply>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "reply"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "error_code: String",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "error_code"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "completed_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rag_message",
+            "name": "completed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "2af8e5e68c35e70260a4d65a5e6b3c43ce67f0b8475264e32d74f178b20f4aec"
+}

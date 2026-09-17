@@ -90,6 +90,12 @@ impl RagIndexPayload {
 /// service: no dispatch, no `rag_output` row. That is `Module::Chatbot`, the
 /// package's only module, so it gates every outbound dispatch and not just the
 /// `/chatbot` nest.
+///
+/// The answer may also name the doc id the service minted per file — `files`
+/// as `[{id, doc_id}]` — which is stamped onto the matching attachment rows,
+/// and only onto this note's own files. Best-effort: a failed stamp is logged
+/// and the output still lands, because the map is optional on the wire and a
+/// service that omits it is simply not heard from on that front.
 pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: &CourseNote) {
     if !tenant.modules.contains(Module::Chatbot) {
         tracing::debug!(
@@ -148,6 +154,38 @@ pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: 
     if !answer.is_object() {
         tracing::warn!("rag.index answered with a non-object payload — keeping the stored rows");
         return;
+    }
+
+    // A service may name the doc id it minted for each file — `files` as
+    // `[{id, doc_id}]` — so a row remembers what its bytes were indexed as.
+    // Only ids of *this* note's attachments are honoured: a service bug
+    // naming another note's file must not stamp that row. Best-effort — a
+    // failed write is logged and the stored answer still lands.
+    if let Some(claims) = answer.get("files").and_then(serde_json::Value::as_array) {
+        for claim in claims {
+            let (Some(id), Some(doc_id)) = (
+                claim.get("id").and_then(serde_json::Value::as_str),
+                claim.get("doc_id").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let Some(file) = files.iter().find(|file| file.get_id().key() == id) else {
+                continue;
+            };
+            if let Err(err) =
+                crate::db::course_note_file::set_rag_doc_id(&state.db, file.get_id(), doc_id).await
+            {
+                tracing::warn!(
+                    "could not stamp doc id on course note file {}: {err}",
+                    file.get_id().key()
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            "the rag.index answer for course note {} names no doc ids",
+            note.get_id().key()
+        );
     }
 
     let sources = files.iter().map(|file| file.get_id().clone()).collect();

@@ -32,6 +32,7 @@ async fn spec() -> Value {
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: None,
@@ -1067,6 +1068,26 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "title",
             "maxLength",
             MAX_CHATBOT_THREAD_TITLE_LEN as i64,
+        ),
+        // --- the RAG nest reuses the chatbot's shapes and its school knobs:
+        // the same title cap and the same per-message character cap ---
+        (
+            "CreateRagThread",
+            "title",
+            "maxLength",
+            MAX_CHATBOT_THREAD_TITLE_LEN as i64,
+        ),
+        (
+            "RenameRagThread",
+            "title",
+            "maxLength",
+            MAX_CHATBOT_THREAD_TITLE_LEN as i64,
+        ),
+        (
+            "SendRagMessage",
+            "content",
+            "maxLength",
+            MAX_CHATBOT_MESSAGE_LEN as i64,
         ),
         // --- whiteboards ---
         (

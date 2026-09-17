@@ -22,7 +22,9 @@ use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 
 use crate::config::Config;
-use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
+use crate::constant::{
+    CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS, RAG_PENDING_STALE_SECS,
+};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, Username};
 use crate::error::AppError;
@@ -255,10 +257,6 @@ async fn migrator(set: &str) -> Result<Migrator, AppError> {
         .map_err(|err| AppError::Internal(format!("cannot read the {set} migrations: {err}")))
 }
 
-/// Apply the school schema to a school database — the template at boot, every
-/// newly minted school at create — then sweep the chatbot turns the previous
-/// process owed an answer. Idempotent: an already-migrated database runs only
-/// the sweep.
 /// Apply the control schema (schools, builders, the shared rate-limit
 /// window) to a control database. Idempotent: an already-migrated database
 /// runs nothing. The boot path folds this into [`boot_control`]; suites that
@@ -272,6 +270,10 @@ pub async fn migrate_control(pool: &PgPool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Apply the school schema to a school database — the template at boot, every
+/// newly minted school at create — then sweep the chatbot and RAG turns the
+/// previous process owed an answer. Idempotent: an already-migrated database
+/// runs only the sweep.
 pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     migrator("school")
         .await?
@@ -295,6 +297,19 @@ pub async fn migrate_school(pool: &PgPool) -> Result<(), AppError> {
     )
     .bind(now)
     .bind(now - CHATBOT_PENDING_STALE_SECS * 1_000)
+    .execute(pool)
+    .await?;
+    // The RAG nest mirrors the chatbot's asynchronous send, so it owes the
+    // same sweep with its own horizon (`RAG_PENDING_STALE_SECS`): a `rag_message`
+    // left `pending` by the dead process presents as failed to any reader
+    // either way, and the same `interrupted` code records why.
+    sqlx::query(
+        "UPDATE rag_message SET status = 'failed', error_code = 'interrupted',
+         completed_at = $1
+         WHERE status = 'pending' AND created_at < $2",
+    )
+    .bind(now)
+    .bind(now - RAG_PENDING_STALE_SECS * 1_000)
     .execute(pool)
     .await?;
     Ok(())

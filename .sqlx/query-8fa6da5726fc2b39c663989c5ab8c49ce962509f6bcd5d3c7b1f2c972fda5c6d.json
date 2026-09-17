@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE course_note_file SET rag_doc_id = $2 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8fa6da5726fc2b39c663989c5ab8c49ce962509f6bcd5d3c7b1f2c972fda5c6d"
+}

@@ -1,6 +1,11 @@
 //! The `course_note_file` table: attachment rows for a course note, listed
 //! newest first, with the note's file cap claimed and released in the same
 //! write as the row.
+//!
+//! The `rag_doc_id` column belongs to the RAG index path alone — stamped by
+//! [`set_rag_doc_id`] and read back by [`find_by_rag_doc_id`] — and is
+//! deliberately absent from [`CourseNoteFile`]: no other query has to know
+//! the column exists.
 
 use crate::constant::MAX_COURSE_NOTE_FILES;
 use crate::database::{Database, tx_with_retry, unique_violation};
@@ -110,6 +115,49 @@ pub async fn list_for(
     .bind(note.uuid())
     .run::<CourseNoteFile>(limit, offset, db)
     .await
+}
+
+/// Every file row claiming `doc_id` — the content hash an indexing service
+/// minted for a file's bytes. The column is deliberately not unique
+/// (identical bytes produce the same doc id), so one doc may be claimed by
+/// several files, and a file's next re-index may find its bytes already
+/// covered. Ordered by id so callers presenting the rows do not shuffle
+/// between reads.
+pub async fn find_by_rag_doc_id(
+    db: &Database,
+    doc_id: &str,
+) -> Result<Vec<CourseNoteFile>, AppError> {
+    let files = sqlx::query_as!(
+        CourseNoteFile,
+        r#"SELECT id AS "id: CourseNoteFileId",
+               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
+               content_type AS "content_type: FileContentType", size FROM course_note_file
+           WHERE rag_doc_id = $1 ORDER BY id"#,
+        doc_id
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(files)
+}
+
+/// Stamp the indexing service's `doc_id` onto a file row — what a service
+/// staged, so the next refresh can tell whether those bytes are already
+/// covered. A plain id-keyed update: the column is owned by the RAG index
+/// path alone, and no cap or counter moves with it. An unknown id updates
+/// nothing, which the caller already tolerates as best-effort.
+pub async fn set_rag_doc_id(
+    db: &Database,
+    file: &CourseNoteFileId,
+    doc_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query!(
+        r#"UPDATE course_note_file SET rag_doc_id = $2 WHERE id = $1"#,
+        file.uuid(),
+        doc_id
+    )
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// The blob names (the rows' own ids, since a file's blob is named by its

@@ -863,6 +863,7 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai,
@@ -982,7 +983,7 @@ fn payloads_are_opaque(v: Value) -> Value {
 
 use axum::Router;
 use axum::http::StatusCode;
-use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN};
+use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, AI_RAG_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN};
 use hezarfen_backend::database::Database;
 use uuid::Uuid;
 
@@ -996,6 +997,7 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
+        rag_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
         ai: Some(bridge.clone()),
@@ -2742,4 +2744,318 @@ async fn a_dispatch_is_traced_by_capability_and_a_refused_handshake_is_counted()
         refused >= 1,
         "the refused handshake must be counted under reason=bad_token"
     );
+}
+
+
+// ---------------------------------------------------------------- rag -----
+
+/// Open a RAG thread for a fresh user. Returns (session cookie, thread id).
+async fn rag_user(app: &Router, name: &str) -> (String, String) {
+    let cookie = common::login(app, name).await;
+    let res = common::send(app, "POST", "/rag/threads", Some(&cookie), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    (cookie, common::id_of(&res.body))
+}
+
+/// Ask the corpus one question (asserts `202`) and return the reserved
+/// assistant row's id.
+async fn rag_ask(app: &Router, cookie: &str, thread: &str, text: &str) -> String {
+    let res = common::send(
+        app,
+        "POST",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(cookie),
+        Some(json!({ "content": text })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    res.body["message_id"]
+        .as_str()
+        .expect("message_id")
+        .to_string()
+}
+
+/// Poll a RAG turn until it leaves `pending`.
+async fn rag_settled(app: &Router, cookie: &str, thread: &str, mid: &str) -> Value {
+    for _ in 0..500 {
+        let res = common::send(
+            app,
+            "GET",
+            &format!("/rag/threads/{thread}/messages/{mid}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        if res.body["status"] != "pending" {
+            return res.body;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the RAG turn never settled");
+}
+
+/// The RAG wire contract: the scope is derived server-side from the asker's
+/// live memberships — a club/etüt membership is the `sinif: null` pair, since
+/// such a corpus is school-wide — and the asker's role rides the request,
+/// read from the session, never from the body.
+#[tokio::test]
+async fn the_rag_request_carries_the_askers_scope_and_role() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({ "text": "cevap", "abstained": false, "reason": "", "citations": [] })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&staff),
+        Some(json!({ "title": "Satranç Kulübü", "kind": "club" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let club = common::id_of(&res.body);
+
+    let (cookie, thread) = rag_user(&app, "ali").await;
+    let ali = common::me_id(&app, &cookie).await;
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/courses/{club}/members"),
+        Some(&staff),
+        Some(json!({ "user_id": ali })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let mid = rag_ask(&app, &cookie, &thread, "ikinci yasa nedir?").await;
+    assert_eq!(
+        rag_settled(&app, &cookie, &thread, &mid).await["status"],
+        "complete"
+    );
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "one dispatch per turn, never a re-send");
+    assert_eq!(seen[0].capability, AI_RAG_CHAT_CAPABILITY);
+    let payload = &seen[0].payload;
+    assert_eq!(payload["message"], "ikinci yasa nedir?");
+    assert_eq!(payload["asker"], ali);
+    assert_eq!(payload["asker_role"], "student");
+    assert_eq!(
+        payload["scope"],
+        json!([{ "sinif": null, "ders": "Satranç Kulübü" }]),
+        "a club is school-wide, so its pair names no grade"
+    );
+    assert_eq!(payload["history"], json!([]));
+}
+
+/// An abstention is a complete turn, not an error: the service's `reason` and
+/// `citations` land on the row (and therefore in both the polling read and the
+/// SSE `done` payload, which are built from the same row).
+#[tokio::test]
+async fn an_abstained_rag_answer_keeps_its_reason_and_citations() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "Bu soruyu yanıtlayamam.",
+            "abstained": true,
+            "reason": "insufficient_data",
+            "citations": [{
+                "n": 1,
+                "doc_id": "01DOC",
+                "pages": [3, 4],
+                "span_ids": ["s-7"],
+                "ders": "Fizik",
+            }],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, thread) = rag_user(&app, "ali").await;
+
+    let mid = rag_ask(&app, &cookie, &thread, "optik nedir?").await;
+    let turn = rag_settled(&app, &cookie, &thread, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["content"], "Bu soruyu yanıtlayamam.");
+    assert_eq!(turn["abstained"], true);
+    assert_eq!(turn["reason"], "insufficient_data");
+    assert!(turn["error_code"].is_null(), "{turn}");
+    let citation = &turn["citations"][0];
+    assert_eq!(citation["n"], 1);
+    assert_eq!(citation["pages"], json!([3, 4]));
+    assert_eq!(citation["span_ids"], json!(["s-7"]));
+    assert_eq!(citation["ders"], "Fizik");
+    assert!(
+        citation["file"].is_null(),
+        "no course-note file claims the document yet: {turn}"
+    );
+}
+
+/// A citation's corpus `doc_id` resolves to a course-note file only when the
+/// **asker** may view that file's course: identical PDF bytes make one document
+/// claimable from several courses, so the per-candidate visibility check is the
+/// whole point. A passage whose file the asker cannot open stays citable, with
+/// `file: null`.
+#[tokio::test]
+async fn a_citation_resolves_only_to_a_file_the_asker_may_view() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "F = m·a [1]",
+            "abstained": false,
+            "reason": "",
+            "citations": [{ "n": 1, "doc_id": "01DOC", "pages": [7], "span_ids": [], "ders": "Fizik" }],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let course = common::create_course(&app, &staff, "Fizik").await;
+    let author = common::me_id(&app, &staff).await;
+    let note = Uuid::now_v7();
+    let file = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO course_note (id, course, author, title, content, file_count) \
+         VALUES ($1, $2, $3, 'Notlar', 'Newton', 1)",
+    )
+    .bind(note)
+    .bind(Uuid::parse_str(&course).expect("course id"))
+    .bind(Uuid::parse_str(&author).expect("author id"))
+    .execute(&db)
+    .await
+    .expect("seed course note");
+    sqlx::query(
+        "INSERT INTO course_note_file (id, course_note, name, content_type, size, rag_doc_id) \
+         VALUES ($1, $2, 'recap.pdf', 'application/pdf', 12, '01DOC')",
+    )
+    .bind(file)
+    .bind(note)
+    .execute(&db)
+    .await
+    .expect("seed course note file");
+
+    // The manager sees the course, so the citation opens the file.
+    let res = common::send(&app, "POST", "/rag/threads", Some(&staff), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let staff_thread = common::id_of(&res.body);
+    let mid = rag_ask(&app, &staff, &staff_thread, "kütle nedir?").await;
+    let turn = rag_settled(&app, &staff, &staff_thread, &mid).await;
+    assert_eq!(
+        turn["citations"][0]["file"],
+        file.to_string(),
+        "the viewer's citation must open the file: {turn}"
+    );
+
+    // A student with no tie to the course gets the same citation unresolved.
+    let (cookie, thread) = rag_user(&app, "ali").await;
+    let mid = rag_ask(&app, &cookie, &thread, "kütle nedir?").await;
+    let turn = rag_settled(&app, &cookie, &thread, &mid).await;
+    assert!(
+        turn["citations"][0]["file"].is_null(),
+        "a citation a student cannot open stays unresolved: {turn}"
+    );
+    assert_eq!(turn["citations"][0]["n"], 1, "nothing else is dropped");
+}
+
+/// No service offering `rag.chat`: a `503`, and nothing is written — no
+/// half-thread to poll forever.
+#[tokio::test]
+async fn no_rag_worker_means_503_and_no_rows() {
+    let bridge = bridge().await;
+    let (app, db) = chat_app(&bridge).await;
+    let (cookie, thread) = rag_user(&app, "ali").await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/rag/threads/{thread}/messages"),
+        Some(&cookie),
+        Some(json!({ "content": "soru" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM rag_message")
+        .fetch_one(&db)
+        .await
+        .expect("count rag messages");
+    assert_eq!(rows, 0, "a refused turn leaves no trace");
+}
+
+/// The nest is gated by the school's `chatbot` module, exactly like
+/// `/chatbot`: with the module off the whole URL space answers the disabled
+/// refusal (the codebase's contract for a gated nest — see integration's
+/// meals test), never a handler.
+#[tokio::test]
+async fn a_school_without_the_chatbot_module_has_no_rag_nest() {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = common::login_as(&app, &db, "ada", "admin").await;
+
+    let res = common::send(&app, "GET", "/rag/threads", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let mut without_chatbot = ModuleSet::all();
+    without_chatbot.remove(Module::Chatbot);
+    tenants
+        .set_modules(&slug, &without_chatbot)
+        .await
+        .expect("take the chatbot module back");
+
+    for route in ["/rag/threads", "/chatbot/threads"] {
+        let res = common::send(&app, "GET", route, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{route}: {}", res.body);
+        assert_eq!(
+            res.body,
+            json!({ "error": "module disabled", "module": "chatbot" }),
+            "one gate governs both nests"
+        );
+    }
+    let res = common::send(&app, "POST", "/rag/threads", Some(&cookie), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// The service is a trust boundary: a reply carrying more citations (or more
+/// pages per citation) than a row may hold is refused whole — the turn fails
+/// rather than storing a clipped answer that reads as a complete one.
+#[tokio::test]
+async fn a_rag_reply_past_the_citation_caps_fails_the_turn() {
+    let bridge = bridge().await;
+    let citations: Vec<Value> = (0..51)
+        .map(|n| json!({ "n": n, "doc_id": "d", "pages": [], "span_ids": [], "ders": null }))
+        .collect();
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "cevap",
+            "abstained": false,
+            "reason": "",
+            "citations": citations,
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, thread) = rag_user(&app, "ali").await;
+
+    let mid = rag_ask(&app, &cookie, &thread, "soru").await;
+    let turn = rag_settled(&app, &cookie, &thread, &mid).await;
+    assert_eq!(turn["status"], "failed", "{turn}");
+    assert_eq!(turn["error_code"], "bad_reply", "{turn}");
+    assert_eq!(turn["content"], "", "nothing of the over-cap answer is stored");
 }
