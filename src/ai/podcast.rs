@@ -17,10 +17,10 @@
 //! rather than a per-capability one: no call waits on a model.
 //!
 //! Tenancy is the transport's job: [`crate::ai::server`] stamps the caller's
-//! school onto every `hab/2` request and refuses an answer that does not echo
-//! it, so a worker registered by one school never answers another's call —
-//! the wall holds even though the job records themselves live outside the
-//! backend's databases.
+//! school onto every `hab/2` request; it does **not** verify the echo on
+//! replies (the bridge correlates answers by frame id alone), so the wall is
+//! the stamp plus the service's own honesty — and it holds even though the
+//! job records themselves live outside the backend's databases.
 //!
 //! The produced audio does not cross the bridge. `podcast.result` answers an
 //! `audio_id` that is a path *relative* to the service's

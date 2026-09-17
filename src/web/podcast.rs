@@ -35,7 +35,9 @@
 //! What the backend can and cannot judge, stated plainly: the gate is a
 //! session — any authenticated member of the school may use the doors, the same
 //! floor `/chatbot` and `/rag` hold — and the school wall is the bridge's
-//! (`hab/2` refuses an answer that does not echo the school). It cannot scope
+//! (`hab/2` stamps the caller's school onto every request; the bridge does
+//! not verify the echo on replies — answers are correlated by frame id
+//! alone). It cannot scope
 //! *which* sources a caller may narrate: `source_id` is the service's own
 //! record, and no backend query can say what it names. That is a property of
 //! the wire the two sides share, not an oversight — the service resolves the
