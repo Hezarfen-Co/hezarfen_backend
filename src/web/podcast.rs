@@ -32,10 +32,15 @@
 //! A job nobody is updating — the service died mid-pipeline — is *presented*
 //! as `failed`/`interrupted` by the read path after a bounded, ETA-scaled
 //! window (see [`PodcastJob::projected`]): the projection writes nothing, and
-//! the service's next report overwrites it. And what the backend still cannot
-//! judge is stated plainly: `source_id` is the service's own handle on shared
-//! media, so no backend query can say what it names — the service resolves it,
-//! the backend enforces the tenant.
+//! the service's next report overwrites it.
+//!
+//! The **source** is resolved here, not by the service: `source_id` names a
+//! course note in the caller's own school, and the submit door hands the
+//! service the blob key of that note's newest `application/pdf` attachment
+//! (`source_key`) — the file it reads under its shared media root. A note with
+//! no such attachment, or one whose blob is missing from this host, is refused
+//! `409 source_missing` before the row is written, so a job that could only
+//! fail is never queued.
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -58,9 +63,11 @@ use crate::ai::podcast::{self, PodcastCancelPayload, PodcastSubmitPayload};
 use crate::constant::{
     AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY, PODCAST_INTERRUPTED_CODE,
 };
+use crate::domain::course_note::CourseNoteId;
 use crate::domain::podcast_job::{PodcastJob, PodcastJobId};
 use crate::domain::user::User;
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::course_note_file as note_files;
 use crate::service::podcast_job as jobs;
 use crate::state::AppState;
 use crate::web::tenant_state::{SchoolSlug, State};
@@ -153,7 +160,15 @@ struct CancelVerdict {
 /// finds the job rather than a `404`; and every dispatch outcome that is not an
 /// acceptance leaves the row `failed` with a reason code rather than claiming
 /// `queued` forever. With no worker connected the row is not written at all —
-/// the `503` is the whole answer.
+/// the `503` is the whole answer — and a note with no usable PDF never gets as
+/// far as a row either (see below).
+///
+/// `source_id` names a course note in this school, and the door resolves it
+/// first: what the service narrates is that note's **newest
+/// `application/pdf` attachment**, whose blob key rides the dispatch as
+/// `source_key`. A note with no PDF — or one whose blob is missing from this
+/// host — is a `409 source_missing` before anything is written, so a job that
+/// is guaranteed to fail is never queued for the service to discover later.
 #[utoipa::path(
     post,
     path = "/jobs",
@@ -164,6 +179,7 @@ struct CancelVerdict {
         (status = 202, description = "The job is queued; `job_id` names it from here on", body = JobReceipt),
         (status = 400, description = "Empty `source_id`, or a `format` the service does not serve", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 409, description = "The note has no `application/pdf` attachment, or that attachment's blob is missing from this host (`source_missing`)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing", body = ErrorResponse),
         (status = 503, description = "No AI service offers `podcast.submit` (or the service is at capacity)", body = ErrorResponse),
     ),
@@ -189,11 +205,31 @@ async fn submit(
         }));
     }
 
+    // The source is resolved here, before anything is written: what the
+    // service narrates is the note's own newest PDF, and the key of those
+    // bytes is what rides the dispatch. Both shapes of "no source" are refused
+    // now — queueing the job would only buy a failure in the service's own
+    // `kaynak` stage, with the caller already holding a job id.
+    let file = note_files::newest_pdf(&st.db, &CourseNoteId::from_key(source_id))
+        .await?
+        .ok_or_else(|| source_missing("this course note has no PDF attachment to narrate"))?;
+    let source_key = file.get_id().key();
+    match tokio::fs::try_exists(crate::web::blob_path(&st.files_path, &source_key)).await {
+        Ok(true) => {}
+        Ok(false) => return Err(source_missing("this note's PDF is missing on this host")),
+        Err(err) => {
+            return Err(AppError::Internal(format!(
+                "could not stat the note's PDF blob: {err}"
+            )));
+        }
+    }
+
     let job = jobs::create(&st.db, user.get_id(), source_id, req.format.as_deref()).await?;
     let job_id = job.get_id().key();
     let payload = PodcastSubmitPayload {
         job_id: job_id.clone(),
         source_id: source_id.to_string(),
+        source_key,
         format: req.format.clone(),
         user_id: user.get_id().key(),
     };
@@ -521,6 +557,18 @@ fn worker_for(st: &AppState, capability: &str) -> Result<AiBridge, NoWorker> {
         return Err(NoWorker::Unconnected);
     }
     Ok(bridge)
+}
+
+/// The submit door's own refusal: the note behind `source_id` cannot be
+/// narrated — it has no PDF attachment, or the bytes the row names are gone
+/// from this host. One code (`source_missing`) for both, a message that says
+/// which side is missing, and a `409` either way, so a client branches on the
+/// code instead of parsing the sentence.
+fn source_missing(message: &str) -> AppError {
+    AppError::ConflictCoded {
+        code: "source_missing",
+        message: message.to_string(),
+    }
 }
 
 /// A relayed failure as the response a client branches on: the service's own

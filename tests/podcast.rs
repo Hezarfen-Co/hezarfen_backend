@@ -292,13 +292,15 @@ async fn submit(app: &Router, cookie: &str, body: Value) -> common::Res {
     common::send(app, "POST", "/podcast/jobs", Some(cookie), Some(body)).await
 }
 
-/// Submit one job with the standard body (asserting the `202`) and hand back
-/// the backend-minted id every other door names.
-async fn submit_job(app: &Router, cookie: &str) -> String {
+/// Submit one job for `source` with the standard format (asserting the `202`)
+/// and hand back the backend-minted id every other door names. `source` is the
+/// note id: the door resolves the note's own newest PDF before it writes
+/// anything, so every submitting test needs a real note behind its source.
+async fn submit_job(app: &Router, cookie: &str, source: &str) -> String {
     let res = submit(
         app,
         cookie,
-        json!({ "source_id": SOURCE_ID, "format": FORMAT }),
+        json!({ "source_id": source, "format": FORMAT }),
     )
     .await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
@@ -306,6 +308,49 @@ async fn submit_job(app: &Router, cookie: &str) -> String {
         .as_str()
         .expect("the receipt names the job")
         .to_string()
+}
+
+/// The source a submit narrates, minted through the real doors: a teacher's
+/// catalog course, one course note under it, and the note's PDF attachment.
+/// Returns (note id, blob key) — the key is what the door hands the service as
+/// `source_key`.
+async fn note_with_pdf(app: &Router, db: &Database) -> (String, String) {
+    let teacher = common::login_as(app, db, "hoca", "teacher").await;
+    let course = common::create_course(app, &teacher, "Matematik").await;
+    let note = create_note(app, &teacher, &course).await;
+    let key = upload_attachment(app, &teacher, &note, "recap.pdf", "application/pdf").await;
+    (note, key)
+}
+
+/// One course note under `course`, created by `teacher`.
+async fn create_note(app: &Router, teacher: &str, course: &str) -> String {
+    let res = common::send(
+        app,
+        "POST",
+        "/course-notes",
+        Some(teacher),
+        Some(json!({ "course": course, "title": "Bölüm 1", "content": "özet" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    common::id_of(&res.body)
+}
+
+/// One attachment uploaded onto `note` (asserting the `201`); returns the
+/// row's own id — the blob key the bytes are stored under in the school's blob
+/// directory.
+async fn upload_attachment(
+    app: &Router,
+    teacher: &str,
+    note: &str,
+    name: &str,
+    content_type: &str,
+) -> String {
+    let res =
+        common::upload_course_note_file(app, teacher, note, name, content_type, b"%PDF-1.4 minimal")
+            .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    common::id_of(&res.body)
 }
 
 /// One `GET /podcast/jobs/{id}`.
@@ -357,14 +402,21 @@ async fn audio_of(app: &Router, cookie: &str, id: &str) -> (StatusCode, HeaderMa
 /// client-initiated capability frame on the connection it registered with,
 /// echoing the job's own identity — the backend refuses a report that
 /// describes a different job.
-fn report_frame(job_id: &str, user_id: &str, state: &str, stage: &str, progress: f64) -> Value {
+fn report_frame(
+    job_id: &str,
+    source_id: &str,
+    user_id: &str,
+    state: &str,
+    stage: &str,
+    progress: f64,
+) -> Value {
     json!({
         "id": format!("report-{state}"),
         "school": DEMO_SLUG,
         "capability": "podcast.report",
         "payload": {
             "job_id": job_id,
-            "source_id": SOURCE_ID,
+            "source_id": source_id,
             "format": FORMAT,
             "user_id": user_id,
             "state": state,
@@ -541,11 +593,12 @@ fn episode_bytes() -> Vec<u8> {
 async fn a_submit_writes_the_row_and_hands_the_service_its_own_job_id() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
+    let (note, key) = note_with_pdf(&app, &db).await;
 
     let res = submit(
         &app,
         &cookie,
-        json!({ "source_id": SOURCE_ID, "format": FORMAT }),
+        json!({ "source_id": &note, "format": FORMAT }),
     )
     .await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
@@ -564,7 +617,12 @@ async fn a_submit_writes_the_row_and_hands_the_service_its_own_job_id() {
         seen[0].payload["job_id"], job_id,
         "the service was handed the row's own id"
     );
-    assert_eq!(seen[0].payload["source_id"], SOURCE_ID);
+    assert_eq!(seen[0].payload["source_id"], note);
+    assert_eq!(
+        seen[0].payload["source_key"], key,
+        "the note's PDF blob key rides the dispatch: {}",
+        seen[0].payload
+    );
     assert_eq!(seen[0].payload["format"], FORMAT);
     assert_eq!(seen[0].payload["user_id"], user);
 
@@ -576,7 +634,7 @@ async fn a_submit_writes_the_row_and_hands_the_service_its_own_job_id() {
             .expect("the row is on the books");
     assert_eq!(state, "queued");
     assert_eq!(eta, Some(ETA_SECS), "the service's estimate landed on the row");
-    assert_eq!(source, SOURCE_ID);
+    assert_eq!(source, note, "the row records the note the job narrates");
 }
 
 /// A service that accepts the job under an id of its own has answered about a
@@ -593,8 +651,9 @@ async fn a_submit_that_echoes_another_job_id_is_a_bad_gateway() {
     let (app, db) = common::app_with_ai(Some(bridge)).await;
     let cookie = common::login(&app, "ali").await;
     let user = common::me_id(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
 
-    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    let res = submit(&app, &cookie, json!({ "source_id": note })).await;
     assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.body);
     assert_eq!(res.body["error"], "bad_reply");
 
@@ -616,9 +675,10 @@ async fn a_submit_that_echoes_another_job_id_is_a_bad_gateway() {
 /// distinguish "absent" from "empty".
 #[tokio::test]
 async fn an_omitted_format_is_not_sent_at_all() {
-    let (service, app, cookie, _db) = podcast_app().await;
+    let (service, app, cookie, db) = podcast_app().await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
 
-    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    let res = submit(&app, &cookie, json!({ "source_id": note })).await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
 
     let seen = service.seen();
@@ -652,12 +712,13 @@ async fn a_blank_source_id_is_refused_before_anything_is_written() {
 async fn a_running_report_lands_on_the_row_and_the_reads_stay_off_the_service() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
 
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "running", "tts", 0.5),
+            report_frame(&job_id, &note, &user, "running", "tts", 0.5),
         )
         .await,
         &job_id,
@@ -690,14 +751,15 @@ async fn a_running_report_lands_on_the_row_and_the_reads_stay_off_the_service() 
 /// with the content type the row recorded.
 #[tokio::test]
 async fn a_finished_job_serves_the_uploaded_bytes() {
-    let (service, app, cookie, _db) = podcast_app().await;
+    let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
 
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "running", "tts", 0.25),
+            report_frame(&job_id, &note, &user, "running", "tts", 0.25),
         )
         .await,
         &job_id,
@@ -717,7 +779,7 @@ async fn a_finished_job_serves_the_uploaded_bytes() {
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "done", "", 1.0),
+            report_frame(&job_id, &note, &user, "done", "", 1.0),
         )
         .await,
         &job_id,
@@ -750,7 +812,8 @@ async fn a_finished_job_serves_the_uploaded_bytes() {
 #[tokio::test]
 async fn a_cancel_of_a_live_job_stops_it() {
     let (service, app, cookie, db) = podcast_app().await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
 
     let res = cancel_of(&app, &cookie, &job_id).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -777,11 +840,12 @@ async fn a_cancel_of_a_live_job_stops_it() {
 async fn a_cancel_of_a_terminal_job_answers_false_without_the_service() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "failed", "", 0.0),
+            report_frame(&job_id, &note, &user, "failed", "", 0.0),
         )
         .await,
         &job_id,
@@ -851,8 +915,9 @@ async fn a_refusing_service_tombstones_the_row() {
     let (app, db) = common::app_with_ai(Some(bridge)).await;
     let cookie = common::login(&app, "ali").await;
     let user = common::me_id(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
 
-    let res = submit(&app, &cookie, json!({ "source_id": SOURCE_ID })).await;
+    let res = submit(&app, &cookie, json!({ "source_id": note })).await;
     assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
     assert_eq!(res.body["error"], "busy");
 
@@ -875,8 +940,9 @@ async fn a_refusing_service_tombstones_the_row() {
 /// either.
 #[tokio::test]
 async fn another_users_job_reads_as_absent() {
-    let (service, app, ali, _db) = podcast_app().await;
-    let job_id = submit_job(&app, &ali).await;
+    let (service, app, ali, db) = podcast_app().await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &ali, &note).await;
     let seen_before = service.seen().len();
 
     let ayse = common::login(&app, "ayse").await;
@@ -949,13 +1015,14 @@ async fn a_stale_job_reads_as_interrupted_but_the_row_is_untouched() {
 /// instead of parsing the sentence.
 #[tokio::test]
 async fn the_result_and_audio_doors_are_not_ready_before_done() {
-    let (service, app, cookie, _db) = podcast_app().await;
+    let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "running", "tts", 0.5),
+            report_frame(&job_id, &note, &user, "running", "tts", 0.5),
         )
         .await,
         &job_id,
@@ -984,11 +1051,12 @@ async fn the_result_and_audio_doors_are_not_ready_before_done() {
 async fn a_done_report_before_the_upload_is_refused() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
-    let job_id = submit_job(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
     assert_report_stored(
         &capability_call(
             &service.conn,
-            report_frame(&job_id, &user, "running", "tts", 0.5),
+            report_frame(&job_id, &note, &user, "running", "tts", 0.5),
         )
         .await,
         &job_id,
@@ -996,7 +1064,7 @@ async fn a_done_report_before_the_upload_is_refused() {
 
     let answer = capability_call(
         &service.conn,
-        report_frame(&job_id, &user, "done", "", 1.0),
+        report_frame(&job_id, &note, &user, "done", "", 1.0),
     )
     .await;
     assert_eq!(refusal_code(&answer), "audio_missing");
@@ -1087,6 +1155,90 @@ async fn the_old_path_audio_door_is_gone() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// The submit door resolves the source itself: a note with no PDF attachment
+/// is refused `409 source_missing` **before** anything is written. Pre-fix the
+/// door accepted the job and it died later in the service's `kaynak` stage —
+/// a queued job guaranteed to fail, which is what this refusal exists to
+/// prevent. A newer non-PDF attachment changes nothing: it is not a source.
+#[tokio::test]
+async fn a_note_with_no_pdf_is_refused_at_the_door() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Matematik").await;
+    let note = create_note(&app, &teacher, &course).await;
+
+    let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.body["code"], "source_missing");
+
+    // A non-PDF attachment is newer than nothing, and is still not a source.
+    let _txt = upload_attachment(&app, &teacher, &note, "ozet.txt", "text/plain").await;
+    let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.body["code"], "source_missing");
+
+    assert!(
+        service.seen().is_empty(),
+        "the refusal never reaches a worker: {:?}",
+        service.seen()
+    );
+    assert_eq!(rows_for(&db, &user).await, 0, "and no row is written");
+}
+
+/// A note whose PDF is on record but whose blob is gone from this host is
+/// refused the same way: the row is intact and the bytes are not, and the
+/// service could only fail on it — so the door answers now instead of queueing
+/// a job nobody can finish.
+#[tokio::test]
+async fn a_pdf_whose_blob_is_gone_is_refused_at_the_door() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let (note, key) = note_with_pdf(&app, &db).await;
+
+    let path = common::blob_dir().join(&key);
+    assert!(path.is_file(), "the upload wrote the blob");
+    std::fs::remove_file(&path).expect("take the blob away");
+    assert!(!path.exists(), "the blob really is gone");
+
+    let res = submit(&app, &cookie, json!({ "source_id": note })).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.body["code"], "source_missing");
+
+    assert!(service.seen().is_empty(), "nothing was dispatched");
+    assert_eq!(rows_for(&db, &user).await, 0, "and no row is written");
+}
+
+/// Which attachment narrates: the note's **newest PDF**, not its newest file —
+/// a text recap uploaded after the PDF is not a source, and a corrected PDF
+/// uploaded after that is.
+#[tokio::test]
+async fn the_source_is_the_newest_pdf_attachment() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Matematik").await;
+    let note = create_note(&app, &teacher, &course).await;
+
+    let draft = upload_attachment(&app, &teacher, &note, "taslak.pdf", "application/pdf").await;
+    let _newer_text =
+        upload_attachment(&app, &teacher, &note, "ozet.txt", "text/plain").await;
+    let corrected =
+        upload_attachment(&app, &teacher, &note, "duzeltilmis.pdf", "application/pdf").await;
+    assert_ne!(draft, corrected, "two distinct attachment rows");
+
+    let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "exactly one dispatch");
+    assert_eq!(seen[0].payload["source_id"], note);
+    assert_eq!(
+        seen[0].payload["source_key"], corrected,
+        "the newest PDF, not the newest file: {}",
+        seen[0].payload
+    );
 }
 
 /// Authentication is the whole gate on every door: no cookie is a `401`, not a

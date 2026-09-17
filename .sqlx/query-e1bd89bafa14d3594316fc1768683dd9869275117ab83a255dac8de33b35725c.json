@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: CourseNoteFileId\",\n               course_note AS \"course_note: CourseNoteId\", name AS \"name: FileName\",\n               content_type AS \"content_type: FileContentType\", size FROM course_note_file\n           WHERE course_note = $1 AND content_type = 'application/pdf'\n           ORDER BY id DESC\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseNoteFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course_note: CourseNoteId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "course_note"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: FileName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e1bd89bafa14d3594316fc1768683dd9869275117ab83a255dac8de33b35725c"
+}

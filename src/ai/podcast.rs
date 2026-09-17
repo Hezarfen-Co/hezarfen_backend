@@ -15,8 +15,11 @@
 //! worker:
 //!
 //! * [`submit`] — `podcast.submit`, whose payload carries the backend-minted
-//!   `job_id` and the submitting `user_id` (the service stores both; its own
-//!   record is keyed by the id the backend will keep asking about).
+//!   `job_id`, the submitting `user_id` (the service stores both; its own
+//!   record is keyed by the id the backend will keep asking about), and the
+//!   `source_key` of the note's PDF: the backend resolves which file that is
+//!   before the job exists, so the service is never asked to open a name it
+//!   cannot turn into bytes.
 //! * [`cancel`] — `podcast.cancel`, unchanged: a write on the service's queue,
 //!   and the capability is what decides whether a deployment offers the door.
 //!
@@ -49,7 +52,14 @@ pub use crate::constant::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodcastSubmitPayload {
     pub job_id: String,
+    /// The course note the job narrates, for the record. `source_key` is the
+    /// handle the service actually opens.
     pub source_id: String,
+    /// The blob key of the note's PDF attachment — the file the service reads
+    /// at `<PODCAST_MEDIA_ROOT>/<school>/<source_key>`. The backend resolves
+    /// it (the note's newest `application/pdf` attachment) before the job
+    /// exists; `source_id` alone names nothing the service could open.
+    pub source_key: String,
     /// `None` means the service applies its own default (`duz_okuma` today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
