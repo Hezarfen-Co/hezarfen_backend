@@ -1,5 +1,9 @@
 //! Public discovery for the AI bridge.
 //!
+//! Two reads: the bridge's certificate, which a service needs before it can
+//! dial in, and the capabilities currently on offer, which a client needs
+//! before it offers an AI feature it cannot get an answer from.
+//!
 //! An AI service needs the bridge's certificate before it can dial in, and the
 //! certificate is regenerated on every boot when no PEM pair is configured. So
 //! it is published here: the service fetches this over HTTP, pins what it gets,
@@ -14,6 +18,8 @@
 //! network, put a real certificate in `AI_TLS_CERT`/`AI_TLS_KEY` and distribute
 //! it out of band.
 
+use std::collections::BTreeMap;
+
 use axum::Json;
 use axum::extract::State;
 use base64::Engine;
@@ -27,10 +33,13 @@ use crate::constant::AI_PROTOCOL;
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 use crate::web::CurrentUser;
-use std::collections::BTreeMap;
 
 pub fn routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::new().routes(routes!(bridge_certificate, capabilities))
+    // One `routes!` per path: the multi-handler form groups methods under a
+    // single path, so two `get` handlers never share one.
+    OpenApiRouter::new()
+        .routes(routes!(bridge_certificate))
+        .routes(routes!(capabilities))
 }
 
 /// Everything a service needs to reach the bridge, except the shared token
