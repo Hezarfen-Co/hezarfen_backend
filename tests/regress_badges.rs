@@ -26,9 +26,10 @@ use common::{
     send, set_role, taught_under,
 };
 use hezarfen_backend::constant::{
-    BADGES, HIGH_MARK_MIN, MIN_COUNTED_POMODORO_MS, STUDY_STREAK_LAST_DAY_FIELD,
+    HIGH_MARK_MIN, MIN_COUNTED_POMODORO_MS, STUDY_STREAK_LAST_DAY_FIELD,
 };
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::badge::BADGES;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::{Value, json};
 

@@ -6,7 +6,8 @@
 //! [`super::courses::can_view_course`] (the above, or anyone the course
 //! reaches).
 
-use crate::web::tenant_state::{ResolvedTenant, State};
+use crate::tenant::ResolvedTenant;
+use crate::web::tenant_state::State;
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};

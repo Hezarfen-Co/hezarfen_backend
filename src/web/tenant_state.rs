@@ -21,19 +21,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::module::ModuleSet;
 use crate::state::AppState;
-use crate::tenant::Slug;
-
-/// Everything one registry read tells us about the school behind a request:
-/// its handle and what it has bought. Cached in the request's extensions by
-/// [`resolve_tenant`], so a request that needs the school twice (the shadow
-/// [`State`] *and* [`crate::web::CurrentUser`], which is most of them) reads
-/// the registry once.
-#[derive(Clone)]
-pub struct ResolvedTenant {
-    pub slug: Slug,
-    pub db: Database,
-    pub modules: ModuleSet,
-}
+use crate::tenant::{ResolvedTenant, Slug};
 
 /// The school a request has already been resolved into, injected as a request
 /// extension by an in-process caller that has no cookie — today only the AI

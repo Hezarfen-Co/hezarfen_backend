@@ -21,8 +21,8 @@ use utoipa_axum::routes;
 use crate::error::ErrorResponse;
 use crate::module::{Module, ModuleSet, Package};
 use crate::state::AppState;
+use crate::tenant::ResolvedTenant;
 use crate::web::CurrentUser;
-use crate::web::tenant_state::ResolvedTenant;
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()

@@ -1,10 +1,5 @@
 //! Validation limits, in one place.
 
-use crate::domain::badge::BadgeStat;
-use crate::domain::message::Folder;
-use crate::domain::preferences::{Language, Theme};
-use crate::domain::role::Role;
-
 /// A school slug's length bounds — the name in front of the dot in the session
 /// cookie, which is also the school's database name and its blob directory
 /// (see [`crate::tenant::Slug`]).
@@ -749,27 +744,9 @@ pub const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 /// One week, the only recurrence step this backend expands.
 pub const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
 
-// --- enum value tables -------------------------------------------------
-
-/// Every *assignable* role, lowest privilege first. `Role::Ai` is deliberately
-/// absent: it is a service principal, so leaving it out of this table is what
-/// keeps `Role::try_from_str` (and every surface that lists roles) from ever
-/// handing it to a user.
-pub const ROLES: [Role; 5] = [
-    Role::Parent,
-    Role::Student,
-    Role::Teacher,
-    Role::Manager,
-    Role::Admin,
-];
-
 /// The record key `User::ai_principal` carries. A literal, not a ULID, so it
 /// can never collide with a minted user row — and the row is never written.
 pub const AI_PRINCIPAL_KEY: &str = "ai_service";
-
-pub const THEMES: [Theme; 2] = [Theme::Light, Theme::Dark];
-
-pub const LANGUAGES: [Language; 2] = [Language::Tr, Language::En];
 
 /// A `palette_color` preference is `#` plus exactly six hex digits — the length
 /// of the whole string, `#` included.
@@ -785,11 +762,6 @@ pub const PALETTE_COLOR_LEN: usize = 7;
 /// list of the frontend's palette, so a new palette entry needs no backend
 /// change.
 pub const PALETTE_COLOR_PATTERN: &str = "^#[0-9a-fA-F]{6}$";
-
-/// Folders a sender may file their side into (`Sent` is their home).
-pub const SENDER_FOLDERS: [Folder; 3] = [Folder::Sent, Folder::Archive, Folder::Trash];
-/// Folders a recipient may file their side into (`Inbox` is their home).
-pub const RECIPIENT_FOLDERS: [Folder; 3] = [Folder::Inbox, Folder::Archive, Folder::Trash];
 
 /// The two lifecycle states of a pool question. `pending`: awaiting teacher+
 /// approval, visible only to the asker and to teacher+. `approved`: in the
@@ -1064,66 +1036,6 @@ pub const LESSON_COUNTED_AT_FIELD: &str = "held_counted_at";
 /// every deployment, forever.
 pub const HIGH_MARK_MIN: i64 = 90;
 
-/// The badge catalog: every badge the system can award, as
-/// `(id, the counter it reads, the value that earns it)`. Hardcoded on
-/// purpose — moving a threshold is a deploy, which is what keeps
-/// [`crate::domain::badge::earned`] a pure function of the stats and makes the
-/// rules reviewable in a diff instead of editable in a settings row.
-///
-/// The ids are the API: the frontend maps them to a label and an icon, and an
-/// award row stores one forever. So an id is never reused for a different
-/// meaning; retiring one is done by deleting the line, and the awards that
-/// carry it simply stop being served (no data migration —
-/// [`crate::db::badge::list_for`] filters to the live
-/// catalog).
-pub const BADGES: [(&str, BadgeStat, i64); 34] = [
-    ("homework_submitted_1", BadgeStat::HomeworkSubmitted, 1),
-    ("homework_submitted_10", BadgeStat::HomeworkSubmitted, 10),
-    ("homework_submitted_50", BadgeStat::HomeworkSubmitted, 50),
-    ("homework_on_time_10", BadgeStat::HomeworkOnTime, 10),
-    ("homework_on_time_25", BadgeStat::HomeworkOnTime, 25),
-    ("exam_sat_1", BadgeStat::ExamSat, 1),
-    ("exam_sat_10", BadgeStat::ExamSat, 10),
-    ("exam_sat_25", BadgeStat::ExamSat, 25),
-    ("pomodoro_finished_10", BadgeStat::PomodoroFinished, 10),
-    ("pomodoro_finished_50", BadgeStat::PomodoroFinished, 50),
-    ("pomodoro_finished_200", BadgeStat::PomodoroFinished, 200),
-    // Ten and fifty hours of focus, in the milliseconds the counter stores.
-    (
-        "pomodoro_focus_ms_36000000",
-        BadgeStat::PomodoroFocusMs,
-        36_000_000,
-    ),
-    (
-        "pomodoro_focus_ms_180000000",
-        BadgeStat::PomodoroFocusMs,
-        180_000_000,
-    ),
-    ("marks_given_10", BadgeStat::MarksGiven, 10),
-    ("marks_given_50", BadgeStat::MarksGiven, 50),
-    ("marks_given_250", BadgeStat::MarksGiven, 250),
-    ("lessons_held_10", BadgeStat::LessonsHeld, 10),
-    ("lessons_held_50", BadgeStat::LessonsHeld, 50),
-    ("lessons_held_200", BadgeStat::LessonsHeld, 200),
-    ("pool_approved_5", BadgeStat::PoolApproved, 5),
-    ("pool_approved_25", BadgeStat::PoolApproved, 25),
-    ("pool_approved_100", BadgeStat::PoolApproved, 100),
-    ("pool_published_1", BadgeStat::PoolPublished, 1),
-    ("pool_published_10", BadgeStat::PoolPublished, 10),
-    ("pool_published_50", BadgeStat::PoolPublished, 50),
-    ("lessons_attended_10", BadgeStat::LessonsAttended, 10),
-    ("lessons_attended_50", BadgeStat::LessonsAttended, 50),
-    ("lessons_attended_200", BadgeStat::LessonsAttended, 200),
-    // Exam marks at or above `HIGH_MARK_MIN`, counted per graded sitting.
-    ("high_mark_1", BadgeStat::HighMark, 1),
-    ("high_mark_10", BadgeStat::HighMark, 10),
-    ("high_mark_25", BadgeStat::HighMark, 25),
-    // Consecutive study days, read off the longest run ever held — so these
-    // are earned once and never lost when the run breaks.
-    ("study_streak_3", BadgeStat::StudyStreak, 3),
-    ("study_streak_7", BadgeStat::StudyStreak, 7),
-    ("study_streak_30", BadgeStat::StudyStreak, 30),
-];
 /// Cap 1, not N: an appointment slot holds at most one live booking, so this
 /// counter is really an "is it taken" flag kept in the shape every other cap
 /// uses (`claim`/`release`), which is what makes rejecting or cancelling a

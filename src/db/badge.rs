@@ -6,9 +6,9 @@
 
 use sqlx::AssertSqlSafe;
 
-use crate::constant::{BADGE_AWARD_TABLE, BADGES};
+use crate::constant::BADGE_AWARD_TABLE;
 use crate::database::Database;
-use crate::domain::badge::{BadgeAward, BadgeStats};
+use crate::domain::badge::{BADGES, BadgeAward, BadgeStats};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;

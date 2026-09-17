@@ -33,7 +33,6 @@ use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::module::ModuleSet;
 use crate::telemetry::Metrics;
-use crate::web::tenant_state::ResolvedTenant;
 
 /// The school every in-memory test bootstrap got and every test suite still
 /// names. Not special to the code — just the one name the test harness and
@@ -333,6 +332,18 @@ pub struct Tenants {
     /// [`Tenants::new_test_adopting`]; dropped with this registry's last
     /// handle. `None` in production, where databases outlive the process.
     leases: Option<crate::database::TestDatabases>,
+}
+
+/// Everything one registry read tells us about the school behind a request:
+/// its handle and what it has bought. Cached in the request's extensions by
+/// [`crate::web::tenant_state::resolve_tenant`], so a request that needs the
+/// school twice (the shadow [`crate::web::tenant_state::State`] *and*
+/// [`crate::web::CurrentUser`], which is most of them) reads the registry once.
+#[derive(Clone)]
+pub struct ResolvedTenant {
+    pub slug: Slug,
+    pub db: Database,
+    pub modules: ModuleSet,
 }
 
 impl Tenants {

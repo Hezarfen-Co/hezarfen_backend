@@ -1,6 +1,5 @@
 use sqlx::Type;
 
-use crate::constant::ROLES;
 use crate::error::ValidationError;
 
 /// The access levels, in ascending order of privilege.
@@ -88,6 +87,18 @@ impl Role {
         }
     }
 }
+
+/// Every *assignable* role, lowest privilege first. `Role::Ai` is deliberately
+/// absent: it is a service principal, so leaving it out of this table is what
+/// keeps `Role::try_from_str` (and every surface that lists roles) from ever
+/// handing it to a user.
+pub const ROLES: [Role; 5] = [
+    Role::Parent,
+    Role::Student,
+    Role::Teacher,
+    Role::Manager,
+    Role::Admin,
+];
 
 #[cfg(test)]
 mod tests {

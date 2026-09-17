@@ -173,10 +173,20 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("STATUS_PENDING", "pool-question lifecycle state"),
     ("STATUS_APPROVED", "pool-question lifecycle state"),
     ("POOL_QUESTION_STATUSES", "pool-question lifecycle states"),
+    // Which folders a copy may be filed into is carried by the message itself
+    // (its `folder` field), so the client reads the accepted set off the
+    // resource it is acting on — never a public list, and /limits has no
+    // message-folder group to place them in.
+    (
+        "SENDER_FOLDERS",
+        "folders a sender may file their side into",
+    ),
+    (
+        "RECIPIENT_FOLDERS",
+        "folders a recipient may file their side into",
+    ),
     ("BANK_VISIBILITY_PRIVATE", "bank-question visibility value"),
     ("BANK_VISIBILITY_SCHOOL", "bank-question visibility value"),
-    ("SENDER_FOLDERS", "folders a sender may file into"),
-    ("RECIPIENT_FOLDERS", "folders a recipient may file into"),
     // Client-facing, but deliberately not compile-time contracts: these are
     // per-deployment defaults an operator overrides by environment variable.
     // `GET /limits` publishes the running server's ACTUAL tiers (from
@@ -244,7 +254,7 @@ fn is_storage_identifier(name: &str) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// Every `pub const` declared in `src/constant.rs`.
+/// Every `pub const` declared in `source`, in declaration order.
 fn declared_constants(source: &str) -> BTreeSet<String> {
     source
         .lines()
@@ -255,15 +265,24 @@ fn declared_constants(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// True when `limits.rs` mentions the constant as a whole word — the response
-/// is built by naming each constant directly, so a mention is the reference.
+/// True when `limits.rs` mentions the constant as a whole word in its *body* —
+/// the response is built by naming each constant directly, so a mention there
+/// is the reference. `use` lines are skipped: an import proves a name is in
+/// scope, not that anything publishes it, and reading it as a reference would
+/// let deleting a table from the response keep the guard green.
 fn references(source: &str, name: &str) -> bool {
-    source.match_indices(name).any(|(at, _)| {
-        let before = source[..at].chars().next_back();
-        let after = source[at + name.len()..].chars().next();
-        let boundary = |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
-        boundary(before) && boundary(after)
-    })
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("use "))
+        .any(|line| {
+            line.match_indices(name).any(|(at, _)| {
+                let before = line[..at].chars().next_back();
+                let after = line[at + name.len()..].chars().next();
+                let boundary =
+                    |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
+                boundary(before) && boundary(after)
+            })
+        })
 }
 
 #[test]
@@ -300,6 +319,56 @@ fn every_constant_is_published_or_deliberately_excluded() {
             .map(|name| name.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+}
+
+/// The accepted-value tables that moved out of `src/constant.rs` into their
+/// domain modules (which is also their only legal home — `validation_bounds_
+/// live_in_constant_rs` below bans the bound-shaped ones elsewhere, but an
+/// array of enum values is neither a `MAX_`/`MIN_` bound nor numeric, so it
+/// escapes that sweep). Each is either published by `GET /limits` or excused
+/// with a reason; both are consumed by the test below.
+const MOVED_TABLES: &[(&str, &str)] = &[
+    ("src/domain/role.rs", "ROLES"),
+    ("src/domain/preferences.rs", "THEMES"),
+    ("src/domain/preferences.rs", "LANGUAGES"),
+    ("src/domain/message.rs", "SENDER_FOLDERS"),
+    ("src/domain/message.rs", "RECIPIENT_FOLDERS"),
+    ("src/domain/badge.rs", "BADGES"),
+];
+
+#[test]
+fn moved_value_tables_are_still_published_or_deliberately_excluded() {
+    // The sweep above only reads `src/constant.rs`, so the day the accepted-
+    // value tables moved into their domain modules they left its scan: nothing
+    // then failed if a future edit dropped one from `src/web/limits.rs`. This
+    // re-establishes that guarantee for the tables that moved — but for that
+    // table list alone, not the whole modules, so the many server-side bounds
+    // that also live there are not dragged in and do not each need an
+    // EXCLUDED entry of their own.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let limits = fs::read_to_string(format!("{root}/src/web/limits.rs")).expect("read limits.rs");
+    let excluded: BTreeSet<&str> = EXCLUDED.iter().map(|(name, _)| *name).collect();
+
+    let mut missing = Vec::new();
+    for (module, name) in MOVED_TABLES {
+        let source = fs::read_to_string(format!("{root}/{module}"))
+            .unwrap_or_else(|_| panic!("read {module}"));
+        assert!(
+            declared_constants(&source).contains(*name),
+            "{name} is no longer a `pub const` in {module} — MOVED_TABLES is stale"
+        );
+        if !excluded.contains(name) && !references(&limits, name) {
+            missing.push(format!("  {name} ({module})"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these accepted-value tables left src/constant.rs and now reach neither GET /limits \
+         nor the EXCLUDED list in this test:\n{}\n\nAdd each to src/web/limits.rs so clients \
+         stop guessing it, or to EXCLUDED with the reason it is not client-facing.",
+        missing.join("\n")
     );
 }
 
@@ -384,10 +453,20 @@ fn validation_bounds_live_in_constant_rs() {
 fn exclusions_are_real_constants() {
     // An exclusion for a deleted constant is dead weight that also silently
     // widens the allowlist if the name is ever reused for something public.
+    // A name is real when it is declared in `src/constant.rs` or is one of the
+    // accepted-value tables that moved into its domain module — the two homes
+    // the completeness test above reads.
     let root = env!("CARGO_MANIFEST_DIR");
     let constants =
         fs::read_to_string(format!("{root}/src/constant.rs")).expect("read constant.rs");
-    let declared = declared_constants(&constants);
+    let mut declared = declared_constants(&constants);
+    for (module, name) in MOVED_TABLES {
+        let source = fs::read_to_string(format!("{root}/{module}"))
+            .unwrap_or_else(|_| panic!("read {module}"));
+        if declared_constants(&source).contains(*name) {
+            declared.insert((*name).to_string());
+        }
+    }
 
     let stale: Vec<&str> = EXCLUDED
         .iter()
@@ -397,6 +476,7 @@ fn exclusions_are_real_constants() {
 
     assert!(
         stale.is_empty(),
-        "EXCLUDED names constants that no longer exist in src/constant.rs: {stale:?} — drop them"
+        "EXCLUDED names constants that no longer exist (neither in src/constant.rs nor in \
+         the modules listed in MOVED_TABLES): {stale:?} — drop them"
     );
 }

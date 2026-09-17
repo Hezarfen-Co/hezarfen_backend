@@ -19,7 +19,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::*;
-use crate::constant::{LANGUAGES, ROLES, THEMES};
+use crate::domain::badge::BADGES;
+use crate::domain::preferences::{LANGUAGES, THEMES};
+use crate::domain::role::ROLES;
 use crate::state::AppState;
 
 pub fn routes() -> OpenApiRouter<AppState> {

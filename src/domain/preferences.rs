@@ -5,7 +5,7 @@
 
 use sqlx::Type;
 
-use crate::constant::{LANGUAGES, PALETTE_COLOR_LEN, THEMES};
+use crate::constant::PALETTE_COLOR_LEN;
 use crate::error::ValidationError;
 
 /// The frontend color scheme.
@@ -40,6 +40,8 @@ impl Theme {
     }
 }
 
+pub const THEMES: [Theme; 2] = [Theme::Light, Theme::Dark];
+
 /// The frontend interface language, as an ISO 639-1 code — the same values the
 /// frontend's locale switch uses (`"tr"` Turkish, `"en"` English).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -69,6 +71,8 @@ impl Language {
             })
     }
 }
+
+pub const LANGUAGES: [Language; 2] = [Language::Tr, Language::En];
 
 /// The frontend accent color, a 6-digit hex with a leading `#`, stored
 /// lowercase (`"#fefae0"`).

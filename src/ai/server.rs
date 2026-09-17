@@ -32,11 +32,11 @@ use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::module::Module;
 use crate::telemetry::Metrics;
-use crate::tenant::{Slug, Tenants};
+use crate::tenant::{ResolvedTenant, Slug, Tenants};
 use crate::web::blob_path;
 use crate::web::courses::can_view_course;
 use crate::web::extractor::AiPrincipal;
-use crate::web::tenant_state::{ResolvedTenant, TenantExt, school_files_path};
+use crate::web::tenant_state::{TenantExt, school_files_path};
 
 /// What the bridge needs to come up.
 #[derive(Clone, Debug)]

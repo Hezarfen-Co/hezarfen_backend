@@ -143,7 +143,7 @@ mod tests {
         );
         // Every role reaches the wire as its documented lowercase slug — the
         // one `Role::as_str` already publishes, not a second spelling.
-        for role in crate::constant::ROLES {
+        for role in crate::domain::role::ROLES {
             let encoded = serde_json::to_value(ChatRequestPayload {
                 message: "hi".into(),
                 asker_role: role.as_str().to_string(),

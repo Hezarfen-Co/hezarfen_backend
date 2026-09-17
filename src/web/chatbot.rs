@@ -20,7 +20,8 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::{ResolvedTenant, SchoolSlug, State, TenantExt};
+use crate::tenant::ResolvedTenant;
+use crate::web::tenant_state::{SchoolSlug, State, TenantExt};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;

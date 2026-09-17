@@ -20,7 +20,7 @@ use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::CourseNoteFile;
 use crate::module::Module;
 use crate::state::AppState;
-use crate::web::tenant_state::ResolvedTenant;
+use crate::tenant::ResolvedTenant;
 
 /// The capability string routed to an indexing service. Defined once, in
 /// [`crate::constant`]; re-exported here so a reader of the payload contract

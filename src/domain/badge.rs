@@ -10,12 +10,12 @@
 //!   counter that later drops below the threshold — a submission withdrawn,
 //!   say — leaves the badge standing, because it records that the student did
 //!   the thing, not that they still have it.
-//! - **Pure rules.** The catalog is [`crate::constant::BADGES`], a hardcoded
-//!   table, so [`earned`] is a total function of [`BadgeStats`] with no I/O
-//!   and no configuration behind it.
+//! - **Pure rules.** The catalog is [`BADGES`], a hardcoded table, so
+//!   [`earned`] is a total function of [`BadgeStats`] with no I/O and no
+//!   configuration behind it.
 
 use crate::constant::{
-    BADGES, EXAM_SAT_TOTAL_FIELD, HIGH_MARK_TOTAL_FIELD, HOMEWORK_ON_TIME_TOTAL_FIELD,
+    EXAM_SAT_TOTAL_FIELD, HIGH_MARK_TOTAL_FIELD, HOMEWORK_ON_TIME_TOTAL_FIELD,
     HOMEWORK_SUBMITTED_TOTAL_FIELD, LESSONS_ATTENDED_TOTAL_FIELD, LESSONS_HELD_TOTAL_FIELD,
     MARKS_GIVEN_TOTAL_FIELD, POMODORO_FINISHED_TOTAL_FIELD, POMODORO_FOCUS_MS_TOTAL_FIELD,
     POOL_APPROVED_TOTAL_FIELD, POOL_PUBLISHED_TOTAL_FIELD, STUDY_STREAK_LONGEST_FIELD,
@@ -91,6 +91,67 @@ impl BadgeStat {
         }
     }
 }
+
+/// The badge catalog: every badge the system can award, as
+/// `(id, the counter it reads, the value that earns it)`. Hardcoded on
+/// purpose — moving a threshold is a deploy, which is what keeps
+/// [`crate::domain::badge::earned`] a pure function of the stats and makes the
+/// rules reviewable in a diff instead of editable in a settings row.
+///
+/// The ids are the API: the frontend maps them to a label and an icon, and an
+/// award row stores one forever. So an id is never reused for a different
+/// meaning; retiring one is done by deleting the line, and the awards that
+/// carry it simply stop being served (no data migration —
+/// [`crate::db::badge::list_for`] filters to the live
+/// catalog).
+pub const BADGES: [(&str, BadgeStat, i64); 34] = [
+    ("homework_submitted_1", BadgeStat::HomeworkSubmitted, 1),
+    ("homework_submitted_10", BadgeStat::HomeworkSubmitted, 10),
+    ("homework_submitted_50", BadgeStat::HomeworkSubmitted, 50),
+    ("homework_on_time_10", BadgeStat::HomeworkOnTime, 10),
+    ("homework_on_time_25", BadgeStat::HomeworkOnTime, 25),
+    ("exam_sat_1", BadgeStat::ExamSat, 1),
+    ("exam_sat_10", BadgeStat::ExamSat, 10),
+    ("exam_sat_25", BadgeStat::ExamSat, 25),
+    ("pomodoro_finished_10", BadgeStat::PomodoroFinished, 10),
+    ("pomodoro_finished_50", BadgeStat::PomodoroFinished, 50),
+    ("pomodoro_finished_200", BadgeStat::PomodoroFinished, 200),
+    // Ten and fifty hours of focus, in the milliseconds the counter stores.
+    (
+        "pomodoro_focus_ms_36000000",
+        BadgeStat::PomodoroFocusMs,
+        36_000_000,
+    ),
+    (
+        "pomodoro_focus_ms_180000000",
+        BadgeStat::PomodoroFocusMs,
+        180_000_000,
+    ),
+    ("marks_given_10", BadgeStat::MarksGiven, 10),
+    ("marks_given_50", BadgeStat::MarksGiven, 50),
+    ("marks_given_250", BadgeStat::MarksGiven, 250),
+    ("lessons_held_10", BadgeStat::LessonsHeld, 10),
+    ("lessons_held_50", BadgeStat::LessonsHeld, 50),
+    ("lessons_held_200", BadgeStat::LessonsHeld, 200),
+    ("pool_approved_5", BadgeStat::PoolApproved, 5),
+    ("pool_approved_25", BadgeStat::PoolApproved, 25),
+    ("pool_approved_100", BadgeStat::PoolApproved, 100),
+    ("pool_published_1", BadgeStat::PoolPublished, 1),
+    ("pool_published_10", BadgeStat::PoolPublished, 10),
+    ("pool_published_50", BadgeStat::PoolPublished, 50),
+    ("lessons_attended_10", BadgeStat::LessonsAttended, 10),
+    ("lessons_attended_50", BadgeStat::LessonsAttended, 50),
+    ("lessons_attended_200", BadgeStat::LessonsAttended, 200),
+    // Exam marks at or above `HIGH_MARK_MIN`, counted per graded sitting.
+    ("high_mark_1", BadgeStat::HighMark, 1),
+    ("high_mark_10", BadgeStat::HighMark, 10),
+    ("high_mark_25", BadgeStat::HighMark, 25),
+    // Consecutive study days, read off the longest run ever held — so these
+    // are earned once and never lost when the run breaks.
+    ("study_streak_3", BadgeStat::StudyStreak, 3),
+    ("study_streak_7", BadgeStat::StudyStreak, 7),
+    ("study_streak_30", BadgeStat::StudyStreak, 30),
+];
 
 /// The lifetime counters one user has accumulated, as the badge rules see
 /// them. Every field is a count and never an `Option`: the columns are

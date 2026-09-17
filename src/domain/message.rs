@@ -1,10 +1,7 @@
 use sqlx::Type;
 use uuid::Uuid;
 
-use crate::constant::{
-    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN, RECIPIENT_FOLDERS,
-    SENDER_FOLDERS,
-};
+use crate::constant::{MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN};
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -88,6 +85,11 @@ impl Folder {
         matches!(self, Folder::Inbox | Folder::Sent | Folder::Archive)
     }
 }
+
+/// Folders a sender may file their side into (`Sent` is their home).
+pub const SENDER_FOLDERS: [Folder; 3] = [Folder::Sent, Folder::Archive, Folder::Trash];
+/// Folders a recipient may file their side into (`Inbox` is their home).
+pub const RECIPIENT_FOLDERS: [Folder; 3] = [Folder::Inbox, Folder::Archive, Folder::Trash];
 
 /// Typed message row id. A UUIDv7 minted by the process-wide monotonic
 /// generator, so `id` order is mint order.

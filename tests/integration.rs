@@ -5217,7 +5217,7 @@ async fn admin_creates_a_user() {
 /// hold. `Role` carries no `serde` derive (`src/domain/role.rs:21`), so no
 /// handler can bind a role straight out of a body — every request-supplied role
 /// passes `Role::try_from_str`, which answers only with a member of
-/// `constant::ROLES` (`src/constant.rs:674`, the five human roles).
+/// `domain::role::ROLES` (`src/domain/role.rs`, the five human roles).
 ///
 /// Grep-verified 2026-08-12, the complete set of role paths a request can reach:
 ///   * `src/web/users.rs:453` — `PATCH /users/{id}/role`, the *only* path that

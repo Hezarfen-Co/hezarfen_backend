@@ -38,7 +38,7 @@ pub enum Role {
 }
 
 /// The roles a request may ask for: the five human ones, exactly
-/// [`crate::constant::ROLES`]. Documentation only — the handlers still take the
+/// [`crate::domain::role::ROLES`]. Documentation only — the handlers still take the
 /// role as a string and funnel it through
 /// [`crate::domain::role::Role::try_from_str`], so an unknown value is a uniform
 /// `400` rather than a deserialization error. It exists because [`Role`] (the
