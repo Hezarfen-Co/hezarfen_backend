@@ -146,6 +146,22 @@ const EXCLUDED: &[(&str, &str)] = &[
          `zeka_run`, which the client polls",
     ),
     (
+        "AI_PODCAST_SUBMIT_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_PODCAST_STATUS_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_PODCAST_RESULT_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_PODCAST_CANCEL_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
         "CHAT_STREAM_POLL_MS",
         "server-side poll cadence behind the SSE stream",
     ),

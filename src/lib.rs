@@ -166,6 +166,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest(
             "/insights",
             gate(web::insights::routes(), &state, Module::Chatbot),
+        )
+        .nest(
             "/podcast",
             gate(web::podcast::routes(), &state, Module::Chatbot),
         )
