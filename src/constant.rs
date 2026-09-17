@@ -640,6 +640,35 @@ pub const AI_INSIGHT_REFRESH_TIMEOUT_SECS: u64 = 300;
 /// anyone answer it, so the same staleness window applies.
 pub const RAG_PENDING_STALE_SECS: i64 = CHATBOT_PENDING_STALE_SECS;
 
+// ---- podcast ---------------------------------------------------------------
+//
+// The podcast service turns one stored source into an audio episode, which is
+// a *job*: submitted, polled, collected, and maybe cancelled — the service
+// owns the record, and the backend relays each HTTP call to the worker that
+// declares the matching capability. All four capabilities answer immediately
+// (the pipeline runs in the service's own pool), so unlike `rag.index` and
+// `rag.chat` none of them needs a per-capability deadline: the bridge's
+// ordinary request timeout already covers a job-store read.
+
+/// The capability an AI service declares to accept a podcast job. The backend
+/// dispatches on it from `POST /podcast/jobs`, and the service mints the job
+/// id every other `podcast.*` call then names.
+pub const AI_PODCAST_SUBMIT_CAPABILITY: &str = "podcast.submit";
+
+/// The capability an AI service declares to report one podcast job's state,
+/// read back by `GET /podcast/jobs/{id}`.
+pub const AI_PODCAST_STATUS_CAPABILITY: &str = "podcast.status";
+
+/// The capability an AI service declares to hand back a finished job's
+/// artifacts — above all the `audio_id` the `/podcast/audio` door streams.
+pub const AI_PODCAST_RESULT_CAPABILITY: &str = "podcast.result";
+
+/// The capability an AI service declares to cancel one podcast job. Its own
+/// capability rather than a flag on submit: the cancel is a write on the
+/// service's queue, and the capability is what decides whether a deployment
+/// can offer the door at all.
+pub const AI_PODCAST_CANCEL_CAPABILITY: &str = "podcast.cancel";
+
 /// The most `(sınıf, ders)` scope pairs one `rag.chat` request may carry. The
 /// corpus is routed by the **pair** — a grade and a subject list sent
 /// separately would cross-product into combinations the asker never named — so
