@@ -580,6 +580,41 @@ pub const AI_RAG_INDEX_CAPABILITY: &str = "rag.index";
 /// is fire-and-forget, off the HTTP request path.
 pub const AI_RAG_INDEX_TIMEOUT_SECS: u64 = 120;
 
+/// The capability an AI service declares to answer a RAG question over a
+/// school's course-note corpus. Separate from [`AI_CHAT_CAPABILITY`] on
+/// purpose: retrieval-then-answer is its own service with its own corpus, and
+/// a deployment may run one without the other. With no worker carrying it the
+/// RAG endpoints report the service as unavailable.
+pub const AI_RAG_CHAT_CAPABILITY: &str = "rag.chat";
+
+/// Deadline on one `rag.chat` round trip. Much longer than a plain chat turn
+/// ([`AI_DEFAULT_REQUEST_TIMEOUT_SECS`]): the service first retrieves the
+/// relevant passages and only then generates an answer, so a question that
+/// touches several course notes is retrieval plus inference, not inference
+/// alone.
+pub const AI_RAG_CHAT_TIMEOUT_SECS: u64 = 90;
+
+/// How long a `rag.chat` turn may sit `pending` before a reader projects it as
+/// failed. The RAG nest mirrors the chatbot's asynchronous send
+/// ([`CHATBOT_PENDING_STALE_SECS`]): the round trip outlives the request that
+/// started it, and a restart mid-inference strands the row rather than letting
+/// anyone answer it, so the same staleness window applies.
+pub const RAG_PENDING_STALE_SECS: i64 = CHATBOT_PENDING_STALE_SECS;
+
+/// The most `(sınıf, ders)` scope pairs one `rag.chat` request may carry. The
+/// corpus is routed by the **pair** — a grade and a subject list sent
+/// separately would cross-product into combinations the asker never named — so
+/// this is the number of pairs handed to the service in one call, bounding
+/// both the frame size and the service's routing work. A request carrying more
+/// is refused rather than silently narrowed: dropping pairs would answer a
+/// question the asker did not ask, scoped to corpora they did not name.
+pub const MAX_RAG_SCOPE_PAIRS: usize = 200;
+
+/// Default per-minute message limit for the RAG nest, when the school sets
+/// none — a lower ceiling than the chatbot's, since every message here spends
+/// a retrieval over the whole course-note corpus before it generates anything.
+pub const DEFAULT_RAG_RATE_LIMIT: u32 = 6;
+
 /// Hard ceiling on one chat message's characters — the newtype bound, above
 /// which no school setting can reach. Sized for a pasted question with its
 /// working, well under [`AI_MAX_FRAME_BYTES`] once history rides along.

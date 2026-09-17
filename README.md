@@ -4051,6 +4051,52 @@ is opaque to the transport; its shape belongs to the capability.
 rather than answer late. A handled failure is an `err` frame; a crash is just a
 dropped stream.
 
+### The `rag.chat` capability
+
+`rag.chat` answers a question **about a school's course-note corpus**, with
+citations. Same `Request`/`Response` frames as any capability; only the payload
+differs. The service retrieves the relevant passages first and then generates,
+so its deadline (90s) is longer than a plain chat turn's.
+
+The request payload:
+
+```json
+{ "message": "ikinci yasa nedir?", "asker": "01ASKER", "asker_role": "student",
+  "scope": [ { "sinif": "11", "ders": "Fizik" } ],
+  "history": [ { "role": "user", "content": "merhaba" } ] }
+```
+
+`asker` is the id of the person who asked, so the service can read *their* own
+data back through the api reads above (`on_behalf_of`) — a question about "my
+marks" is answered from their marks. `asker_role` is their school role, the
+same lowercase strings the chatbot request carries. `scope` is a list of
+`(sinif, ders)` **pairs**: the corpus is routed by the pair, so a grade and a
+subject list sent separately would cross-product into combinations the asker
+never named. At most `MAX_RAG_SCOPE_PAIRS` (200) pairs ride one request.
+`history` is the same oldest-first tail as `chat.reply`, optional.
+
+The reply payload:
+
+```json
+{ "text": "F = m·a [1]", "abstained": false, "reason": "",
+  "citations": [ { "n": 1, "doc_id": "01DOC", "pages": [3],
+                   "span_ids": ["s-7"], "ders": "Fizik" } ] }
+```
+
+A refusal that is part of the answer stays here rather than becoming an `err`
+frame: `abstained: true` with a short `reason` (`guard_*`, `insufficient_data`,
+`model_abstained`, `scope_mismatch`, `role_required`, …) is a completed turn.
+Each citation's `n` is the marker `[N]` the answer text uses, so a client
+resolves `[N]` by finding the citation whose `n` is `N` and opening the
+document `citations[].doc_id` names. `doc_id` is the **corpus** document id —
+the backend maps it to the `course_note_file` that owns that PDF.
+
+For that mapping to exist, the `rag.index` **reply** should echo each indexed
+file's ids: the service answers `{"files": [{"id": "<course_note_file id>",
+"doc_id": "<corpus doc id>"}]}`, naming the corpus id it assigned to each file
+it indexed. The backend pairs the echoed `doc_id` back to the file it sent, so
+a later citation's `doc_id` resolves to a downloadable file.
+
 ### API reads (the other direction)
 
 A service usually needs school data to do its work — who asked, their notes,

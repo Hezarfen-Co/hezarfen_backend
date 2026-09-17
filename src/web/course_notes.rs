@@ -19,7 +19,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::ai::rag::spawn_index;
-use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::constant::{AI_RAG_INDEX_CAPABILITY, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, CourseNoteTitle};
@@ -28,14 +28,15 @@ use crate::domain::course_note_file::{
 };
 use crate::domain::rag_output::{RagOutput, RagOutputId};
 use crate::error::{AppError, ErrorResponse};
+use crate::module::Module;
 use crate::service;
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
 use super::notes::content_disposition;
 use super::{
-    CurrentUser, Page, PageParams, RequireTeacher, UploadFileForm, blob_path, read_upload,
-    remove_blob,
+    CurrentUser, Page, PageParams, RequireTeacher, UploadFileForm, ai_unavailable, blob_path,
+    read_upload, remove_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -52,6 +53,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(create, list))
         .routes(routes!(get_one, update, delete_one))
         .routes(routes!(list_rag))
+        .routes(routes!(reindex_rag))
         .routes(routes!(delete_rag))
         .merge(files)
 }
@@ -659,4 +661,62 @@ async fn delete_rag(
         .ok_or(AppError::NotFound)?;
     service::rag_output::delete(&st.db, output.get_id()).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Re-index a course note now, without waiting for its next write.
+///
+/// Indexing otherwise fires only on a note or file write, so a note saved
+/// while no AI service was connected stays unindexed until something touches
+/// it again — this door re-runs the same dispatch on demand. The `202` says
+/// the re-index was *dispatched*, not that it finished: the bridge round trip
+/// runs off the request path ([`spawn_index`]), and an unreachable service
+/// leaves the stored index as it was. Poll `GET /course-notes/{id}/rag` for
+/// the output once it lands.
+#[utoipa::path(
+    post,
+    path = "/{id}/rag/reindex",
+    tag = "course-notes",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course note id")),
+    responses(
+        (status = 202, description = "Re-index dispatched; poll `GET /course-notes/{id}/rag` for the stored output"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 503, description = "No AI service is available — nothing was written, retry later", body = ErrorResponse),
+    ),
+)]
+async fn reindex_rag(
+    State(st): State<AppState>,
+    tenant: ResolvedTenant,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let (note, course) = note_with_course(id.clone(), st.db.clone()).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can re-index this course note",
+        ));
+    }
+    // The same 503 gate `ai::rag::index_course_note` applies internally, lifted
+    // here so the caller learns why nothing will happen instead of getting a
+    // `202` for a dispatch that would silently no-op. `has_capability` is racy
+    // by design and guards no write — the note is untouched either way.
+    if !tenant.modules.contains(Module::Chatbot) {
+        return Ok(ai_unavailable(
+            "the AI service is not enabled on this deployment",
+        ));
+    }
+    let Some(bridge) = st.ai.as_ref() else {
+        return Ok(ai_unavailable(
+            "the AI service is not enabled on this deployment",
+        ));
+    };
+    if !bridge.has_capability(AI_RAG_INDEX_CAPABILITY) {
+        return Ok(ai_unavailable("no AI service is connected right now"));
+    }
+    // `note` was just read through the shared path, so the dispatched payload
+    // is the note as it stands now.
+    spawn_index(&st, &tenant, note);
+    Ok(StatusCode::ACCEPTED.into_response())
 }

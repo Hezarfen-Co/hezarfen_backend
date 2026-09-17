@@ -433,7 +433,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 268;
+    const MIN_PROTECTED: usize = 269;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
@@ -27845,6 +27845,82 @@ async fn course_note_rag_outputs_read_and_delete() {
     )
     .await;
     assert_eq!(common::total(&list.body), 0, "{}", list.body);
+}
+
+/// The manual reindex door is a note write like any other: teacher+, and
+/// management rights over the parent course. A foreign teacher, a student, and
+/// an unknown note are all refused — and none of them writes a row.
+#[tokio::test]
+async fn course_note_rag_reindex_denies_foreign_teacher_student_and_unknown_note() {
+    let (app, db) = app_and_db().await;
+    let creator = login_as(&app, &db, "reindex_teacher", "teacher").await;
+    let outsider = login_as(&app, &db, "reindex_other_teacher", "teacher").await;
+    let student = login_as(&app, &db, "reindex_student", "student").await;
+
+    let course = create_course(&app, &creator, "reindex").await;
+    let note = create_course_note(&app, &creator, &course, "to reindex").await;
+    let uri = format!("/course-notes/{note}/rag/reindex");
+
+    // A teacher who does not manage the course: 403, like every other write.
+    let res = send(&app, "POST", &uri, Some(&outsider), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // A student fails the teacher+ wall before any rights check.
+    let res = send(&app, "POST", &uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // An unknown note is a 404, never a silent 202.
+    let res = send(
+        &app,
+        "POST",
+        "/course-notes/01NOTANOTE/rag/reindex",
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+
+    let (rows, total) =
+        hezarfen_backend::db::rag_output::list_for(&db, &CourseNoteId::from_key(&note), None, 0)
+            .await
+            .unwrap();
+    assert!(rows.is_empty() && total == 0, "a refusal wrote a row");
+}
+
+/// With no AI service connected the door answers `503` and dispatches nothing:
+/// a `202` here would promise a reindex nothing could ever run.
+#[tokio::test]
+async fn course_note_rag_reindex_reports_503_and_writes_nothing_without_a_service() {
+    // `app_and_db` wires no AI bridge in — the same "no service connected"
+    // state a school is in before its AI features are provisioned.
+    let (app, db) = app_and_db().await;
+    let creator = login_as(&app, &db, "reindex_off_teacher", "teacher").await;
+    let course = create_course(&app, &creator, "reindex_off").await;
+    let note = create_course_note(&app, &creator, &course, "unindexed").await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/course-notes/{note}/rag/reindex"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert!(
+        res.body["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "{}",
+        res.body
+    );
+
+    let (rows, total) =
+        hezarfen_backend::db::rag_output::list_for(&db, &CourseNoteId::from_key(&note), None, 0)
+            .await
+            .unwrap();
+    assert!(
+        rows.is_empty() && total == 0,
+        "reindex dispatched while no service was connected"
+    );
 }
 
 // =========================================================================
