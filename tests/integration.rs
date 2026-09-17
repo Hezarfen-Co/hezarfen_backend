@@ -28833,7 +28833,11 @@ async fn probe_school_rows_never_reach_the_control_database_on(
         .unwrap();
     assert_eq!(schools, vec!["beta".to_string(), "demo".to_string()]);
 
-    // User search never crosses the wall.
+    // User search never crosses the wall. Compare the returned names, not the
+    // raw body: a substring match over the serialized JSON also hits the hex of
+    // a UUIDv7 id — "ada" rides inside `01a0adad-…`, whose ms-timestamp prefix
+    // spells it for a slice of every wall-clock window — so the negative
+    // assertion flipped with the clock instead of with the search.
     for (cookie, forbidden) in [(&a, "boran"), (&b, "ada")] {
         for q in ["b", "a", "boran", "ada", "bstudent"] {
             let res = send(
@@ -28845,8 +28849,13 @@ async fn probe_school_rows_never_reach_the_control_database_on(
             )
             .await;
             assert_eq!(res.status, StatusCode::OK, "search {q}: {}", res.body);
+            let named = res.body["items"]
+                .as_array()
+                .expect("search items")
+                .iter()
+                .any(|item| item["username"] == forbidden || item["display_name"] == forbidden);
             assert!(
-                !res.body.to_string().contains(forbidden),
+                !named,
                 "GET /users/search?q={q} returned the other school's `{forbidden}`: {}",
                 res.body
             );

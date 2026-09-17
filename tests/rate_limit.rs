@@ -107,14 +107,7 @@ async fn register_and_login_share_the_auth_bucket() {
     let app = app_with(auth_only(2)).await;
     let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
 
-    let (status, _, _) = send_as(
-        &app,
-        "1.1.1.1",
-        "POST",
-        "/auth/register",
-        Some(creds),
-    )
-    .await;
+    let (status, _, _) = send_as(&app, "1.1.1.1", "POST", "/auth/register", Some(creds)).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _, _) = send_as(
         &app,
@@ -556,23 +549,27 @@ async fn a_down_database_leaves_each_process_on_its_local_budget() {
     tokio::time::sleep(Duration::from_secs(RATE_SYNC_TIMEOUT_SECS + 1)).await;
     tokio::time::pause();
 
-    // The table comes back before the read, so the assertion reads the state
-    // the outage left: no round landed, so there is no row at all — and the
-    // unreported deltas are still sitting in the buckets.
+    // The table comes back. A fold parked inside its statement lands the
+    // moment it does — real I/O the virtual clock cannot order, which is why
+    // this asserts the arithmetic and not the timing: a round that raced the
+    // outage never folds the same deltas twice, and the deltas the outage
+    // could not report are still sitting in the buckets to be carried.
     tokio::time::resume();
     sqlx::query("ALTER TABLE rate_limit_out RENAME TO rate_limit")
         .execute(&db)
         .await
         .expect("give the shared table back");
     tokio::time::pause();
-    let rows = read_shared_hits(&db).await;
-    assert_eq!(rows, Vec::<i64>::new());
+    let raced: i64 = read_shared_hits(&db).await.iter().sum();
+    assert!(raced <= 6, "the deltas are folded once: {raced}");
 
-    // Recovery needs no restart: the next round carries the deltas, and the
-    // shared row holds everything both processes admitted while it was down.
+    // Recovery needs no restart. Two rounds, because each limiter's fold is
+    // its own statement: the shared row ends at everything both processes
+    // admitted while the table was gone — three each, the local budget.
+    sync_round().await;
     sync_round().await;
     let rows = read_shared_hits(&db).await;
-    assert_eq!(rows, vec![6]);
+    assert_eq!(rows.iter().sum::<i64>(), 6);
 }
 
 /// Boot the app on a real TCP port, `ConnectInfo` wired exactly like `main`.
