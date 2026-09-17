@@ -125,6 +125,17 @@ jobs:
     # runtime image is debian:trixie-slim — float either side carelessly
     # and the binary stops loading. See the TARGET comment above.
     runs-on: ubuntu-24.04
+    # GitHub's default job timeout is 360 minutes, and this job holds the
+    # repo's serial deploy lock (every later push queues behind it), so a
+    # stall burned six hours per run (observed: 3h38m on 35251780342 and
+    # 35256696519, both cancelled by hand). 90 is measured, not guessed:
+    # the *fastest* green Build-and-test was 49m13s (run 35227878489,
+    # 13:34:06→14:23:19 — its Test step alone 41m18s), but three other
+    # green runs took 66-68 min (35184706020 68m14s, 35103425693 66m32s,
+    # 35184706020's Test step 60m25s), so 50-60 would kill legitimate
+    # green runs. 90 keeps ~30% headroom over the worst green while
+    # cutting lock-held stall time from 6h to 1.5h.
+    timeout-minutes: 90
     env:
       # The 41 test binaries each link the full tonic/otlp/axum/sqlx stack;
       # with debug info they blow past the runner's free disk and the
@@ -182,11 +193,55 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # The runner's state and the repo's hang policy, recorded BEFORE the
+      # suite starts: if the job is killed mid-suite, this is what the log
+      # still holds. `show-config` is nextest's documented door onto its
+      # resolved configuration (0.9.143: `version` and `test-groups`); it
+      # reads the config file for real — a missing or syntactically broken
+      # .config/nextest.toml exits 96 here (verified locally), and a key
+      # nextest does not know is warned about by name — so a silently
+      # ignored slow-timeout cannot hide.
+      - name: Test environment
+        run: |
+          df -h /
+          free -m
+          nproc
+          cargo nextest --version
+          cat .config/nextest.toml
+          cargo nextest show-config test-groups --no-pager || true
+
       # A broken build must never reach the server: the whole suite gates
       # the deploy (doc_sync included, so README drift blocks it too).
       # --no-fail-fast: one load-luck assert must not skip the other 1000 tests.
+      # --config-file: pin the hang policy to the repo file explicitly, so a
+      # nextest release that moves the default lookup cannot silently drop it.
+      # `timeout --foreground 4200` (70 min) bounds the step at the shell
+      # level, unbuffered and unpiped: output up to the kill survives, and a
+      # stall exits 124 naming the phase instead of running to the job's
+      # 90-minute ceiling. 4200s because CI's Test step has run 41m18s
+      # (green, 35227878489) and 60m25s (green, 35184706020) — local 565s is
+      # not the yardstick — so 70 min clears the worst green by ~10 min and
+      # still sits below the 90-minute job timeout.
       - name: Test
-        run: cargo nextest run --no-fail-fast
+        run: |
+          set -euo pipefail
+          timeout --foreground 4200 \
+            cargo nextest run --no-fail-fast --config-file .config/nextest.toml
+
+      # Always, including when the step above was killed: the discriminator.
+      # If the stall is a DB-side wait (the suite mints and clones control+
+      # school databases per test), this names the query and the state; if it
+      # is disk or memory, df/free show it; docker's own log shows a crashed
+      # or refusing Postgres.
+      - name: Stall diagnostics
+        if: always()
+        run: |
+          echo '=== df -h / ==='; df -h / || true
+          echo '=== free -m ==='; free -m || true
+          echo '=== docker system df ==='; docker system df || true
+          echo '=== postgres container log (tail 80) ==='; docker logs hezarfen_backend_pg --tail 80 || true
+          echo '=== pg_stat_activity by state ==='; docker exec hezarfen_backend_pg psql -U "$PG_USER" -c 'select count(*), state from pg_stat_activity group by state' || true
+          echo '=== 20 longest-running queries ==='; docker exec hezarfen_backend_pg psql -U "$PG_USER" -c "select pid, now()-query_start as age, left(query,120) from pg_stat_activity where state='active' order by 2 desc limit 20" || true
 
 
       - name: Build the release
