@@ -3511,11 +3511,13 @@ async fn no_insight_refresh_worker_means_503_and_nothing_is_dispatched() {
 // Everything below rides a real client-initiated QUIC stream, like the api
 // read it is shaped after.
 
-use hezarfen_backend::ai::protocol::{CapabilityRequest, CapabilityResponse};
+use hezarfen_backend::ai::protocol::{
+    BlobUploadRequest, BlobUploadResponse, CapabilityRequest, CapabilityResponse,
+};
 use hezarfen_backend::constant::{
     AI_INSIGHT_PENDING_LIST_CAPABILITY, AI_INSIGHT_RETENTION_SWEEP_CAPABILITY,
     AI_INSIGHT_RUN_UPSERT_CAPABILITY, AI_INSIGHT_SCHOOLS_LIST_CAPABILITY,
-    AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
+    AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY, AI_PODCAST_REPORT_CAPABILITY, PODCAST_AUDIO_MAX_BYTES,
 };
 use hezarfen_backend::domain::user::{Password, Username};
 use hezarfen_backend::service::builder;
@@ -3951,4 +3953,316 @@ async fn the_storage_doors_are_manager_only_and_write_the_callers_own_school() {
     .await;
     assert_eq!(kept.status, StatusCode::OK);
     assert_eq!(kept.body["summary"]["marks"]["ortalama"], 72);
+}
+
+// ------------------------------------------------------ the podcast job rows --
+//
+// The podcast service owns nothing but its pipeline: the job row, its state
+// and the produced audio are the backend's. The service reports each
+// transition through a `podcast.report` capability call and streams the
+// finished mp3 as a `BlobUploadRequest`; both ride real client-initiated QUIC
+// streams below, and the two-school test is the one that proves the frame's
+// school — never anything the payload says — decides which database a report
+// or an upload can touch.
+
+/// Seed one `queued` job and its submitting user in `db`, returning both ids.
+async fn seed_podcast_job(db: &Database) -> (String, String) {
+    let user = hezarfen_backend::domain::monotonic_id::next_uuid();
+    sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
+        .bind(user)
+        .bind(format!("podcaster-{}", &user.simple().to_string()[..12]))
+        .execute(db)
+        .await
+        .expect("insert the submitter");
+    let job = hezarfen_backend::domain::monotonic_id::next_uuid();
+    let now = hezarfen_backend::domain::timestamp::Timestamp::now().as_millis();
+    sqlx::query(
+        "INSERT INTO podcast_job (id, user_id, source_id, state, stage, progress, \
+             created_at, updated_at) VALUES ($1, $2, 'kaynak-1', 'queued', '', 0, $3, $3)",
+    )
+    .bind(job)
+    .bind(user)
+    .bind(now)
+    .execute(db)
+    .await
+    .expect("insert the job");
+    (job.to_string(), user.to_string())
+}
+
+/// The row's own answers to what the tests ask of it:
+/// (state, stage, progress, audio_key, duration_secs).
+async fn podcast_row(
+    db: &Database,
+    job: &str,
+) -> (String, String, f64, Option<String>, Option<f64>) {
+    use sqlx::Row as _;
+    let row = sqlx::query(
+        "SELECT state, stage, progress, audio_key, duration_secs FROM podcast_job WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(job).expect("a job uuid"))
+    .fetch_one(db)
+    .await
+    .expect("the job row");
+    (
+        row.get("state"),
+        row.get("stage"),
+        row.get("progress"),
+        row.get("audio_key"),
+        row.get("duration_secs"),
+    )
+}
+
+fn report_call(
+    school: &str,
+    job: &str,
+    user: &str,
+    state: &str,
+    stage: &str,
+    progress: f64,
+) -> CapabilityRequest {
+    CapabilityRequest {
+        id: format!("trace-report-{job}-{state}"),
+        school: school.to_string(),
+        capability: AI_PODCAST_REPORT_CAPABILITY.to_string(),
+        payload: json!({
+            "job_id": job,
+            "source_id": "kaynak-1",
+            "format": "duz_okuma",
+            "user_id": user,
+            "state": state,
+            "stage": stage,
+            "progress": progress,
+        }),
+    }
+}
+
+/// One upload: the frame, then exactly `size` raw bytes, then FIN — the shape
+/// a service writes when it hands back a produced episode.
+async fn podcast_upload(
+    conn: &quinn::Connection,
+    school: &str,
+    job: &str,
+    name: &str,
+    content_type: &str,
+    body: &[u8],
+) -> BlobUploadResponse {
+    let (mut send, mut recv) = conn.open_bi().await.expect("upload stream");
+    let request = BlobUploadRequest {
+        id: format!("trace-upload-{job}"),
+        upload: true,
+        school: school.to_string(),
+        job_id: job.to_string(),
+        name: name.to_string(),
+        content_type: content_type.to_string(),
+        size: body.len() as u64,
+        duration_secs: Some(12.5),
+    };
+    write_frame(&mut send, &request)
+        .await
+        .expect("write BlobUploadRequest");
+    send.write_all(body).await.expect("write the bytes");
+    let _ = send.finish();
+    read_frame(&mut recv).await.expect("read BlobUploadResponse")
+}
+
+fn upload_key(answer: BlobUploadResponse) -> (String, u64) {
+    match answer {
+        BlobUploadResponse::Ok { key, size, .. } => (key, size),
+        BlobUploadResponse::Err { code, message, .. } => {
+            panic!("expected the bytes to be stored, got {code}: {message}")
+        }
+    }
+}
+
+fn upload_refusal(answer: BlobUploadResponse) -> (String, String) {
+    match answer {
+        BlobUploadResponse::Err { code, message, .. } => (code, message),
+        BlobUploadResponse::Ok { key, .. } => panic!("expected a refusal, got key {key}"),
+    }
+}
+
+/// The whole ingest handshake over the bridge: running reports land on the
+/// backend's row, a done report before the upload is refused `audio_missing`,
+/// the upload stores the exact bytes under the school's own directory, and
+/// only then can the job be finished. Bad echoes and illegal transitions are
+/// refused without writing anything.
+#[tokio::test]
+async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("podcaster", &["podcast.submit"]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (_app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let (job, user) = seed_podcast_job(&db).await;
+    let conn = &service.conn;
+
+    let answer = capability_call(
+        conn,
+        report_call(DEMO_SLUG, &job, &user, "running", "script", 0.5),
+    )
+    .await;
+    assert_eq!(ok_capability(answer)["job_id"], job);
+    assert_eq!(podcast_row(&db, &job).await.0, "running");
+    assert_eq!(podcast_row(&db, &job).await.1, "script");
+
+    // `done` means a stored episode: a report that claims one before the
+    // upload is refused, and nothing about the row moves.
+    let (code, _) = refused_capability(
+        capability_call(conn, report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)).await,
+    );
+    assert_eq!(code, "audio_missing");
+    assert_eq!(podcast_row(&db, &job).await.0, "running");
+
+    // A report that names another user is refused; the row is untouched.
+    let (code, _) = refused_capability(
+        capability_call(
+            conn,
+            report_call(
+                DEMO_SLUG,
+                &job,
+                "00000000-0000-7000-8000-000000000000",
+                "failed",
+                "",
+                0.0,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(code, "not_permitted");
+    // And so is a transition the service's own table forbids.
+    let (code, _) = refused_capability(
+        capability_call(conn, report_call(DEMO_SLUG, &job, &user, "queued", "", 0.0)).await,
+    );
+    assert_eq!(code, "invalid_payload");
+    assert_eq!(podcast_row(&db, &job).await.0, "running");
+
+    // The upload: bytes on disk exactly as sent, key keyed by the job id, row
+    // stamped with the reference and the duration.
+    let body = blob_bytes(200 * 1024);
+    let (key, size) = upload_key(
+        podcast_upload(conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await,
+    );
+    assert_eq!(size, body.len() as u64);
+    assert_eq!(key, format!("podcast/{job}.mp3"));
+    let stored = common::files_dir().join(DEMO_SLUG).join(&key);
+    assert_eq!(std::fs::read(&stored).expect("the stored episode"), body);
+    let row = podcast_row(&db, &job).await;
+    assert_eq!(row.3.as_deref(), Some(key.as_str()));
+    assert_eq!(row.4, Some(12.5));
+
+    // Now — and only now — `done` is accepted.
+    assert_eq!(
+        ok_capability(
+            capability_call(conn, report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)).await
+        )["stored"],
+        true
+    );
+    assert_eq!(podcast_row(&db, &job).await.0, "done");
+
+    // And a job the backend never minted is `unknown_job`.
+    let stranger = hezarfen_backend::domain::monotonic_id::next_uuid().to_string();
+    let (code, _) = refused_capability(
+        capability_call(conn, report_call(DEMO_SLUG, &stranger, &user, "running", "ocr", 0.1))
+            .await,
+    );
+    assert_eq!(code, "unknown_job");
+}
+
+/// The frame's school decides the database, and nothing else: a report or an
+/// upload naming the demo school cannot reach a job that lives in beta's.
+#[tokio::test]
+async fn a_report_or_upload_cannot_reach_another_schools_job() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("podcaster", &["podcast.submit"]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (_app, _demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let beta = Slug::try_new("beta").unwrap();
+    let beta_db = tenants
+        .create(
+            hezarfen_backend::tenant::SchoolId::generate(),
+            &beta,
+            "Beta College",
+            ModuleSet::all(),
+        )
+        .await
+        .expect("beta");
+    let (job, user) = seed_podcast_job(&beta_db).await;
+
+    let (code, _) = refused_capability(
+        capability_call(
+            &service.conn,
+            report_call(DEMO_SLUG, &job, &user, "running", "script", 0.2),
+        )
+        .await,
+    );
+    assert_eq!(code, "unknown_job");
+    assert_eq!(
+        podcast_row(&beta_db, &job).await.0,
+        "queued",
+        "beta's row is untouched by a frame that named demo"
+    );
+
+    let body = blob_bytes(4096);
+    let (code, _) = upload_refusal(
+        podcast_upload(&service.conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await,
+    );
+    assert_eq!(code, "unknown_job");
+    let leaked = common::files_dir()
+        .join(DEMO_SLUG)
+        .join(format!("podcast/{job}.mp3"));
+    assert!(
+        !leaked.exists(),
+        "no bytes may land under a school the job does not belong to"
+    );
+    assert!(
+        podcast_row(&beta_db, &job).await.3.is_none(),
+        "beta's row names no audio"
+    );
+}
+
+/// The size ceiling is a refusal before a byte is read: the frame alone is
+/// enough to refuse it, so a backend that read first would park the stream
+/// instead of answering. The client here never sends a body on purpose.
+#[tokio::test]
+async fn an_upload_past_the_audio_ceiling_is_refused_before_a_byte_is_read() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("podcaster", &["podcast.submit"]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (_app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let (job, _user) = seed_podcast_job(&db).await;
+
+    let (mut send, mut recv) = service.conn.open_bi().await.expect("upload stream");
+    let request = BlobUploadRequest {
+        id: "trace-oversize".to_string(),
+        upload: true,
+        school: DEMO_SLUG.to_string(),
+        job_id: job.clone(),
+        name: "bolum.mp3".to_string(),
+        content_type: "audio/mpeg".to_string(),
+        size: PODCAST_AUDIO_MAX_BYTES as u64 + 1,
+        duration_secs: None,
+    };
+    write_frame(&mut send, &request).await.expect("write the frame");
+    let answer: BlobUploadResponse = read_frame(&mut recv).await.expect("read the answer");
+    let (code, _) = upload_refusal(answer);
+    assert_eq!(code, "invalid_payload");
+    let _ = send.finish();
+
+    assert!(podcast_row(&db, &job).await.3.is_none(), "the row names no audio");
+    let stored = common::files_dir().join(format!("podcast/{job}.mp3"));
+    assert!(!stored.exists(), "an oversize upload stores nothing");
 }
