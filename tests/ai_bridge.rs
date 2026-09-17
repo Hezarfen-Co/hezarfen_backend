@@ -3354,3 +3354,150 @@ async fn a_rag_stream_replays_a_settled_turn_with_its_citations() {
     assert_eq!(citation["span_ids"], json!(["s-1"]), "{message}");
     assert_eq!(citation["ders"], "Fizik", "{message}");
 }
+
+// ---- insights ----------------------------------------------------------
+
+use hezarfen_backend::ai::insight;
+use hezarfen_backend::constant::{AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY};
+
+/// Wait until the fake service has seen `expected` requests. The compute doors
+/// dispatch off the request path, so the frame lands when it lands.
+async fn await_seen(service: &FakeService, expected: usize) -> Vec<Request> {
+    for _ in 0..500 {
+        let seen = service.seen();
+        if seen.len() >= expected {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the service never saw {expected} request(s)");
+}
+
+/// The outbound half of `hab/2` for `insight.student`: the door dispatches to
+/// the worker carrying that exact capability, the frame names the school the
+/// caller acted in, and the answer round-trips back through the typed
+/// contract.
+#[tokio::test]
+async fn an_insight_student_dispatch_names_the_school_and_round_trips() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_STUDENT_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "user_id": "echoed-back",
+            "generated_at": "2026-09-17T00:00:00Z",
+            "archetype": "ezberci",
+            "signals": [],
+            "recommendations": [],
+            "coverage": { "marks": 4 },
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    // A manager may read any student, so the reach gate is out of this test's
+    // way; the student is the subject.
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let student = common::login(&app, "ali").await;
+    let ali = common::me_id(&app, &student).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/insights/students/{ali}"),
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let seen = await_seen(&service, 1).await;
+    assert_eq!(seen.len(), 1, "one dispatch per request, never a re-send");
+    assert_eq!(seen[0].capability, AI_INSIGHT_STUDENT_CAPABILITY);
+    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the school");
+    assert_eq!(seen[0].payload["user_id"], ali);
+
+    // The same worker driven directly answers the contract's shape, so the
+    // round trip — not only the send — is exercised: a reply the bridge could
+    // not parse would fail here.
+    let reply = insight::compute_student(
+        &bridge,
+        &demo(),
+        &hezarfen_backend::ai::StudentRequest {
+            user_id: ali.clone(),
+            since: None,
+            sections: None,
+        },
+    )
+    .await
+    .expect("the round trip answers");
+    assert_eq!(reply.user_id.as_deref(), Some("echoed-back"));
+    assert_eq!(reply.archetype.as_deref(), Some("ezberci"));
+    assert_eq!(reply.coverage, Some(json!({ "marks": 4 })));
+}
+
+/// Routing is exact-match, and the refusal is the shared `503`, not a `500`:
+/// a worker carrying only `insight.student` is no fallback for
+/// `insight.refresh`, and a refused door dispatches nothing at all.
+#[tokio::test]
+async fn no_insight_refresh_worker_means_503_and_nothing_is_dispatched() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_STUDENT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    assert!(
+        !bridge.has_capability(AI_INSIGHT_REFRESH_CAPABILITY),
+        "the premise: no worker carries insight.refresh"
+    );
+    let (app, db) = chat_app(&bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert_eq!(res.body["error"], "no AI service is connected right now");
+    assert_eq!(
+        service.seen().len(),
+        0,
+        "a refused refresh must not reach the student-only worker"
+    );
+
+    // The student door still routes to that same worker — the 503 above is the
+    // capability's absence, not the worker's.
+    let student = common::login(&app, "ali").await;
+    let ali = common::me_id(&app, &student).await;
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/insights/students/{ali}"),
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(await_seen(&service, 1).await[0].payload["user_id"], ali);
+
+    // Under-privileged callers are refused before availability is even asked:
+    // the refresh door is manager+.
+    let veli = common::login(&app, "veli").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&veli),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}

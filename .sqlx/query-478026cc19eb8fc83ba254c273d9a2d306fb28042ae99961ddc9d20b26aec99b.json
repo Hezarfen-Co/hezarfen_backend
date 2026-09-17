@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dimension, label, n_answers, n_correct, accuracy,\n                  overall_n_answers, overall_accuracy, contrast, confidence,\n                  computed_at\n           FROM zeka_student_segment_profile\n           WHERE student = $1 AND confidence <> 'none'\n           ORDER BY dimension, label",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "dimension",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "dimension"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "label",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "label"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "n_answers",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "n_answers"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "n_correct",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "n_correct"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "accuracy",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "accuracy"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "overall_n_answers",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "overall_n_answers"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "overall_accuracy",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "overall_accuracy"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "contrast",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "contrast"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "confidence",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "confidence"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "computed_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_segment_profile",
+            "name": "computed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "478026cc19eb8fc83ba254c273d9a2d306fb28042ae99961ddc9d20b26aec99b"
+}

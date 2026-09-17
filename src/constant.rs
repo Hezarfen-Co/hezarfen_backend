@@ -594,6 +594,45 @@ pub const AI_RAG_CHAT_CAPABILITY: &str = "rag.chat";
 /// alone.
 pub const AI_RAG_CHAT_TIMEOUT_SECS: u64 = 90;
 
+/// The capability an AI service declares to analyse one student (ZEKA,
+/// `hezarfen_zeka`). It is the on-demand half of ZEKA — the service also
+/// recomputes on its own schedule — and it is what a teacher's "hesapla" is
+/// routed to. The service reads the student's own data back through the
+/// bridge's api reads and writes nothing but its `zeka_*` rows.
+pub const AI_INSIGHT_STUDENT_CAPABILITY: &str = "insight.student";
+
+/// Deadline on one `insight.student` round trip. Computing one student reads
+/// several of the school's sources (marks, attendance, submissions, study
+/// stints) and writes the derived rows before answering, so it is
+/// batch-shaped work — the same ceiling [`AI_RAG_INDEX_TIMEOUT_SECS`] gives a
+/// note with ten attachments. Nobody waits on it: the dispatch runs detached
+/// and a reader polls the stored rows.
+pub const AI_INSIGHT_STUDENT_TIMEOUT_SECS: u64 = 120;
+
+/// The capability an AI service declares to analyse one class×course (a
+/// şube's own instance of a course). Declared here so the name exists in one
+/// place, but **no door dispatches it yet**: the request would name a course
+/// the service has to enumerate a roster for, and the bridge's read allowlist
+/// carries no member listing — that half of the contract is still open
+/// (`hezarfen_zeka/service/docs/BACKEND-GEREKSINIMLERI.md`, item 3).
+pub const AI_INSIGHT_CLASS_CAPABILITY: &str = "insight.class";
+
+/// The capability an AI service declares to recompute a whole school's
+/// insights. A batch job: the service works through its configured student
+/// list under its own time budget and writes a run ledger. Like ZEKA's own
+/// schedule, this is optional on top of the service's own cadence — it is
+/// what lets the office trigger a sweep from the UI.
+pub const AI_INSIGHT_REFRESH_CAPABILITY: &str = "insight.refresh";
+
+/// Deadline on one `insight.refresh` round trip — the longest AI deadline in
+/// this file. The service answers when its batch is over: the ceiling is
+/// sized well past ZEKA's default 60s per-school budget (a raised
+/// `ZEKA_BUDGET_MS` included) and well inside its hourly default cadence. The
+/// run's progress does not depend on it — ZEKA writes its own `zeka_run`
+/// ledger — this only bounds how long the detached task waits for the
+/// summary.
+pub const AI_INSIGHT_REFRESH_TIMEOUT_SECS: u64 = 300;
+
 /// How long a `rag.chat` turn may sit `pending` before a reader projects it as
 /// failed. The RAG nest mirrors the chatbot's asynchronous send
 /// ([`CHATBOT_PENDING_STALE_SECS`]): the round trip outlives the request that

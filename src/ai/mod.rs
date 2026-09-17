@@ -27,6 +27,7 @@
 pub mod api;
 pub mod chat;
 pub mod error;
+pub mod insight;
 pub mod protocol;
 pub mod rag;
 pub mod rag_chat;
@@ -36,6 +37,9 @@ pub mod tls;
 
 pub use chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 pub use error::AiError;
+pub use insight::{
+    ClassRequest, ClassResponse, RefreshRequest, RefreshResponse, StudentRequest, StudentResponse,
+};
 pub use rag::{RagFile, RagIndexPayload};
 pub use rag_chat::{
     RagChatReplyPayload, RagChatRequestPayload, RagCitation, RagScopePair, RagTurn,

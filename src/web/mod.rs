@@ -21,6 +21,7 @@ pub mod events;
 pub mod exam_ws;
 pub mod exams;
 pub mod homework;
+pub mod insights;
 pub mod instances;
 pub mod limits;
 pub mod marks;

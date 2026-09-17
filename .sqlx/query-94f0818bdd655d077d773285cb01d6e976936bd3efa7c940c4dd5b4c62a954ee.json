@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT run, student FROM zeka_run_pending\n                   WHERE run = ANY($1) ORDER BY run, ord",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_run_pending",
+            "name": "run"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_run_pending",
+            "name": "student"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "94f0818bdd655d077d773285cb01d6e976936bd3efa7c940c4dd5b4c62a954ee"
+}

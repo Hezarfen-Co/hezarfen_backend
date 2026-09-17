@@ -434,7 +434,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 318;
+    const MIN_PROTECTED: usize = 323;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
@@ -29690,10 +29690,12 @@ const CORE_PREFIXES: [(&str, &str); 13] = [
 ///
 /// A module may own more than one prefix: `courses` also answers under
 /// `/instances` (the instance anchor), and `chatbot` — the whole `ai` package —
-/// also answers under `/rag`.
-const MODULE_PREFIXES: [(Module, &str); 23] = [
+/// also answers under `/rag`, `/insights` and `/podcast`.
+const MODULE_PREFIXES: [(Module, &str); 25] = [
     (Module::Chatbot, "/chatbot"),
     (Module::Chatbot, "/rag"),
+    (Module::Chatbot, "/insights"),
+    (Module::Chatbot, "/podcast"),
     (Module::Notes, "/notes"),
     (Module::Messages, "/messages"),
     (Module::Events, "/events"),
@@ -30008,4 +30010,308 @@ async fn login_ignores_a_leftover_school_field() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+// --- insights: ZEKA's own tables, read back ---------------------------------
+
+/// Seed one student's ZEKA rows the way the service writes them (the backend
+/// never composes one, only reads): a nightly summary, one attention item, a
+/// live card addressed to the homeroom teacher, a dismissed card and an
+/// expired card addressed to the student, one displayable segment row and one
+/// below the display floor.
+async fn seed_insight_rows(
+    db: &hezarfen_backend::database::Database,
+    course: &str,
+    student: &str,
+    teacher: &str,
+) {
+    let student_uuid = Uuid::parse_str(student).expect("student id");
+    let teacher_uuid = Uuid::parse_str(teacher).expect("teacher id");
+    let course_uuid = Uuid::parse_str(course).expect("course id");
+    let now = Timestamp::now().as_millis();
+
+    sqlx::query(
+        "INSERT INTO zeka_student_summary
+             (student, marks, attendance, submission, study, confidence, computed_at, retain_until)
+         VALUES ($1, '{\"courses\":{\"matematik\":{\"average\":72}}}'::jsonb, NULL, NULL, NULL,
+                 'stable', $2, $3)",
+    )
+    .bind(student_uuid)
+    .bind(now)
+    .bind(now + 400 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO zeka_attention_item
+             (student, trigger, course, fact, window_from, window_to, evidence, ord)
+         VALUES ($1, 'attendance', NULL, 'son 30 gunun 4 dersi kacirildi', $2, $3,
+                 '{\"absent_days\":4}'::jsonb, 1)",
+    )
+    .bind(student_uuid)
+    .bind(now - 30 * 86_400_000)
+    .bind(now)
+    .execute(db)
+    .await
+    .unwrap();
+
+    let live_card = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO zeka_recommendation
+             (id, audience, product, rule_id, rule_version, scope, about, audience_role,
+              course, evidence, confidence, created_at, expires_at, retain_until,
+              dismissed_at, dismissed_by, dismiss_reason)
+         VALUES ($1, $2, 'T4', 'T4.attendance', 1, NULL, $3, 'teacher', $4,
+                 '{\"absent_days\":4,\"limitation\":\"yalniz ders yoklamasi\"}'::jsonb,
+                 'stable', $5, $6, $7, NULL, NULL, NULL)",
+    )
+    .bind(live_card)
+    .bind(teacher_uuid)
+    .bind(student_uuid)
+    .bind(course_uuid)
+    .bind(now)
+    .bind(now + 86_400_000)
+    .bind(now + 90 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+
+    // Dismissed: the application's own audit trail — a card closed by its
+    // audience must never be shown again.
+    sqlx::query(
+        "INSERT INTO zeka_recommendation
+             (id, audience, product, rule_id, rule_version, scope, about, audience_role,
+              course, evidence, confidence, created_at, expires_at, retain_until,
+              dismissed_at, dismissed_by, dismiss_reason)
+         VALUES ($1, $2, 'O3', 'O3.pattern', 1, NULL, NULL, 'student', NULL,
+                 '{\"n_stints\":7,\"limitation\":\"tek donem\"}'::jsonb,
+                 'stable', $3, $4, $5, $3, $2, 'bu dogru degil')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(student_uuid)
+    .bind(now)
+    .bind(now + 86_400_000)
+    .bind(now + 90 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+
+    // Expired: past its `expires_at`, so it is shown to nobody.
+    sqlx::query(
+        "INSERT INTO zeka_recommendation
+             (id, audience, product, rule_id, rule_version, scope, about, audience_role,
+              course, evidence, confidence, created_at, expires_at, retain_until,
+              dismissed_at, dismissed_by, dismiss_reason)
+         VALUES ($1, $2, 'O1', 'O1.review_band', 1, NULL, NULL, 'student', NULL,
+                 '{\"band\":\"review\",\"limitation\":\"n=3\"}'::jsonb,
+                 'exploratory', $3, $4, $5, NULL, NULL, NULL)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(student_uuid)
+    .bind(now - 10 * 86_400_000)
+    .bind(now - 86_400_000)
+    .bind(now + 90 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO zeka_student_segment_profile
+             (student, dimension, label, n_answers, n_correct, accuracy,
+              overall_n_answers, overall_accuracy, contrast, confidence,
+              computed_at, retain_until)
+         VALUES ($1, 'bilissel_talep', 'analiz', 120, 48, 0.40, 240, 0.55, -0.15,
+                 'stable', $2, $3)",
+    )
+    .bind(student_uuid)
+    .bind(now)
+    .bind(now + 400 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+
+    // Below the display floor (n < 30): it stays in the database and off every
+    // screen, so a reader must not see this label.
+    sqlx::query(
+        "INSERT INTO zeka_student_segment_profile
+             (student, dimension, label, n_answers, n_correct, accuracy,
+              overall_n_answers, overall_accuracy, contrast, confidence,
+              computed_at, retain_until)
+         VALUES ($1, 'okuma_yuku', 'yuksek', 12, 9, 0.75, 240, 0.55, 0.20,
+                 'none', $2, $3)",
+    )
+    .bind(student_uuid)
+    .bind(now)
+    .bind(now + 400 * 86_400_000)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// The insight read is gated twice: role first (a student is refused outright),
+/// then reach (a teacher is `404`ed for a student they do not teach) — while
+/// the homeroom teacher of the student's own şube reads it whole, and the
+/// reader's own filters (dismissed/expired cards, noise segments, the
+/// attention list's audience) all hold.
+#[tokio::test]
+async fn insight_reads_are_gated_to_the_students_the_caller_reaches() {
+    let (app, db) = app_and_db().await;
+    let staff = login_as(&app, &db, "mudur", "manager").await;
+
+    let homeroom = login_as(&app, &db, "ayse", "teacher").await;
+    let taught = taught_under(&app, &staff, &homeroom, "matematik").await;
+
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    add_member(&app, &staff, &taught.class, &ali_id).await;
+
+    // A teacher the student shares no instance with — the refusal arm.
+    let stranger = login_as(&app, &db, "bora", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    add_member(&app, &staff, &taught.class, &veli_id).await;
+
+    let teacher_uuid = me_id(&app, &homeroom).await;
+    seed_insight_rows(&db, &taught.course, &ali_id, &teacher_uuid).await;
+
+    // The homeroom teacher runs the instance the student sits in: the whole
+    // card, with the filters applied.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/insights/students/{ali_id}"),
+        Some(&homeroom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["user_id"], ali_id);
+    assert_eq!(res.body["summary"]["confidence"], "stable");
+    assert_eq!(
+        res.body["summary"]["marks"]["courses"]["matematik"]["average"],
+        72
+    );
+    assert_eq!(
+        res.body["attention"].as_array().expect("attention").len(),
+        1
+    );
+    assert_eq!(res.body["attention"][0]["trigger"], "attendance");
+    let cards = res.body["cards"].as_array().expect("cards");
+    assert_eq!(
+        cards.len(),
+        1,
+        "dismissed and expired cards are filtered out"
+    );
+    assert_eq!(cards[0]["rule_id"], "T4.attendance");
+    assert_eq!(cards[0]["about"], ali_id);
+    assert_eq!(cards[0]["course"], taught.course);
+    assert_eq!(cards[0]["evidence"]["limitation"], "yalniz ders yoklamasi");
+    let segments = res.body["segments"].as_array().expect("segments");
+    assert_eq!(segments.len(), 1, "a confidence:none row is not shown");
+    assert_eq!(segments[0]["label"], "analiz");
+    assert_eq!(segments[0]["contrast"], -0.15);
+
+    // The same student's own view: the summary and the profile, and the two
+    // things the contract keeps off a student's screen — the attention list
+    // about themselves, and any card not addressed to them (their live card
+    // belongs to the teacher, and their own two are dismissed/expired).
+    let res = send(&app, "GET", "/insights/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["summary"]["confidence"], "stable");
+    assert_eq!(
+        res.body["attention"].as_array().expect("attention").len(),
+        0
+    );
+    assert_eq!(res.body["cards"].as_array().expect("cards").len(), 0);
+    assert_eq!(res.body["segments"].as_array().expect("segments").len(), 1);
+
+    // A teacher who does not run any instance the student sits in reads the
+    // same 404 a missing id reads — and the row above proves it is a refusal,
+    // not an absence.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/insights/students/{ali_id}"),
+        Some(&stranger),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+
+    // A fellow student is refused at the role gate, the same posture
+    // `/marks/{user}` takes.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/insights/students/{ali_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // The reach check has no existence oracle either: an id no user holds
+    // reads exactly like the unreachable one.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/insights/students/{}", Uuid::now_v7()),
+        Some(&stranger),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// The run ledger is the management view: manager+ reads it whole — with the
+/// two child tables joined back in their writer's order — and a teacher is
+/// refused outright (a pending-student list is a list of people).
+#[tokio::test]
+async fn the_insight_run_ledger_is_manager_only() {
+    let (app, db) = app_and_db().await;
+    let staff = login_as(&app, &db, "mudur", "manager").await;
+    let teacher = login_as(&app, &db, "ayse", "teacher").await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let now = Timestamp::now().as_millis();
+    sqlx::query(
+        "INSERT INTO zeka_run
+             (run_day, started_at, finished_at, status, duration_ms,
+              students_total, students_ok, students_failed, students_skipped,
+              rows_written, budget_exceeded, budget_ms, retain_until)
+         VALUES ('2026-09-16', $1, $2, 'partial', 61000, 12, 10, 1, 1, 44, true, 60000, $3)",
+    )
+    .bind(now - 61_000)
+    .bind(now)
+    .bind(now + 90 * 86_400_000)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO zeka_run_pending (run, student, ord) VALUES ('2026-09-16', $1, 1)")
+        .bind(Uuid::parse_str(&ali_id).expect("student id"))
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO zeka_run_failed_module (run, module, ord)
+         VALUES ('2026-09-16', 'study', 1), ('2026-09-16', 'attendance', 2)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let res = send(&app, "GET", "/insights/runs", Some(&staff), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"], 1);
+    let run = &res.body["items"][0];
+    assert_eq!(run["run_day"], "2026-09-16");
+    assert_eq!(run["status"], "partial");
+    assert_eq!(run["budget_exceeded"], true);
+    assert_eq!(run["pending_students"], json!([ali_id]));
+    assert_eq!(run["failed_modules"], json!(["study", "attendance"]));
+
+    let res = send(&app, "GET", "/insights/runs", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 }

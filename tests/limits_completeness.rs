@@ -123,6 +123,29 @@ const EXCLUDED: &[(&str, &str)] = &[
          stream, never on this number",
     ),
     (
+        "AI_INSIGHT_STUDENT_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_INSIGHT_STUDENT_TIMEOUT_SECS",
+        "deadline on one student's compute; the dispatch is off the request \
+         path and a reader polls the stored rows",
+    ),
+    (
+        "AI_INSIGHT_CLASS_CAPABILITY",
+        "capability string an AI service declares (declared for the contract; \
+         no door dispatches it yet)",
+    ),
+    (
+        "AI_INSIGHT_REFRESH_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_INSIGHT_REFRESH_TIMEOUT_SECS",
+        "deadline on one school-wide recompute; the run's own ledger is \
+         `zeka_run`, which the client polls",
+    ),
+    (
         "CHAT_STREAM_POLL_MS",
         "server-side poll cadence behind the SSE stream",
     ),
