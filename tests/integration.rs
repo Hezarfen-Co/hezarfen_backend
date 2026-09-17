@@ -27164,15 +27164,8 @@ async fn course_note_creator_writes_assigned_teacher_refused_and_enrolled_studen
     // (a) the creator writes note + file.
     let note = create_course_note(&app, &creator, &course, "recap").await;
     let bytes = b"%PDF-1.4 fake";
-    let up = upload_course_note_file(
-        &app,
-        &creator,
-        &note,
-        "recap.pdf",
-        "application/pdf",
-        bytes,
-    )
-    .await;
+    let up =
+        upload_course_note_file(&app, &creator, &note, "recap.pdf", "application/pdf", bytes).await;
     assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
     let file_id = id_of(&up.body);
 
@@ -29685,8 +29678,13 @@ const CORE_PREFIXES: [(&str, &str); 13] = [
 /// Every module's nest prefix. Written down rather than derived: the point is
 /// to catch a nest that was mounted without a gate, and a derived list would
 /// be derived from the same code it is checking.
-const MODULE_PREFIXES: [(Module, &str); 22] = [
+///
+/// A module may own more than one prefix: `courses` also answers under
+/// `/instances` (the instance anchor), and `chatbot` — the whole `ai` package —
+/// also answers under `/rag`.
+const MODULE_PREFIXES: [(Module, &str); 23] = [
     (Module::Chatbot, "/chatbot"),
+    (Module::Chatbot, "/rag"),
     (Module::Notes, "/notes"),
     (Module::Messages, "/messages"),
     (Module::Events, "/events"),

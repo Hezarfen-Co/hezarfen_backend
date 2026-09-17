@@ -1063,7 +1063,7 @@ async fn rag_chat_payloads_carry_the_documented_wire_keys() {
     // Byte-level: the `(sinif, ders)` pair set, not a re-wrapped shape.
     let text = String::from_utf8(bytes).expect("the frame body is UTF-8 JSON");
     assert!(
-        text.contains(r#""scope":[{"sinif":"11","ders":"Fizik"}]"#),
+        text.contains(r#""scope":[{"ders":"Fizik","sinif":"11"}]"#),
         "{text}"
     );
 
@@ -1083,7 +1083,8 @@ async fn rag_chat_payloads_carry_the_documented_wire_keys() {
     let id = frame["id"].as_str().expect("trace id").to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{reply}}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{reply}}}"#)
+            .as_bytes(),
     )
     .await;
 
