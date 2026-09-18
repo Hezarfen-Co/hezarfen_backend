@@ -326,6 +326,16 @@ pub struct ReportSchool {
     pub name: String,
 }
 
+/// One class (şube) as a rendered document labels it: the id the summaries'
+/// own evidence carries, and the display name a reader should see in its
+/// place. A document that prints the id instead is a machine identifier on
+/// the most human-facing artifact the product ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ClassLabel {
+    pub id: String,
+    pub name: String,
+}
+
 // ---- shared validation -----------------------------------------------------
 
 /// Refuse a batch past [`MAX_INSIGHT_BATCH_ROWS`] rather than taking it
@@ -872,6 +882,27 @@ pub async fn school_identity(
         slug: slug.to_string(),
         name: row.name,
     }))
+}
+
+/// Every class (şube) of the school, id and display name, in name order.
+///
+/// The service's summaries carry class ids inside their own evidence objects,
+/// so a document that groups by class has only those ids to print — and an id
+/// is not a label. This is the lookup that turns them into names. It is sent
+/// whole rather than narrowed to the ids the current rows mention: a school's
+/// class list is tens of rows, and a partial list would make the renderer's
+/// fallback depend on how complete this read's filters were.
+pub async fn all_classes(db: &Database) -> Result<Vec<ClassLabel>, AppError> {
+    let rows = sqlx::query!("SELECT id, name FROM class_group ORDER BY name, id")
+        .fetch_all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ClassLabel {
+            id: row.id.to_string(),
+            name: row.name,
+        })
+        .collect())
 }
 
 // ---- the school-wide reads the report payload carries -----------------------

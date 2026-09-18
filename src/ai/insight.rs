@@ -220,6 +220,14 @@ pub struct ReportRequest {
     /// The school's own identity, so the document prints a display name
     /// rather than a slug.
     pub school: ReportSchool,
+    /// Every class (şube) of the school, id and display name: the summaries'
+    /// evidence carries class **ids**, and a document that groups by class
+    /// must print the name a reader recognizes. A sibling key rather than a
+    /// member of [`Self::school`]: it is a lookup for the rows, not part of
+    /// the school's identity. A class a row names but this list does not
+    /// carry (a deleted one) is absent on purpose — the renderer falls back
+    /// to an honest label, never a name invented here.
+    pub classes: Vec<ClassLabel>,
     /// Every stored summary (with its attention items) in the school.
     pub summaries: Vec<SummaryRow>,
     pub recommendations: Vec<RecommendationRow>,
@@ -358,9 +366,9 @@ fn malformed(err: serde_json::Error) -> AiError {
 // names exist, what each payload is, and how a refusal reads.
 
 pub use crate::db::insight::{
-    AttentionRow, PendingList, ProfileRow, ProfileWriteRequest, PurgeRequest, RecommendationRow,
-    RecommendationWriteRequest, ReportSchool, RunRow, RunWriteRequest, SchoolDirectory,
-    SegmentConfidences, SegmentLabels, SegmentRow, SegmentWriteRequest, SummaryRow,
+    AttentionRow, ClassLabel, PendingList, ProfileRow, ProfileWriteRequest, PurgeRequest,
+    RecommendationRow, RecommendationWriteRequest, ReportSchool, RunRow, RunWriteRequest,
+    SchoolDirectory, SegmentConfidences, SegmentLabels, SegmentRow, SegmentWriteRequest, SummaryRow,
     SummaryWriteRequest, TableVerdicts, WriteReceipt,
 };
 
@@ -609,6 +617,10 @@ mod tests {
                 slug: "demo".into(),
                 name: "Demo Okulu".into(),
             },
+            classes: vec![ClassLabel {
+                id: "class-1".into(),
+                name: "8-A".into(),
+            }],
             summaries: Vec::new(),
             recommendations: Vec::new(),
             profiles: Vec::new(),
@@ -621,6 +633,7 @@ mod tests {
                 "run_day": "2026-09-17",
                 "requested_by": "user-9",
                 "school": { "id": "school-1", "slug": "demo", "name": "Demo Okulu" },
+                "classes": [{ "id": "class-1", "name": "8-A" }],
                 "summaries": [],
                 "recommendations": [],
                 "profiles": [],

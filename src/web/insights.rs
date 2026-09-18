@@ -413,6 +413,7 @@ async fn generate_report(
         run_day: run_day.clone(),
         requested_by: user.get_id().key(),
         school,
+        classes: db::insight::all_classes(&st.db).await?,
         summaries: db::insight::all_summaries(&st.db).await?,
         recommendations: db::insight::all_recommendations(&st.db).await?,
         profiles: db::insight::all_profiles(&st.db).await?,

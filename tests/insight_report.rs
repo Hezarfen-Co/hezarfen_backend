@@ -429,6 +429,7 @@ async fn a_generated_report_is_stored_and_served_to_its_manager() {
     let manager_id = common::me_id(&app, &manager).await;
     let student = common::login(&app, "ali").await;
     let student_id = common::me_id(&app, &student).await;
+    let class_id = common::create_class(&app, &manager, "8-A", json!({})).await;
     seed_report_rows(&db, "2026-09-16", &student_id, &manager_id).await;
 
     let res = generate(&app, &manager, "2026-09-16").await;
@@ -463,6 +464,16 @@ async fn a_generated_report_is_stored_and_served_to_its_manager() {
             .is_some_and(|name| !name.is_empty()),
         "the school's display name travels"
     );
+    // The class (şube) lookup: the summaries' evidence carries class ids, and
+    // the document must print the name a reader recognizes.
+    let classes = request.payload["classes"]
+        .as_array()
+        .expect("classes is a list");
+    let seeded = classes
+        .iter()
+        .find(|row| row["id"] == class_id.as_str())
+        .expect("the school's own class is in the payload");
+    assert_eq!(seeded["name"], "8-A");
     let summaries = request.payload["summaries"]
         .as_array()
         .expect("summaries is a list");
