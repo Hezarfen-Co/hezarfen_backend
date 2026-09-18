@@ -1,7 +1,7 @@
 //! The README's `## Endpoints` table is generated, not written by hand.
 //!
-//! A hand-maintained route table drifts the moment a handler changes: the
-//! `.claude/kb-sync.sh` hook only catches a *missing* path, never a stale Auth
+//! A hand-maintained route table drifts the moment a handler changes: a prose
+//! review only catches a *missing* path, never a stale Auth
 //! cell nor a row for a route the code deleted. So this test renders the table
 //! from the served `/api-docs/openapi.json` and asserts the marker block in
 //! README.md matches it. Regenerate after any route change:
