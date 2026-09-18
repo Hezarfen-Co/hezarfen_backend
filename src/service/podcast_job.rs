@@ -148,13 +148,15 @@ pub async fn read_for(
     podcast_job::read_for(db, id, user).await
 }
 
-/// A user's own jobs, newest first.
+/// A user's own jobs, newest first, each paired with the title of the course
+/// note it narrates — `None` once that note is gone. The pairing is this
+/// list's whole extra read; everything else is the row.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
     limit: Option<i64>,
     offset: i64,
-) -> Result<(Vec<PodcastJob>, i64), AppError> {
+) -> Result<(Vec<(PodcastJob, Option<String>)>, i64), AppError> {
     podcast_job::list_for_user(db, user, limit, offset).await
 }
 

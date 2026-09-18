@@ -14,13 +14,16 @@
 //! (`podcast_job_done_has_audio`) backstops the service layer's refusal, so a
 //! result door can trust every `done` row to name a blob.
 
+use std::collections::HashMap;
+
 use crate::database::Database;
 use crate::db::page::PagedList;
+use crate::domain::course_note::CourseNoteId;
 use crate::domain::podcast_job::{PodcastJob, PodcastJobId, PodcastJobState};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-use sqlx::query_as;
+use sqlx::{query, query_as};
 
 /// Write one freshly minted job. The id and timestamps are the caller's — the
 /// service is handed the id this statement stores, so the row and the
@@ -96,20 +99,64 @@ pub async fn read_for(
 }
 
 /// A user's jobs, newest first — the sort `podcast_job_user_created` exists
-/// for.
+/// for — each paired with the title of the course note it narrates.
+///
+/// The title is a second read over the page alone (the [`PagedList`] window
+/// already chose the rows), not a join inside the paging statement: the
+/// count that pages the list must count jobs, and a join there could only
+/// multiply or drop one. A note that is gone answers `None` — the job stays
+/// in the caller's history either way.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
     limit: Option<i64>,
     offset: i64,
-) -> Result<(Vec<PodcastJob>, i64), AppError> {
-    PagedList::new(
+) -> Result<(Vec<(PodcastJob, Option<String>)>, i64), AppError> {
+    let (rows, total) = PagedList::new(
         "podcast_job WHERE user_id = $1",
         "ORDER BY created_at DESC, id DESC",
     )
     .bind(user.uuid())
-    .run(limit, offset, db)
-    .await
+    .run::<PodcastJob>(limit, offset, db)
+    .await?;
+    Ok((with_source_titles(db, rows).await?, total))
+}
+
+/// Pair the jobs of one page with the titles of the notes they narrate: one
+/// statement however many distinct notes the page names (the ids ride a
+/// single `ANY`), none at all for an empty page.
+///
+/// `source_id` is stored as the string the submit door was handed, so the
+/// lookup parses it the same way that door did
+/// ([`CourseNoteId::from_key`]); a job whose source no row matches keeps its
+/// `None`.
+async fn with_source_titles(
+    db: &Database,
+    jobs: Vec<PodcastJob>,
+) -> Result<Vec<(PodcastJob, Option<String>)>, AppError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<uuid::Uuid> = jobs
+        .iter()
+        .map(|job| CourseNoteId::from_key(job.get_source_id()).uuid())
+        .collect();
+    let titles: HashMap<uuid::Uuid, String> =
+        query!("SELECT id, title FROM course_note WHERE id = ANY($1)", &ids,)
+            .fetch_all(db)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.title))
+            .collect();
+    Ok(jobs
+        .into_iter()
+        .map(|job| {
+            let title = titles
+                .get(&CourseNoteId::from_key(job.get_source_id()).uuid())
+                .cloned();
+            (job, title)
+        })
+        .collect())
 }
 
 /// Apply one validated report: `from` is the state the service layer read and

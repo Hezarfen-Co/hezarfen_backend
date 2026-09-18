@@ -28,7 +28,7 @@ use hezarfen_backend::ai::protocol::{
 use hezarfen_backend::ai::{AiBridge, BridgeConfig};
 use hezarfen_backend::constant::{
     AI_ALPN, AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY, AI_PROTOCOL,
-    PODCAST_JOB_RETENTION_SECS, PODCAST_JOB_STALE_FLOOR_SECS,
+    PODCAST_INTERRUPTED_CODE, PODCAST_JOB_RETENTION_SECS, PODCAST_JOB_STALE_FLOOR_SECS,
 };
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
@@ -560,6 +560,44 @@ async fn seed_done_job(
     job
 }
 
+/// One job row in the shape the history reads: a chosen `state`, the note it
+/// narrates, and a `created_at` the test owns — the list orders by that
+/// column, so a wall-clock stamp would race the assertion. `done` rows name
+/// an artifact (the schema's own rule); anything else carries none.
+async fn seed_listed_job(
+    db: &Database,
+    job: Uuid,
+    user: &str,
+    source: &str,
+    state: &str,
+    created_at: i64,
+) -> Uuid {
+    let done = state == "done";
+    let audio_key = done.then(|| format!("podcast/{job}.mp3"));
+    sqlx::query(
+        "INSERT INTO podcast_job (id, user_id, source_id, format, state, stage, progress, \
+             error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, \
+             created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, '', 1, $6, $7, $8, $9, $10, $11, $12, $12)",
+    )
+    .bind(job)
+    .bind(uuid_of(user))
+    .bind(source)
+    .bind(FORMAT)
+    .bind(state)
+    .bind((state == "failed").then_some(PODCAST_INTERRUPTED_CODE))
+    .bind(&audio_key)
+    .bind(done.then_some(AUDIO_NAME))
+    .bind(done.then_some(AUDIO_TYPE))
+    .bind(done.then_some(4096_i64))
+    .bind(done.then_some(DURATION_SECS))
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("seed the listed job");
+    job
+}
+
 /// Write `bytes` at `key` under the demo school's blob directory — the layout
 /// an ingested episode lands in, and the only place the audio door reads.
 fn write_blob(key: &str, bytes: &[u8]) {
@@ -865,6 +903,285 @@ async fn a_cancel_of_a_terminal_job_answers_false_without_the_service() {
         .await
         .expect("the row is still there");
     assert_eq!(state, "failed", "the verdict never rewrites a terminal row");
+}
+
+// ------------------------------------------------------------- the history --
+
+/// One `GET /podcast/jobs…` — the caller's own history.
+async fn list_of(app: &Router, cookie: &str, query: &str) -> common::Res {
+    common::send(
+        app,
+        "GET",
+        &format!("/podcast/jobs{query}"),
+        Some(cookie),
+        None,
+    )
+    .await
+}
+
+/// The `job_id`s of one list response, in the order it returned them.
+fn ids_of(body: &Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .expect("a list response carries items")
+        .iter()
+        .map(|item| {
+            item["job_id"]
+                .as_str()
+                .expect("every item names its job")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The history shows what the school produced: a finished episode comes back
+/// with the title of the note it narrates, its running time, and where it
+/// ended — all from the backend's own row, with no service in the picture.
+#[tokio::test]
+async fn the_history_lists_a_finished_job_with_its_source_title() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let stamp = now_ms();
+    let job = seed_listed_job(&db, Uuid::now_v7(), &user, &note, "done", stamp).await;
+
+    let res = list_of(&app, &cookie, "").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"], 1);
+    assert_eq!(res.body["offset"], 0);
+    let item = &res.body["items"][0];
+    assert_eq!(item["job_id"], job.to_string());
+    assert_eq!(item["state"], "done");
+    assert_eq!(item["format"], FORMAT);
+    assert_eq!(item["source_id"], note);
+    assert_eq!(item["source_title"], "Bölüm 1");
+    assert_eq!(item["created_at"], stamp);
+    assert_eq!(item["finished_at"], stamp);
+    assert_eq!(item["duration_secs"], DURATION_SECS);
+    assert!(item["error_code"].is_null());
+}
+
+/// Newest first, with the id breaking the tie: the frozen order, on rows
+/// seeded out of order — including two that share their instant.
+#[tokio::test]
+async fn the_history_is_newest_first() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let base = now_ms() - 3 * 60 * 60 * 1_000;
+    let oldest = seed_listed_job(&db, Uuid::now_v7(), &user, SOURCE_ID, "done", base).await;
+    let middle = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        SOURCE_ID,
+        "failed",
+        base + 3_600_000,
+    )
+    .await;
+    let tie_old = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        SOURCE_ID,
+        "done",
+        base + 7_200_000,
+    )
+    .await;
+    let tie_new = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        SOURCE_ID,
+        "done",
+        base + 7_200_000,
+    )
+    .await;
+
+    let res = list_of(&app, &cookie, "").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"], 4);
+    assert_eq!(
+        ids_of(&res.body),
+        vec![
+            tie_new.to_string(),
+            tie_old.to_string(),
+            middle.to_string(),
+            oldest.to_string()
+        ]
+    );
+}
+
+/// `?limit=&offset=` slice the ordered history and `total` stays the unpaged
+/// count, so a client can page without a second request — and an offset past
+/// the tail is an empty page, not an error.
+#[tokio::test]
+async fn the_history_pages_with_limit_and_offset() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let base = now_ms() - 3 * 60 * 60 * 1_000;
+    let oldest = seed_listed_job(&db, Uuid::now_v7(), &user, SOURCE_ID, "done", base).await;
+    let middle = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        SOURCE_ID,
+        "done",
+        base + 3_600_000,
+    )
+    .await;
+    let newest = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        SOURCE_ID,
+        "done",
+        base + 7_200_000,
+    )
+    .await;
+
+    let first = list_of(&app, &cookie, "?limit=2").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(first.body["total"], 3);
+    assert_eq!(first.body["limit"], 2);
+    assert_eq!(
+        ids_of(&first.body),
+        vec![newest.to_string(), middle.to_string()]
+    );
+
+    let second = list_of(&app, &cookie, "?limit=1&offset=1").await;
+    assert_eq!(second.body["total"], 3);
+    assert_eq!(second.body["offset"], 1);
+    assert_eq!(ids_of(&second.body), vec![middle.to_string()]);
+
+    let past = list_of(&app, &cookie, "?limit=2&offset=9").await;
+    assert_eq!(past.body["total"], 3);
+    assert!(ids_of(&past.body).is_empty());
+
+    let bad = list_of(&app, &cookie, "?limit=0").await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+    assert!(
+        bad.body["error"]
+            .as_str()
+            .expect("an error")
+            .contains("limit"),
+        "the refusal names the field: {}",
+        bad.body
+    );
+
+    let unpaged = list_of(&app, &cookie, "?offset=1").await;
+    assert_eq!(unpaged.body["total"], 3);
+    assert!(unpaged.body["limit"].is_null());
+    assert_eq!(
+        ids_of(&unpaged.body).len(),
+        2,
+        "{oldest} is the one skipped"
+    );
+}
+
+/// A school with no episodes yet answers an empty page — `items: []`,
+/// `total: 0` — never a `404`.
+#[tokio::test]
+async fn an_empty_history_is_an_empty_page() {
+    let (app, cookie, _db) = app_without_ai().await;
+
+    let res = list_of(&app, &cookie, "").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"], 0);
+    assert!(ids_of(&res.body).is_empty());
+    assert!(res.body["limit"].is_null());
+}
+
+/// A live job lists as itself, with everything only a finished episode can
+/// know left `null` — and a job nobody has updated inside its ETA-scaled
+/// window reads `failed`/`interrupted`, the same read-side projection the
+/// per-id door applies. The projection writes nothing: the row still says
+/// `running` afterwards.
+#[tokio::test]
+async fn a_live_job_lists_with_nulls_and_a_stale_one_reads_failed() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let fresh = seed_listed_job(&db, Uuid::now_v7(), &user, SOURCE_ID, "running", now_ms()).await;
+    let aged = now_ms() - (PODCAST_JOB_STALE_FLOOR_SECS + 100) * 1_000;
+    let stale = seed_listed_job(&db, Uuid::now_v7(), &user, SOURCE_ID, "running", aged).await;
+
+    let res = list_of(&app, &cookie, "").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let items = res.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    let live = items
+        .iter()
+        .find(|item| item["job_id"] == fresh.to_string())
+        .expect("the fresh job is listed");
+    assert_eq!(live["state"], "running");
+    assert!(live["finished_at"].is_null());
+    assert!(live["duration_secs"].is_null());
+    assert!(live["error_code"].is_null());
+    assert!(live["source_title"].is_null(), "no note answers to that id");
+    let dead = items
+        .iter()
+        .find(|item| item["job_id"] == stale.to_string())
+        .expect("the stale job is listed");
+    assert_eq!(dead["state"], "failed");
+    assert_eq!(dead["error_code"], "interrupted");
+
+    let stored: String = sqlx::query_scalar("SELECT state FROM podcast_job WHERE id = $1")
+        .bind(stale)
+        .fetch_one(&db)
+        .await
+        .expect("the row is still there");
+    assert_eq!(stored, "running", "the projection wrote nothing");
+}
+
+/// The history is school-scoped like every other door: each school lists its
+/// own episodes only, even when both hold a job for a user of the same name —
+/// and a note's title never crosses either.
+#[tokio::test]
+async fn the_history_never_shows_another_schools_jobs() {
+    let deployment = common::deployment_with(&[("beta", "Beta Koleji")]).await;
+    let app = &deployment.app;
+    let demo_db = common::demo_db(&deployment.tenants).await;
+    let beta_db = deployment
+        .tenants
+        .get(&Slug::try_new("beta").expect("the beta slug"))
+        .await
+        .expect("the beta school's handle");
+    let demo_cookie = common::login_as_school(app, &demo_db, DEMO_SLUG, "ali", "teacher").await;
+    let beta_cookie = common::login_as_school(app, &beta_db, "beta", "ali", "teacher").await;
+    let demo_user = common::me_id(app, &demo_cookie).await;
+    let beta_user = common::me_id(app, &beta_cookie).await;
+
+    let course = common::create_course(app, &demo_cookie, "Matematik").await;
+    let demo_note = create_note(app, &demo_cookie, &course).await;
+    let demo_job = seed_listed_job(
+        &demo_db,
+        Uuid::now_v7(),
+        &demo_user,
+        &demo_note,
+        "done",
+        now_ms(),
+    )
+    .await;
+    let beta_job = seed_listed_job(
+        &beta_db,
+        Uuid::now_v7(),
+        &beta_user,
+        SOURCE_ID,
+        "done",
+        now_ms(),
+    )
+    .await;
+
+    let demo_list = list_of(app, &demo_cookie, "").await;
+    assert_eq!(demo_list.status, StatusCode::OK, "{}", demo_list.body);
+    assert_eq!(demo_list.body["total"], 1);
+    assert_eq!(ids_of(&demo_list.body), vec![demo_job.to_string()]);
+    assert_eq!(demo_list.body["items"][0]["source_title"], "Bölüm 1");
+
+    let beta_list = list_of(app, &beta_cookie, "").await;
+    assert_eq!(beta_list.status, StatusCode::OK, "{}", beta_list.body);
+    assert_eq!(beta_list.body["total"], 1);
+    assert_eq!(ids_of(&beta_list.body), vec![beta_job.to_string()]);
+    assert_ne!(beta_list.body["items"][0]["job_id"], demo_job.to_string());
 }
 
 // --------------------------------------------------------------- refusals --
@@ -1250,6 +1567,7 @@ async fn every_door_requires_a_session() {
 
     let doors = [
         ("POST", "/podcast/jobs".to_string(), Some(json!({ "source_id": SOURCE_ID }))),
+        ("GET", "/podcast/jobs".to_string(), None),
         ("GET", format!("/podcast/jobs/{id}"), None),
         ("GET", format!("/podcast/jobs/{id}/result"), None),
         ("GET", format!("/podcast/jobs/{id}/audio"), None),

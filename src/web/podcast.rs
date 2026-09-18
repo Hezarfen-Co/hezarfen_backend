@@ -10,16 +10,17 @@
 //! that a restart or a wiped volume could take down with it. The service's own
 //! record is a mirror the pipeline works against, not the source of truth.
 //!
-//! Five doors:
+//! Six doors:
 //!
 //! * `POST   /podcast/jobs`           — write the row, dispatch `podcast.submit`
+//! * `GET    /podcast/jobs`           — the caller's own history, newest first
 //! * `GET    /podcast/jobs/{id}`      — the row's snapshot (projected, see below)
 //! * `GET    /podcast/jobs/{id}/result` — a finished job's artifact references
 //! * `GET    /podcast/jobs/{id}/audio`  — streams the ingested episode
 //! * `POST   /podcast/jobs/{id}/cancel` — forward the cancel, stamp the verdict
 //!
 //! The two dispatching doors (`submit`, `cancel`) refuse `503` when no worker
-//! declares their capability; the three reading doors need no service at all.
+//! declares their capability; the four reading doors need no service at all.
 //! A relayed failure keeps the service's own code and decides the HTTP status
 //! (`failure`), so a client branches on the same vocabulary the bridge speaks.
 //!
@@ -44,7 +45,7 @@
 
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
@@ -72,7 +73,7 @@ use crate::service::podcast_job as jobs;
 use crate::state::AppState;
 use crate::web::tenant_state::{SchoolSlug, State};
 
-use super::{CurrentUser, ai_unavailable};
+use super::{CurrentUser, Page, PageParams, ai_unavailable};
 
 /// How much of the audio is read per chunk, and how many chunks the body may
 /// have in flight. 4 × 64 KiB is the whole memory ceiling one audio stream
@@ -82,7 +83,7 @@ const AUDIO_CHUNKS_IN_FLIGHT: usize = 4;
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(submit))
+        .routes(routes!(submit, list))
         .routes(routes!(status))
         .routes(routes!(result))
         .routes(routes!(audio))
@@ -266,6 +267,93 @@ async fn submit(
             Ok(failure(&code))
         }
     }
+}
+
+/// One episode in the caller's history: the backend's own row, plus the title
+/// of the course note it narrates.
+#[derive(Serialize, ToSchema)]
+struct JobSummary {
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
+    job_id: String,
+    /// `queued`, `running`, `done`, `failed` or `cancelled` — a job nobody
+    /// has updated inside its ETA-scaled window is presented as `failed`.
+    state: String,
+    /// The narration the service resolved; `null` until its first report
+    /// settles it.
+    #[schema(example = "duz_okuma")]
+    format: Option<String>,
+    /// The course note this episode narrates.
+    #[schema(example = "019732e3-7b00-7000-8000-00000000face")]
+    source_id: String,
+    /// That note's title as of this read; `null` once the note is gone — the
+    /// episode keeps its place in the history either way.
+    #[schema(example = "Hücre ve Canlıların Ortak Özellikleri")]
+    source_title: Option<String>,
+    /// UTC unix-milliseconds, server-stamped.
+    created_at: i64,
+    /// When the job reached its terminal state (the write that finished it);
+    /// `null` while it is live.
+    finished_at: Option<i64>,
+    /// The finished episode's running time, as the service declared it at
+    /// upload; `null` until then.
+    duration_secs: Option<f64>,
+    /// The failure's own code, once one is on the record.
+    error_code: Option<String>,
+}
+
+impl JobSummary {
+    fn new(job: &PodcastJob, source_title: Option<String>) -> Self {
+        Self {
+            job_id: job.get_id().key(),
+            state: job.get_state().as_str().to_string(),
+            format: job.get_format().map(str::to_string),
+            source_id: job.get_source_id().to_string(),
+            source_title,
+            created_at: job.get_created_at().as_millis(),
+            finished_at: job
+                .get_state()
+                .is_terminal()
+                .then(|| job.get_updated_at().as_millis()),
+            duration_secs: job.get_duration_secs(),
+            error_code: job.get_error_code().map(str::to_string),
+        }
+    }
+}
+
+/// The caller's own episodes, newest first — every job the backend ever
+/// minted for this user, whatever state it stopped in, each with the title of
+/// the note it narrated. Paged via `?limit=&offset=`.
+///
+/// This is a reading door like the per-id ones: it answers from the rows
+/// alone, so with the service down, restarted, or never connected at all the
+/// history is still exactly what it was. A job nobody has updated inside its
+/// ETA-scaled window is presented as `failed` (the same read-side projection
+/// the per-id door applies); rows past the retention window stay listed —
+/// opening one is what earns the `410`.
+#[utoipa::path(
+    get,
+    path = "/jobs",
+    tag = "podcast",
+    security(("session_cookie" = [])),
+    params(PageParams),
+    responses(
+        (status = 200, description = "A page of the caller's episodes, newest first", body = Page<JobSummary>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    ),
+)]
+async fn list(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<JobSummary>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let (jobs, total) = jobs::list_for_user(&st.db, user.get_id(), limit, offset).await?;
+    let items = jobs
+        .into_iter()
+        .map(|(job, source_title)| JobSummary::new(&job.projected(), source_title))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// One job's current state — the backend's own row, so this door answers with
