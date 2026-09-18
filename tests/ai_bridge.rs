@@ -3539,6 +3539,221 @@ async fn no_insight_refresh_worker_means_503_and_nothing_is_dispatched() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 }
 
+// ---- a capability a service contradicts --------------------------------
+//
+// The class this closes: a service announces `insight.refresh` in its `Hello`,
+// the door reads that as availability and answers `202`, and the service then
+// answers the dispatch with `unknown_capability` — a permanent, self-
+// contradictory refusal. Nothing is queued and nobody is told. So the registry
+// withdraws the contradicted claim, and the *next* door call takes the `503`
+// path it already had. A transient refusal must not do this: a busy or
+// restarting service keeps its claim.
+
+/// Wait until `bridge` offers (or no longer offers) `capability`.
+async fn await_capability(bridge: &AiBridge, capability: &str, offered: bool) {
+    for _ in 0..500 {
+        if bridge.has_capability(capability) == offered {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the bridge never turned `{capability}` offered={offered}");
+}
+
+/// The capability names `GET /ai/capabilities` lists right now.
+async fn listed_capabilities(app: &Router, cookie: &str) -> Vec<String> {
+    let res = common::send(app, "GET", "/ai/capabilities", Some(cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.body["capabilities"]
+        .as_array()
+        .expect("a capabilities array")
+        .iter()
+        .map(|entry| {
+            entry["capability"]
+                .as_str()
+                .expect("a capability name")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_capability_refused_as_unknown_is_withdrawn_so_the_door_stops_queuing() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_REFRESH_CAPABILITY]),
+        Behaviour::Fail {
+            code: "unknown_capability".into(),
+            message: "'insight.refresh' bu serviste tanimli degil".into(),
+        },
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+
+    // While the claim stands the door queues — the `202` the user saw.
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(
+        await_seen(&service, 1).await[0].capability,
+        AI_INSIGHT_REFRESH_CAPABILITY
+    );
+
+    // The refusal is permanent and contradicts the handshake, so the claim is
+    // withdrawn — and the very next refresh is refused rather than queued.
+    await_capability(&bridge, AI_INSIGHT_REFRESH_CAPABILITY, false).await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert_eq!(res.body["error"], "no AI service is connected right now");
+    assert_eq!(
+        service.seen().len(),
+        1,
+        "the refused refresh dispatched nothing"
+    );
+
+    // Discovery tells the same story: the capability is gone from the list.
+    assert!(
+        !listed_capabilities(&app, &staff)
+            .await
+            .contains(&AI_INSIGHT_REFRESH_CAPABILITY.to_string()),
+        "a withdrawn capability must not be advertised as available"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_refusal_keeps_the_claim_and_the_door_keeps_queuing() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_REFRESH_CAPABILITY]),
+        Behaviour::Fail {
+            code: "unavailable".into(),
+            message: "the school database could not be reached".into(),
+        },
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+
+    // Drive one dispatch through the registry directly so the refusal is known
+    // to have been processed before the claim is read — the door's own
+    // dispatch is detached and would leave this racy.
+    let err = bridge
+        .dispatch(&demo(), AI_INSIGHT_REFRESH_CAPABILITY, json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AiError::Remote { code, .. } if code == "unavailable"),
+        "{err}"
+    );
+    assert!(
+        bridge.has_capability(AI_INSIGHT_REFRESH_CAPABILITY),
+        "a busy or unreachable service has not contradicted its claim"
+    );
+
+    // So the door still queues, and discovery still lists it.
+    let (app, db) = chat_app(&bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(
+        await_seen(&service, 1).await[0].capability,
+        AI_INSIGHT_REFRESH_CAPABILITY
+    );
+    assert!(
+        listed_capabilities(&app, &staff)
+            .await
+            .contains(&AI_INSIGHT_REFRESH_CAPABILITY.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_reconnecting_service_restores_a_withdrawn_capability() {
+    let bridge = bridge().await;
+    let broken = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_REFRESH_CAPABILITY]),
+        Behaviour::Fail {
+            code: "unknown_capability".into(),
+            message: "not implemented".into(),
+        },
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+
+    // One refresh withdraws the claim.
+    common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    await_capability(&bridge, AI_INSIGHT_REFRESH_CAPABILITY, false).await;
+
+    // The service restarts — the withdrawal is per connection, never durable.
+    broken.conn.close(0u32.into(), b"restarting");
+    drop(broken);
+    await_workers(&bridge, 0).await;
+
+    let fixed = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_REFRESH_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    assert!(
+        bridge.has_capability(AI_INSIGHT_REFRESH_CAPABILITY),
+        "a fresh Hello restores the declared capability"
+    );
+    assert!(
+        listed_capabilities(&app, &staff)
+            .await
+            .contains(&AI_INSIGHT_REFRESH_CAPABILITY.to_string())
+    );
+
+    // And it serves again: the door queues and the dispatch reaches it.
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(
+        await_seen(&fixed, 1).await[0].capability,
+        AI_INSIGHT_REFRESH_CAPABILITY
+    );
+}
+
 // ------------------------------------------- the backend-served capabilities --
 //
 // The other direction: a service calling the *backend*. ZEKA's storage

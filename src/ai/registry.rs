@@ -7,7 +7,7 @@
 //! silently dead service into a closed connection, and the connection task
 //! turns that into a [`Registry::remove`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +23,12 @@ pub struct Worker<C> {
     pub id: String,
     pub service: String,
     pub capabilities: Vec<String>,
+    /// Capabilities this worker claimed in its `Hello` and then answered
+    /// `unknown_capability` for. The advertised list is left untouched; this
+    /// is the subtraction applied on top of it, so a self-contradicting answer
+    /// stops routing without rewriting what the service declared. See
+    /// [`Registry::withdraw`].
+    withdrawn: Mutex<HashSet<String>>,
     /// Ceiling from the worker's `Hello`, already clamped by
     /// [`clamp_concurrency`].
     pub max_concurrent: usize,
@@ -40,6 +46,18 @@ impl<C> Worker<C> {
 
     pub fn conn(&self) -> &C {
         &self.conn
+    }
+
+    /// Does this worker offer `capability` right now? False for a name it
+    /// never declared, and false for one it declared and then withdrew by
+    /// refusing it as unknown ([`Registry::withdraw`]).
+    pub fn offers(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
+            && !self
+                .withdrawn
+                .lock()
+                .expect("ai registry lock")
+                .contains(capability)
     }
 }
 
@@ -114,6 +132,12 @@ impl<C> Default for Registry<C> {
 impl<C> Registry<C> {
     /// Add a freshly handshaken worker. `id` is caller-assigned (a ULID) and
     /// must be unique; reusing one replaces the old entry.
+    ///
+    /// A fresh `Hello` is also how a withdrawn capability comes back: the
+    /// entry is built from the handshake alone (see [`Registry::withdraw`] for
+    /// why a claim is ever subtracted), so a service that reconnects —
+    /// necessarily landing here under a new worker id — offers everything it
+    /// declares again.
     pub fn insert(
         &self,
         id: String,
@@ -126,6 +150,7 @@ impl<C> Registry<C> {
             id: id.clone(),
             service,
             capabilities,
+            withdrawn: Mutex::new(HashSet::new()),
             max_concurrent,
             inflight: AtomicUsize::new(0),
             conn,
@@ -158,7 +183,7 @@ impl<C> Registry<C> {
         let workers = self.workers.lock().expect("ai registry lock");
         let mut offering = workers
             .values()
-            .filter(|w| w.capabilities.iter().any(|c| c == capability))
+            .filter(|w| w.offers(capability))
             .peekable();
         if offering.peek().is_none() {
             return Err(AiError::NoWorker(capability.to_string()));
@@ -185,7 +210,15 @@ impl<C> Registry<C> {
             .map(|w| WorkerSnapshot {
                 id: w.id.clone(),
                 service: w.service.clone(),
-                capabilities: w.capabilities.clone(),
+                // What the worker is offering, not what it declared: a
+                // withdrawn capability must vanish from discovery exactly as
+                // it vanishes from routing.
+                capabilities: w
+                    .capabilities
+                    .iter()
+                    .filter(|c| w.offers(c))
+                    .cloned()
+                    .collect(),
                 inflight: w.inflight(),
                 max_concurrent: w.max_concurrent,
             })
@@ -195,12 +228,46 @@ impl<C> Registry<C> {
     }
 
     /// Is anything at all connected for `capability`?
+    ///
+    /// What counts is what a worker is *offering*, so a claim one of them has
+    /// withdrawn ([`Registry::withdraw`]) reads as absent — which is what lets
+    /// a door branch on this and stop queuing work nobody will do.
     pub fn has_capability(&self, capability: &str) -> bool {
         self.workers
             .lock()
             .expect("ai registry lock")
             .values()
-            .any(|w| w.capabilities.iter().any(|c| c == capability))
+            .any(|w| w.offers(capability))
+    }
+
+    /// Withdraw one capability from one worker: it advertised the name in its
+    /// `Hello` and then answered a dispatch with a permanent, self-contradictory
+    /// refusal (`unknown_capability`). The claim cannot be trusted again for
+    /// this connection, so `pick` and `has_capability` stop seeing it and the
+    /// worker drops out of discovery for that name.
+    ///
+    /// This is a subtraction, never a mutation of the declared list: a fresh
+    /// [`Registry::insert`] — every reconnect does one, under a new worker id —
+    /// restores the capability, so a service that fixes itself recovers with no
+    /// operator action. Scoped to the one worker that answered: a sibling
+    /// process declaring the same capability is untouched.
+    ///
+    /// A no-op for a worker already removed (its connection closed) or for a
+    /// capability it never declared, so a late answer from a dead or confused
+    /// worker cannot invent a state.
+    pub fn withdraw(&self, id: &str, capability: &str) {
+        let workers = self.workers.lock().expect("ai registry lock");
+        let Some(worker) = workers.get(id) else {
+            return;
+        };
+        if !worker.capabilities.iter().any(|c| c == capability) {
+            return;
+        }
+        worker
+            .withdrawn
+            .lock()
+            .expect("ai registry lock")
+            .insert(capability.to_string());
     }
 }
 
@@ -343,6 +410,53 @@ mod tests {
         // The lease outlives removal — its request is still on the wire.
         assert_eq!(held.worker().id, "w1");
         assert!(reg.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_capability_stops_routing_and_a_fresh_hello_restores_it() {
+        let reg = registry_with(&[("w1", &["ocr.extract", "ocr.classify"], 4)]);
+        reg.withdraw("w1", "ocr.extract");
+        assert!(!reg.has_capability("ocr.extract"));
+        assert!(
+            reg.has_capability("ocr.classify"),
+            "the sibling claim is untouched"
+        );
+        assert!(matches!(
+            reg.pick("ocr.extract").unwrap_err(),
+            AiError::NoWorker(_)
+        ));
+        assert_eq!(
+            reg.snapshot()[0].capabilities,
+            vec!["ocr.classify".to_string()],
+            "discovery reports what is offered, not what was declared"
+        );
+
+        // A reconnect re-inserts the worker from its handshake alone.
+        reg.insert(
+            "w1".into(),
+            "svc".into(),
+            vec!["ocr.extract".into(), "ocr.classify".into()],
+            4,
+            (),
+        );
+        assert!(reg.has_capability("ocr.extract"));
+        reg.pick("ocr.extract").expect("restored");
+    }
+
+    #[tokio::test]
+    async fn withdrawing_one_worker_leaves_a_sibling_offering_the_same() {
+        let reg = registry_with(&[("w1", &["ocr.extract"], 2), ("w2", &["ocr.extract"], 2)]);
+        reg.withdraw("w1", "ocr.extract");
+        assert!(reg.has_capability("ocr.extract"));
+        assert_eq!(reg.pick("ocr.extract").unwrap().worker().id, "w2");
+
+        // Neither a name the worker never declared nor a worker already gone
+        // is a state withdraw may invent.
+        reg.withdraw("w2", "grade.essay");
+        assert!(!reg.has_capability("grade.essay"));
+        reg.remove("w2");
+        reg.withdraw("w2", "ocr.extract");
+        assert!(!reg.has_capability("ocr.extract"));
     }
 
     #[tokio::test]

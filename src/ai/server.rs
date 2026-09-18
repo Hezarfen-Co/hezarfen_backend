@@ -336,6 +336,25 @@ impl AiBridge {
         .instrument(span.clone())
         .await;
 
+        // A worker that answers `unknown_capability` for a name it advertised
+        // in its own `Hello` has contradicted its handshake. That claim is the
+        // only reason this dispatch was routed here, and the only reason the
+        // caller's door answered `202` instead of "nothing is connected", so it
+        // is withdrawn: `has_capability` stops seeing it and the next door call
+        // refuses instead of queuing work nobody will do. A reconnect restores
+        // it (every fresh `Hello` inserts a worker with its declared list).
+        if let Err(AiError::Remote { code, .. }) = &outcome
+            && contradicts_its_own_claim(code)
+        {
+            self.inner.registry.withdraw(&lease.worker().id, capability);
+            tracing::warn!(
+                service = %lease.worker().service,
+                capability,
+                code = %code,
+                "AI service refused a capability it advertised; claim withdrawn until it reconnects"
+            );
+        }
+
         metrics
             .ai_request_duration
             .record(started.elapsed().as_secs_f64(), &attrs);
@@ -379,6 +398,22 @@ impl AiBridge {
     pub fn close(&self) {
         self.inner.endpoint.close(0u32.into(), b"shutting down");
     }
+}
+
+/// Does this refusal code mean the worker contradicted a claim it made in its
+/// own `Hello` — it advertised the capability and then answered that this name
+/// is not one it implements?
+///
+/// Only `unknown_capability` does. The protocol's refusal vocabulary names no
+/// sibling for "no operation by this name": its one example of a service-defined
+/// code (`unsupported_image`) is a verdict about *this request's payload*, and
+/// the other codes a service may answer — `invalid_payload`, `unavailable`,
+/// `timed_out`, `internal`, `capacity` — are the same kind of thing. Those must
+/// leave the claim standing so a busy, restarting or overloaded service keeps
+/// getting the next request; only a permanent "this name is not mine" licenses
+/// a withdrawal (see [`Registry::withdraw`]).
+fn contradicts_its_own_claim(code: &str) -> bool {
+    code == "unknown_capability"
 }
 
 /// Accept connections until the endpoint closes. One task per service.
