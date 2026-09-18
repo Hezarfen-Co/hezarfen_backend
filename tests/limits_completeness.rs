@@ -123,6 +123,26 @@ const EXCLUDED: &[(&str, &str)] = &[
          stream, never on this number",
     ),
     (
+        "AI_RAG_SUMMARIZE_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_RAG_SUMMARIZE_TIMEOUT_SECS",
+        "deadline on one one-shot summary of a range; the caller waits on the \
+         artifact itself and acts on the door's 200/400/403/503, never on this \
+         number",
+    ),
+    (
+        "AI_RAG_QUESTIONS_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_RAG_QUESTIONS_TIMEOUT_SECS",
+        "deadline on one one-shot question set over a range; the caller waits \
+         on the artifact itself and acts on the door's 200/400/403/503, never \
+         on this number",
+    ),
+    (
         "AI_INSIGHT_STUDENT_CAPABILITY",
         "capability string an AI service declares",
     ),

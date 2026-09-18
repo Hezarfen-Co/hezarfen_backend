@@ -367,6 +367,10 @@ struct RagLimits {
     /// corpus is routed by the pair, so this bounds what one question can ask
     /// a retrieval to sweep.
     max_scope_pairs: usize,
+    /// Hard ceiling on the practice questions one `POST /rag/questions` call
+    /// may ask for. The caller waits on the generation, so this bounds one
+    /// model round trip rather than a corpus sweep.
+    max_questions: u32,
     /// Hard ceiling on the citations one answer may store in its message row.
     max_citations: usize,
     /// Pages one citation may span. A citation names a page range, and an
@@ -686,6 +690,7 @@ impl LimitsResponse {
             },
             rag: RagLimits {
                 max_scope_pairs: MAX_RAG_SCOPE_PAIRS,
+                max_questions: MAX_RAG_QUESTIONS,
                 max_citations: MAX_RAG_CITATIONS,
                 max_citation_pages: MAX_RAG_CITATION_PAGES,
                 max_message_len: MAX_CHATBOT_MESSAGE_LEN,

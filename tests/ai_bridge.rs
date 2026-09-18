@@ -3392,6 +3392,398 @@ async fn a_rag_stream_replays_a_settled_turn_with_its_citations() {
     assert_eq!(citation["ders"], "Fizik", "{message}");
 }
 
+// ---- rag study: the one-shot summarize/questions doors -----------------
+//
+// No thread, no stored row: these doors wait on exactly one dispatch and answer
+// with the artifact. These pin the wire payloads (the scope derived
+// server-side, the asker, the question-set knobs), the authorization the body
+// is held to, and the rule that an abstention is a complete `200`.
+
+use hezarfen_backend::constant::{AI_RAG_QUESTIONS_CAPABILITY, AI_RAG_SUMMARIZE_CAPABILITY};
+
+/// A signed-in student whose derived scope is exactly one school-wide club
+/// corpus — the cheapest scope a real school can produce, and the same fixture
+/// the chat tests above use. Returns (app, their cookie, their user id).
+async fn study_user(bridge: &AiBridge) -> (Router, String, String) {
+    let (app, db) = chat_app(bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&staff),
+        Some(json!({ "title": "Satranç Kulübü", "kind": "club" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let club = common::id_of(&res.body);
+
+    let cookie = common::login(&app, "ali").await;
+    let student = common::me_id(&app, &cookie).await;
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/courses/{club}/members"),
+        Some(&staff),
+        Some(json!({ "user_id": student })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    (app, cookie, student)
+}
+
+/// The summarize wire contract end to end: one `rag.summarize` dispatch, the
+/// frame naming the school and the asker, the scope derived from the asker's
+/// own memberships (a club is school-wide, so `sinif: null`) with the body's
+/// range carried inside it, and the reply mapped back field for field.
+#[tokio::test]
+async fn the_summarize_request_carries_the_askers_scope_and_role() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "DNA, kalıtımı taşıyan moleküldür.",
+            "abstained": false,
+            "reason": "",
+            "citations": [{ "n": 1, "pages": [16], "span_ids": ["s-3"] }],
+            "scope_pages": [16, 17],
+            "hierarchical": true,
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, student) = study_user(&bridge).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/summarize",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü", "pages": [16, 17], "scope_label": "DNA" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["text"], "DNA, kalıtımı taşıyan moleküldür.");
+    assert_eq!(res.body["abstained"], false);
+    assert_eq!(res.body["reason"], "");
+    assert_eq!(res.body["citations"][0]["n"], 1);
+    assert_eq!(res.body["citations"][0]["pages"], json!([16]));
+    assert_eq!(res.body["citations"][0]["span_ids"], json!(["s-3"]));
+    assert_eq!(res.body["scope_pages"], json!([16, 17]));
+    assert_eq!(res.body["hierarchical"], true);
+    // A summary is addressed to a range the caller selected, not to one
+    // document, so its citations carry no corpus id to resolve into a file.
+    assert!(
+        res.body["citations"][0]["doc_id"].is_null(),
+        "no file may be implied for a study citation: {}",
+        res.body
+    );
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "one dispatch per call, never a re-send");
+    assert_eq!(seen[0].capability, AI_RAG_SUMMARIZE_CAPABILITY);
+    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the caller's school");
+    let payload = &seen[0].payload;
+    assert_eq!(payload["asker"], student);
+    assert_eq!(payload["asker_role"], "student");
+    assert_eq!(
+        payload["scope"],
+        json!({
+            "sinif": null,
+            "ders": "Satranç Kulübü",
+            "pages": [16, 17],
+            "span_ids": [],
+            "scope_label": "DNA",
+        }),
+        "a club is school-wide, so its scope names no grade"
+    );
+}
+
+/// The questions wire contract: the same scope, plus the shape of the set, and
+/// the service's own `soru`/`cevap`/`zorluk` rows mapped onto this API's
+/// `question`/`answer`/`difficulty` (the wire keeps the service's vocabulary).
+#[tokio::test]
+async fn the_questions_request_carries_its_knobs_and_maps_its_rows() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_QUESTIONS_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "items": [
+                { "soru": "DNA nedir?", "cevap": "Kalıtım molekülü.", "zorluk": "kolay" },
+                { "soru": "Baz eşleşmesi nedir?", "cevap": "A-T ve G-C.", "zorluk": "orta" },
+            ],
+            "abstained": false,
+            "reason": "",
+            "span_ids": ["s-3"],
+            "pages": [16],
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, student) = study_user(&bridge).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/questions",
+        Some(&cookie),
+        Some(json!({
+            "ders": "Satranç Kulübü",
+            "span_ids": ["s-3"],
+            "n": 2,
+            "difficulty": "kolay",
+            "seed_question": "DNA nedir?",
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body["items"],
+        json!([
+            { "question": "DNA nedir?", "answer": "Kalıtım molekülü.", "difficulty": "kolay" },
+            { "question": "Baz eşleşmesi nedir?", "answer": "A-T ve G-C.", "difficulty": "orta" },
+        ])
+    );
+    assert_eq!(res.body["abstained"], false);
+    assert_eq!(res.body["span_ids"], json!(["s-3"]));
+    assert_eq!(res.body["pages"], json!([16]));
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "one dispatch per call, never a re-send");
+    assert_eq!(seen[0].capability, AI_RAG_QUESTIONS_CAPABILITY);
+    let payload = &seen[0].payload;
+    assert_eq!(payload["asker"], student);
+    assert_eq!(payload["asker_role"], "student");
+    assert_eq!(payload["n"], 2);
+    assert_eq!(payload["difficulty"], "kolay");
+    assert_eq!(payload["seed_question"], "DNA nedir?");
+    assert_eq!(
+        payload["scope"],
+        json!({
+            "sinif": null,
+            "ders": "Satranç Kulübü",
+            "pages": [],
+            "span_ids": ["s-3"],
+            "scope_label": "",
+        })
+    );
+
+    // The knobs' defaults are the documented ones, and a body that names none
+    // of them still dispatches a well-formed request.
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/questions",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let seen = service.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].payload["n"], 5, "`n` defaults to 5");
+    assert_eq!(seen[1].payload["difficulty"], "orta");
+    assert_eq!(seen[1].payload["seed_question"], Value::Null);
+}
+
+/// A connected worker that does not carry the capability is not a worker for
+/// these doors: both answer the shared `503`, and nothing is dispatched.
+#[tokio::test]
+async fn no_study_worker_means_503_and_nothing_is_dispatched() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, _student) = study_user(&bridge).await;
+
+    for path in ["/rag/summarize", "/rag/questions"] {
+        let res = common::send(
+            &app,
+            "POST",
+            path,
+            Some(&cookie),
+            Some(json!({ "ders": "Satranç Kulübü" })),
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: {}",
+            res.body
+        );
+        assert_eq!(
+            res.body["error"], "no AI service is connected right now",
+            "{path}: {}",
+            res.body
+        );
+    }
+    assert!(
+        service.seen().is_empty(),
+        "a door refused for want of a capability dispatches nothing"
+    );
+}
+
+/// The body only *names* a target inside the asker's own derived pairs. A ders
+/// they hold no pair for, and a grade that is not the exact pair they hold, are
+/// both `403` — and neither reaches the service.
+#[tokio::test]
+async fn a_corpus_outside_the_askers_scope_is_refused() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY, AI_RAG_QUESTIONS_CAPABILITY]),
+        Behaviour::Answer(json!({ "text": "özet", "items": [] })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, _student) = study_user(&bridge).await;
+
+    for path in ["/rag/summarize", "/rag/questions"] {
+        // A subject this student is not enrolled in anywhere.
+        let res = common::send(
+            &app,
+            "POST",
+            path,
+            Some(&cookie),
+            Some(json!({ "ders": "Fizik" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}: {}", res.body);
+
+        // The club's own pair has no grade, so naming one is not that pair.
+        let res = common::send(
+            &app,
+            "POST",
+            path,
+            Some(&cookie),
+            Some(json!({ "ders": "Satranç Kulübü", "sinif": "10" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}: {}", res.body);
+    }
+    assert!(
+        service.seen().is_empty(),
+        "an out-of-scope request never reaches the service"
+    );
+
+    // A set size outside the door's own bound is a malformed body, refused
+    // before any dispatch.
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/questions",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü", "n": 21 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(service.seen().is_empty(), "`n` is judged before the dispatch");
+}
+
+/// An abstention is a complete answer on both doors: `200` with the service's
+/// own `reason`, never an error status.
+#[tokio::test]
+async fn an_abstained_study_answer_is_a_complete_200() {
+    let summary_bridge = bridge().await;
+    let _service = connect_service(
+        &summary_bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "Bu aralıkta özetlenecek içerik yok.",
+            "abstained": true,
+            "reason": "empty_scope",
+            "citations": [],
+            "scope_pages": [],
+            "hierarchical": false,
+        })),
+    )
+    .await;
+    await_workers(&summary_bridge, 1).await;
+    let (app, cookie, _student) = study_user(&summary_bridge).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/summarize",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["abstained"], true);
+    assert_eq!(res.body["reason"], "empty_scope");
+    assert_eq!(res.body["text"], "Bu aralıkta özetlenecek içerik yok.");
+
+    let questions_bridge = bridge().await;
+    let _service = connect_service(
+        &questions_bridge,
+        hello("rag", &[AI_RAG_QUESTIONS_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "items": [],
+            "abstained": true,
+            "reason": "insufficient_data",
+            "span_ids": [],
+            "pages": [],
+        })),
+    )
+    .await;
+    await_workers(&questions_bridge, 1).await;
+    let (app, cookie, _student) = study_user(&questions_bridge).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/questions",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["items"], json!([]));
+    assert_eq!(res.body["abstained"], true);
+    assert_eq!(res.body["reason"], "insufficient_data");
+}
+
+/// Two verdicts mean the **backend** built a request the service may not
+/// answer. The caller gets a `502` — not a refusal that reads as their own
+/// fault — and this side logs it as the bug it is.
+#[tokio::test]
+async fn a_verdict_that_blames_the_backends_own_request_is_a_502() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY]),
+        Behaviour::Answer(json!({
+            "text": "",
+            "abstained": true,
+            "reason": "role_required",
+            "citations": [],
+            "scope_pages": [],
+            "hierarchical": false,
+        })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, _student) = study_user(&bridge).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/summarize",
+        Some(&cookie),
+        Some(json!({ "ders": "Satranç Kulübü" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.body);
+    assert_eq!(res.body["error"], "role_required", "{}", res.body);
+}
+
 // ---- insights ----------------------------------------------------------
 
 use hezarfen_backend::ai::insight;

@@ -17,6 +17,7 @@
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`rag`] — the `rag.index` payloads, and the course-note dispatch behind them
 //! * [`rag_chat`] — the `rag.chat` payloads: a scoped question and the citations behind its answer
+//! * [`rag_study`] — the `rag.summarize`/`rag.questions` payloads: one range of one corpus, answered in one shot
 //! * [`podcast`] — the `podcast.*` job payloads, the relay behind submit/cancel,
 //!   and the job-state report the service calls back
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
@@ -38,6 +39,7 @@ pub mod podcast;
 pub mod protocol;
 pub mod rag;
 pub mod rag_chat;
+pub mod rag_study;
 pub mod registry;
 pub mod server;
 pub mod tls;

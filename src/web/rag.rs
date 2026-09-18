@@ -31,6 +31,13 @@
 //! restart therefore orphans a turn in flight: its row stays `pending` until a
 //! reader projects it failed, and the boot sweep stamps that verdict durably
 //! ([`crate::constant::RAG_PENDING_STALE_SECS`]).
+//!
+//! The two **study** doors (`POST /rag/summarize`, `POST /rag/questions`) are
+//! the exception to that shape, and deliberately: a summary or a question set
+//! is one artifact about one range of one corpus, so there is no thread to
+//! open, no row to poll and nothing stored — the request waits for the
+//! artifact, under a dispatch deadline kept inside the middleware's own
+//! envelope.
 
 use std::time::Duration;
 
@@ -53,9 +60,14 @@ use utoipa_axum::routes;
 
 use crate::ai::chat::ChatRole;
 use crate::ai::rag_chat::RagScopePair;
+use crate::ai::rag_study::{
+    self, RagQuestion, RagQuestionsPayload, RagQuestionsReply, RagScope, RagSummarizePayload,
+    RagSummarizeReply, RagSummaryCitation,
+};
 use crate::ai::AiBridge;
 use crate::constant::{
-    AI_RAG_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, REPLY_CHUNKS,
+    AI_RAG_CHAT_CAPABILITY, AI_RAG_QUESTIONS_CAPABILITY, AI_RAG_SUMMARIZE_CAPABILITY,
+    CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, MAX_RAG_QUESTIONS, REPLY_CHUNKS,
 };
 use crate::database::Database;
 use crate::domain::rag_message::{
@@ -78,6 +90,10 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(list_messages, send_message))
         .routes(routes!(read_message))
         .routes(routes!(stream_message))
+        // One `routes!(…)` call is one *path*: two handlers in it must share
+        // it (different methods). These two doors share neither.
+        .routes(routes!(summarize))
+        .routes(routes!(questions))
 }
 
 // ---- threads ----------------------------------------------------------
@@ -828,6 +844,386 @@ async fn stream_message(
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()))
 }
 
+// ---- the one-shot study doors ----------------------------------------------
+//
+// Two capabilities of the same RAG service, each exactly one dispatch: a
+// summary of one page/span range, and a set of practice questions over one.
+// They are this nest's only doors that neither thread nor store — the artifact
+// *is* the answer — so they wait for it, and no per-user rate limiter charges
+// them: one-shot requests cannot be retried into a loop the way a thread can,
+// and the RAG counts its own per-call rate and budget caps.
+//
+// Authorization is the nest's own scope derivation, applied twice: the asker's
+// `(sinif, ders)` pairs come from [`service::rag_scope::for_user`] — never from
+// the body — and the body only *names* a target inside them
+// ([`resolve_study_pair`]). The pair that travels to the service is the derived
+// one, so the corpus it retrieves from is a corpus the backend already decided
+// the asker may study. The service's own scope guard is defence in depth: when
+// it answers `role_required`/`scope_mismatch` the **backend** built a bad
+// request, and that is reported as one (a `502`, logged by
+// [`crate::ai::rag_study`]).
+
+/// The scope half of a study request: which corpus, and which range inside it.
+#[derive(Deserialize, ToSchema)]
+struct StudyScopeRequest {
+    /// The subject/course to study. Required, non-empty.
+    ders: String,
+    /// The şube/grade the corpus belongs to. Optional — a school-wide corpus
+    /// (club/etüt) has none — and required in practice when the subject is
+    /// taught at more than one grade: the door then answers `400` instead of
+    /// guessing which section the caller meant.
+    #[serde(default)]
+    sinif: Option<String>,
+    /// Pages of the corpus to work over. Normally exactly one of
+    /// `pages`/`span_ids` is named; naming neither is answered by the service
+    /// as an abstention (`empty_scope`), not refused here.
+    #[serde(default)]
+    pages: Vec<i64>,
+    /// Retrieval span ids to work over, for a range the caller already holds
+    /// from an earlier retrieval.
+    #[serde(default)]
+    span_ids: Vec<String>,
+    /// A human label for the range (the heading the caller selected).
+    #[serde(default)]
+    scope_label: Option<String>,
+}
+
+impl StudyScopeRequest {
+    /// The wire scope this request names, with the **resolved** pair as its
+    /// `(sinif, ders)` half: the corpus the service is addressed to is the one
+    /// the asker's own memberships authorized, never the body's spelling of
+    /// it.
+    fn into_scope(self, pair: RagScopePair) -> RagScope {
+        RagScope {
+            sinif: pair.sinif,
+            ders: pair.ders,
+            pages: self.pages,
+            span_ids: self.span_ids,
+            scope_label: self.scope_label.unwrap_or_default(),
+        }
+    }
+}
+
+/// A `/rag/questions` body: the same scope, plus the shape of the set to
+/// generate.
+#[derive(Deserialize, ToSchema)]
+struct QuestionsRequest {
+    #[serde(flatten)]
+    scope: StudyScopeRequest,
+    /// How many questions to generate. Defaults to 5; the door holds it to
+    /// `1..=20`.
+    #[serde(default = "default_question_count")]
+    n: u32,
+    /// The difficulty asked for, in the service's own vocabulary
+    /// (`kolay`/`orta`/`zor`), defaulting to `orta`. Forwarded, never judged
+    /// here: the vocabulary belongs to the service.
+    #[serde(default = "default_difficulty")]
+    difficulty: String,
+    /// A question to base the set on, when the caller wants variations of one
+    /// particular exercise. Omitted means "any question within the range".
+    #[serde(default)]
+    seed_question: Option<String>,
+}
+
+fn default_question_count() -> u32 {
+    5
+}
+
+fn default_difficulty() -> String {
+    "orta".to_string()
+}
+
+/// One citation behind a summary, as the bridge carries it. Unlike `rag.chat`'s
+/// citations it names no corpus document, so nothing here resolves to a
+/// course-note file: a summary is addressed to a range the caller selected.
+#[derive(Serialize, ToSchema)]
+struct RagSummaryCitationResponse {
+    n: u32,
+    pages: Vec<i64>,
+    span_ids: Vec<String>,
+}
+
+impl From<RagSummaryCitation> for RagSummaryCitationResponse {
+    fn from(citation: RagSummaryCitation) -> Self {
+        Self {
+            n: citation.n,
+            pages: citation.pages,
+            span_ids: citation.span_ids,
+        }
+    }
+}
+
+/// A summary of one range of one corpus. `abstained` with a `reason` is a
+/// complete answer, exactly as it is on a chat turn.
+#[derive(Serialize, ToSchema)]
+struct RagSummarizeResponse {
+    text: String,
+    abstained: bool,
+    reason: String,
+    citations: Vec<RagSummaryCitationResponse>,
+    /// The pages the summary actually covered.
+    scope_pages: Vec<i64>,
+    /// Whether the service summarized hierarchically (per section, then rolled
+    /// up) rather than flat.
+    hierarchical: bool,
+}
+
+impl From<RagSummarizeReply> for RagSummarizeResponse {
+    fn from(reply: RagSummarizeReply) -> Self {
+        Self {
+            text: reply.text,
+            abstained: reply.abstained,
+            reason: reply.reason,
+            citations: reply.citations.into_iter().map(Into::into).collect(),
+            scope_pages: reply.scope_pages,
+            hierarchical: reply.hierarchical,
+        }
+    }
+}
+
+/// One generated practice question. The bridge's `soru`/`cevap`/`zorluk` become
+/// this API's `question`/`answer`/`difficulty` here: the wire keeps the
+/// service's vocabulary, the HTTP surface keeps the backend's.
+#[derive(Serialize, ToSchema)]
+struct RagQuestionResponse {
+    question: String,
+    answer: String,
+    difficulty: String,
+}
+
+impl From<RagQuestion> for RagQuestionResponse {
+    fn from(question: RagQuestion) -> Self {
+        Self {
+            question: question.soru,
+            answer: question.cevap,
+            difficulty: question.zorluk,
+        }
+    }
+}
+
+/// A generated set of practice questions over one range of one corpus.
+#[derive(Serialize, ToSchema)]
+struct RagQuestionsResponse {
+    items: Vec<RagQuestionResponse>,
+    abstained: bool,
+    reason: String,
+    /// The retrieval spans the whole set is bounded to.
+    span_ids: Vec<String>,
+    /// The pages those spans sit on.
+    pages: Vec<i64>,
+}
+
+impl From<RagQuestionsReply> for RagQuestionsResponse {
+    fn from(reply: RagQuestionsReply) -> Self {
+        Self {
+            items: reply.items.into_iter().map(Into::into).collect(),
+            abstained: reply.abstained,
+            reason: reply.reason,
+            span_ids: reply.span_ids,
+            pages: reply.pages,
+        }
+    }
+}
+
+/// The one `(sınıf, ders)` pair a study request may address, resolved against
+/// the asker's own derived pairs — the body only *names* a target inside them.
+///
+/// A named grade must be a pair the asker holds **exactly**; anything else is a
+/// `403`, because a corpus the asker cannot study must not be summarized on
+/// their behalf. An absent or empty grade resolves the subject alone: exactly
+/// one pair for that `ders` is the target, none is a `403`, and more than one
+/// is a `400` — the caller must name the şube, since picking one for them would
+/// answer from a corpus they did not name.
+fn resolve_study_pair(
+    pairs: &[RagScopePair],
+    ders: &str,
+    sinif: Option<&str>,
+) -> Result<RagScopePair, AppError> {
+    if ders.trim().is_empty() {
+        return Err(AppError::Validation(ValidationError::Empty("ders")));
+    }
+    match sinif.filter(|grade| !grade.trim().is_empty()) {
+        Some(grade) => pairs
+            .iter()
+            .find(|pair| pair.ders == ders && pair.sinif.as_deref() == Some(grade))
+            .cloned()
+            .ok_or(AppError::Forbidden(
+                "the requested ders/sinif pair is not in your scope",
+            )),
+        None => {
+            let mut candidates = pairs.iter().filter(|pair| pair.ders == ders);
+            let Some(first) = candidates.next() else {
+                return Err(AppError::Forbidden(
+                    "the requested ders is not in your scope",
+                ));
+            };
+            if candidates.next().is_some() {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field: "sinif",
+                    reason: "name the grade: this ders is taught in more than one",
+                }));
+            }
+            Ok(first.clone())
+        }
+    }
+}
+
+/// Summarize one range of one corpus the caller may study.
+///
+/// Synchronous by design: the summary is what the caller asked for, so there is
+/// no thread to open, no row to poll and nothing stored. The scope is derived
+/// from the asker's own memberships — never from the body, which only names a
+/// target inside them — and the `(sinif, ders)` pair that reaches the service
+/// is the derived one. `503` when no AI service offers `rag.summarize`.
+/// `abstained: true` with a `reason` is a complete answer riding a `200`.
+///
+/// The dispatch deadline (25 s) is deliberately under the middleware's own
+/// 30 s envelope ([`crate::constant::REQUEST_TIMEOUT_SECS`]): this door waits,
+/// and being dropped mid-flight would answer with prose written for a request
+/// that may have written something.
+#[utoipa::path(
+    post,
+    path = "/summarize",
+    tag = "rag",
+    security(("session_cookie" = [])),
+    request_body = StudyScopeRequest,
+    responses(
+        (status = 200, description = "The summary — possibly an abstention: `abstained: true` with a `reason` is a complete answer", body = RagSummarizeResponse),
+        (status = 400, description = "`ders` is empty, or `sinif` was omitted for a ders taught in more than one grade", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "The requested `(sinif, ders)` is not one of the caller's own scopes", body = ErrorResponse),
+        (status = 409, description = "The AI service refused to run the request — its model is unavailable, or the request was over its rate or budget cap", body = ErrorResponse),
+        (status = 502, description = "The AI service answered something this backend could not use, or built a request it refused", body = ErrorResponse),
+        (status = 503, description = "No AI service offers `rag.summarize` right now", body = ErrorResponse),
+        (status = 504, description = "The AI service did not answer within the dispatch deadline", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn summarize(
+    State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
+    CurrentUser(user): CurrentUser,
+    Json(req): Json<StudyScopeRequest>,
+) -> Result<Response, AppError> {
+    let Some(bridge) = st.ai.clone() else {
+        return Ok(ai_unavailable(
+            "the AI service is not enabled on this deployment",
+        ));
+    };
+    if !bridge.has_capability(AI_RAG_SUMMARIZE_CAPABILITY) {
+        return Ok(ai_unavailable("no AI service is connected right now"));
+    }
+
+    // The scope the corpus is routed by, derived from the asker's own
+    // memberships on every request — never from the body, so a caller cannot
+    // summarize a corpus they cannot study. The body's `ders`/`sinif` only pick
+    // a pair out of that set.
+    let pairs = service::rag_scope::for_user(&st.db, &user, user.get_role()).await?;
+    let pair = resolve_study_pair(&pairs, &req.ders, req.sinif.as_deref())?;
+    let payload = RagSummarizePayload {
+        scope: req.into_scope(pair),
+        // What the session already proves, never what the body claims.
+        asker: user.get_id().key(),
+        asker_role: user.get_role().as_str().to_string(),
+    };
+
+    match rag_study::summarize(&bridge, &slug, payload).await {
+        Ok(reply) => Ok(Json(RagSummarizeResponse::from(reply)).into_response()),
+        Err(code) => Ok(failure(&code)),
+    }
+}
+
+/// Generate practice questions over one range of one corpus the caller may
+/// study, with the answers bounded to that range.
+///
+/// One-shot and synchronous like [`summarize`], and gated the same way: the
+/// same derived scope, the same `403`/`400` resolution, the same `503` when no
+/// service offers the capability, and the same rule that an abstention is a
+/// complete answer on a `200`. What it adds is the shape of the set: `n`
+/// (default 5, at most [`MAX_RAG_QUESTIONS`]), `difficulty` (default `orta`)
+/// and an optional `seed_question` to generate variations of one exercise.
+#[utoipa::path(
+    post,
+    path = "/questions",
+    tag = "rag",
+    security(("session_cookie" = [])),
+    request_body = QuestionsRequest,
+    responses(
+        (status = 200, description = "The generated questions — possibly an abstention: `abstained: true` with a `reason` is a complete answer", body = RagQuestionsResponse),
+        (status = 400, description = "`ders` is empty, `sinif` was omitted for a ders taught in more than one grade, or `n` is outside `1..=20`", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "The requested `(sinif, ders)` is not one of the caller's own scopes", body = ErrorResponse),
+        (status = 409, description = "The AI service refused to run the request — its model is unavailable, or the request was over its rate or budget cap", body = ErrorResponse),
+        (status = 502, description = "The AI service answered something this backend could not use, or built a request it refused", body = ErrorResponse),
+        (status = 503, description = "No AI service offers `rag.questions` right now", body = ErrorResponse),
+        (status = 504, description = "The AI service did not answer within the dispatch deadline", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn questions(
+    State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
+    CurrentUser(user): CurrentUser,
+    Json(req): Json<QuestionsRequest>,
+) -> Result<Response, AppError> {
+    let Some(bridge) = st.ai.clone() else {
+        return Ok(ai_unavailable(
+            "the AI service is not enabled on this deployment",
+        ));
+    };
+    if !bridge.has_capability(AI_RAG_QUESTIONS_CAPABILITY) {
+        return Ok(ai_unavailable("no AI service is connected right now"));
+    }
+
+    let pairs = service::rag_scope::for_user(&st.db, &user, user.get_role()).await?;
+    let pair = resolve_study_pair(&pairs, &req.scope.ders, req.scope.sinif.as_deref())?;
+    if !(1..=MAX_RAG_QUESTIONS).contains(&req.n) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "n",
+            reason: "must be between 1 and 20",
+        }));
+    }
+    let payload = RagQuestionsPayload {
+        scope: req.scope.into_scope(pair),
+        asker: user.get_id().key(),
+        asker_role: user.get_role().as_str().to_string(),
+        n: req.n,
+        difficulty: req.difficulty,
+        seed_question: req.seed_question,
+    };
+
+    match rag_study::questions(&bridge, &slug, payload).await {
+        Ok(reply) => Ok(Json(RagQuestionsResponse::from(reply)).into_response()),
+        Err(code) => Ok(failure(&code)),
+    }
+}
+
+/// A relayed failure as the response a client branches on: the service's own
+/// code decides the status where it is one this backend knows, and anything
+/// else is a `502` — the backend cannot vouch for an answer it did not
+/// understand, and a gateway error is exactly that claim.
+///
+/// `role_required` and `scope_mismatch` land in that fallback deliberately:
+/// both mean the **backend** composed a request the service may not answer, so
+/// [`crate::ai::rag_study`] logs them as bugs where they are detected and the
+/// caller is told the gateway failed rather than being handed the service's own
+/// wording for this side's defect.
+fn failure(code: &str) -> Response {
+    let status = match code {
+        "bad_request" => StatusCode::BAD_REQUEST,
+        "not_found" => StatusCode::NOT_FOUND,
+        "not_ready" | "llm_unavailable" => StatusCode::CONFLICT,
+        "busy" | "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "timed_out" => StatusCode::GATEWAY_TIMEOUT,
+        "internal" => StatusCode::INTERNAL_SERVER_ERROR,
+        // `transport`, `protocol`, `bad_reply`, `role_required`,
+        // `scope_mismatch`, `service_error`, and any code the service
+        // invented: a bad gateway.
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(json!({ "error": code }))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,5 +1252,54 @@ mod tests {
         });
         assert_eq!(unresolved.file, None);
         assert_eq!(unresolved.pages, vec![3, 4]);
+    }
+
+    fn pair(sinif: Option<&str>, ders: &str) -> RagScopePair {
+        RagScopePair {
+            sinif: sinif.map(str::to_string),
+            ders: ders.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_study_pair_resolves_only_inside_the_askers_own_scope() {
+        let pairs = vec![
+            pair(Some("10"), "Biyoloji"),
+            pair(None, "Satranç Kulübü"),
+            pair(Some("9"), "Matematik"),
+        ];
+
+        // A named grade must be the exact pair, and the resolved pair is what
+        // travels — never the body's own spelling.
+        let resolved = resolve_study_pair(&pairs, "Biyoloji", Some("10")).unwrap();
+        assert_eq!(resolved.sinif.as_deref(), Some("10"));
+        let grade_less = resolve_study_pair(&pairs, "Satranç Kulübü", None).unwrap();
+        assert_eq!(grade_less.sinif, None);
+
+        // A grade the asker is not scoped to, and a ders they hold no pair
+        // for, are both `403` — a corpus they cannot study must not be
+        // summarized on their behalf.
+        assert!(matches!(
+            resolve_study_pair(&pairs, "Biyoloji", Some("11")),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            resolve_study_pair(&pairs, "Fizik", None),
+            Err(AppError::Forbidden(_))
+        ));
+        // An empty ders is a malformed body, not a scope refusal.
+        assert!(matches!(
+            resolve_study_pair(&pairs, "  ", None),
+            Err(AppError::Validation(ValidationError::Empty("ders")))
+        ));
+
+        // Two şubeler teaching one course: the caller must name the grade,
+        // because picking one for them answers from a corpus they did not name.
+        let two = vec![pair(Some("9"), "Fizik"), pair(Some("10"), "Fizik")];
+        assert!(matches!(
+            resolve_study_pair(&two, "Fizik", None),
+            Err(AppError::Validation(ValidationError::Invalid { field: "sinif", .. }))
+        ));
+        assert!(resolve_study_pair(&two, "Fizik", Some("10")).is_ok());
     }
 }

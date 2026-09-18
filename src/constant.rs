@@ -594,6 +594,39 @@ pub const AI_RAG_CHAT_CAPABILITY: &str = "rag.chat";
 /// alone.
 pub const AI_RAG_CHAT_TIMEOUT_SECS: u64 = 90;
 
+/// The capability an AI service declares to summarize one page/span range of
+/// one school's course-note corpus. One-shot and synchronous, unlike
+/// [`AI_RAG_CHAT_CAPABILITY`]: the caller names exactly one `(sinif, ders)`
+/// corpus plus the range inside it and waits for the summary itself — no
+/// thread, no stored row. With no worker carrying it the door reports the
+/// service as unavailable.
+pub const AI_RAG_SUMMARIZE_CAPABILITY: &str = "rag.summarize";
+
+/// Deadline on one `rag.summarize` round trip, and deliberately the short
+/// waiting-door budget of this family: the door **waits** for the summary and
+/// every HTTP request shares one envelope, [`REQUEST_TIMEOUT_SECS`] (30 s).
+/// That middleware drops the handler future wherever it stands and answers its
+/// own `503`, whose prose is written for a request that may have written
+/// something — wrong for a door that stores nothing. So the dispatch deadline
+/// stays **under** the ceiling: the service gets 25 s and this side's own error
+/// path fires first with the honest verdict (the service did not answer).
+/// Raising this value needs the middleware ceiling raised with it.
+pub const AI_RAG_SUMMARIZE_TIMEOUT_SECS: u64 = 25;
+
+/// The capability an AI service declares to generate practice questions over
+/// one page/span range of one school's course-note corpus, with the answers
+/// bounded to that range. Like [`AI_RAG_SUMMARIZE_CAPABILITY`] it is one-shot
+/// and synchronous — nothing is stored — and it is its own capability because a
+/// deployment may serve summaries without serving question generation.
+pub const AI_RAG_QUESTIONS_CAPABILITY: &str = "rag.questions";
+
+/// Deadline on one `rag.questions` round trip. The same waiting-door budget as
+/// [`AI_RAG_SUMMARIZE_TIMEOUT_SECS`] for the same reason: generating N
+/// questions is one model round trip the caller waits on, and it must finish
+/// inside the middleware's [`REQUEST_TIMEOUT_SECS`] envelope rather than be cut
+/// by it mid-flight.
+pub const AI_RAG_QUESTIONS_TIMEOUT_SECS: u64 = 25;
+
 /// The capability an AI service declares to analyse one student (ZEKA,
 /// `hezarfen_zeka`). It is the on-demand half of ZEKA — the service also
 /// recomputes on its own schedule — and it is what a teacher's "calculate" is
@@ -826,6 +859,13 @@ pub const PODCAST_INTERRUPTED_CODE: &str = "interrupted";
 /// is refused rather than silently narrowed: dropping pairs would answer a
 /// question the asker did not ask, scoped to corpora they did not name.
 pub const MAX_RAG_SCOPE_PAIRS: usize = 200;
+
+/// The most practice questions one `rag.questions` request may ask for. The
+/// caller waits on the generation, so this is the ceiling on one model round
+/// trip — not a corpus sweep — and the door refuses a larger set before it
+/// dispatches anything. Published at `GET /limits` (`rag.max_questions`) so a
+/// client bounds its own input instead of hard-coding the number.
+pub const MAX_RAG_QUESTIONS: u32 = 20;
 
 /// Default per-minute message limit for the RAG nest, when the school sets
 /// none — a lower ceiling than the chatbot's, since every message here spends

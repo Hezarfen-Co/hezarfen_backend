@@ -1436,6 +1436,8 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/questions/{id}/solutions/{sid}/image`                          | student | The solution photo's bytes. Access follows the question the solution hangs on — in practice school-wide, since solutions exist only on approved questions. |
 | POST   | `/questions/{id}/solutions/{sid}/image`                          | student | Attach (or replace) the solution's photo. Author only — and at any time, since solutions are never frozen. `multipart/form-data` with the image under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes` (settings). |
 | DELETE | `/questions/{id}/solutions/{sid}/image`                          | student | Remove the solution's photo. Author only, anytime — solutions are never frozen. |
+| POST   | `/rag/questions`                                                 | student | Generate practice questions over one range of one corpus the caller may study, with the answers bounded to that range. |
+| POST   | `/rag/summarize`                                                 | student | Summarize one range of one corpus the caller may study. |
 | GET    | `/rag/threads`                                                   | student | The caller's own threads, most recently active first. Paged via `?limit=&offset=`. Nobody — no teacher, no admin — reads anyone else's. |
 | POST   | `/rag/threads`                                                   | student | Start a new RAG thread, optionally named. Every authenticated role may ask — parents included. A user may keep up to the school's `max_chatbot_threads` threads *across both AI nests*; at the cap the request is refused (409) until an old thread is deleted — the cap is storage protection, not a usage quota (that is the per-minute message limit). |
 | PATCH  | `/rag/threads/{id}`                                              | student | Rename a thread, or clear its name (`title: null`). Owner only; someone else's thread is a `404`, never a `403`. The edit counts as activity, so the thread moves to the top of the list. |
@@ -4128,6 +4130,80 @@ file's ids: the service answers `{"files": [{"id": "<course_note_file id>",
 "doc_id": "<corpus doc id>"}]}`, naming the corpus id it assigned to each file
 it indexed. The backend pairs the echoed `doc_id` back to the file it sent, so
 a later citation's `doc_id` resolves to a downloadable file.
+
+### The `rag.summarize` and `rag.questions` capabilities
+
+Two more capabilities of the same RAG service, over the same `Request`/`Response`
+frames. Both are **one-shot**: the caller names exactly one `(sinif, ders)`
+corpus and a range inside it and waits for the artifact — a summary, or a set of
+practice questions. No thread, no stored row, no poll: where `rag.chat` runs the
+round trip behind a `202` with a 90 s budget, each of these rides a **25 s**
+dispatch deadline so it finishes inside the HTTP middleware's own 30 s envelope.
+
+`rag.summarize` asks for:
+
+```json
+{ "scope": { "sinif": "10", "ders": "biyoloji", "pages": [16, 17],
+             "span_ids": [], "scope_label": "DNA" },
+  "asker": "01ASKER", "asker_role": "teacher" }
+```
+
+`rag.questions` sends the same three keys plus the shape of the set:
+`n` (the number of questions), `difficulty` (`kolay`/`orta`/`zor`, whatever the
+service knows) and `seed_question` (`null` means "any question in the range").
+
+`sinif` is `null` for a school-wide corpus (club/etüt). `pages`/`span_ids` are
+the range — normally exactly one of them is used, and naming neither is answered
+by the service as an abstention (`empty_scope`) rather than refused here.
+`asker`/`asker_role` are the calling user and their live school role, exactly as
+on `rag.chat`.
+
+The summarize reply:
+
+```json
+{ "text": "…", "abstained": false, "reason": "",
+  "citations": [ { "n": 1, "pages": [16], "span_ids": ["s-3"] } ],
+  "scope_pages": [16, 17], "hierarchical": true }
+```
+
+The questions reply, whose row keys are the **service's** own:
+
+```json
+{ "items": [ { "soru": "…", "cevap": "…", "zorluk": "orta" } ],
+  "abstained": false, "reason": "", "span_ids": ["s-3"], "pages": [16] }
+```
+
+A refusal that is part of the answer stays here, as it does for `rag.chat`:
+`abstained: true` with a `reason` is a complete request, never an `err` frame.
+Every optional key defaults, but `text` (summarize) and `items` (questions) are
+required — a reply without the artifact is unreadable, not empty.
+
+The HTTP doors are `POST /rag/summarize` and `POST /rag/questions`, with a flat
+body: `ders` (required, non-empty), `sinif`, `pages`, `span_ids`, `scope_label`,
+and for questions `n` (default 5, at most 20), `difficulty` (default `orta`) and
+`seed_question`. Authorization is the nest's own scope derivation, applied
+twice: the caller's `(sınıf, ders)` pairs come from their live memberships and
+the body only **names a target inside them** — a pair the caller does not hold is
+a `403`, and omitting `sinif` for a ders taught at more than one grade is a
+`400`, because choosing a corpus for the caller would answer from material they
+never named. The door maps the service's `soru`/`cevap`/`zorluk` onto this API's
+`question`/`answer`/`difficulty`. `503` when no service offers the capability,
+`504` when the service does not answer in time, and `502` when it answers
+something unreadable — including the two verdicts that blame the request the
+**backend** built (`role_required`, `scope_mismatch`), which are logged as the
+bugs they are instead of being relayed as the caller's own fault.
+
+Two honest limits, on the RAG side, that the backend cannot paper over:
+
+* **A grade-less corpus is unroutable.** A `sinif: null` pair is legal on the
+  wire — a club or etüt membership produces one — but the RAG routes its corpora
+  by grade, so such a request is answered with an abstention rather than with
+  material from every grade. Grade-scoped pairs are the ones that retrieve.
+* **A summary citation cannot be opened.** A `rag.chat` citation carries the
+  corpus `doc_id` the backend resolves to the `course_note_file` behind it; a
+  summary is addressed to a range the caller selected rather than to one
+  document, so its citations carry no `doc_id` and there is no file to resolve —
+  the `[N]` markers point at pages and retrieval spans, not at downloads.
 
 ### API reads (the other direction)
 
