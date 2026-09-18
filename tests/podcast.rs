@@ -1091,6 +1091,103 @@ async fn an_empty_history_is_an_empty_page() {
     assert!(res.body["limit"].is_null());
 }
 
+/// `?source_id=` narrows the history to one note's own episodes — the studio
+/// panel's list — and `total` counts that same filtered predicate, so a client
+/// can page a scoped list. A note with no episodes is an empty page, not an
+/// error; omitting the filter still returns every job, so the absent case is
+/// exactly the response it always was.
+#[tokio::test]
+async fn the_history_scopes_to_one_note_when_asked() {
+    let (app, cookie, db) = app_without_ai().await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Matematik").await;
+    let first = create_note(&app, &teacher, &course).await;
+    let second = create_note(&app, &teacher, &course).await;
+    let empty = create_note(&app, &teacher, &course).await;
+    let user = common::me_id(&app, &cookie).await;
+    let base = now_ms() - 3 * 60 * 60 * 1_000;
+    let older = seed_listed_job(&db, Uuid::now_v7(), &user, &first, "done", base).await;
+    let newer = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        &first,
+        "failed",
+        base + 3_600_000,
+    )
+    .await;
+    let other = seed_listed_job(
+        &db,
+        Uuid::now_v7(),
+        &user,
+        &second,
+        "done",
+        base + 7_200_000,
+    )
+    .await;
+
+    let scoped = list_of(&app, &cookie, &format!("?source_id={first}")).await;
+    assert_eq!(scoped.status, StatusCode::OK, "{}", scoped.body);
+    assert_eq!(scoped.body["total"], 2, "the count is the filtered count");
+    assert_eq!(
+        ids_of(&scoped.body),
+        vec![newer.to_string(), older.to_string()],
+        "newest first, and only the asked note's rows"
+    );
+    assert!(
+        scoped.body["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["source_id"] == first),
+        "every row narrates the asked note: {}",
+        scoped.body
+    );
+
+    let second_only = list_of(&app, &cookie, &format!("?source_id={second}")).await;
+    assert_eq!(second_only.status, StatusCode::OK, "{}", second_only.body);
+    assert_eq!(second_only.body["total"], 1);
+    assert_eq!(ids_of(&second_only.body), vec![other.to_string()]);
+
+    let none = list_of(&app, &cookie, &format!("?source_id={empty}")).await;
+    assert_eq!(none.status, StatusCode::OK, "{}", none.body);
+    assert_eq!(none.body["total"], 0, "a note with no episodes is an empty page");
+    assert!(ids_of(&none.body).is_empty());
+
+    let all = list_of(&app, &cookie, "").await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    assert_eq!(all.body["total"], 3, "omitting the filter returns every job");
+    assert_eq!(ids_of(&all.body).len(), 3);
+}
+
+/// A `source_id` that is not a uuid is a `400` naming the field — refused
+/// rather than parsed to the nil id and answering an empty page that hides the
+/// caller's typo.
+#[tokio::test]
+async fn a_malformed_source_filter_is_refused() {
+    let (app, cookie, db) = app_without_ai().await;
+    let user = common::me_id(&app, &cookie).await;
+    let _ = seed_listed_job(&db, Uuid::now_v7(), &user, SOURCE_ID, "done", now_ms()).await;
+
+    for bad in ["not-a-uuid", "%20", ""] {
+        let res = list_of(&app, &cookie, &format!("?source_id={bad}")).await;
+        assert_eq!(
+            res.status,
+            StatusCode::BAD_REQUEST,
+            "source_id={bad:?}: {}",
+            res.body
+        );
+        assert!(
+            res.body["error"]
+                .as_str()
+                .expect("an error")
+                .contains("source_id"),
+            "the refusal names the field: {}",
+            res.body
+        );
+    }
+}
+
 /// A live job lists as itself, with everything only a finished episode can
 /// know left `null` — and a job nobody has updated inside its ETA-scaled
 /// window reads `failed`/`interrupted`, the same read-side projection the
@@ -1182,6 +1279,25 @@ async fn the_history_never_shows_another_schools_jobs() {
     assert_eq!(beta_list.body["total"], 1);
     assert_eq!(ids_of(&beta_list.body), vec![beta_job.to_string()]);
     assert_ne!(beta_list.body["items"][0]["job_id"], demo_job.to_string());
+
+    // The filter is school-scoped like the list itself: the demo school's own
+    // note scopes to its one job, and the other school's note id names no job
+    // here, whichever side asks — a foreign note id is an empty page, not a
+    // window into the other school.
+    let demo_scoped = list_of(app, &demo_cookie, &format!("?source_id={demo_note}")).await;
+    assert_eq!(demo_scoped.status, StatusCode::OK, "{}", demo_scoped.body);
+    assert_eq!(demo_scoped.body["total"], 1);
+    assert_eq!(ids_of(&demo_scoped.body), vec![demo_job.to_string()]);
+
+    let cross = list_of(app, &demo_cookie, &format!("?source_id={SOURCE_ID}")).await;
+    assert_eq!(cross.status, StatusCode::OK, "{}", cross.body);
+    assert_eq!(cross.body["total"], 0, "beta's note names no demo job");
+    assert!(ids_of(&cross.body).is_empty());
+
+    let cross_back = list_of(app, &beta_cookie, &format!("?source_id={demo_note}")).await;
+    assert_eq!(cross_back.status, StatusCode::OK, "{}", cross_back.body);
+    assert_eq!(cross_back.body["total"], 0, "demo's note names no beta job");
+    assert!(ids_of(&cross_back.body).is_empty());
 }
 
 // --------------------------------------------------------------- refusals --

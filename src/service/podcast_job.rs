@@ -11,6 +11,7 @@
 
 use crate::database::Database;
 use crate::db::podcast_job;
+use crate::domain::course_note::CourseNoteId;
 use crate::domain::podcast_job::{PodcastJob, PodcastJobId, PodcastJobState};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -151,13 +152,17 @@ pub async fn read_for(
 /// A user's own jobs, newest first, each paired with the title of the course
 /// note it narrates — `None` once that note is gone. The pairing is this
 /// list's whole extra read; everything else is the row.
+///
+/// `source_id` narrows the list to one course note; `None` leaves the whole
+/// history, byte-for-byte the response it always was.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
+    source_id: Option<&CourseNoteId>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<(PodcastJob, Option<String>)>, i64), AppError> {
-    podcast_job::list_for_user(db, user, limit, offset).await
+    podcast_job::list_for_user(db, user, source_id, limit, offset).await
 }
 
 /// Apply one report from the service. The order of the checks is the point:

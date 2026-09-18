@@ -106,19 +106,31 @@ pub async fn read_for(
 /// count that pages the list must count jobs, and a join there could only
 /// multiply or drop one. A note that is gone answers `None` — the job stays
 /// in the caller's history either way.
+///
+/// `source_id` narrows the list to one course note when given, and leaves it
+/// whole when absent. The filter is part of `from_where`, so the page and the
+/// count run the *same* predicate — a `total` that disagreed with the window
+/// would page forever. The stored column holds the string the submit door was
+/// handed verbatim ([`crate::service::podcast_job::create`]), so the compare
+/// is `lower(source_id) = $2` against the canonical key: an upper-case
+/// spelling of the same note still matches, and a note whose jobs exist is
+/// never silently reported empty.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
+    source_id: Option<&CourseNoteId>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<(PodcastJob, Option<String>)>, i64), AppError> {
-    let (rows, total) = PagedList::new(
-        "podcast_job WHERE user_id = $1",
-        "ORDER BY created_at DESC, id DESC",
-    )
-    .bind(user.uuid())
-    .run::<PodcastJob>(limit, offset, db)
-    .await?;
+    let from_where = match source_id {
+        Some(_) => "podcast_job WHERE user_id = $1 AND lower(source_id) = $2",
+        None => "podcast_job WHERE user_id = $1",
+    };
+    let mut list = PagedList::new(from_where, "ORDER BY created_at DESC, id DESC").bind(user.uuid());
+    if let Some(source_id) = source_id {
+        list = list.bind(source_id.key());
+    }
+    let (rows, total) = list.run::<PodcastJob>(limit, offset, db).await?;
     Ok((with_source_titles(db, rows).await?, total))
 }
 

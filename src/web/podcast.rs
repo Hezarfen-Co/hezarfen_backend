@@ -13,7 +13,8 @@
 //! Six doors:
 //!
 //! * `POST   /podcast/jobs`           — write the row, dispatch `podcast.submit`
-//! * `GET    /podcast/jobs`           — the caller's own history, newest first
+//! * `GET    /podcast/jobs`           — the caller's own history, newest first,
+//!   optionally narrowed to one course note (`?source_id=`)
 //! * `GET    /podcast/jobs/{id}`      — the row's snapshot (projected, see below)
 //! * `GET    /podcast/jobs/{id}/result` — a finished job's artifact references
 //! * `GET    /podcast/jobs/{id}/audio`  — streams the ingested episode
@@ -55,7 +56,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -320,6 +321,44 @@ impl JobSummary {
     }
 }
 
+/// The optional `?source_id=` filter on the history: keep only the episodes
+/// that narrate one course note. Omitted, the list is the caller's whole
+/// history — the same response it has always been.
+#[derive(Debug, Deserialize, IntoParams)]
+struct HistoryFilter {
+    /// Keep only the jobs that narrate this course note (a note id).
+    #[param(example = "019732e3-7b00-7000-8000-00000000face")]
+    source_id: Option<String>,
+}
+
+impl HistoryFilter {
+    /// Validate the filter into the note to scope by, or `None` for the whole
+    /// history. The key is parsed the same way the submit door and the title
+    /// lookup parse it ([`CourseNoteId::from_key`]): that path maps anything
+    /// that is not a uuid to the nil id, so a key that lands there is refused
+    /// rather than silently scoping to a note no row can name.
+    fn resolve(&self) -> Result<Option<CourseNoteId>, AppError> {
+        let Some(raw) = self.source_id.as_deref() else {
+            return Ok(None);
+        };
+        let key = raw.trim();
+        if key.is_empty() {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "source_id",
+                reason: "must not be empty",
+            }));
+        }
+        let note = CourseNoteId::from_key(key);
+        if note.uuid().is_nil() {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "source_id",
+                reason: "must be a hyphenated uuid",
+            }));
+        }
+        Ok(Some(note))
+    }
+}
+
 /// The caller's own episodes, newest first — every job the backend ever
 /// minted for this user, whatever state it stopped in, each with the title of
 /// the note it narrated. Paged via `?limit=&offset=`.
@@ -330,15 +369,20 @@ impl JobSummary {
 /// ETA-scaled window is presented as `failed` (the same read-side projection
 /// the per-id door applies); rows past the retention window stay listed —
 /// opening one is what earns the `410`.
+///
+/// `source_id` narrows the list to the jobs that narrate one course note — the
+/// studio panel that lists a note's own episodes — while leaving the door's
+/// school scoping, ordering and projection untouched. Omitted, the response is
+/// the caller's whole history, unchanged.
 #[utoipa::path(
     get,
     path = "/jobs",
     tag = "podcast",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, HistoryFilter),
     responses(
         (status = 200, description = "A page of the caller's episodes, newest first", body = Page<JobSummary>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, or source_id", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -346,9 +390,12 @@ async fn list(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
+    Query(filter): Query<HistoryFilter>,
 ) -> Result<Json<Page<JobSummary>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (jobs, total) = jobs::list_for_user(&st.db, user.get_id(), limit, offset).await?;
+    let source_id = filter.resolve()?;
+    let (jobs, total) =
+        jobs::list_for_user(&st.db, user.get_id(), source_id.as_ref(), limit, offset).await?;
     let items = jobs
         .into_iter()
         .map(|(job, source_title)| JobSummary::new(&job.projected(), source_title))
