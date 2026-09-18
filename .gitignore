@@ -1,6 +1,5 @@
 /target
 /data
 .env
-/history.txt
 /graphify-out
 /src/graphify-out
