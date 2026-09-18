@@ -55,6 +55,13 @@ pub use crate::constant::{
 pub struct StudentRequest {
     /// The student's user id.
     pub user_id: String,
+    /// Who asked for this compute: the caller the door authenticated, and the
+    /// principal every bridge read for this dispatch runs as. The service
+    /// passes it as `on_behalf_of`, because the synthetic `ai` principal a
+    /// read with nobody named would run as is refused `403` on a per-student
+    /// report (`/marks/{user}` and the rest) — the report answers a teacher or
+    /// a manager, never the service itself.
+    pub requested_by: String,
     /// ISO-8601 date to compute from; omitted, the service starts at the
     /// term's beginning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +102,8 @@ pub struct StudentResponse {
 pub struct ClassRequest {
     /// The course or class the analysis is about.
     pub course_id: String,
+    /// Who asked for this compute — see [`StudentRequest::requested_by`].
+    pub requested_by: String,
     /// The term to read; omitted, the service uses the current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub term: Option<String>,
@@ -121,16 +130,35 @@ pub struct ClassResponse {
     pub coverage: Option<Value>,
 }
 
+/// `roster_source` when the caller named the students themselves: the list is
+/// passed through exactly as given.
+pub const ROSTER_SOURCE_EXPLICIT: &str = "explicit";
+
+/// `roster_source` when the door filled `user_ids` from the school's own
+/// student roster (an empty request body).
+pub const ROSTER_SOURCE_SCHOOL: &str = "school";
+
 /// What the backend asks a service to recompute for a whole school.
 ///
-/// A batch job: with `user_ids` omitted the service works through its own
-/// configured student list — the backend does not enumerate one, because a
-/// school-wide roster is not something the bridge's read scope hands a
-/// service (same doc, item 3).
+/// A batch job, and the door always fills `user_ids`: a caller-named list
+/// passes through exactly as given ([`ROSTER_SOURCE_EXPLICIT`]), while an
+/// empty one is filled from the school's own student roster
+/// ([`ROSTER_SOURCE_SCHOOL`]) — the backend enumerates one now because the
+/// service's own roster discovery reads homework `assigned` lists, which a
+/// live school rarely fills, so an empty body used to sweep nobody.
+/// `roster_source` records which of the two the list was, so the run's counts
+/// read honestly: a `school` sweep that computed few students is a bounded
+/// run, not a caller who named few.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefreshRequest {
+    /// Who asked for this sweep — see [`StudentRequest::requested_by`].
+    pub requested_by: String,
+    /// The students to recompute, in the order the door resolved them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_ids: Option<Vec<String>>,
+    /// Which roster [`Self::user_ids`] came from: [`ROSTER_SOURCE_EXPLICIT`]
+    /// or [`ROSTER_SOURCE_SCHOOL`].
+    pub roster_source: String,
     /// Recompute even where a cached result is still valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
@@ -425,22 +453,34 @@ mod tests {
     fn the_request_names_are_the_contracts() {
         let request = StudentRequest {
             user_id: "user-1".into(),
+            requested_by: "user-9".into(),
             since: Some("2026-09-01".into()),
             sections: None,
         };
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
-            serde_json::json!({ "user_id": "user-1", "since": "2026-09-01" }),
-            "an omitted section list stays off the wire, not null"
+            serde_json::json!({
+                "user_id": "user-1",
+                "requested_by": "user-9",
+                "since": "2026-09-01",
+            }),
+            "a requested_by always rides the wire; an omitted section list stays off it, not null"
         );
 
         let refresh = RefreshRequest {
+            requested_by: "user-9".into(),
             user_ids: Some(vec!["user-1".into()]),
+            roster_source: ROSTER_SOURCE_EXPLICIT.into(),
             force: Some(true),
         };
         assert_eq!(
             serde_json::to_value(&refresh).unwrap(),
-            serde_json::json!({ "user_ids": ["user-1"], "force": true })
+            serde_json::json!({
+                "requested_by": "user-9",
+                "user_ids": ["user-1"],
+                "roster_source": "explicit",
+                "force": true,
+            })
         );
     }
 

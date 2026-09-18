@@ -202,6 +202,12 @@ const EXCLUDED: &[(&str, &str)] = &[
          service's own list, not something a browser assembles",
     ),
     (
+        "MAX_INSIGHT_REFRESH_STUDENTS",
+        "students one school-wide refresh may carry when its door fills the \
+         roster itself; the refresh batch is the AI service's own work unit, \
+         not a client-facing bound",
+    ),
+    (
         "AI_PODCAST_SUBMIT_CAPABILITY",
         "capability string an AI service declares",
     ),

@@ -710,6 +710,15 @@ pub const MAX_INSIGHT_PENDING_STUDENTS: usize = 20_000;
 /// mistake.
 pub const MAX_INSIGHT_PURGE_STUDENTS: usize = 20_000;
 
+/// The most students one `insight.refresh` may carry when its door fills an
+/// empty request body from the school's own roster. The service works through
+/// the list in its own batches (`ZEKA_REFRESH_BATCH`, 25 at a time) and
+/// records the rest as pending for its next run, so the ceiling is the frame's,
+/// not one run's — [`MAX_INSIGHT_PENDING_STUDENTS`]'s size class. Over it the
+/// door **refuses** rather than clipping: a clipped roster would leave students
+/// unanalysed while the run's ledger read as complete.
+pub const MAX_INSIGHT_REFRESH_STUDENTS: usize = 20_000;
+
 /// How long a `rag.chat` turn may sit `pending` before a reader projects it as
 /// failed. The RAG nest mirrors the chatbot's asynchronous send
 /// ([`CHATBOT_PENDING_STALE_SECS`]): the round trip outlives the request that

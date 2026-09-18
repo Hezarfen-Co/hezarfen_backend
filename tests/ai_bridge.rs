@@ -3463,6 +3463,7 @@ async fn an_insight_student_dispatch_names_the_school_and_round_trips() {
         &demo(),
         &hezarfen_backend::ai::StudentRequest {
             user_id: ali.clone(),
+            requested_by: ali.clone(),
             since: None,
             sections: None,
         },
@@ -3537,6 +3538,132 @@ async fn no_insight_refresh_worker_means_503_and_nothing_is_dispatched() {
     )
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+// ---- the requester and the roster a refresh reads -------------------------
+
+use hezarfen_backend::ai::insight::{ROSTER_SOURCE_EXPLICIT, ROSTER_SOURCE_SCHOOL};
+
+/// The ids of a JSON array of strings, sorted — the roster's own order is the
+/// database's (newest first), which is not what these tests are about.
+fn sorted_ids(value: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = value
+        .as_array()
+        .expect("a json array")
+        .iter()
+        .map(|id| id.as_str().expect("an id string").to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Every `insight.*` dispatch names the caller it runs as. The compute doors
+/// are authorized for the caller, so the service must read the student's data
+/// as that caller too — the synthetic `ai` principal those reads would
+/// otherwise run as is refused `403` on `/marks/{user}`. The refresh door also
+/// fills an empty body from the school's own student roster: its own discovery
+/// (homework `assigned` lists) does not name enough of a live school to sweep.
+#[tokio::test]
+async fn the_insight_doors_name_the_caller_and_the_refresh_roster_they_read() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello(
+            "zeka",
+            &[AI_INSIGHT_STUDENT_CAPABILITY, AI_INSIGHT_REFRESH_CAPABILITY],
+        ),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let staff_id = common::me_id(&app, &staff).await;
+    let ayse = common::login_as(&app, &db, "ayse", "student").await;
+    let ayse_id = common::me_id(&app, &ayse).await;
+    let veli = common::login_as(&app, &db, "veli", "student").await;
+    let veli_id = common::me_id(&app, &veli).await;
+
+    // The student door names the caller beside the student it computes.
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/insights/students/{ayse_id}"),
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let seen = await_seen(&service, 1).await;
+    assert_eq!(seen[0].payload["user_id"], ayse_id);
+    assert_eq!(seen[0].payload["requested_by"], staff_id);
+
+    // An empty refresh body carries the school's own roster — both students.
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    let seen = await_seen(&service, 2).await;
+    assert_eq!(seen[1].payload["requested_by"], staff_id);
+    assert_eq!(seen[1].payload["roster_source"], ROSTER_SOURCE_SCHOOL);
+    let mut expected = vec![ayse_id.clone(), veli_id.clone()];
+    expected.sort();
+    assert_eq!(sorted_ids(&seen[1].payload["user_ids"]), expected);
+
+    // A named list is used exactly as given, never widened to the roster.
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({ "user_ids": [veli_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    let seen = await_seen(&service, 3).await;
+    assert_eq!(seen[2].payload["roster_source"], ROSTER_SOURCE_EXPLICIT);
+    assert_eq!(seen[2].payload["requested_by"], staff_id);
+    assert_eq!(seen[2].payload["user_ids"], json!([veli_id]));
+}
+
+/// A school with no students still dispatches an honest empty sweep: the
+/// roster fill answers an empty list rather than refusing, so a refresh on a
+/// brand-new school completes with `0 requested` instead of vanishing.
+#[tokio::test]
+async fn an_empty_school_roster_still_dispatches_with_an_empty_list() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("zeka", &[AI_INSIGHT_REFRESH_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let staff = common::login_as(&app, &db, "mudur", "manager").await;
+    let staff_id = common::me_id(&app, &staff).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/insights/refresh",
+        Some(&staff),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let seen = await_seen(&service, 1).await;
+    assert_eq!(seen[0].payload["requested_by"], staff_id);
+    assert_eq!(seen[0].payload["roster_source"], ROSTER_SOURCE_SCHOOL);
+    assert_eq!(seen[0].payload["user_ids"], json!([]));
 }
 
 // ---- a capability a service contradicts --------------------------------

@@ -54,11 +54,14 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::ai::insight::{
-    self, PendingList, ProfileWriteRequest, PurgeRequest, RecommendationWriteRequest,
-    RefreshRequest, RunWriteRequest, SchoolDirectory, SegmentWriteRequest, StudentRequest,
-    SummaryWriteRequest, TableVerdicts, WriteReceipt,
+    self, PendingList, ProfileWriteRequest, PurgeRequest, ROSTER_SOURCE_EXPLICIT,
+    ROSTER_SOURCE_SCHOOL, RecommendationWriteRequest, RefreshRequest, RunWriteRequest,
+    SchoolDirectory, SegmentWriteRequest, StudentRequest, SummaryWriteRequest, TableVerdicts,
+    WriteReceipt,
 };
-use crate::constant::{AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY};
+use crate::constant::{
+    AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY, MAX_INSIGHT_REFRESH_STUDENTS,
+};
 use crate::database::Database;
 use crate::db;
 use crate::domain::class_group::ClassGroupId;
@@ -133,8 +136,9 @@ struct ComputeStudentRequest {
 
 #[derive(Deserialize, ToSchema, Default)]
 struct RefreshInsightsRequest {
-    /// Student user ids to recompute; omit for the service's own configured
-    /// list — the backend does not enumerate a school roster for it.
+    /// Student user ids to recompute; omit (or send an empty list) to sweep
+    /// the school's own student roster — every user holding the `student`
+    /// role. A named list is used exactly as given.
     user_ids: Option<Vec<String>>,
     /// Recompute even where the service considers its cached result valid.
     force: Option<bool>,
@@ -149,6 +153,10 @@ struct RefreshInsightsRequest {
 /// Authorization is [`student_insight`]'s, gate for gate: the caller must be
 /// able to read the student before they may ask for a recompute, and the
 /// refusal is a `404` (a foreign id and a missing one look the same).
+///
+/// The dispatch names the **caller** as `requested_by`, not the student: the
+/// service reads the student's marks and the rest as that caller, so a
+/// teacher's or manager's own reach is what the reads answer against.
 #[utoipa::path(
     post,
     path = "/students/{user}",
@@ -178,6 +186,7 @@ async fn compute_student(
     let body = body.map(|Json(body)| body).unwrap_or_default();
     let request = StudentRequest {
         user_id: target.key(),
+        requested_by: user.get_id().key(),
         since: body.since,
         sections: body.sections,
     };
@@ -212,6 +221,15 @@ async fn compute_student(
 /// Manager+ only: this is a school-wide batch, and the run it starts spends
 /// the service's whole time budget. `503` when no service offers
 /// `insight.refresh` — nothing is queued.
+///
+/// The dispatch names the **caller** as `requested_by` — the principal the
+/// service's own reads for the sweep run as — and always fills `user_ids`: a
+/// named list passes through exactly as given, while an empty body is filled
+/// from the school's own student roster (every user holding the `student`
+/// role). The service's own roster discovery reads homework `assigned` lists,
+/// so an empty body used to sweep nobody; the payload's `roster_source` records
+/// which roster the list was. A school with no students dispatches an empty
+/// list and answers `0` honestly.
 #[utoipa::path(
     post,
     path = "/refresh",
@@ -220,7 +238,7 @@ async fn compute_student(
     request_body = RefreshInsightsRequest,
     responses(
         (status = 202, description = "Queued; the service writes its run ledger on its own", body = AcceptedResponse),
-        (status = 400, description = "`user_ids` names something that is not a user id", body = ErrorResponse),
+        (status = 400, description = "`user_ids` names something that is not a user id, or the school's roster is larger than one refresh may carry", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 503, description = "No AI service offers `insight.refresh` right now; nothing was queued", body = ErrorResponse),
@@ -230,12 +248,18 @@ async fn compute_student(
 async fn refresh(
     State(st): State<AppState>,
     tenant: ResolvedTenant,
-    RequireManager(_user): RequireManager,
+    RequireManager(user): RequireManager,
     body: Option<Json<RefreshInsightsRequest>>,
 ) -> Result<Response, AppError> {
     let body = body.map(|Json(body)| body).unwrap_or_default();
+    let (roster, roster_source) = match normalized_ids(body.user_ids)? {
+        Some(ids) if !ids.is_empty() => (ids, ROSTER_SOURCE_EXPLICIT),
+        _ => (school_roster(&st.db).await?, ROSTER_SOURCE_SCHOOL),
+    };
     let request = RefreshRequest {
-        user_ids: normalized_ids(body.user_ids)?,
+        requested_by: user.get_id().key(),
+        user_ids: Some(roster),
+        roster_source: roster_source.to_string(),
         force: body.force,
     };
     let Some(bridge) = st.ai.clone() else {
@@ -249,9 +273,10 @@ async fn refresh(
 
     let slug = tenant.slug.clone();
     tokio::spawn(async move {
+        let source = request.roster_source.clone();
         match insight::refresh(&bridge, &slug, &request).await {
             Ok(answer) => tracing::info!(
-                "insight.refresh answered: {} requested, {} computed, {} skipped, {} failed",
+                "insight.refresh ({source} roster) answered: {} requested, {} computed, {} skipped, {} failed",
                 answer.requested.unwrap_or(0),
                 answer.computed.unwrap_or(0),
                 answer.skipped.unwrap_or(0),
@@ -571,6 +596,32 @@ fn normalized_ids(ids: Option<Vec<String>>) -> Result<Option<Vec<String>>, AppEr
             .collect::<Result<Vec<String>, AppError>>()
     })
     .transpose()
+}
+
+/// The school's own student roster, as the refresh door fills an empty request
+/// body with.
+///
+/// The same set the office's student table lists: every `app_user` holding the
+/// `student` role exactly, newest first ([`db::user::list_by_role`]). It is
+/// what the service cannot assemble itself — its own roster discovery reads
+/// homework `assigned` lists, which a live school rarely fills — so an empty
+/// body must name the school here or the sweep computes nobody.
+///
+/// Refused, never clipped, past
+/// [`MAX_INSIGHT_REFRESH_STUDENTS`](crate::constant::MAX_INSIGHT_REFRESH_STUDENTS):
+/// a clipped roster would leave students unanalysed while the run read as
+/// complete. A school with no students answers an empty list — a sweep that
+/// computed nobody is a true answer, not a failure.
+async fn school_roster(db: &Database) -> Result<Vec<String>, AppError> {
+    let students = db::user::list_by_role(db, Role::Student).await?;
+    if students.len() > MAX_INSIGHT_REFRESH_STUDENTS {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_ids",
+            reason: "the school's roster is larger than one refresh may carry; \
+                     name the students to recompute explicitly",
+        }));
+    }
+    Ok(students.iter().map(|user| user.get_id().key()).collect())
 }
 
 // ---- the reads -------------------------------------------------------------
