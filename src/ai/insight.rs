@@ -296,8 +296,10 @@ pub async fn refresh(
 
 /// Ask for one school-level report document, awaited. The request carries
 /// every row the document needs, and the answer carries the rendered HTML
-/// back; the deadline is [`AI_INSIGHT_REPORT_TIMEOUT_SECS`]. The caller
-/// stores the document — this function only moves it.
+/// back; the deadline is [`AI_INSIGHT_REPORT_TIMEOUT_SECS`] — short on
+/// purpose, so the caller's own error path wins the race against the request
+/// envelope ([`crate::constant::REQUEST_TIMEOUT_SECS`]). The caller stores the
+/// document — this function only moves it.
 pub async fn report(
     bridge: &AiBridge,
     school: &Slug,
@@ -592,4 +594,74 @@ mod tests {
         assert!(answer.signals.is_empty());
         assert!(answer.coverage.is_none());
     }
+
+    /// The report payload's own names, pinned on the encoded JSON for the same
+    /// reason as the request test above: `hezarfen_zeka` reads `kind`,
+    /// `run_day`, `school` and the four row lists by name.
+    #[test]
+    fn the_report_request_names_are_the_contracts() {
+        let request = ReportRequest {
+            kind: REPORT_KIND_SCHOOL.into(),
+            run_day: "2026-09-17".into(),
+            requested_by: "user-9".into(),
+            school: ReportSchool {
+                id: "school-1".into(),
+                slug: "demo".into(),
+                name: "Demo Okulu".into(),
+            },
+            summaries: Vec::new(),
+            recommendations: Vec::new(),
+            profiles: Vec::new(),
+            runs: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "kind": "okul",
+                "run_day": "2026-09-17",
+                "requested_by": "user-9",
+                "school": { "id": "school-1", "slug": "demo", "name": "Demo Okulu" },
+                "summaries": [],
+                "recommendations": [],
+                "profiles": [],
+                "runs": [],
+            })
+        );
+    }
+
+    /// A report answer without a document is not a partial answer: `html` is
+    /// the one member the door cannot do without, and a service that omits it
+    /// is out of step, not empty-handed — the door would rather refuse the
+    /// dispatch than store a blank artifact. Every other member stays optional.
+    #[test]
+    fn a_report_answer_without_html_does_not_parse() {
+        let missing = serde_json::from_value::<ReportResponse>(serde_json::json!({
+            "kind": "okul",
+            "run_day": "2026-09-17"
+        }));
+        assert!(
+            missing.is_err(),
+            "a documentless answer is Malformed, never an empty file"
+        );
+
+        let answer: ReportResponse =
+            serde_json::from_value(serde_json::json!({ "html": "<!doctype html><html></html>" }))
+                .expect("the rest is optional");
+        assert!(answer.notes.is_empty());
+        assert!(!answer.truncated);
+        assert!(answer.byte_size.is_none());
+    }
+
+    /// The report door waits on its dispatch inside ONE HTTP request, so its
+    /// deadline must stay under the request envelope
+    /// ([`crate::constant::REQUEST_TIMEOUT_SECS`]): the middleware drops the
+    /// handler future at that ceiling — mid-write included — and answers its
+    /// own `503` whose "the write may or may not have applied" prose is wrong
+    /// for a door that knows nothing was stored. Raising the dispatch deadline
+    /// without the ceiling silently re-breaks exactly that, so the invariant
+    /// is checked when this module compiles, not when a test runs.
+    const _: () = assert!(
+        AI_INSIGHT_REPORT_TIMEOUT_SECS < crate::constant::REQUEST_TIMEOUT_SECS,
+        "the report dispatch must lose the race to the middleware on purpose"
+    );
 }

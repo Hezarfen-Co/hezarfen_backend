@@ -644,14 +644,21 @@ pub const AI_INSIGHT_REFRESH_TIMEOUT_SECS: u64 = 300;
 /// way it never composes an insight row.
 pub const AI_INSIGHT_REPORT_CAPABILITY: &str = "insight.report";
 
-/// Deadline on one `insight.report` round trip. Sized like the refresh sweep's
-/// ceiling, because it renders the same school-wide row set: the service does
-/// no reads and no model calls, but a large school's rows are already on its
-/// side of the wire when this starts ticking. Unlike the other two insight
-/// dispatches, a caller *waits on this one* — the door stores the document
-/// before it answers, so the deadline is also the ceiling on what a manager
-/// can be made to wait for.
-pub const AI_INSIGHT_REPORT_TIMEOUT_SECS: u64 = 300;
+/// Deadline on one `insight.report` round trip, and deliberately the shortest
+/// whole-school deadline in this file: the report door is the one insight
+/// dispatch that **waits** — it stores the returned document before it answers
+/// — and every HTTP request shares one envelope, [`REQUEST_TIMEOUT_SECS`].
+/// That middleware drops the handler future wherever it stands, mid-write
+/// included, and answers its own `503` whose prose ("the write may or may not
+/// have applied") is wrong for a door that knows nothing was stored.
+///
+/// So the dispatch deadline stays **under** the middleware ceiling: the
+/// service gets 25 s, and the door's own error path fires first with the
+/// honest answer (nothing was stored; no temp file was ever opened). The
+/// school-wide row reads happen before the dispatch and share the same
+/// envelope, which is why the margin is not spent here. Raising this value
+/// needs the middleware ceiling raised with it.
+pub const AI_INSIGHT_REPORT_TIMEOUT_SECS: u64 = 25;
 
 // ---- zeka's storage surface (capabilities the *backend* serves) ------------
 //
