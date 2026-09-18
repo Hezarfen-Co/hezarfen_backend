@@ -1,0 +1,170 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT audience, product, rule_id, rule_version, scope, about, audience_role,\n                  course, evidence AS \"evidence: SqlJson<JsonValue>\",\n                  confidence, created_at, expires_at, retain_until\n           FROM zeka_recommendation ORDER BY audience, created_at, rule_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "audience",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "audience"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "product",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "product"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "rule_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "rule_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "rule_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "rule_version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "scope",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "scope"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "about",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "about"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "audience_role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "audience_role"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "course",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "evidence: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "evidence"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "confidence",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "confidence"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "expires_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_recommendation",
+            "name": "retain_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "14e1fd9d16713ee60c209e545fb9a2b3ef792d0acfdcecff7c8fd50362454a69"
+}

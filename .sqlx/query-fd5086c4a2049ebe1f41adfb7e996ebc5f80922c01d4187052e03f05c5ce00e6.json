@@ -1,0 +1,110 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT student,\n                  marks AS \"marks?: SqlJson<JsonValue>\",\n                  attendance AS \"attendance?: SqlJson<JsonValue>\",\n                  submission AS \"submission?: SqlJson<JsonValue>\",\n                  study AS \"study?: SqlJson<JsonValue>\",\n                  confidence, computed_at, retain_until\n           FROM zeka_student_summary ORDER BY student",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "student",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "marks?: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "marks"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attendance?: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "attendance"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "submission?: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "submission"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "study?: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "study"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "confidence",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "confidence"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "computed_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "computed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_student_summary",
+            "name": "retain_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fd5086c4a2049ebe1f41adfb7e996ebc5f80922c01d4187052e03f05c5ce00e6"
+}

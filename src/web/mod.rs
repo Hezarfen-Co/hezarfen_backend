@@ -255,6 +255,49 @@ pub(crate) async fn remove_blob(files_path: &FsPath, key: &str) {
     }
 }
 
+/// How much of a stored blob is read per chunk, and how many chunks its body
+/// may have in flight. 4 × 64 KiB is the whole memory ceiling one stream
+/// costs, however large the file behind it. Shared by every streaming blob
+/// door (podcast audio, the insight report document).
+const BLOB_CHUNK_BYTES: usize = 64 * 1024;
+const BLOB_CHUNKS_IN_FLIGHT: usize = 4;
+
+/// A stored file as a byte stream: a reader task hands chunks to the body over
+/// a bounded channel, so a client that stops reading parks the pump at the
+/// next send instead of pinning the whole file in memory, and a closed body
+/// ends the task by itself.
+pub(crate) fn pump(
+    file: tokio::fs::File,
+) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(
+        BLOB_CHUNKS_IN_FLIGHT,
+    );
+    tokio::spawn(async move {
+        let mut file = file;
+        let mut buf = vec![0u8; BLOB_CHUNK_BYTES];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
 /// The declared content type of an inline-displayed image upload, held to the
 /// raster allowlist — SVG stays out (it can script) since these bytes are
 /// rendered inline to whole classes. Shared by exam question images and pool

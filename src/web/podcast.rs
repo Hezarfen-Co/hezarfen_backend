@@ -45,7 +45,7 @@
 //! fail is never queued.
 
 use axum::Json;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{Path, Query};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -53,9 +53,6 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::mpsc;
-use tokio_stream::Stream;
-use tokio_stream::wrappers::ReceiverStream;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -74,13 +71,7 @@ use crate::service::podcast_job as jobs;
 use crate::state::AppState;
 use crate::web::tenant_state::{SchoolSlug, State};
 
-use super::{CurrentUser, Page, PageParams, ai_unavailable};
-
-/// How much of the audio is read per chunk, and how many chunks the body may
-/// have in flight. 4 × 64 KiB is the whole memory ceiling one audio stream
-/// costs, however large the file behind it.
-const AUDIO_CHUNK_BYTES: usize = 64 * 1024;
-const AUDIO_CHUNKS_IN_FLIGHT: usize = 4;
+use super::{CurrentUser, Page, PageParams, ai_unavailable, pump};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -628,33 +619,6 @@ async fn owned(st: &AppState, user: &User, id: &str) -> Result<PodcastJob, AppEr
         return Err(AppError::Expired("this podcast job has expired"));
     }
     Ok(job)
-}
-
-/// A file as a byte stream: a reader task hands chunks to the body over a
-/// bounded channel, so a client that stops reading parks the pump at the next
-/// send instead of pinning the whole file in memory, and a closed body ends the
-/// task by itself.
-fn pump(file: tokio::fs::File) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(AUDIO_CHUNKS_IN_FLIGHT);
-    tokio::spawn(async move {
-        let mut file = file;
-        let mut buf = vec![0u8; AUDIO_CHUNK_BYTES];
-        loop {
-            match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-            }
-        }
-    });
-    ReceiverStream::new(rx)
 }
 
 /// Why a dispatching door has no worker to talk to. Deliberately small: the

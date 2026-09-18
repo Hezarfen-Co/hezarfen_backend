@@ -635,6 +635,24 @@ pub const AI_INSIGHT_REFRESH_CAPABILITY: &str = "insight.refresh";
 /// summary.
 pub const AI_INSIGHT_REFRESH_TIMEOUT_SECS: u64 = 300;
 
+/// The capability an AI service declares to render a school-level report
+/// document. The service computes nothing here: the backend already holds
+/// every row the document is built from (the `zeka_*` tables), sends them in
+/// the request, and stores the self-contained HTML the service answers with.
+/// The rendering lives in the service because the reader/report-package
+/// contract does — the backend never composes an insight document, the same
+/// way it never composes an insight row.
+pub const AI_INSIGHT_REPORT_CAPABILITY: &str = "insight.report";
+
+/// Deadline on one `insight.report` round trip. Sized like the refresh sweep's
+/// ceiling, because it renders the same school-wide row set: the service does
+/// no reads and no model calls, but a large school's rows are already on its
+/// side of the wire when this starts ticking. Unlike the other two insight
+/// dispatches, a caller *waits on this one* — the door stores the document
+/// before it answers, so the deadline is also the ceiling on what a manager
+/// can be made to wait for.
+pub const AI_INSIGHT_REPORT_TIMEOUT_SECS: u64 = 300;
+
 // ---- zeka's storage surface (capabilities the *backend* serves) ------------
 //
 // The three constants above are capabilities an AI service *declares*: the

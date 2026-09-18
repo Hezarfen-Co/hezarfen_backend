@@ -145,6 +145,16 @@ const EXCLUDED: &[(&str, &str)] = &[
         "deadline on one school-wide recompute; the run's own ledger is \
          `zeka_run`, which the client polls",
     ),
+    (
+        "AI_INSIGHT_REPORT_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_INSIGHT_REPORT_TIMEOUT_SECS",
+        "deadline on one school-level report render; the manager waits on the \
+         artifact itself and a client acts on the door's 200/409/503, never on \
+         this number",
+    ),
     // The storage surface ZEKA's rows are written through (the service calls
     // these; the backend runs them). A browser never speaks the bridge, and
     // the HTTP doors that mirror them publish what a client can act on.

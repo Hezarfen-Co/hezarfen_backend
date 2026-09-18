@@ -41,10 +41,20 @@
 //! student's compute can outlast the request-timeout layer
 //! ([`crate::constant::REQUEST_TIMEOUT_SECS`]). The client polls the stored
 //! rows — the compute doors change nothing a reader cannot already see.
+//!
+//! The **report** doors are the one exception, and deliberately: building the
+//! school's document is not a compute the service does on its own schedule —
+//! it is one artifact the manager asked for, rendered from rows the backend
+//! already holds, so `POST /runs/{run_day}/report` waits, stores the returned
+//! HTML under the school's own blob directory, and answers `200` with what
+//! was stored. `GET /runs/{run_day}/report` streams that document back.
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Path, Query};
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -53,14 +63,16 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::ai::error::AiError;
 use crate::ai::insight::{
-    self, PendingList, ProfileWriteRequest, PurgeRequest, ROSTER_SOURCE_EXPLICIT,
-    ROSTER_SOURCE_SCHOOL, RecommendationWriteRequest, RefreshRequest, RunWriteRequest,
+    self, PendingList, ProfileWriteRequest, PurgeRequest, REPORT_KIND_SCHOOL, ROSTER_SOURCE_EXPLICIT,
+    ROSTER_SOURCE_SCHOOL, RecommendationWriteRequest, RefreshRequest, ReportRequest, RunWriteRequest,
     SchoolDirectory, SegmentWriteRequest, StudentRequest, SummaryWriteRequest, TableVerdicts,
     WriteReceipt,
 };
 use crate::constant::{
-    AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY, MAX_INSIGHT_REFRESH_STUDENTS,
+    AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_REPORT_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY,
+    MAX_INSIGHT_REFRESH_STUDENTS,
 };
 use crate::database::Database;
 use crate::db;
@@ -75,7 +87,9 @@ use crate::state::AppState;
 use crate::tenant::ResolvedTenant;
 use crate::web::tenant_state::State;
 
-use super::{CurrentUser, Page, PageParams, RequireBuilder, RequireManager, ai_unavailable, paginate};
+use super::{
+    CurrentUser, Page, PageParams, RequireBuilder, RequireManager, ai_unavailable, paginate, pump,
+};
 
 /// The single `now` every card read is filtered against. ZEKA stores unix
 /// milliseconds, so "expired" is a comparison, not a projection.
@@ -89,6 +103,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(my_insight))
         .routes(routes!(student_insight, compute_student))
         .routes(routes!(list_runs, write_run))
+        .routes(routes!(generate_report, serve_report))
         .routes(routes!(write_summaries))
         .routes(routes!(write_recommendations))
         .routes(routes!(write_segments))
@@ -297,6 +312,286 @@ fn accepted() -> Response {
         }),
     )
         .into_response()
+}
+
+// ---- the report doors ------------------------------------------------------
+
+/// The receipt for a stored report. `generated_at` is this backend's clock the
+/// moment the document was stored — the artifact's age is what a manager
+/// re-clicking the button wants to see.
+#[derive(Serialize, ToSchema)]
+struct ReportReceipt {
+    /// The run day the document is about, `YYYY-MM-DD`.
+    #[schema(example = "2026-09-17")]
+    run_day: String,
+    /// The stored document's size in bytes.
+    byte_size: u64,
+    /// Whether the service clipped the document. A clipped report must not
+    /// read as a complete one.
+    truncated: bool,
+    /// The service's own remarks about the document — e.g. that the run day
+    /// has no ledger row. Shown to the manager beside the artifact.
+    notes: Vec<String>,
+    /// When this backend stored the document, unix milliseconds.
+    generated_at: i64,
+}
+
+/// Where a school's generated report documents live under its blob directory:
+/// one file per run day. The day is validated before it is joined (see
+/// [`db::insight::run_day_ok`]), so the key can carry no separator and no
+/// `..`.
+const REPORT_DIR: &str = "zeka_report";
+
+fn report_key(run_day: &str) -> String {
+    format!("{REPORT_DIR}/{run_day}.html")
+}
+
+/// Render the school's report for one run day, and store it. Synchronous, and
+/// deliberately so: the manager clicked one button, and the document is what
+/// they asked for — there is no queue to poll and no partial state, and the
+/// receipt says what was stored.
+///
+/// Manager+ only: the document is whole-school, like the refresh sweep and the
+/// run ledger. The payload is read from this school's own `zeka_*` tables and
+/// dispatched to the service that declares `insight.report`; the service may
+/// not read a database, so every row the document needs travels in the
+/// request — the same serde rows the storage surface writes.
+///
+/// A run day with no ledger row, or one whose tables are empty, is still a
+/// legal request: the service renders what it was given and says so in
+/// `notes`. Refusals: `503` when no service offers the capability, or it did
+/// not answer — nothing was stored; `429` when every worker is at capacity;
+/// and the service's own typed refusals, mapped per class by
+/// [`report_refusal`].
+#[utoipa::path(
+    post,
+    path = "/runs/{run_day}/report",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    params(("run_day" = String, Path, description = "The run day, `YYYY-MM-DD`")),
+    responses(
+        (status = 200, description = "The document was rendered and stored; the receipt says what was stored", body = ReportReceipt),
+        (status = 400, description = "`run_day` is not a `YYYY-MM-DD` day, or the AI service refused the composed request", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "The AI service answered, refusing — `report_refused`, or `report_empty` when it has no rows to render; nothing was stored", body = ErrorResponse),
+        (status = 413, description = "The rendered document is over the AI service's size ceiling; nothing was stored", body = ErrorResponse),
+        (status = 429, description = "Every AI service offering `insight.report` is at capacity", body = ErrorResponse),
+        (status = 503, description = "No AI service offers `insight.report`, or it did not answer; nothing was stored", body = ErrorResponse),
+    ),
+)]
+async fn generate_report(
+    State(st): State<AppState>,
+    tenant: ResolvedTenant,
+    RequireManager(user): RequireManager,
+    Path(run_day): Path<String>,
+) -> Result<Response, AppError> {
+    if !db::insight::run_day_ok(&run_day) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "run_day",
+            reason: "must be a `YYYY-MM-DD` day",
+        }));
+    }
+    let Some(bridge) = st.ai.clone() else {
+        return Ok(ai_unavailable(
+            "the AI service is not enabled on this deployment",
+        ));
+    };
+    if !bridge.has_capability(AI_INSIGHT_REPORT_CAPABILITY) {
+        return Ok(ai_unavailable("no AI service is connected right now"));
+    }
+    let Some(school) =
+        db::insight::school_identity(st.tenants.control(), tenant.slug.as_str()).await?
+    else {
+        return Err(AppError::Internal(format!(
+            "the resolved school `{}` has no control row",
+            tenant.slug.as_str()
+        )));
+    };
+    let request = ReportRequest {
+        kind: REPORT_KIND_SCHOOL.to_string(),
+        run_day: run_day.clone(),
+        requested_by: user.get_id().key(),
+        school,
+        summaries: db::insight::all_summaries(&st.db).await?,
+        recommendations: db::insight::all_recommendations(&st.db).await?,
+        profiles: db::insight::all_profiles(&st.db).await?,
+        runs: db::insight::runs_for_report(&st.db, &run_day).await?,
+    };
+    let answer = match insight::report(&bridge, &tenant.slug, &request).await {
+        Ok(answer) => answer,
+        Err(AiError::Remote { code, message }) => {
+            tracing::warn!("insight.report refused: {code}: {message}");
+            return Err(report_refusal(code, message));
+        }
+        Err(AiError::Busy(_)) => {
+            return Err(AppError::TooManyRequests { retry_after_secs: 5 });
+        }
+        // No worker (the capability was withdrawn between the check and the
+        // dispatch), a timeout, a transport or protocol failure: the document
+        // cannot be produced now, and claiming otherwise would store nothing.
+        Err(err) => {
+            tracing::warn!("insight.report failed: {err}");
+            return Ok(ai_unavailable(
+                "the AI service did not answer; nothing was stored",
+            ));
+        }
+    };
+    // An empty document is not a document: storing it would serve a blank
+    // page as if it were the report, and a manager would read that as "the
+    // school has nothing to say". Refused, never persisted.
+    if answer.html.trim().is_empty() {
+        tracing::error!("insight.report answered with an empty document for {run_day}");
+        return Err(AppError::Internal(
+            "the AI service answered with an empty document".to_string(),
+        ));
+    }
+    store_report(&st.files_path, &run_day, &answer.html).await?;
+    Ok(Json(ReportReceipt {
+        run_day,
+        byte_size: answer.html.len() as u64,
+        truncated: answer.truncated,
+        notes: answer.notes,
+        generated_at: now_millis(),
+    })
+    .into_response())
+}
+
+/// The service's refusal vocabulary as this door's HTTP answer.
+///
+/// The report service closes four codes (`hezarfen_zeka`'s handler) and a
+/// client branches on the class each becomes:
+///
+/// * `bad_request` — the service judged the composed request bad (an unserved
+///   kind, a malformed day, a row field that is not a list, a school
+///   disagreement). The payload is composed here, so this is a backend defect
+///   and the caller can only be told the request was refused; the service's
+///   own words go to the log.
+/// * `insufficient_rows` — all four row lists were empty, so there is no
+///   document to build. `409 report_empty`: no retry conjures data, a sweep
+///   does.
+/// * `document_too_large` — over the service's own HTML ceiling, which it
+///   never truncates past. `413`.
+/// * `internal` — the render failed on the service's side. `500`.
+///
+/// Anything else is `409 report_refused` with the service's code and message
+/// kept verbatim: a service may define codes this backend has never heard of,
+/// and swallowing them would hide the one explanation a caller needs.
+fn report_refusal(code: String, message: String) -> AppError {
+    match code.as_str() {
+        "bad_request" => AppError::Validation(ValidationError::Invalid {
+            field: "report",
+            reason: "the AI service refused the composed request; the reason is in the backend log",
+        }),
+        "insufficient_rows" => AppError::ConflictCoded {
+            code: "report_empty",
+            message: format!(
+                "the AI service has no rows to render a report from: {message}"
+            ),
+        },
+        "document_too_large" => AppError::PayloadTooLarge(format!(
+            "the rendered report is over the AI service's size ceiling, and it does not truncate: {message}"
+        )),
+        "internal" => AppError::Internal(format!(
+            "the AI service failed to render the report: {message}"
+        )),
+        _ => AppError::ConflictCoded {
+            code: "report_refused",
+            message: format!("the AI service refused the report: {code}: {message}"),
+        },
+    }
+}
+
+/// The stored report document, streamed.
+///
+/// `409 report_missing` when nothing has been generated for the day — a
+/// refusal that covers a day the ledger has never heard of too: generation
+/// accepts such a day on purpose (the document's `notes` say it), so a `404`
+/// here could refuse a day the POST door had just answered `200` for.
+#[utoipa::path(
+    get,
+    path = "/runs/{run_day}/report",
+    tag = "insights",
+    security(("session_cookie" = [])),
+    params(("run_day" = String, Path, description = "The run day, `YYYY-MM-DD`")),
+    responses(
+        (status = 200, description = "The stored document", content_type = "text/html"),
+        (status = 400, description = "`run_day` is not a `YYYY-MM-DD` day", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "No report has been generated for this day (`report_missing`)", body = ErrorResponse),
+    ),
+)]
+async fn serve_report(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(run_day): Path<String>,
+) -> Result<Response, AppError> {
+    if !db::insight::run_day_ok(&run_day) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "run_day",
+            reason: "must be a `YYYY-MM-DD` day",
+        }));
+    }
+    let key = report_key(&run_day);
+    let path = crate::web::blob_path(&st.files_path, &key);
+    let file = tokio::fs::File::open(&path).await.map_err(|err| {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!("could not open the stored report {key}: {err}");
+        }
+        AppError::ConflictCoded {
+            code: "report_missing",
+            message: format!("no report has been generated for `{run_day}` yet"),
+        }
+    })?;
+    Ok((
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (CACHE_CONTROL, HeaderValue::from_static("private, no-store")),
+        ],
+        Body::from_stream(pump(file)),
+    )
+        .into_response())
+}
+
+/// Store the rendered document under the school's own blob directory.
+///
+/// Written to a temp name and renamed into place: the artifact appears
+/// atomically or not at all, so a reader — or a second POST racing this one —
+/// can never open a half-written document. The temp file is removed if
+/// anything fails before the rename.
+async fn store_report(
+    files_path: &std::path::Path,
+    run_day: &str,
+    html: &str,
+) -> Result<(), AppError> {
+    crate::web::ensure_files_dir(files_path).await?;
+    let dir = crate::web::blob_path(files_path, REPORT_DIR);
+    tokio::fs::create_dir_all(&dir).await.map_err(|err| {
+        AppError::Internal(format!("failed to create the report directory: {err}"))
+    })?;
+    let temp = dir.join(format!(
+        ".report-{}.tmp",
+        crate::domain::monotonic_id::next_uuid()
+    ));
+    if let Err(err) = tokio::fs::write(&temp, html.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(AppError::Internal(format!(
+            "failed to write the report document: {err}"
+        )));
+    }
+    let path = crate::web::blob_path(files_path, &report_key(run_day));
+    if let Err(err) = tokio::fs::rename(&temp, &path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(AppError::Internal(format!(
+            "failed to store the report document: {err}"
+        )));
+    }
+    Ok(())
 }
 
 // ---- the storage doors -----------------------------------------------------

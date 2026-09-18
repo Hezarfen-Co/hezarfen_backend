@@ -5,8 +5,11 @@
 //!
 //! * **Outbound** (the backend dispatches to the service):
 //!   [`AI_INSIGHT_STUDENT_CAPABILITY`] — one student, on demand;
-//!   [`AI_INSIGHT_REFRESH_CAPABILITY`] — a school-wide sweep, on demand. The
-//!   dispatches below carry them ([`compute_student`], [`refresh`]).
+//!   [`AI_INSIGHT_REFRESH_CAPABILITY`] — a school-wide sweep, on demand;
+//!   [`AI_INSIGHT_REPORT_CAPABILITY`] — a school-level report document, on
+//!   demand (its request carries the rows the backend already holds). The
+//!   dispatches below carry them ([`compute_student`], [`refresh`],
+//!   [`report`]).
 //! * **Inbound** (the service calls the backend): the nine operations of
 //!   [`AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY`]'s family — the storage surface
 //!   ZEKA's `zeka_*` rows are written and read through, because **no AI
@@ -39,11 +42,15 @@ use serde_json::Value;
 use crate::ai::AiBridge;
 use crate::ai::error::AiError;
 use crate::ai::protocol::FrameError;
-use crate::constant::{AI_INSIGHT_REFRESH_TIMEOUT_SECS, AI_INSIGHT_STUDENT_TIMEOUT_SECS};
+use crate::constant::{
+    AI_INSIGHT_REFRESH_TIMEOUT_SECS, AI_INSIGHT_REPORT_TIMEOUT_SECS,
+    AI_INSIGHT_STUDENT_TIMEOUT_SECS,
+};
 use crate::tenant::Slug;
 
 pub use crate::constant::{
-    AI_INSIGHT_CLASS_CAPABILITY, AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY,
+    AI_INSIGHT_CLASS_CAPABILITY, AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_REPORT_CAPABILITY,
+    AI_INSIGHT_STUDENT_CAPABILITY,
 };
 
 /// What the backend asks a service to compute for one student.
@@ -167,7 +174,7 @@ pub struct RefreshRequest {
 /// The receipt for a refresh: what the sweep did, once it did it. The run's
 /// own ledger is `zeka_run` in the school database, which is what a reader
 /// polls while this answer is still on its way.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshResponse {
     #[serde(default)]
     pub started_at: Option<String>,
@@ -180,6 +187,76 @@ pub struct RefreshResponse {
     /// `{user_id, code, message}` per student the sweep could not compute.
     #[serde(default)]
     pub failed: Vec<Value>,
+}
+
+/// `kind` on a school-level report request — the one document kind this
+/// dispatch asks for today. Spelled as the service's own vocabulary spells it
+/// (`okul`), because it selects a builder there.
+pub const REPORT_KIND_SCHOOL: &str = "okul";
+
+/// What the backend asks a service to render for a whole school, for one run
+/// day.
+///
+/// Unlike the other two outbound requests, this one **carries the data**: the
+/// service computes nothing here, and it may not read a school's database, so
+/// the backend sends the rows it already holds from its own `zeka_*` tables —
+/// the same serde rows the storage surface writes ([`SummaryRow`],
+/// [`RecommendationRow`], [`ProfileRow`], [`RunRow`]) — and the service
+/// renders them into one self-contained document.
+///
+/// A run day with no `zeka_run` row, or one whose tables are empty, is a
+/// legal request: the lists are then empty (or missing the absent day) and
+/// the document's own `notes` say so. Nothing here refuses a day the ledger
+/// does not know.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportRequest {
+    /// [`REPORT_KIND_SCHOOL`] — which builder the service runs.
+    pub kind: String,
+    /// The run day the document is about, `YYYY-MM-DD`.
+    pub run_day: String,
+    /// Who asked for the document — see [`StudentRequest::requested_by`]. The
+    /// rendering reads nothing, but the service's logs name the requester.
+    pub requested_by: String,
+    /// The school's own identity, so the document prints a display name
+    /// rather than a slug.
+    pub school: ReportSchool,
+    /// Every stored summary (with its attention items) in the school.
+    pub summaries: Vec<SummaryRow>,
+    pub recommendations: Vec<RecommendationRow>,
+    pub profiles: Vec<ProfileRow>,
+    /// The ledger rows the document may show: the named day first when it
+    /// exists, then the newest days, at most a handful.
+    pub runs: Vec<RunRow>,
+}
+
+/// What the service rendered. `html` is the one required member: a response
+/// without a document is not a partial answer, it is a dispatch that produced
+/// nothing to store, and [`crate::ai::insight::report`]'s caller would rather
+/// refuse it than persist an empty file. The rest is the service's own
+/// bookkeeping, optional for the same reason every response member here is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportResponse {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub run_day: Option<String>,
+    /// `html` today — the format the stored artifact is served as. Recorded
+    /// rather than assumed, so a future format is visible on the wire.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// The self-contained document, `<!doctype html>` first.
+    pub html: String,
+    #[serde(default)]
+    pub byte_size: Option<u64>,
+    /// Whether the service clipped the document (a row set past its own
+    /// ceiling). Stored and reported verbatim: a clipped document must not
+    /// read as a complete one.
+    #[serde(default)]
+    pub truncated: bool,
+    /// The service's own remarks about the document — e.g. that the run day
+    /// has no ledger row. Shown to the manager beside the artifact.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// Compute one student's insight, awaited. No capability check here: the
@@ -217,8 +294,27 @@ pub async fn refresh(
     .await
 }
 
-/// One request, one typed answer — the two dispatches differ only in
-/// capability, deadline and payload type.
+/// Ask for one school-level report document, awaited. The request carries
+/// every row the document needs, and the answer carries the rendered HTML
+/// back; the deadline is [`AI_INSIGHT_REPORT_TIMEOUT_SECS`]. The caller
+/// stores the document — this function only moves it.
+pub async fn report(
+    bridge: &AiBridge,
+    school: &Slug,
+    request: &ReportRequest,
+) -> Result<ReportResponse, AiError> {
+    dispatch(
+        bridge,
+        school,
+        AI_INSIGHT_REPORT_CAPABILITY,
+        AI_INSIGHT_REPORT_TIMEOUT_SECS,
+        request,
+    )
+    .await
+}
+
+/// One request, one typed answer — the dispatches differ only in capability,
+/// deadline and payload type.
 ///
 /// A reply that does not parse as the expected type is a
 /// [`FrameError::Malformed`]: the bytes were JSON, but not this contract's
@@ -261,9 +357,9 @@ fn malformed(err: serde_json::Error) -> AiError {
 
 pub use crate::db::insight::{
     AttentionRow, PendingList, ProfileRow, ProfileWriteRequest, PurgeRequest, RecommendationRow,
-    RecommendationWriteRequest, RunRow, RunWriteRequest, SchoolDirectory, SegmentConfidences,
-    SegmentLabels, SegmentRow, SegmentWriteRequest, SummaryRow, SummaryWriteRequest,
-    TableVerdicts, WriteReceipt,
+    RecommendationWriteRequest, ReportSchool, RunRow, RunWriteRequest, SchoolDirectory,
+    SegmentConfidences, SegmentLabels, SegmentRow, SegmentWriteRequest, SummaryRow,
+    SummaryWriteRequest, TableVerdicts, WriteReceipt,
 };
 
 use crate::constant::{

@@ -1,0 +1,98 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT student, trigger, course, fact, window_from, window_to,\n                  evidence AS \"evidence: SqlJson<JsonValue>\"\n           FROM zeka_attention_item ORDER BY student, ord",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "student",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "trigger",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "trigger"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "course",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "fact",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "fact"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "window_from",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "window_from"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "window_to",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "window_to"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "evidence: SqlJson<JsonValue>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "zeka_attention_item",
+            "name": "evidence"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "34ecb6b00feed60a86453a9ef7b6a93569a3e21c0d6a8393871139f95f9612ba"
+}

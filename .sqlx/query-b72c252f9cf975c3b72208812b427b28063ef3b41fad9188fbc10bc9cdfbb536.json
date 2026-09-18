@@ -1,0 +1,173 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT run_day, started_at, finished_at, status, duration_ms,\n                  students_total, students_ok, students_failed, students_skipped,\n                  rows_written, budget_exceeded, budget_ms, retain_until\n           FROM zeka_run\n           ORDER BY (run_day = $1) DESC, started_at DESC, run_day DESC\n           LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_day",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "run_day"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "started_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "finished_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "duration_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "duration_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "students_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "students_total"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "students_ok",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "students_ok"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "students_failed",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "students_failed"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "students_skipped",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "students_skipped"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "rows_written",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "rows_written"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "budget_exceeded",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "budget_exceeded"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "budget_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "budget_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "zeka_run",
+            "name": "retain_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b72c252f9cf975c3b72208812b427b28063ef3b41fad9188fbc10bc9cdfbb536"
+}

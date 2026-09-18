@@ -43,6 +43,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::AssertSqlSafe;
+use sqlx::types::Json as SqlJson;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -313,6 +314,18 @@ pub struct SchoolDirectory {
     pub schools: Vec<String>,
 }
 
+/// One school's own identity, as a rendered report prints it. The bridge
+/// frame already names the school by slug, but a document that reaches a
+/// manager's screen carries the display name, and the control row is the only
+/// authority on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReportSchool {
+    /// `school.id` — the surrogate key, not the slug: a slug may be renamed.
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+}
+
 // ---- shared validation -----------------------------------------------------
 
 /// Refuse a batch past [`MAX_INSIGHT_BATCH_ROWS`] rather than taking it
@@ -357,7 +370,10 @@ fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, AppError> {
 
 /// `YYYY-MM-DD`, the ledger's key. Checked here so a malformed day is the
 /// caller's `invalid_payload` and not a CHECK violation dressed as a `500`.
-fn run_day_ok(day: &str) -> bool {
+/// The report doors share it: a run day shapes a blob key there, and a
+/// caller-supplied path segment that shapes a path is validated before it is
+/// joined.
+pub fn run_day_ok(day: &str) -> bool {
     let bytes = day.as_bytes();
     bytes.len() == 10
         && bytes
@@ -839,6 +855,226 @@ pub async fn active_schools(control: &Database) -> Result<SchoolDirectory, AppEr
     .fetch_all(control)
     .await?;
     Ok(SchoolDirectory { schools })
+}
+
+/// One school's identity row, by slug. `None` only for a slug the control
+/// database does not hold — a resolved tenant always has one, so a caller
+/// reads that as an internal fault, not as a refusal.
+pub async fn school_identity(
+    control: &Database,
+    slug: &str,
+) -> Result<Option<ReportSchool>, AppError> {
+    let row = sqlx::query!("SELECT id, name FROM school WHERE slug = $1", slug)
+        .fetch_optional(control)
+        .await?;
+    Ok(row.map(|row| ReportSchool {
+        id: row.id.to_string(),
+        slug: slug.to_string(),
+        name: row.name,
+    }))
+}
+
+// ---- the school-wide reads the report payload carries -----------------------
+//
+// Every read above is per-student or per-audience, because that is every
+// reader this nest had. A *document* about the school is the first caller that
+// needs the whole row set at once, so these four project each table straight
+// into the wire rows the bridge payload carries ([`SummaryRow`],
+// [`RecommendationRow`], [`ProfileRow`], [`RunRow`]) — one mapping, in one
+// place, shared by SQL and the wire. No filters: the document's own reader
+// (the service's report package) decides what it shows, and a backend that
+// pre-filtered would be a second, silent author of the report.
+
+/// Every stored summary with its attention items, in student order. The
+/// attention list is one query for the whole set, grouped by student — not
+/// one query per summary.
+pub async fn all_summaries(db: &Database) -> Result<Vec<SummaryRow>, AppError> {
+    let rows = sqlx::query!(
+        r#"SELECT student,
+                  marks AS "marks?: SqlJson<JsonValue>",
+                  attendance AS "attendance?: SqlJson<JsonValue>",
+                  submission AS "submission?: SqlJson<JsonValue>",
+                  study AS "study?: SqlJson<JsonValue>",
+                  confidence, computed_at, retain_until
+           FROM zeka_student_summary ORDER BY student"#
+    )
+    .fetch_all(db)
+    .await?;
+    let mut attention: BTreeMap<Uuid, Vec<AttentionRow>> = BTreeMap::new();
+    for row in sqlx::query!(
+        r#"SELECT student, trigger, course, fact, window_from, window_to,
+                  evidence AS "evidence: SqlJson<JsonValue>"
+           FROM zeka_attention_item ORDER BY student, ord"#
+    )
+    .fetch_all(db)
+    .await?
+    {
+        attention.entry(row.student).or_default().push(AttentionRow {
+            trigger: row.trigger,
+            course: row.course.map(|course| course.to_string()),
+            fact: row.fact,
+            window_from: row.window_from,
+            window_to: row.window_to,
+            evidence: row.evidence.0,
+        });
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| SummaryRow {
+            attention: attention.remove(&row.student).unwrap_or_default(),
+            student: row.student.to_string(),
+            marks: row.marks.map(|json| json.0),
+            attendance: row.attendance.map(|json| json.0),
+            submission: row.submission.map(|json| json.0),
+            study: row.study.map(|json| json.0),
+            confidence: row.confidence,
+            computed_at: row.computed_at,
+            retain_until: row.retain_until,
+        })
+        .collect())
+}
+
+/// Every stored card, whatever its audience, in a stable order. The write
+/// merged each row's `limitation` into its stored evidence object, so the
+/// read leaves the [write-side](RecommendationRow::limitation) field empty —
+/// a second copy here could only disagree with the one inside `evidence`.
+///
+/// The wire row carries no `dismissed_at`, so the stored dismissal trail
+/// (`dismissed_at`/`dismiss_by`/`dismiss_reason` on the table) does not
+/// travel: a consumer that gates on dismissal cannot fire on this read. That
+/// is a known gap of the report payload's contract — the reader that filters
+/// dismissals is the per-audience read ([`crate::web::insights`]), and
+/// widening the row here is a contract change this lane does not make.
+pub async fn all_recommendations(db: &Database) -> Result<Vec<RecommendationRow>, AppError> {
+    let rows = sqlx::query!(
+        r#"SELECT audience, product, rule_id, rule_version, scope, about, audience_role,
+                  course, evidence AS "evidence: SqlJson<JsonValue>",
+                  confidence, created_at, expires_at, retain_until
+           FROM zeka_recommendation ORDER BY audience, created_at, rule_id"#
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| RecommendationRow {
+            audience: row.audience.to_string(),
+            product: row.product,
+            rule_id: row.rule_id,
+            rule_version: row.rule_version,
+            scope: row.scope,
+            about: row.about.map(|about| about.to_string()),
+            audience_role: row.audience_role,
+            course: row.course.map(|course| course.to_string()),
+            evidence: row.evidence.0,
+            limitation: None,
+            confidence: row.confidence,
+            // The column is `created_at`; the wire row spells it `computed_at`,
+            // and the write maps the same pair the same way.
+            computed_at: row.created_at,
+            expires_at: row.expires_at,
+            retain_until: row.retain_until,
+        })
+        .collect())
+}
+
+/// Every stored segment profile, in student order. Noise rows (`confidence =
+/// 'none'`) are included: this read feeds a document, and the display floor is
+/// the reader's rule, applied where the reader applies it.
+pub async fn all_profiles(db: &Database) -> Result<Vec<ProfileRow>, AppError> {
+    let rows = sqlx::query!(
+        r#"SELECT student, dimension, label, n_answers, n_correct, accuracy,
+                  overall_n_answers, overall_accuracy, contrast, confidence,
+                  computed_at, retain_until
+           FROM zeka_student_segment_profile ORDER BY student, dimension, label"#
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ProfileRow {
+            student: row.student.to_string(),
+            dimension: row.dimension,
+            label: row.label,
+            n_answers: row.n_answers,
+            n_correct: row.n_correct,
+            accuracy: row.accuracy,
+            overall_n_answers: row.overall_n_answers,
+            overall_accuracy: row.overall_accuracy,
+            contrast: row.contrast,
+            confidence: row.confidence,
+            computed_at: row.computed_at,
+            retain_until: row.retain_until,
+        })
+        .collect())
+}
+
+/// How many ledger rows a report carries: the named day plus recent context.
+/// Deliberately small — the ledger is context for the document, which is
+/// about one day, not a ledger dump.
+const REPORT_RUNS: i64 = 5;
+
+/// The run ledger a report carries, with each run's children. The named day
+/// leads when it exists (a report about it must be able to show it even if it
+/// has scrolled out of the newest rows), then the newest days follow.
+pub async fn runs_for_report(db: &Database, run_day: &str) -> Result<Vec<RunRow>, AppError> {
+    let rows = sqlx::query!(
+        r#"SELECT run_day, started_at, finished_at, status, duration_ms,
+                  students_total, students_ok, students_failed, students_skipped,
+                  rows_written, budget_exceeded, budget_ms, retain_until
+           FROM zeka_run
+           ORDER BY (run_day = $1) DESC, started_at DESC, run_day DESC
+           LIMIT $2"#,
+        run_day,
+        REPORT_RUNS,
+    )
+    .fetch_all(db)
+    .await?;
+    let days: Vec<String> = rows.iter().map(|row| row.run_day.clone()).collect();
+    let mut pending: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in sqlx::query!(
+        r#"SELECT run, student FROM zeka_run_pending
+           WHERE run = ANY($1) ORDER BY run, ord"#,
+        &days
+    )
+    .fetch_all(db)
+    .await?
+    {
+        pending
+            .entry(row.run)
+            .or_default()
+            .push(row.student.to_string());
+    }
+    let mut failed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in sqlx::query!(
+        r#"SELECT run, module FROM zeka_run_failed_module
+           WHERE run = ANY($1) ORDER BY run, ord"#,
+        &days
+    )
+    .fetch_all(db)
+    .await?
+    {
+        failed.entry(row.run).or_default().push(row.module);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| RunRow {
+            pending_students: pending.remove(&row.run_day).unwrap_or_default(),
+            failed_modules: failed.remove(&row.run_day).unwrap_or_default(),
+            run_day: row.run_day,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            status: row.status,
+            duration_ms: row.duration_ms,
+            students_total: row.students_total,
+            students_ok: row.students_ok,
+            students_failed: row.students_failed,
+            students_skipped: row.students_skipped,
+            rows_written: row.rows_written,
+            budget_exceeded: row.budget_exceeded,
+            budget_ms: row.budget_ms,
+            retain_until: row.retain_until,
+        })
+        .collect())
 }
 
 // ---- retention -------------------------------------------------------------

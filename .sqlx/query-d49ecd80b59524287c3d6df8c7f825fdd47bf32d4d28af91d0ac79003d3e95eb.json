@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT run, module FROM zeka_run_failed_module\n           WHERE run = ANY($1) ORDER BY run, ord",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_run_failed_module",
+            "name": "run"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "module",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "zeka_run_failed_module",
+            "name": "module"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d49ecd80b59524287c3d6df8c7f825fdd47bf32d4d28af91d0ac79003d3e95eb"
+}
