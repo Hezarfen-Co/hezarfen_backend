@@ -55,6 +55,9 @@ struct UserLimits {
     max_display_name_len: usize,
     /// Free text under a profile's name.
     max_bio_len: usize,
+    /// A student number's length bound (free text; unique inside the school,
+    /// and only ever held by a `student` account).
+    max_student_number_len: usize,
     /// How many course references a profile read embeds — a cap on the
     /// response, not on membership. The full list stays at `/courses/me`.
     max_profile_courses: usize,
@@ -546,6 +549,7 @@ impl LimitsResponse {
                 max_name_len: MAX_NAME_LEN,
                 max_display_name_len: MAX_DISPLAY_NAME_LEN,
                 max_bio_len: MAX_BIO_LEN,
+                max_student_number_len: MAX_STUDENT_NUMBER_LEN,
                 max_profile_courses: MAX_PROFILE_COURSES,
                 max_profile_classes: MAX_PROFILE_CLASSES,
                 max_email_len: MAX_EMAIL_LEN,

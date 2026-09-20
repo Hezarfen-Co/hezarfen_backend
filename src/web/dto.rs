@@ -83,6 +83,12 @@ pub struct PersonRef {
     /// `"Name Surname"` join, else `null`.
     #[schema(example = "Ada Lovelace")]
     pub display_name: Option<String>,
+    /// The school-issued student number, `null` for every account that holds
+    /// none (every staff account included). Part of "who this is" the way a
+    /// username is, which is why it rides this ref rather than a route of its
+    /// own — a roster that names a student can name their number.
+    #[schema(example = "1234")]
+    pub student_number: Option<String>,
 }
 
 impl PersonRef {
@@ -103,6 +109,9 @@ impl PersonRef {
                 .get_display_name()
                 .map(|chosen| chosen.as_str().to_string())
                 .or_else(|| (!full.is_empty()).then(|| full.join(" "))),
+            student_number: user
+                .get_student_number()
+                .map(|number| number.as_str().to_string()),
         }
     }
 
@@ -124,6 +133,7 @@ impl PersonRef {
                 id: id.key().to_string(),
                 username: id.key().to_string(),
                 display_name: None,
+                student_number: None,
             })
     }
 }
@@ -156,6 +166,12 @@ pub struct UserResponse {
     #[schema(example = "ada")]
     pub username: String,
     pub role: Role,
+    /// The school-issued student number, unique inside the school. `null`
+    /// when the account holds none — every staff account, and any student the
+    /// office has not numbered yet. Only ever a value on a `student` row: a
+    /// role change away from `student` clears it.
+    #[schema(example = "1234")]
+    pub student_number: Option<String>,
     #[schema(example = "Ada")]
     pub name: Option<String>,
     #[schema(example = "Lovelace")]
@@ -194,6 +210,9 @@ impl UserResponse {
             id: user.get_id().key().to_string(),
             username: user.get_username().as_str().to_string(),
             role: user.get_role().into(),
+            student_number: user
+                .get_student_number()
+                .map(|number| number.as_str().to_string()),
             name: user.get_name().map(|v| v.as_str().to_string()),
             surname: user.get_surname().map(|v| v.as_str().to_string()),
             email: user.get_email().map(|v| v.as_str().to_string()),

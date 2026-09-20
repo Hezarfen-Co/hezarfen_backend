@@ -379,8 +379,14 @@ async fn create_school(
     let id = SchoolId::generate();
     let db = st.tenants.create(id, &slug, &name, modules).await?;
     let seeded = async {
-        crate::service::user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin)
-            .await?;
+        crate::service::user::create_with_role(
+            &db,
+            username,
+            Some(*person.get_id()),
+            Role::Admin,
+            None,
+        )
+        .await?;
         // The admin's person gets the membership the school row answers for —
         // idempotent, so a retried create after a torn pair completes it.
         service::person::link_school(&st.db, person.get_id(), &slug).await?;

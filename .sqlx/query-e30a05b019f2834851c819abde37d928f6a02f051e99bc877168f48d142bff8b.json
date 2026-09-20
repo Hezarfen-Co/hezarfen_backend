@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO app_user (id, username, person, role, created_at)\n           VALUES ($1, $2, $3, $4, $5)\n           RETURNING id AS \"id: UserId\",\n                     username AS \"username: Username\",\n                     person AS \"person: PersonId\",\n                     role AS \"role: Role\",\n                     name AS \"name: PersonName\",\n                     surname AS \"surname: PersonName\",\n                     email AS \"email: Email\",\n                     phone AS \"phone: Phone\",\n                     birth_date AS \"birth_date: BirthDate\",\n                     theme AS \"theme: Theme\",\n                     language AS \"language: Language\",\n                     palette_color AS \"palette_color: PaletteColor\",\n                     display_name AS \"display_name: DisplayName\",\n                     bio AS \"bio: Bio\",\n                     avatar_file,\n                     avatar_content_type AS \"avatar_content_type: FileContentType\",\n                     branch,\n                     avatar_size",
+  "query": "INSERT INTO app_user (id, username, person, role, student_number, created_at)\n           VALUES ($1, $2, $3, $4, $5, $6)\n           RETURNING id AS \"id: UserId\",\n                     username AS \"username: Username\",\n                     person AS \"person: PersonId\",\n                     role AS \"role: Role\",\n                     name AS \"name: PersonName\",\n                     surname AS \"surname: PersonName\",\n                     email AS \"email: Email\",\n                     phone AS \"phone: Phone\",\n                     birth_date AS \"birth_date: BirthDate\",\n                     theme AS \"theme: Theme\",\n                     language AS \"language: Language\",\n                     palette_color AS \"palette_color: PaletteColor\",\n                     display_name AS \"display_name: DisplayName\",\n                     bio AS \"bio: Bio\",\n                     avatar_file,\n                     avatar_content_type AS \"avatar_content_type: FileContentType\",\n                     branch,\n                     student_number AS \"student_number: StudentNumber\",\n                     avatar_size",
   "describe": {
     "columns": [
       {
@@ -192,6 +192,17 @@
       },
       {
         "ordinal": 17,
+        "name": "student_number: StudentNumber",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "student_number"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
         "name": "avatar_size",
         "type_info": "Int8",
         "origin": {
@@ -207,6 +218,7 @@
         "Uuid",
         "Text",
         "Uuid",
+        "Text",
         "Text",
         "Int8"
       ]
@@ -229,8 +241,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "22d8652b21f633600d075ca3aff634ad2ae34dfbc87907a1f41229365726763f"
+  "hash": "e30a05b019f2834851c819abde37d928f6a02f051e99bc877168f48d142bff8b"
 }

@@ -244,6 +244,12 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_PASSWORD_LEN as i64,
         ),
+        (
+            "CreateUser",
+            "student_number",
+            "maxLength",
+            MAX_STUDENT_NUMBER_LEN as i64,
+        ),
         ("SelectSchool", "school", "minLength", MIN_SLUG_LEN as i64),
         ("SelectSchool", "school", "maxLength", MAX_SLUG_LEN as i64),
         ("UpdateProfile", "name", "maxLength", MAX_NAME_LEN as i64),
@@ -263,6 +269,12 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "branch",
             "maxLength",
             MAX_SETTINGS_ITEM_LEN as i64,
+        ),
+        (
+            "UpdateProfile",
+            "student_number",
+            "maxLength",
+            MAX_STUDENT_NUMBER_LEN as i64,
         ),
         (
             "CreateNote",

@@ -20,7 +20,7 @@ use crate::domain::class_group::ClassGroupId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
 use crate::domain::role::Role;
-use crate::domain::user::{Password, User, UserId, Username};
+use crate::domain::user::{Password, StudentNumber, User, UserId, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
@@ -99,6 +99,13 @@ struct UpdateProfile {
     /// clear it (a school that lists no subjects stores none).
     #[schema(example = "Matematik", max_length = 50)]
     branch: Option<String>,
+    /// The school-issued student number of the account being patched, unique
+    /// inside the school. Only a `student` account may hold one — naming one
+    /// for any other role, or naming a number another student already holds,
+    /// is refused. Omit to keep the current value; send `""` (or whitespace)
+    /// to clear it.
+    #[schema(example = "1234", max_length = 32)]
+    student_number: Option<String>,
 }
 
 /// Partial UI-preference update. Same field semantics as [`UpdateProfile`]:
@@ -158,10 +165,47 @@ fn merge_branch(
     }
 }
 
+/// Resolve the `student_number` a request names. Same merge shape as
+/// [`merge_field`] — absent (or `null`) is "keep", blank is an explicit
+/// clear — plus the two checks a plain field does not carry:
+///
+/// * **The role gate.** A number names a student of this school, so only a
+///   `student` row may receive one; naming one for any other role is a 400,
+///   not a silent write the next role change would clear.
+/// * **The shape**, through [`StudentNumber`]: non-blank after trimming and
+///   within the published bound. Blank is a *clear* rather than a parse
+///   failure, so whitespace can never become a stored number — the same
+///   reading every other patchable field has.
+///
+/// `""` on a non-student stays a clear (a no-op: such a row never holds one),
+/// and a value that collides with another student's is the unique index's
+/// refusal — a 409 from the writer, never a pre-check that could race.
+fn merge_student_number(
+    patch: Option<&str>,
+    role: Role,
+) -> Result<Option<Option<StudentNumber>>, ValidationError> {
+    match patch {
+        None => Ok(None),
+        Some(raw) if raw.trim().is_empty() => Ok(Some(None)),
+        Some(raw) => {
+            if role != Role::Student {
+                return Err(StudentNumber::non_student_refusal());
+            }
+            Ok(Some(Some(StudentNumber::try_new(raw)?)))
+        }
+    }
+}
+
 /// Validate and persist exactly the info fields `req` carried — nothing is
 /// merged from `user`'s snapshot, so a concurrent PATCH of another field is not
 /// reverted. Shared by the self-service and admin profile endpoints — they
 /// differ only in whose row they load and who may call them.
+///
+/// `student_number` is resolved against the target's *live* role, read with the
+/// row we hold — so the role gate cannot be raced by a role change landing in
+/// between (a promotion that lands first makes this a 400; this write landing
+/// first leaves nothing behind, because the role write clears the number in the
+/// same statement).
 async fn apply_profile(
     user: User,
     req: &UpdateProfile,
@@ -176,6 +220,7 @@ async fn apply_profile(
     let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
     let display_name = merge_field(req.display_name.as_deref(), DisplayName::try_new)?;
     let bio = merge_field(req.bio.as_deref(), Bio::try_new)?;
+    let student_number = merge_student_number(req.student_number.as_deref(), user.get_role())?;
     // Only a request that actually names a branch pays the settings read.
     let branch = match req.branch {
         Some(_) => {
@@ -195,6 +240,7 @@ async fn apply_profile(
         display_name,
         bio,
         branch,
+        student_number,
     )
     .await?;
     Ok(UserResponse::new(&updated))
@@ -245,7 +291,7 @@ struct SearchUsers {
 /// student or parent naming a role they may not message is refused. Paged
 /// via `?limit=&offset=` like the other lists (omit `limit` for every
 /// match); returns a `{items, total, limit, offset}` envelope carrying only
-/// id/username/display name — no contact details.
+/// id/username/display name and the student number — no contact details.
 #[utoipa::path(
     get,
     path = "/search",
@@ -332,13 +378,21 @@ struct CreateUser {
     /// The role the account is born with. Omitted → `student`.
     #[schema(example = "teacher")]
     role: Option<String>,
+    /// The school-issued student number, unique inside the school. Only a
+    /// `student` account may hold one — naming one while creating any other
+    /// role is a `400`, and a number another student already holds is a `409`.
+    /// Omit to create the account unnumbered; blank is the same as omitted.
+    #[schema(example = "1234", max_length = 32)]
+    student_number: Option<String>,
 }
 
 /// Create a school account directly — the school-office path for adding a
 /// student or a staff member with no self-registration and no invite. Admin
 /// only. `{username, password}` are required and `role` is optional (omitted →
 /// `student`); the row is born with its role rather than promoted into it, so
-/// a new teacher is never briefly a student. The username is a global
+/// a new teacher is never briefly a student. `student_number` numbers a new
+/// student at mint time — a `409` when another student in this school already
+/// holds it, a `400` on a non-student role. The username is a global
 /// **person** credential exactly as at `POST /auth/register`: a name new
 /// everywhere creates the person and this school's `app_user`, while a person
 /// who already exists is attached to this school only when the password
@@ -353,10 +407,10 @@ struct CreateUser {
     request_body = CreateUser,
     responses(
         (status = 201, description = "Account created, holding the requested role", body = UserResponse),
-        (status = 400, description = "Invalid username or password (a reserved username included), or an unknown role", body = ErrorResponse),
+        (status = 400, description = "Invalid username or password (a reserved username included), an unknown role, or a student number on a non-student role", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
-        (status = 409, description = "The username is taken in this school, or that person exists under a different password", body = ErrorResponse),
+        (status = 409, description = "The username is taken in this school, that person exists under a different password, or the student number is already taken (`code: student_number_taken`)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -381,6 +435,10 @@ async fn create_user(
         Some(raw) => Role::try_from_str(raw)?,
         None => Role::Student,
     };
+    // The number is validated against the role the row is being born with
+    // (the same gate the profile writer applies), then bound into the mint —
+    // one statement, so a refused number leaves no half-created account.
+    let student_number = merge_student_number(req.student_number.as_deref(), role)?.flatten();
     let password = Password::try_new(&req.password)?;
     let password_hash = password.hash_async().await?;
 
@@ -399,10 +457,16 @@ async fn create_user(
 
     // School half, born with its role: a fresh row holds no enrollments or
     // teaching assignments for a later promotion to sweep. A username already
-    // taken in this school refuses here, before the membership is written.
-    let user =
-        crate::service::user::create_with_role(&st.db, username, Some(*person.get_id()), role)
-            .await?;
+    // taken in this school refuses here, before the membership is written, and
+    // so does a student number another student already holds.
+    let user = crate::service::user::create_with_role(
+        &st.db,
+        username,
+        Some(*person.get_id()),
+        role,
+        student_number,
+    )
+    .await?;
     crate::service::person::link_school(control, person.get_id(), &slug).await?;
     Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))
 }
@@ -411,7 +475,10 @@ async fn create_user(
 /// date, plus the public-profile pair `display_name` and `bio` (both readable
 /// school-wide at `GET /users/{id}/profile`, unlike the contact fields). Any
 /// authenticated role. Omitted fields stay as they are; an empty string clears
-/// a field.
+/// a field. `student_number` follows the same merge semantics, with two
+/// refusals of its own: naming one while the account is not a `student` is a
+/// `400`, and a number another student in this school already holds is a `409`
+/// (`code: student_number_taken`).
 #[utoipa::path(
     patch,
     path = "/me",
@@ -420,8 +487,9 @@ async fn create_user(
     request_body = UpdateProfile,
     responses(
         (status = 200, description = "Updated user", body = UserResponse),
-        (status = 400, description = "Invalid field", body = ErrorResponse),
+        (status = 400, description = "Invalid field, or a student number on a non-student account", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 409, description = "The student number is already taken (`code: student_number_taken`)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -487,7 +555,13 @@ async fn get_user(
 
 /// Update any user's personal info. Admin only — the school-office path for
 /// maintaining records on behalf of students and staff. Same field semantics
-/// as `PATCH /users/me`.
+/// as `PATCH /users/me`, `student_number` included: the number belongs to the
+/// student identity the office maintains, so this is the door that issues it —
+/// a `400` when the target is not a `student`, a `409`
+/// (`code: student_number_taken`) when another student in this school already
+/// holds it. A role change away from `student` clears it on its own
+/// (`PATCH /users/{id}/role`), which is also the answer to "this account is no
+/// longer a student".
 #[utoipa::path(
     patch,
     path = "/{id}/profile",
@@ -497,10 +571,11 @@ async fn get_user(
     request_body = UpdateProfile,
     responses(
         (status = 200, description = "Updated user", body = UserResponse),
-        (status = 400, description = "Invalid field", body = ErrorResponse),
+        (status = 400, description = "Invalid field, or a student number on a non-student account", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "The student number is already taken (`code: student_number_taken`)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -555,7 +630,10 @@ async fn update_user_preferences(
 /// A school that has already lost its admins is recovered by hand against the
 /// database, since the seed never promotes.
 /// Setting any non-`student` role also drops the user's course enrollments —
-/// only students enroll, so a promoted user leaves every roster. Demoting below
+/// only students enroll, so a promoted user leaves every roster — and clears
+/// the account's student number in the same transaction: the number names a
+/// student of this school, so no window exists where a promoted account still
+/// holds one. Demoting below
 /// `teacher` drops their course teaching assignments for the mirror reason, and
 /// withdraws their published appointment slots, cancelling the live bookings on
 /// them: nothing could reach either afterwards — a slot is listed only on its
@@ -827,6 +905,14 @@ async fn my_students(
 // and the counters that motivate. Deliberately *not* `UserResponse` — that one
 // carries email, phone, and birth date, which keep exactly the gate they have
 // today (self, teacher+, admin). Nothing here widens where they are reachable.
+//
+// The student number is deliberately on `UserResponse` (and `PersonRef`) and
+// *not* here: it is the school office's identifier for a student, readable
+// wherever the reader is already looking at student identity — the admin user
+// surfaces, the pickers, a parent's own children's roster — while this profile
+// is readable by every authenticated account school-wide. A number is not a
+// secret, but broadcasting one to the whole school is a widening nobody asked
+// for.
 
 /// A user's public profile. Contact details are not part of it, at any role.
 #[derive(Serialize, ToSchema)]

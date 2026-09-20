@@ -199,9 +199,15 @@ mod tests {
     /// row (and the membership and parent-link gates judge the exact role), so
     /// a fabricated id or the `fixture_user` default would not do.
     async fn person(db: &Database, username: &str, role: Role) -> User {
-        crate::db::user::create_with_role(db, Username::try_new(username).unwrap(), None, role)
-            .await
-            .unwrap()
+        crate::db::user::create_with_role(
+            db,
+            Username::try_new(username).unwrap(),
+            None,
+            role,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     /// A class section carrying a grade label — the half of every instance

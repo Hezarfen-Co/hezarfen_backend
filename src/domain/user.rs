@@ -9,7 +9,7 @@ use argon2::password_hash::phc::PasswordHash as PhcHash;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use uuid::Uuid;
 
-use crate::constant::{AI_PRINCIPAL_KEY, DECOY_PASSWORD};
+use crate::constant::{AI_PRINCIPAL_KEY, DECOY_PASSWORD, MAX_STUDENT_NUMBER_LEN};
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::person::PersonId;
@@ -17,7 +17,7 @@ use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::error::{AppError, ValidationError};
-use crate::validate::{validate_password, validate_username};
+use crate::validate::{validate_password, validate_required, validate_username};
 
 /// Typed user row id. A UUIDv7 minted by the process-wide monotonic
 /// generator, so `id` order is mint order.
@@ -72,6 +72,44 @@ impl Username {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// A validated student number. Construction canonicalizes the value the way
+/// [`Username`] does — the stored string is trimmed, because the partial unique
+/// index keys on it and `"1234 "` must collide with `"1234"`, not sit beside it
+/// as a second number the school never issued.
+///
+/// Shape only: non-blank and within [`MAX_STUDENT_NUMBER_LEN`]. Uniqueness is
+/// the index's, and *so is the role rule* — whether the holding account is a
+/// student is the write path's check (it holds the row), never this type's,
+/// which never sees a role.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct StudentNumber(String);
+
+impl StudentNumber {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        let trimmed = value.trim();
+        validate_required("student_number", trimmed, MAX_STUDENT_NUMBER_LEN)?;
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The refusal every write path answers when a number would land on a row
+    /// that is not a student. Spelled once because two layers must say the
+    /// same thing: the web layer's pre-check (against the role it read) and
+    /// the database's own `CHECK` on the row (against the role at write time,
+    /// which is what closes the read-then-write race) both answer a 400, and a
+    /// client must not have to tell two sentences apart for one rule.
+    pub fn non_student_refusal() -> ValidationError {
+        ValidationError::Invalid {
+            field: "student_number",
+            reason: "only a student account may hold a student number",
+        }
     }
 }
 
@@ -212,6 +250,12 @@ pub struct User {
     /// on rows minted before their person was known (boot seed order, tests).
     pub(crate) person: Option<PersonId>,
     pub(crate) role: Role,
+    /// The school-issued student number, unique inside the school. `None` on
+    /// every account that holds none — every staff account, and every student
+    /// its school has not numbered yet. Only a student row may carry one:
+    /// the write paths refuse a non-student, and the role cascade clears it in
+    /// the same transaction that leaves the student role.
+    pub(crate) student_number: Option<StudentNumber>,
     // Personal info, identical for every role. All optional: accounts are
     // created from bare credentials and filled in later, and rows from before
     // these fields existed simply read back as `None`.
@@ -256,6 +300,7 @@ impl User {
             username: Username(AI_PRINCIPAL_KEY.to_string()),
             person: None,
             role: Role::Ai,
+            student_number: None,
             name: None,
             surname: None,
             email: None,
@@ -286,6 +331,14 @@ impl User {
 
     pub fn get_role(&self) -> Role {
         self.role
+    }
+
+    /// The school-issued student number, as stored. Never non-`None` on a
+    /// non-student row — the writes that could spell that are refused at the
+    /// web layer, and the role cascade clears it on the way out of the student
+    /// role.
+    pub fn get_student_number(&self) -> Option<&StudentNumber> {
+        self.student_number.as_ref()
     }
 
     pub fn get_name(&self) -> Option<&PersonName> {
@@ -367,6 +420,17 @@ mod tests {
         // padding must not survive construction — otherwise "ali " and "ali"
         // become two distinct, visually identical accounts.
         assert_eq!(Username::try_new(" ali ").unwrap().as_str(), "ali");
+    }
+
+    #[tokio::test]
+    async fn student_number_newtype_validates_and_trims() {
+        // Trimmed like the username, because the unique index keys on the
+        // stored string: "1234 " and "1234" must be one number, not two.
+        assert_eq!(StudentNumber::try_new(" 1234 ").unwrap().as_str(), "1234");
+        assert!(StudentNumber::try_new("").is_err());
+        assert!(StudentNumber::try_new("   ").is_err());
+        assert!(StudentNumber::try_new(&"9".repeat(MAX_STUDENT_NUMBER_LEN)).is_ok());
+        assert!(StudentNumber::try_new(&"9".repeat(MAX_STUDENT_NUMBER_LEN + 1)).is_err());
     }
 
     #[tokio::test]

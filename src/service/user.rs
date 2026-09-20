@@ -11,7 +11,7 @@ use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
-use crate::domain::user::{Password, User, UserId, Username};
+use crate::domain::user::{Password, StudentNumber, User, UserId, Username};
 use crate::error::AppError;
 use crate::tenant::{Slug, Tenants};
 
@@ -58,7 +58,8 @@ pub async fn ensure_admin(
         // who registered the name first, so the hole cannot be healed
         // later; it has to be impossible to open.
         None => {
-            user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin).await?;
+            user::create_with_role(&db, username, Some(*person.get_id()), Role::Admin, None)
+                .await?;
             // No `username` field: with OTLP on every event is exported as a
             // log record, so an account name here leaves the process.
             tracing::info!("seeded the admin account named by ADMIN_USERNAME");
@@ -110,14 +111,16 @@ pub async fn create(
 }
 
 /// Mint a row holding `role` outright — the school-creation path, whose
-/// first account must be an admin from birth.
+/// first account must be an admin from birth — optionally numbered
+/// (`student_number`; only a `student` row may carry one, the caller's check).
 pub async fn create_with_role(
     db: &Database,
     username: Username,
     person: Option<PersonId>,
     role: Role,
+    student_number: Option<StudentNumber>,
 ) -> Result<User, AppError> {
-    user::create_with_role(db, username, person, role).await
+    user::create_with_role(db, username, person, role, student_number).await
 }
 
 /// One user row, for callers that only inspect it — the web layer's reads go
@@ -177,6 +180,10 @@ pub async fn set_profile(
     // school's `Settings::get_branches()` list is the caller's check, not this
     // one's.
     branch: Option<Option<String>>,
+    // The school-issued student number, clearable like `bio`; *being a
+    // student* is the caller's check (it holds the row), and uniqueness is
+    // the partial index's, mapped to a 409 in [`crate::db::user`].
+    student_number: Option<Option<StudentNumber>>,
 ) -> Result<User, AppError> {
     user::set_profile(
         db,
@@ -189,6 +196,7 @@ pub async fn set_profile(
         display_name,
         bio,
         branch,
+        student_number,
     )
     .await
 }

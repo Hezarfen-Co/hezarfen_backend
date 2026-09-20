@@ -129,6 +129,7 @@ impl MessageResponse {
                     id: id.key().to_string(),
                     username: id.key().to_string(),
                     display_name: None,
+                    student_number: None,
                 },
                 None,
             ),

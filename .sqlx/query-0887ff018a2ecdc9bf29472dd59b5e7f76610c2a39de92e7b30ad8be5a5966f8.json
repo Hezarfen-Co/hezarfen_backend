@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: UserId\",\n                  username AS \"username: Username\",\n                  person AS \"person: PersonId\",\n                  role AS \"role: Role\",\n                  name AS \"name: PersonName\",\n                  surname AS \"surname: PersonName\",\n                  email AS \"email: Email\",\n                  phone AS \"phone: Phone\",\n                  birth_date AS \"birth_date: BirthDate\",\n                  theme AS \"theme: Theme\",\n                  language AS \"language: Language\",\n                  palette_color AS \"palette_color: PaletteColor\",\n                  display_name AS \"display_name: DisplayName\",\n                  bio AS \"bio: Bio\",\n                  avatar_file,\n                  avatar_content_type AS \"avatar_content_type: FileContentType\",\n                  branch,\n                  avatar_size\n           FROM app_user WHERE role = $1 ORDER BY id DESC",
+  "query": "UPDATE app_user\n               SET role = $2,\n                   student_number = CASE WHEN $2 = 'student' THEN student_number ELSE NULL END\n               WHERE id = $1\n                 AND NOT (role = 'admin'\n                          AND $2 <> 'admin'\n                          AND (SELECT count(*) FROM app_user\n                               WHERE role = 'admin' AND id <> $1) = 0)\n               RETURNING id AS \"id: UserId\",\n                         username AS \"username: Username\",\n                         person AS \"person: PersonId\",\n                         role AS \"role: Role\",\n                         name AS \"name: PersonName\",\n                         surname AS \"surname: PersonName\",\n                         email AS \"email: Email\",\n                         phone AS \"phone: Phone\",\n                         birth_date AS \"birth_date: BirthDate\",\n                         theme AS \"theme: Theme\",\n                         language AS \"language: Language\",\n                         palette_color AS \"palette_color: PaletteColor\",\n                         display_name AS \"display_name: DisplayName\",\n                         bio AS \"bio: Bio\",\n                         avatar_file,\n                         avatar_content_type AS \"avatar_content_type: FileContentType\",\n                         branch,\n                         student_number AS \"student_number: StudentNumber\",\n                         avatar_size",
   "describe": {
     "columns": [
       {
@@ -192,6 +192,17 @@
       },
       {
         "ordinal": 17,
+        "name": "student_number: StudentNumber",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "student_number"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
         "name": "avatar_size",
         "type_info": "Int8",
         "origin": {
@@ -204,6 +215,7 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Text"
       ]
     },
@@ -225,8 +237,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "1a258b398d6023dbb6e42c7e3f3df270d77dc6d69959d376df8be1c170e74e88"
+  "hash": "0887ff018a2ecdc9bf29472dd59b5e7f76610c2a39de92e7b30ad8be5a5966f8"
 }

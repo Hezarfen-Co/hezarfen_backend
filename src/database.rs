@@ -463,6 +463,20 @@ pub fn exclusion_violation(err: &sqlx::Error) -> Option<&str> {
     }
 }
 
+/// The violated `CHECK` constraint's name, when `err` is a check violation
+/// (`23514`) — a row the statement would have written in a state its own DDL
+/// forbids. Named like [`unique_violation`] so a call site can tell which rule
+/// refused (`student_number IS NULL OR role = 'student'`) instead of answering
+/// a generic 500 for a caller's mistake.
+pub fn check_violation(err: &sqlx::Error) -> Option<&str> {
+    let db = err.as_database_error()?;
+    if db.code().as_deref() == Some("23514") {
+        db.constraint()
+    } else {
+        None
+    }
+}
+
 /// A foreign-key violation (`23503`): a parent row a statement names is gone.
 pub fn foreign_key_violation(err: &sqlx::Error) -> bool {
     err.as_database_error()

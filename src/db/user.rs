@@ -4,11 +4,11 @@
 //! the cascade lives in [`crate::service::user`].
 //!
 //! The compile-time macros map columns by name and check each decoded type
-//! against the prepare schema, so the seventeen user columns are spelled
+//! against the prepare schema, so the eighteen user columns are spelled
 //! out — newtype overrides included — in every static statement below. The
 //! repetitions are the check.
 
-use crate::database::{Database, tx_with_retry};
+use crate::database::{Database, check_violation, tx_with_retry, unique_violation};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::{PagedList, Param};
 use crate::domain::board::{Board, BoardId, BoardTitle};
@@ -19,8 +19,20 @@ use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Pho
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{User, UserId, Username};
+use crate::domain::user::{StudentNumber, User, UserId, Username};
 use crate::error::AppError;
+
+/// The answer a duplicate `student_number` gets, from both write paths that
+/// can raise one (the mint and the profile writer). One spelling so the two
+/// cannot drift, and `ConflictCoded` because the frontend branches on the
+/// cause — the number is refused by the partial unique index
+/// (`app_user_student_number`), not by anything the message could name.
+fn number_taken() -> AppError {
+    AppError::ConflictCoded {
+        code: "student_number_taken",
+        message: "student number already taken".to_owned(),
+    }
+}
 
 /// Register a new school account for the control-plane `person` whose
 /// credential login verifies — `person` is the join key, `None` only where the
@@ -33,7 +45,7 @@ pub async fn create(
     username: Username,
     person: Option<PersonId>,
 ) -> Result<User, AppError> {
-    create_with_role(db, username, person, Role::Student).await
+    create_with_role(db, username, person, Role::Student, None).await
 }
 
 /// The one row-minting path. `role` is written *with* the row rather than
@@ -50,18 +62,27 @@ pub async fn create(
 /// of a race gets the same 409 the sequential duplicate always got.
 ///
 /// The row carries its `created_at` mint stamp and, when the caller knows it,
-/// the `person` id the credential lives on.
+/// the `person` id the credential lives on. `student_number` binds as handed:
+/// the *role* rule ("only a student may hold one") is the web layer's gate —
+/// it is the layer that resolves the requested role — while the *uniqueness*
+/// rule is the partial unique index, and its violation answers the same 409
+/// the duplicate username does.
 pub async fn create_with_role(
     db: &Database,
     username: Username,
     person: Option<PersonId>,
     role: Role,
+    student_number: Option<StudentNumber>,
 ) -> Result<User, AppError> {
+    debug_assert!(
+        student_number.is_none() || role == Role::Student,
+        "only a student row may be born with a student number"
+    );
     let id = UserId::generate();
     match sqlx::query_as!(
         User,
-        r#"INSERT INTO app_user (id, username, person, role, created_at)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO app_user (id, username, person, role, student_number, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING id AS "id: UserId",
                      username AS "username: Username",
                      person AS "person: PersonId",
@@ -79,11 +100,13 @@ pub async fn create_with_role(
                      avatar_file,
                      avatar_content_type AS "avatar_content_type: FileContentType",
                      branch,
+                     student_number AS "student_number: StudentNumber",
                      avatar_size"#,
         id.uuid(),
         username.as_str(),
         person.as_ref().map(PersonId::uuid),
         role.as_str(),
+        student_number.as_ref().map(StudentNumber::as_str),
         Timestamp::now().as_millis(),
     )
     .fetch_one(db)
@@ -96,8 +119,16 @@ pub async fn create_with_role(
             );
             Ok(user)
         }
-        Err(err) if crate::database::unique_violation(&err) == Some("app_user_username") => {
+        Err(err) if unique_violation(&err) == Some("app_user_username") => {
             Err(AppError::Conflict("username already taken"))
+        }
+        Err(err) if unique_violation(&err) == Some("app_user_student_number") => {
+            Err(number_taken())
+        }
+        // The row's own CHECK: this path already debug-asserts the rule, and
+        // in a release build the database is what says no.
+        Err(err) if check_violation(&err) == Some("app_user_student_number_student") => {
+            Err(StudentNumber::non_student_refusal().into())
         }
         Err(err) => Err(err.into()),
     }
@@ -123,6 +154,7 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   branch,
+                  student_number AS "student_number: StudentNumber",
                   avatar_size
            FROM app_user WHERE id = $1"#,
         id.uuid()
@@ -168,6 +200,7 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   branch,
+                  student_number AS "student_number: StudentNumber",
                   avatar_size
            FROM app_user WHERE id = ANY($1)"#,
         &ids
@@ -200,6 +233,7 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   branch,
+                  student_number AS "student_number: StudentNumber",
                   avatar_size
            FROM app_user WHERE role = $1 ORDER BY id DESC"#,
         role.as_str()
@@ -285,11 +319,13 @@ pub async fn search(
 /// the floor that guards it and the arm-by-arm reasoning. What follows is
 /// the store side.
 ///
-/// Writes *only* the `role` field of the user row (never the whole row):
-/// the row mixes admin-owned (role) and self-service (profile, preferences)
-/// fields, and each writer starts from a snapshot read at request start. A
-/// whole-row write would carry the snapshot's copy of the *other* group back
-/// over a concurrent edit — an in-flight profile save silently reverting an
+/// Writes *only* the `role` field of the user row — plus `student_number`,
+/// cleared in that same statement whenever the new role is not `student`
+/// (see the statement's own note) — never the whole row: the row mixes
+/// admin-owned (role) and self-service (profile, preferences) fields, and
+/// each writer starts from a snapshot read at request start. A whole-row
+/// write would carry the snapshot's copy of the *other* group back over a
+/// concurrent edit — an in-flight profile save silently reverting an
 /// admin's demotion, or this write erasing a profile edit that raced it.
 /// [`set_profile`] and [`set_preferences`] are scoped for the same reason.
 ///
@@ -396,10 +432,16 @@ pub async fn set_role_cascade(
 
         // The role write, floor guard included. `$2 <> 'admin'` arms the
         // guard only for a demotion: a promotion or a same-role rewrite can
-        // never orphan the admins.
+        // never orphan the admins. `student_number` rides the same statement:
+        // the number names a student of this school, so the write that stops
+        // being one is the write that drops it — a re-stated `student` keeps
+        // it, everything else clears it, and no window exists where a
+        // promoted account still holds one.
         let updated = sqlx::query_as!(
             User,
-            r#"UPDATE app_user SET role = $2
+            r#"UPDATE app_user
+               SET role = $2,
+                   student_number = CASE WHEN $2 = 'student' THEN student_number ELSE NULL END
                WHERE id = $1
                  AND NOT (role = 'admin'
                           AND $2 <> 'admin'
@@ -422,6 +464,7 @@ pub async fn set_role_cascade(
                          avatar_file,
                          avatar_content_type AS "avatar_content_type: FileContentType",
                          branch,
+                         student_number AS "student_number: StudentNumber",
                          avatar_size"#,
             target.uuid(),
             role.as_str(),
@@ -657,6 +700,14 @@ pub async fn set_role_cascade(
 /// for an omitted field would revert a concurrent PATCH of that field —
 /// two profile edits (a name and a phone) used to lose each other. See
 /// [`set_role_cascade`] for why no writer here touches the whole row.
+///
+/// `student_number` is the one column here whose write can be *violated*
+/// rather than merely refused: the partial unique index is its whole
+/// availability check, so a duplicate the caller did not pre-check (and
+/// could not — a pre-check races) comes back as the index's 23505 and is
+/// mapped to the same 409 the duplicate-username path answers. The role
+/// gate ("only a student holds one") stays at the web layer, which holds
+/// the row it read.
 // One argument per nullable column is the point: folding them into a struct
 // would just re-spell the HTTP DTO here and cost the compiler's check that
 // every column was considered at the call site.
@@ -672,6 +723,7 @@ pub async fn set_profile(
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
     branch: Option<Option<String>>,
+    student_number: Option<Option<StudentNumber>>,
 ) -> Result<User, AppError> {
     // `Some(None)` must bind an explicit NULL and `Some(Some(v))` a value:
     // `Param::OptText` carries both shapes of one nullable TEXT column.
@@ -718,8 +770,38 @@ pub async fn set_profile(
             "branch",
             text(branch.as_ref().map(|n| n.as_ref().map(String::as_str))),
         )
+        .set(
+            "student_number",
+            text(
+                student_number
+                    .as_ref()
+                    .map(|n| n.as_ref().map(StudentNumber::as_str)),
+            ),
+        )
         .run(db)
         .await
+        .map_err(|err| match err {
+            // The index's own refusal, named. A `SELECT`-then-write pre-check
+            // would race (two students claim the same number, both read free);
+            // the partial unique index is the serialization point, so this is
+            // the only place the collision is knowable.
+            AppError::Db(sqlx_err)
+                if unique_violation(&sqlx_err) == Some("app_user_student_number") =>
+            {
+                number_taken()
+            }
+            // The other half of the rule, and the one only the database can
+            // hold: this write carried a number from a snapshot that said
+            // `student`, while the role write committed first. The CHECK sees
+            // the row as it is *now*, and the caller gets the same 400 the
+            // web pre-check answers.
+            AppError::Db(sqlx_err)
+                if check_violation(&sqlx_err) == Some("app_user_student_number_student") =>
+            {
+                StudentNumber::non_student_refusal().into()
+            }
+            other => other,
+        })
 }
 
 /// Point the row at a freshly uploaded avatar blob, returning the row *as
@@ -766,6 +848,7 @@ pub async fn set_avatar(
                       avatar_file,
                       avatar_content_type AS "avatar_content_type: FileContentType",
                       branch,
+                      student_number AS "student_number: StudentNumber",
                       avatar_size
                FROM app_user WHERE id = $1 FOR UPDATE"#,
             id.uuid()
@@ -815,6 +898,7 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
                       avatar_file,
                       avatar_content_type AS "avatar_content_type: FileContentType",
                       branch,
+                      student_number AS "student_number: StudentNumber",
                       avatar_size
                FROM app_user WHERE id = $1 FOR UPDATE"#,
             id.uuid()
@@ -878,6 +962,7 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
                   avatar_file,
                   avatar_content_type AS "avatar_content_type: FileContentType",
                   branch,
+                  student_number AS "student_number: StudentNumber",
                   avatar_size
            FROM app_user WHERE username = $1"#,
         username
@@ -930,6 +1015,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -944,6 +1030,70 @@ mod tests {
             after.get_name(),
             Some(&name),
             "the profile edit itself lands"
+        );
+    }
+
+    /// The role rule is the *database's*, not only the handler's: a profile
+    /// write carrying a number read from a `student` snapshot must be refused
+    /// when a promotion committed in between — exactly as the web pre-check
+    /// would have refused it a moment earlier. Without the row's own `CHECK`
+    /// this write lands and leaves a teacher holding a student number, which
+    /// every later read would serve.
+    #[tokio::test]
+    async fn a_stale_number_write_cannot_outrun_a_promotion() {
+        let (db, _leases) = init_test_db().await;
+        let user = a_user("selin", &db).await;
+        let number = StudentNumber::try_new("9-B/17").unwrap();
+        // Numbered while a student.
+        set_profile(
+            &db,
+            user.get_id(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(number.clone())),
+        )
+        .await
+        .unwrap();
+
+        // The handler reads its snapshot (role = student, number set)...
+        let stale = read(&db, user.get_id()).await.unwrap().unwrap();
+        // ...the promotion commits, clearing the number...
+        crate::service::user::set_role(&db, user.get_id(), Role::Teacher)
+            .await
+            .unwrap();
+        // ...and the in-flight save lands from the stale snapshot.
+        let refused = set_profile(
+            &db,
+            stale.get_id(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(number)),
+        )
+        .await;
+        match refused {
+            Err(AppError::Validation(crate::error::ValidationError::Invalid { field, .. })) => {
+                assert_eq!(field, "student_number")
+            }
+            other => panic!("the database must refuse a number on a promoted row: {other:?}"),
+        }
+        let after = read(&db, user.get_id()).await.unwrap().unwrap();
+        assert_eq!(after.get_role(), Role::Teacher);
+        assert_eq!(
+            after.get_student_number(),
+            None,
+            "a promoted row holds no number"
         );
     }
 
@@ -970,6 +1120,7 @@ mod tests {
             None,
             None,
             Some(Some(display_name.clone())),
+            None,
             None,
             None,
         )

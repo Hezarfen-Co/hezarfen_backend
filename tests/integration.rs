@@ -5213,6 +5213,156 @@ async fn admin_creates_a_user() {
     );
 }
 
+/// `student_number` on the mint: a student may be born with one (stored
+/// trimmed), a duplicate in the same school is the partial unique index's
+/// refusal — a 409 carrying the `student_number_taken` code — and any
+/// non-student role refuses the field outright.
+#[tokio::test]
+async fn student_numbers_are_minted_uniquely_and_only_for_students() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+
+    // The number is stored trimmed, exactly like a username: the unique index
+    // keys on the stored string, so padding must not mint a second number.
+    let created = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({
+            "username": "numarali",
+            "password": "secret1",
+            "student_number": " 1234 ",
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(created.body["student_number"], "1234", "{}", created.body);
+    let numbered_id = id_of(&created.body);
+
+    // Read back off the row, not off the create echo.
+    let one = send(
+        &app,
+        "GET",
+        &format!("/users/{numbered_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(one.body["student_number"], "1234");
+
+    // A second student claiming the same number — padded or not — is the
+    // index's refusal, and the body names the cause for a client that
+    // branches on it.
+    for duplicate in ["1234", "1234 "] {
+        let res = send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({
+                "username": "kopyaci",
+                "password": "secret1",
+                "student_number": duplicate,
+            })),
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::CONFLICT,
+            "{duplicate}: {}",
+            res.body
+        );
+        assert_eq!(res.body["error"], "student number already taken");
+        assert_eq!(res.body["code"], "student_number_taken");
+    }
+    // The refused mint wrote nothing: the username is still free.
+    let retry = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({ "username": "kopyaci", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::CREATED, "{}", retry.body);
+    assert!(
+        retry.body["student_number"].is_null(),
+        "an omitted number is null: {}",
+        retry.body
+    );
+
+    // A non-student role may not be born with a number — refused before
+    // anything is written, so the username stays free too.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({
+                "username": "hoca",
+                "password": "secret1",
+                "role": "teacher",
+                "student_number": "5678",
+            })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({ "username": "hoca", "password": "secret1", "role": "teacher" })),
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+
+    // Bound: 32 characters fit, 33 do not.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/users",
+            Some(&admin),
+            Some(json!({
+                "username": "uzun",
+                "password": "secret1",
+                "student_number": "9".repeat(33),
+            })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Blank is the same as omitted, never a stored empty string.
+    let blank = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({
+            "username": "bosluk",
+            "password": "secret1",
+            "student_number": "   ",
+        })),
+    )
+    .await;
+    assert_eq!(blank.status, StatusCode::CREATED, "{}", blank.body);
+    assert!(
+        blank.body["student_number"].is_null(),
+        "whitespace is absent, not a number: {}",
+        blank.body
+    );
+}
+
 /// The AI service principal must never be mintable, storable, or filterable
 /// over HTTP: it is the QUIC bridge's own identity, not an account anybody can
 /// hold. `Role` carries no `serde` derive (`src/domain/role.rs:21`), so no
@@ -5535,6 +5685,257 @@ async fn admin_reads_and_edits_any_profile_with_guards() {
         .await
         .status,
         StatusCode::NOT_FOUND
+    );
+}
+
+/// `student_number` through the profile doors: the office numbers a student,
+/// the number rides every surface that shows student identity, a duplicate is
+/// a coded 409, blank clears (on any role — a clear is not a set), only a
+/// student may hold one, and a role change away from `student` clears it.
+#[tokio::test]
+async fn student_number_patches_follow_the_student_role() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = me_id(&app, &alice).await;
+    let bob = login(&app, "bob").await;
+    let bob_id = me_id(&app, &bob).await;
+
+    // The office numbers alice.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/profile"),
+        Some(&admin),
+        Some(json!({ "student_number": " 9-B/17 " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["student_number"], "9-B/17", "stored trimmed");
+
+    // Every reader that shows student identity carries it: the admin's single
+    // read, the admin listing, the picker ref, and alice's own session.
+    let one = send(
+        &app,
+        "GET",
+        &format!("/users/{alice_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(one.body["student_number"], "9-B/17");
+    let list = send(&app, "GET", "/users", Some(&admin), None).await;
+    let listed = common::items(&list.body)
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .expect("alice listed")
+        .clone();
+    assert_eq!(listed["student_number"], "9-B/17");
+    let search = send(
+        &app,
+        "GET",
+        "/users/search?q=alice&role=student",
+        Some(&admin),
+        None,
+    )
+    .await;
+    let found = common::items(&search.body)
+        .iter()
+        .find(|u| u["username"] == "alice")
+        .expect("alice found")
+        .clone();
+    assert_eq!(found["student_number"], "9-B/17");
+    let me = send(&app, "GET", "/auth/me", Some(&alice), None).await;
+    assert_eq!(me.body["student_number"], "9-B/17");
+
+    // A student owns the number on their own row: the self door takes it too,
+    // under the same rules. An unrelated patch leaves it standing.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&alice),
+        Some(json!({ "student_number": "9-B/18" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["student_number"], "9-B/18");
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&alice),
+        Some(json!({ "name": "Alice" })),
+    )
+    .await;
+    assert_eq!(res.body["student_number"], "9-B/18", "omitted = untouched");
+
+    // Bound: 33 characters are refused through this door too.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/users/me",
+            Some(&alice),
+            Some(json!({ "student_number": "9".repeat(33) })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // bob takes one of his own; alice claiming it is the index's refusal, and
+    // the refused patch left her number exactly as it stood.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/users/{bob_id}/profile"),
+            Some(&admin),
+            Some(json!({ "student_number": "1234" })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let clash = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/profile"),
+        Some(&admin),
+        Some(json!({ "student_number": "1234" })),
+    )
+    .await;
+    assert_eq!(clash.status, StatusCode::CONFLICT, "{}", clash.body);
+    assert_eq!(clash.body["error"], "student number already taken");
+    assert_eq!(clash.body["code"], "student_number_taken");
+    let one = send(
+        &app,
+        "GET",
+        &format!("/users/{alice_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(one.body["student_number"], "9-B/18");
+
+    // Only students hold one. A teacher target refuses a value outright...
+    let teacher = send(
+        &app,
+        "POST",
+        "/users",
+        Some(&admin),
+        Some(json!({ "username": "hoca", "password": "secret1", "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(teacher.status, StatusCode::CREATED, "{}", teacher.body);
+    let teacher_id = id_of(&teacher.body);
+    let refused = send(
+        &app,
+        "PATCH",
+        &format!("/users/{teacher_id}/profile"),
+        Some(&admin),
+        Some(json!({ "student_number": "5678" })),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(
+        refused.body["error"],
+        "student_number: only a student account may hold a student number"
+    );
+    // ...and so does the admin's own row through the self door.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/users/me",
+            Some(&admin),
+            Some(json!({ "student_number": "9999" })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    // A *clear* is not a set: blank on a non-student is the same no-op the
+    // omitted field is, never a refusal.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/users/me",
+            Some(&admin),
+            Some(json!({ "student_number": "" })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    // Blank (and whitespace) clears a student's number rather than storing an
+    // empty string.
+    let cleared = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&alice),
+        Some(json!({ "student_number": "   " })),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{}", cleared.body);
+    assert!(cleared.body["student_number"].is_null(), "{}", cleared.body);
+
+    // The role cascade is the other half of the rule: a promotion out of
+    // `student` clears the number in the same transaction, and a later
+    // demotion back to `student` does not restore it — the number is set, not
+    // remembered.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/users/{alice_id}/profile"),
+            Some(&admin),
+            Some(json!({ "student_number": "9-B/17" })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let promoted = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(promoted.status, StatusCode::OK, "{}", promoted.body);
+    assert!(
+        promoted.body["student_number"].is_null(),
+        "the promotion clears the number: {}",
+        promoted.body
+    );
+    let one = send(
+        &app,
+        "GET",
+        &format!("/users/{alice_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert!(one.body["student_number"].is_null(), "{}", one.body);
+    let demoted = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "student" })),
+    )
+    .await;
+    assert_eq!(demoted.status, StatusCode::OK, "{}", demoted.body);
+    assert!(
+        demoted.body["student_number"].is_null(),
+        "a role change to student leaves it unset: {}",
+        demoted.body
     );
 }
 

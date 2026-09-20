@@ -12,6 +12,13 @@ pub const MAX_SCHOOL_NAME_LEN: usize = 120;
 pub const MIN_USERNAME_LEN: usize = 3;
 pub const MAX_USERNAME_LEN: usize = 32;
 
+/// A student's school-issued number. Free text rather than digits on purpose —
+/// schools prefix, slash and hyphenate them ("9-B/17") — bounded like the other
+/// short labels. Only students hold one (the write paths enforce the role, and
+/// the role cascade clears it), and it is unique inside the school (the partial
+/// unique index is the enforcement).
+pub const MAX_STUDENT_NUMBER_LEN: usize = 32;
+
 /// Separators allowed inside a username (never at the edges, never doubled).
 pub const USERNAME_SEPARATORS: [char; 3] = ['.', '_', '-'];
 
