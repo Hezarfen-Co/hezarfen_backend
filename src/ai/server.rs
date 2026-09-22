@@ -23,7 +23,7 @@ use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
 use crate::constant::{
     AI_BLOB_WRITE_STALL_SECS, AI_HANDSHAKE_TIMEOUT_SECS, AI_MAX_FRAME_BYTES, AI_PROTOCOL,
-    REQUEST_TIMEOUT_SECS,
+    AI_RAG_INDEX_CAPABILITY, REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
 
@@ -32,6 +32,7 @@ use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::module::Module;
+use crate::state::AppState;
 use crate::telemetry::Metrics;
 use crate::service::course::can_view_course;
 use crate::tenant::{ResolvedTenant, Slug, Tenants};
@@ -122,6 +123,11 @@ struct Inner {
     /// process's instruments are built with the router, after the listener is
     /// bound.
     metrics: OnceLock<Metrics>,
+    /// Root [`AppState`] with `ai` cleared, armed by [`AiBridge::arm_api`].
+    /// A `rag.index` registration replays the course-note index through it.
+    /// `ai` stays `None` here so this lock does not cycle back into the
+    /// bridge that holds it; the replay fills the bridge in on a clone.
+    replay: OnceLock<AppState>,
 }
 
 impl Inner {
@@ -187,6 +193,7 @@ impl AiBridge {
             request_timeout: config.request_timeout,
             endpoint,
             metrics: OnceLock::new(),
+            replay: OnceLock::new(),
         });
         tracing::info!(
             "AI bridge listening on {bound} (protocol {AI_PROTOCOL}, cert sha256 {fingerprint})"
@@ -376,6 +383,7 @@ impl AiBridge {
         tenants: Tenants,
         files_path: std::path::PathBuf,
         metrics: Metrics,
+        state: &AppState,
     ) {
         // Not warned about on a second call: the instruments are the same
         // process-global ones either way, so re-arming changes nothing.
@@ -391,6 +399,17 @@ impl AiBridge {
             .is_err()
         {
             tracing::warn!("the AI bridge api path was already armed — keeping the first router");
+        }
+        // `ai` cleared: storing the caller's state as-is would cycle
+        // AppState -> bridge -> this lock -> AppState, and the replay fills
+        // the bridge back in on a clone. A worker that registered in the
+        // boot window, before this arm, already missed its own kick.
+        let mut rooted = state.clone();
+        rooted.ai = None;
+        if self.inner.replay.set(rooted).is_err() {
+            tracing::warn!("rag index replay was already armed — keeping the first state");
+        } else if self.has_capability(AI_RAG_INDEX_CAPABILITY) {
+            spawn_index_replay_if_armed(&self.inner);
         }
     }
 
@@ -442,7 +461,7 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection) {
     )
     .await;
 
-    let (worker_id, service, _control) = match handshake {
+    let (worker_id, service, capabilities, _control) = match handshake {
         Ok(Ok(registered)) => registered,
         Ok(Err(())) => return,
         Err(_) => {
@@ -452,6 +471,12 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection) {
             return;
         }
     };
+    // The welcome is already on the wire. Spawned, not awaited: walking
+    // every school's notes must not hold the handshake, and a registration
+    // that does not offer `rag.index` does not enter.
+    if crate::ai::rag::should_replay_index(&capabilities) {
+        spawn_index_replay_if_armed(&inner);
+    }
 
     // The control stream is held open (`_control`) for the connection's life.
     // Nothing more is read on it: its closure, not a heartbeat frame, is how a
@@ -1202,7 +1227,7 @@ type Control = (quinn::SendStream, quinn::RecvStream);
 async fn register(
     inner: &Inner,
     conn: &quinn::Connection,
-) -> Result<(String, String, Control), ()> {
+) -> Result<(String, String, Vec<String>, Control), ()> {
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(e) => {
@@ -1288,7 +1313,7 @@ async fn register(
         max_concurrent,
         "AI service registered"
     );
-    Ok((worker_id, hello.service, (send, recv)))
+    Ok((worker_id, hello.service, hello.capabilities, (send, recv)))
 }
 
 /// Send a rejection the service can act on, then close. Best-effort: a peer
@@ -1309,6 +1334,24 @@ async fn refuse(
     // it, so the service reports the real reason instead of a bare reset.
     let _ = tokio::time::timeout(Duration::from_millis(200), send.stopped()).await;
     conn.close(1u32.into(), message.as_bytes());
+}
+
+/// Re-index course notes with files, off the handshake path.
+///
+/// No-op when [`AiBridge::arm_api`] has not stored the root state yet. A
+/// worker that dials in during that window is covered by the arm-time kick,
+/// once the state exists and the worker is already in the registry.
+fn spawn_index_replay_if_armed(inner: &Arc<Inner>) {
+    let Some(mut state) = inner.replay.get().cloned() else {
+        tracing::warn!(
+            "rag.index worker registered before replay state was armed; skipping index replay"
+        );
+        return;
+    };
+    state.ai = Some(AiBridge {
+        inner: Arc::clone(inner),
+    });
+    crate::ai::rag::spawn_index_replay(state);
 }
 
 /// Compare two secrets without leaking their common prefix length through

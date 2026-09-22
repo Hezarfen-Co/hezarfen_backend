@@ -85,6 +85,56 @@ async fn time_serves_server_clock_without_auth() {
     assert!(before <= now && now <= after);
 }
 
+/// `GET /school` is the school the session cookie is already bound to.
+/// Every authenticated role may read it; a missing cookie and a builder
+/// cookie are both `401`, the same as every other school surface. The body
+/// is the registry uuid and the display name — never the slug.
+#[tokio::test]
+async fn get_school_returns_uuid_and_name_without_slug() {
+    let (app, db, tenants) = app_and_tenants().await;
+    let (id, name): (Uuid, String) =
+        sqlx::query_as("SELECT id, name FROM school WHERE slug = 'demo'")
+            .fetch_one(tenants.control())
+            .await
+            .expect("demo school");
+
+    let anon = send(&app, "GET", "/school", None, None).await;
+    assert_eq!(anon.status, StatusCode::UNAUTHORIZED);
+
+    hezarfen_backend::service::builder::ensure(
+        tenants.control(),
+        Username::try_new("operator").unwrap(),
+        Password::try_new("secret1").unwrap(),
+    )
+    .await
+    .expect("seed the builder");
+    let builder_login = send(
+        &app,
+        "POST",
+        "/builder/login",
+        None,
+        Some(json!({ "username": "operator", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(builder_login.status, StatusCode::OK, "{}", builder_login.body);
+    let builder_cookie = builder_login.cookie.expect("builder cookie");
+    let builder = send(&app, "GET", "/school", Some(&builder_cookie), None).await;
+    assert_eq!(builder.status, StatusCode::UNAUTHORIZED, "{}", builder.body);
+
+    let expected = json!({ "id": id.to_string(), "name": name });
+    for (username, role) in [("school_student", "student"), ("school_parent", "parent")] {
+        let cookie = login_as(&app, &db, username, role).await;
+        let res = send(&app, "GET", "/school", Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{role}: {}", res.body);
+        assert_eq!(res.body, expected, "{role}");
+        assert!(
+            res.body.get("slug").is_none(),
+            "{role} response must not carry a slug: {}",
+            res.body
+        );
+    }
+}
+
 #[tokio::test]
 async fn limits_publishes_the_bounds_the_api_actually_enforces() {
     let app = mem_app().await;
@@ -434,7 +484,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 342;
+    const MIN_PROTECTED: usize = 343;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
@@ -30051,7 +30101,7 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
 
 /// Route prefixes that are deliberately ungated, each with the reason it is —
 /// a nest here is one no school can be sold or refused.
-const CORE_PREFIXES: [(&str, &str); 13] = [
+const CORE_PREFIXES: [(&str, &str); 14] = [
     ("/", "the health mirror at the root"),
     ("/health", "liveness, read before any school is resolved"),
     ("/time", "the server clock, a deploy constant"),
@@ -30083,6 +30133,10 @@ const CORE_PREFIXES: [(&str, &str); 13] = [
         "the vendor principal, which is not a school user",
     ),
     ("/schools", "the vendor's registry surface, same principal"),
+    (
+        "/school",
+        "the caller's own school identity, not a sold module",
+    ),
 ];
 
 /// Every module's nest prefix. Written down rather than derived: the point is

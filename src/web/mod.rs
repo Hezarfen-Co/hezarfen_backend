@@ -36,6 +36,7 @@ pub mod pomodoro;
 pub mod questions;
 pub mod rag;
 pub mod room;
+pub mod school;
 pub mod sessions;
 pub mod settings;
 pub mod subjects;

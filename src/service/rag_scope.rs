@@ -4,8 +4,8 @@
 //! separately would cross-product into combinations the asker never named
 //! ([`crate::constant::MAX_RAG_SCOPE_PAIRS`]) — so every question needs the set
 //! of pairs its asker is allowed to retrieve from, and that set is derived
-//! *here*, from the asker's own rows, never from the request body: a scope a
-//! client could name is a scope a client could widen.
+//! *here*, never from the request body: a scope a client could name is a
+//! scope a client could widen.
 //!
 //! The derivation is the school's own visibility rules, not a second copy of
 //! them. A student's or a teacher's pairs are the courses their
@@ -15,14 +15,21 @@
 //! school-scoped course belongs to no section. A parent has no sections of
 //! their own, so their scope is their linked children's, read child by child
 //! through the same reader: what a parent may ask about is exactly what their
-//! children could be taught.
+//! children could be taught. A manager or an admin is none of those people:
+//! their scope is every class-course instance in the school
+//! ([`crate::db::class_group::list_all`] plus
+//! [`crate::db::class_course::list_for_class_ids`]), not the rows their own
+//! account happens to hold. An empty personal membership is not an empty
+//! school, and it is not a legal empty scope.
 //!
 //! Two consequences are deliberate. An empty scope is legal and returned as an
-//! empty list — the service answers an unscopable question by abstaining, and a
-//! `400` here would refuse questions the asker is entitled to ask. And a union
-//! over the cap is **refused**, never narrowed: dropping pairs would answer a
-//! question scoped to corpora the asker did not name, which is worse than no
-//! answer at all.
+//! empty list when the asker really has nothing to retrieve from — a student
+//! in no section, a teacher with no assignment, a parent with no linked child,
+//! a manager of a school that has no class-course instance. The service
+//! answers an unscopable question by abstaining, and a `400` here would refuse
+//! questions the asker is entitled to ask. And a union over the cap is
+//! **refused**, never narrowed: dropping pairs would answer a question scoped
+//! to corpora the asker did not name, which is worse than no answer at all.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,25 +47,34 @@ use crate::error::{AppError, ValidationError};
 /// first-seen order and deduped — one entry per distinct pair.
 ///
 /// `role` is the caller's **live** session role, the same value the
-/// `rag.chat` payload carries: the instance arm is the asker's own rows for
-/// everyone but a parent (a section membership, a homeroom column and a
-/// teaching assignment are all keyed on live roles anyway), and the parent
-/// arm is the one that has to be chosen by role, because a parent's own
+/// `rag.chat` payload carries. A manager or an admin reads every class-course
+/// instance in the school. Everyone else reads their own rows: a section
+/// membership, a homeroom column and a teaching assignment are all keyed on
+/// the live role, and the parent arm is chosen by role because a parent's own
 /// sections do not exist.
 ///
-/// The instance arm reads its rows through [`super::instance::visible_instances`]
-/// and the two lookup tables (the class sections the pairs sit in and the
-/// titles of every course named) in one batch read each — never one query per
-/// instance: a teacher can be assigned to dozens of sections, and a per-row
-/// lookup would spend the request's whole budget before the AI service is even
-/// called.
+/// The non-manager instance arm reads its rows through
+/// [`super::instance::visible_instances`], and both arms finish with the same
+/// two lookup tables (the class sections the pairs sit in and the titles of
+/// every course named) in one batch read each — never one query per instance.
+/// A teacher can be assigned to dozens of sections, and a per-row lookup would
+/// spend the request's whole budget before the AI service is even called.
 pub async fn for_user(
     db: &Database,
     user: &User,
     role: Role,
 ) -> Result<Vec<RagScopePair>, AppError> {
     let mut instances: Vec<ClassCourse> = Vec::new();
-    if role == Role::Parent {
+    if role.at_least(Role::Manager) {
+        // A manager or an admin asks about the school, not about the rows
+        // their own account holds. A system admin is in no section, no
+        // homeroom and no teaching assignment, so the personal read is empty
+        // — and an empty personal read is not an empty school.
+        let (classes, _) = crate::db::class_group::list_all(db, None, None, 0).await?;
+        let class_ids: Vec<ClassGroupId> =
+            classes.iter().map(|class| class.get_id().clone()).collect();
+        instances = crate::db::class_course::list_for_class_ids(db, &class_ids).await?;
+    } else if role == Role::Parent {
         // A parent's scope is what their children are taught — read through
         // the same visibility rule, one child at a time because the rule
         // keys on the person asking. A link whose student side changed role
@@ -86,11 +102,15 @@ pub async fn for_user(
     }
     // The school-scoped courses the asker joined directly (club, supervised
     // study). Every role may hold one — the table's own gate is the student
-    // role, so for staff this read is simply empty.
-    let memberships =
+    // role, so for staff this read is simply empty. A manager's scope is the
+    // school's instances, not this personal list, so the read is skipped.
+    let memberships = if role.at_least(Role::Manager) {
+        Vec::new()
+    } else {
         crate::db::course_membership::list_for_user(db, user.get_id(), None, 0)
             .await?
-            .0;
+            .0
+    };
 
     // One batch read per lookup, over every id the two arms named: the class
     // sections decide each instance's grade, and the courses carry the titles
@@ -359,5 +379,63 @@ mod tests {
         );
         let scope = for_user(&db, &student, Role::Student).await.unwrap();
         assert_eq!(scope, vec![pair(Some("6"), "Matematik")]);
+    }
+
+    /// A manager or an admin with no personal class row still scopes every
+    /// class-course pair in the school. A student or a teacher with none does
+    /// not: their empty membership stays an empty scope. Two sections at one
+    /// grade teaching one subject are still one pair — the cap refuses a
+    /// union, it does not get a duplicate slot.
+    #[tokio::test]
+    async fn a_manager_with_no_membership_scopes_the_whole_school() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = person(&db, "ragscope-manager", Role::Manager).await;
+        let admin = person(&db, "ragscope-admin", Role::Admin).await;
+        let student = person(&db, "ragscope-empty-student", Role::Student).await;
+        let teacher = person(&db, "ragscope-empty-teacher", Role::Teacher).await;
+        let grade_eight_a = graded_class(&db, "8-A", "8").await;
+        let grade_eight_b = graded_class(&db, "8-B", "8").await;
+        let grade_nine = graded_class(&db, "9-A", "9").await;
+        attach(&db, &grade_eight_a, "Biology").await;
+        attach(&db, &grade_eight_b, "Biology").await;
+        attach(&db, &grade_nine, "Chemistry").await;
+
+        let expected = vec![
+            (Some("8".to_owned()), "Biology".to_owned()),
+            (Some("9".to_owned()), "Chemistry".to_owned()),
+        ];
+        let manager_scope = for_user(&db, &manager, Role::Manager).await.unwrap();
+        let admin_scope = for_user(&db, &admin, Role::Admin).await.unwrap();
+        assert_eq!(pair_keys(&manager_scope), expected);
+        assert_eq!(pair_keys(&admin_scope), expected);
+        assert_eq!(
+            manager_scope.len(),
+            2,
+            "the repeated grade-8 subject is one pair"
+        );
+        assert!(
+            for_user(&db, &student, Role::Student)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a student with no membership still has an empty scope"
+        );
+        assert!(
+            for_user(&db, &teacher, Role::Teacher)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a teacher with no assignment still has an empty scope"
+        );
+    }
+
+    /// First-seen order is the wire order; the assertion compares the set.
+    fn pair_keys(pairs: &[RagScopePair]) -> Vec<(Option<String>, String)> {
+        let mut keys: Vec<_> = pairs
+            .iter()
+            .map(|pair| (pair.sinif.clone(), pair.ders.clone()))
+            .collect();
+        keys.sort();
+        keys
     }
 }

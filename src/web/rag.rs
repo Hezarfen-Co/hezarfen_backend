@@ -6,8 +6,9 @@
 //! thread, the payload format, and the last look at the reply before it is
 //! stored. There are no intent or rule tables, and every thread is private to
 //! its owner. What differs is the **scope**: every question carries the
-//! `(class, course)` pairs the corpus is routed by, derived server-side from the
-//! asker's own memberships ([`crate::service::rag_scope`]) and never from the
+//! `(class, course)` pairs the corpus is routed by, derived server-side
+//! ([`crate::service::rag_scope`]: a manager or an admin gets every class-course
+//! pair in the school, everyone else their own memberships) and never from the
 //! request body, and every citation the service returns is resolved here to
 //! the course-note file that owns the cited document — the `doc_id` only the
 //! backend can turn into something a reader can open.
@@ -438,7 +439,7 @@ async fn list_messages(
 /// thread is a `404` and is never charged), then the per-user rate limit (a
 /// refused turn leaves no trace), then availability (so an unavailable service
 /// produces a `503` and no dead pending row), then the scope the question is
-/// asked under — derived from the asker's own memberships, never from the
+/// asked under — derived by [`crate::service::rag_scope`], never from the
 /// body. Once the rows are written the turn always settles: the answering task
 /// stamps `complete`/`failed`, a reader projects a long-stale `pending` as
 /// failed, and the boot sweep repairs whatever a process death left behind.
@@ -500,12 +501,15 @@ async fn send_message(
         return Ok(ai_unavailable("no AI service is connected right now"));
     }
 
-    // The scope the corpus is routed by, derived from the asker's own
-    // memberships on every question — never from the body, so a student cannot
+    // The scope the corpus is routed by, derived on every question — a
+    // manager or an admin gets every class-course pair in the school, everyone
+    // else their own memberships — never from the body, so a student cannot
     // widen their own retrieval, and never from a stored copy, so a
     // membership change takes effect on the next question. An empty scope is
-    // legal and is sent as-is: the service abstains rather than the backend
-    // refusing a question it cannot know is answerable.
+    // legal when the asker really has nothing to retrieve from, and is sent
+    // as-is: the service abstains rather than the backend refusing a question
+    // it cannot know is answerable. An admin's empty personal membership is
+    // not that case.
     let scope = service::rag_scope::for_user(&st.db, &user, user.get_role()).await?;
 
     // Each create rides the thread's own row — it moves `updated_at` (the
@@ -891,7 +895,7 @@ struct StudyScopeRequest {
 impl StudyScopeRequest {
     /// The wire scope this request names, with the **resolved** pair as its
     /// `(sinif, ders)` half: the corpus the service is addressed to is the one
-    /// the asker's own memberships authorized, never the body's spelling of
+    /// [`crate::service::rag_scope`] authorized, never the body's spelling of
     /// it.
     fn into_scope(self, pair: RagScopePair) -> RagScope {
         RagScope {
@@ -1072,9 +1076,11 @@ fn resolve_study_pair(
 ///
 /// Synchronous by design: the summary is what the caller asked for, so there is
 /// no thread to open, no row to poll and nothing stored. The scope is derived
-/// from the asker's own memberships — never from the body, which only names a
-/// target inside them — and the `(sinif, ders)` pair that reaches the service
-/// is the derived one. `503` when no AI service offers `rag.summarize`.
+/// by [`crate::service::rag_scope`] — a manager or an admin gets every
+/// class-course pair in the school, everyone else their own memberships —
+/// never from the body, which only names a target inside them — and the
+/// `(sinif, ders)` pair that reaches the service is the derived one. `503`
+/// when no AI service offers `rag.summarize`.
 /// `abstained: true` with a `reason` is a complete answer riding a `200`.
 ///
 /// The dispatch deadline (25 s) is deliberately under the middleware's own
@@ -1114,10 +1120,11 @@ async fn summarize(
         return Ok(ai_unavailable("no AI service is connected right now"));
     }
 
-    // The scope the corpus is routed by, derived from the asker's own
-    // memberships on every request — never from the body, so a caller cannot
-    // summarize a corpus they cannot study. The body's `ders`/`sinif` only pick
-    // a pair out of that set.
+    // The scope the corpus is routed by, derived on every request — a manager
+    // or an admin gets every class-course pair in the school, everyone else
+    // their own memberships — never from the body, so a caller cannot
+    // summarize a corpus they cannot study. The body's `ders`/`sinif` only
+    // pick a pair out of that set.
     let pairs = service::rag_scope::for_user(&st.db, &user, user.get_role()).await?;
     let pair = resolve_study_pair(&pairs, &req.ders, req.sinif.as_deref())?;
     let payload = RagSummarizePayload {

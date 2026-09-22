@@ -134,7 +134,7 @@ pub struct RagChatReplyPayload {
 ///
 /// The request is built from what the session already proves — `asker` and
 /// `asker_role` are read from the live session by the caller, never taken from
-/// a body, and `scope` from the asker's own memberships — and the reply is
+/// a body, and `scope` from [`crate::service::rag_scope`] — and the reply is
 /// mapped into what a message row can hold: the answer text, the abstention,
 /// and the citations whose corpus `doc_id` resolves to a course-note file the
 /// asker may view.

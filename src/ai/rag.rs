@@ -11,6 +11,13 @@
 //! unreadable answer all leave the previously stored
 //! [`RagOutput`](crate::domain::rag_output::RagOutput) rows exactly as they
 //! are. A slightly stale index beats no index.
+//!
+//! A service restart wipes an in-memory index and does not replay it.
+//! [`spawn_index_replay`] runs when a worker that offers `rag.index`
+//! registers, and calls [`index_course_note`] for every course note that has
+//! files, in every active school. The spawn returns immediately: the QUIC
+//! handshake must not wait on it. A chatbot, zeka, or podcast registration
+//! does not offer `rag.index`, so it does not replay.
 
 use serde::{Deserialize, Serialize};
 
@@ -218,9 +225,96 @@ pub fn spawn_index(state: &AppState, tenant: &ResolvedTenant, note: CourseNote) 
     tokio::spawn(async move { index_course_note(&state, &tenant, &note).await });
 }
 
+/// Whether a worker that just registered should have the course-note index
+/// replayed. Only `rag.index` does. `rag.chat`, the chatbot, zeka, and the
+/// podcast worker do not — their registration must not walk every school.
+pub(crate) fn should_replay_index(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == AI_RAG_INDEX_CAPABILITY)
+}
+
+/// [`replay_indexed_notes`] off the handshake path. Returns as soon as the
+/// task is spawned. `state.ai` must already be the bridge that just
+/// registered the worker; `state.db` may still be the control database —
+/// each school is swapped in before [`index_course_note`].
+pub(crate) fn spawn_index_replay(state: AppState) {
+    tokio::spawn(async move {
+        replay_indexed_notes(state).await;
+    });
+}
+
+/// Re-dispatch [`index_course_note`] for every course note that has files, in
+/// every active school. One note at a time: a replay is a catch-up, not a
+/// stampede, and the worker's own concurrency cap is what bounds a single
+/// dispatch.
+async fn replay_indexed_notes(state: AppState) {
+    let directory = match crate::db::insight::active_schools(state.tenants.control()).await {
+        Ok(directory) => directory,
+        Err(err) => {
+            tracing::warn!("rag.index replay could not list active schools: {err}");
+            return;
+        }
+    };
+    for slug in directory.schools {
+        replay_school(&state, &slug).await;
+    }
+}
+
+async fn replay_school(state: &AppState, slug: &str) {
+    let slug = match crate::tenant::Slug::try_new(slug) {
+        Ok(slug) => slug,
+        Err(err) => {
+            tracing::warn!("rag.index replay skipped an unreadable school slug: {err}");
+            return;
+        }
+    };
+    let tenant = match state.tenants.resolve(&slug).await {
+        Ok(tenant) => tenant,
+        Err(err) => {
+            tracing::warn!("rag.index replay skipped `{slug}`: {err}");
+            return;
+        }
+    };
+    if !tenant.modules.contains(Module::Chatbot) {
+        tracing::debug!("rag.index replay skipped `{slug}`: the school has no chatbot module");
+        return;
+    }
+    let notes = match crate::db::course_note::list_with_files(&tenant.db).await {
+        Ok(notes) => notes,
+        Err(err) => {
+            tracing::warn!("rag.index replay could not list course notes in `{slug}`: {err}");
+            return;
+        }
+    };
+    if notes.is_empty() {
+        tracing::debug!("rag.index replay: `{slug}` has no course notes with files");
+        return;
+    }
+    tracing::info!(
+        school = %slug,
+        notes = notes.len(),
+        "replaying rag.index for course notes with files"
+    );
+    // `index_course_note` writes through `state.db`, which on the request
+    // path is the shadow school's database. The root handed in here is the
+    // control database, so the school handle has to be swapped in first.
+    let school_state = AppState {
+        db: tenant.db.clone(),
+        ..state.clone()
+    };
+    for note in &notes {
+        index_course_note(&school_state, &tenant, note).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::{
+        AI_CHAT_CAPABILITY, AI_INSIGHT_STUDENT_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY,
+        AI_RAG_CHAT_CAPABILITY,
+    };
     use serde_json::json;
 
     #[test]
@@ -266,5 +360,25 @@ mod tests {
         }))
         .unwrap();
         assert!(bare.files.is_empty());
+    }
+
+    /// Chatbot, zeka, podcast, and even `rag.chat` must not replay. A worker
+    /// that offers `rag.index` alongside something else still does.
+    #[test]
+    fn index_replay_runs_only_when_the_worker_offers_rag_index() {
+        assert!(should_replay_index(&[AI_RAG_INDEX_CAPABILITY.to_string()]));
+        assert!(should_replay_index(&[
+            AI_CHAT_CAPABILITY.to_string(),
+            AI_RAG_INDEX_CAPABILITY.to_string(),
+        ]));
+        assert!(!should_replay_index(&[AI_CHAT_CAPABILITY.to_string()]));
+        assert!(!should_replay_index(&[AI_RAG_CHAT_CAPABILITY.to_string()]));
+        assert!(!should_replay_index(&[
+            AI_INSIGHT_STUDENT_CAPABILITY.to_string()
+        ]));
+        assert!(!should_replay_index(&[
+            AI_PODCAST_SUBMIT_CAPABILITY.to_string()
+        ]));
+        assert!(!should_replay_index(&[]));
     }
 }

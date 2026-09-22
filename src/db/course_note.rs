@@ -79,6 +79,30 @@ pub async fn list_for_course(
         .await
 }
 
+/// Every course note that has at least one attachment, newest first.
+///
+/// One statement: the attachment table is filtered in the `EXISTS`, not
+/// queried once per note. A note with no files is absent — a `rag.index`
+/// replay has nothing to send for it. `file_count` is not the predicate:
+/// the file rows are the ground truth, and the counter is only a cap.
+pub async fn list_with_files(db: &Database) -> Result<Vec<CourseNote>, AppError> {
+    let notes = sqlx::query_as!(
+        CourseNote,
+        r#"SELECT id AS "id: CourseNoteId", course AS "course: CourseId",
+               author AS "author: UserId", title AS "title: CourseNoteTitle",
+               content AS "content: CourseNoteContent"
+           FROM course_note
+           WHERE EXISTS (
+               SELECT 1 FROM course_note_file
+               WHERE course_note_file.course_note = course_note.id
+           )
+           ORDER BY id DESC"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(notes)
+}
+
 /// Request-scoped: no lock spans the handler's read and this write, so an
 /// omitted field (`None`) is not written at all. Passing the snapshot's
 /// value back instead would revert a concurrent edit of that field —

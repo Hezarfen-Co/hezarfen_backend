@@ -1446,6 +1446,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/rag/threads/{id}/messages`                                     | student | Ask the corpus a question: `{content}`, at most the school's `max_chatbot_message_len`. Answers `202 {message_id, status: "pending"}` the moment both rows are written — the answer itself lands later, in the reserved assistant row. `503` when no AI service offers `rag.chat`, and nothing is written; `429` + `Retry-After` over the per-user send limit. |
 | GET    | `/rag/threads/{id}/messages/{mid}`                               | student | Poll one turn. The non-SSE fallback for `/stream`, reading the same row — including the projection that presents a long-stale `pending` as `failed`, so the two can never disagree about a turn's state. |
 | GET    | `/rag/threads/{id}/messages/{mid}/stream`                        | student | Watch one turn as Server-Sent Events: `delta` chunks of the answer, then a single `done` carrying the finished message, or one `error`. The stream closes after `done`/`error` — one stream per turn, not per thread. |
+| GET    | `/school`                                                        | student | The school the session cookie is bound to: its uuid and display name. |
 | GET    | `/schools`                                                       | builder | Every school this deployment serves, newest first. Paged via `?limit=&offset=` (omit `limit` for the full list). |
 | POST   | `/schools`                                                       | builder | Create a school: its registry row, its database, its schema, and its first admin account — one call, or none of it. |
 | GET    | `/schools/{slug}`                                                | builder | One school by slug. |
@@ -4182,8 +4183,10 @@ The HTTP doors are `POST /rag/summarize` and `POST /rag/questions`, with a flat
 body: `ders` (required, non-empty), `sinif`, `pages`, `span_ids`, `scope_label`,
 and for questions `n` (default 5, at most 20), `difficulty` (default `orta`) and
 `seed_question`. Authorization is the nest's own scope derivation, applied
-twice: the caller's `(sınıf, ders)` pairs come from their live memberships and
-the body only **names a target inside them** — a pair the caller does not hold is
+twice: the caller's `(sınıf, ders)` pairs come from the same derivation as
+`rag.chat` (a manager or an admin gets every class-course pair in the school;
+everyone else, their live memberships) and the body only **names a target
+inside them** — a pair the caller does not hold is
 a `403`, and omitting `sinif` for a ders taught at more than one grade is a
 `400`, because choosing a corpus for the caller would answer from material they
 never named. The door maps the service's `soru`/`cevap`/`zorluk` onto this API's
