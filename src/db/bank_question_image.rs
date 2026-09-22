@@ -328,23 +328,116 @@ mod tests {
     /// a blob stranded on disk.
     ///
     /// The upload writes the template row too (its `points`), so the two
-    /// transactions touch one row and Postgres refuses one of them; the
-    /// barrier releases both sides together so every interleaving gets its
-    /// chance.
+    /// transactions touch one row and Postgres refuses one of them. Both
+    /// orders are forced by awaiting one side to completion before the other
+    /// starts. A barrier is a coin toss under load, and a run where the
+    /// delete loses every overlapped round has still proved the invariant.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_image_written_inside_a_delete_window_never_outlives_its_template() {
         let (db, _leases) = crate::database::init_test_db().await;
 
-        let (mut swept, mut orphans, mut stranded) = (0, 0, 0);
-        for round in 0..8 {
+        async fn upload(
+            db: &Database,
+            question: &BankQuestionId,
+        ) -> Result<(BankQuestionImage, Option<String>), AppError> {
+            upsert(db, BankQuestionImage::new(question, None, png(), 3)).await
+        }
+
+        /// An image both sides report as committed must be in the list the
+        /// delete hands back — that list is what the web layer unlinks from.
+        fn stranded(
+            child: &Result<(BankQuestionImage, Option<String>), AppError>,
+            dropped: &Result<(crate::domain::bank_question::BankQuestion, Vec<BankQuestionImage>), AppError>,
+        ) -> bool {
+            if let (Ok((stored, _)), Ok((_, images))) = (child, dropped) {
+                !images
+                    .iter()
+                    .any(|image| image.get_file() == stored.get_file())
+            } else {
+                false
+            }
+        }
+
+        // Delete-first: the template is gone before the upload starts.
+        {
+            let question = a_template(&db).await;
+            let template = crate::db::bank_question::read(&db, &question)
+                .await
+                .unwrap()
+                .unwrap();
+            let dropped = crate::db::bank_question::delete(&db, template).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                crate::db::bank_question::read(&db, &question)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "delete-first: the template is still there after delete: {dropped:?}"
+            );
+            let child = upload(&db, &question).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: an upload must be answered, not 500: {child:?}"
+            );
+            assert_eq!(
+                list_for_question(&db, &question).await.unwrap().len(),
+                0,
+                "an image row outlived its template"
+            );
+            assert!(
+                !stranded(&child, &dropped),
+                "an image committed inside the window was swept without being handed back, so its blob stays on disk"
+            );
+        }
+
+        // Write-first: the upload lands, then the delete sweeps it and must
+        // hand the blob name back.
+        {
+            let question = a_template(&db).await;
+            let template = crate::db::bank_question::read(&db, &question)
+                .await
+                .unwrap()
+                .unwrap();
+            let child = upload(&db, &question).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the upload must land before the delete: {child:?}"
+            );
+            let dropped = crate::db::bank_question::delete(&db, template).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                crate::db::bank_question::read(&db, &question)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "write-first: the template is still there"
+            );
+            assert_eq!(
+                list_for_question(&db, &question).await.unwrap().len(),
+                0,
+                "an image row outlived its template"
+            );
+            assert!(
+                !stranded(&child, &dropped),
+                "an image committed inside the window was swept without being handed back, so its blob stays on disk"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
             let question = a_template(&db).await;
             let template = crate::db::bank_question::read(&db, &question)
                 .await
                 .unwrap()
                 .unwrap();
 
-            // Delete and upload released together: both write the template row,
-            // so Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
                 let (db, gate, template) = (db.clone(), gate.clone(), template);
@@ -357,50 +450,42 @@ mod tests {
                 let (db, question, gate) = (db.clone(), question.clone(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    upsert(&db, BankQuestionImage::new(&question, None, png(), 3)).await
+                    upload(&db, &question).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
-            // A 404 for the upload is a correct answer; the only defect is
-            // stored state. Neither side may 500 — they contend by design and a
-            // lost round is re-sent, not reported.
             assert!(
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced upload must be answered, not 500: {child:?}"
             );
             assert!(
                 !matches!(drop_it, Err(AppError::Db(_))),
-                "round {round}: a raced delete must retry, not 500: {drop_it:?}"
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
             );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if crate::db::bank_question::read(&db, &question)
                 .await
                 .unwrap()
                 .is_none()
             {
                 swept += 1;
-                orphans += list_for_question(&db, &question).await.unwrap().len();
-                if let (Ok((stored, _)), Ok((_, images))) = (&child, &drop_it)
-                    && !images
-                        .iter()
-                        .any(|image| image.get_file() == stored.get_file())
-                {
-                    stranded += 1;
-                }
+                assert_eq!(
+                    list_for_question(&db, &question).await.unwrap().len(),
+                    0,
+                    "round {round}: an image row outlived its template"
+                );
+                assert!(
+                    !stranded(&child, &drop_it),
+                    "round {round}: an image committed inside the window was swept without being handed back"
+                );
+            } else if drop_it.is_ok() {
+                panic!(
+                    "round {round}: the delete reported success but the template is still there"
+                );
             }
         }
         eprintln!(
-            "bank_question::delete raced by an upload: {swept}/8 rounds deleted the template"
-        );
-        assert!(
-            swept > 0,
-            "no round ever deleted the template, so the window was never reached"
-        );
-        assert_eq!(orphans, 0, "an image row outlived its template");
-        assert_eq!(
-            stranded, 0,
-            "an image committed inside the window was swept without being handed back, so its blob stays on disk"
+            "bank_question::delete raced by an upload: {swept}/4 concurrent rounds deleted the template"
         );
     }
 

@@ -717,13 +717,12 @@ pub(crate) async fn a_test_instance(
 }
 
 /// The race half of "a child of a course must not survive its deletion", run
-/// for one child table: [`delete`] is held open by the schema and
-/// `make` fires its create inside that window, eight rounds.
+/// for one child table.
 ///
 /// The harness lives here, beside the cascade being raced, and each child names
 /// its own pin in its own module (`exam`, `course_session`, `subject`) — the
-/// loop, the window and the verdict are one fact about *this* delete, and three
-/// copies of it would drift into three different tests of three different
+/// orders, the window and the verdict are one fact about *this* delete, and
+/// three copies of it would drift into three different tests of three different
 /// things. The sequential half — a create against a course that is already gone
 /// — is `tests/regress_course_child_orphans.rs`, which needs no server.
 ///
@@ -732,37 +731,111 @@ pub(crate) async fn a_test_instance(
 /// hangs off an *instance* ([`crate::db::class_course`]) and reaches the course
 /// through it. Either way it takes the course uuid as `$1`.
 ///
-/// The window is opened by the database rather than by a lucky interleaving:
-/// Postgres puts the racing create and delete on the same rows (the FK claims
-/// and the cascade), so a barrier start covers every interleaving — and the
-/// child may never outlive the course in any of them.
+/// Both orders are forced by awaiting one side to completion before the other
+/// starts. A barrier is a coin toss under load: whichever side is marginally
+/// faster takes every overlapped round, and requiring the delete to win one of
+/// them fails a run that never let it. A few rounds still start together; those
+/// may all lose the delete, and that is not a failure. A rival that claims an
+/// instance (a session, an exam) makes the write-first delete a refusal — the
+/// course a class still teaches is not deletable — so that round asserts the
+/// refusal, not a sweep. The sweep is the delete-first round, and any round
+/// whose course is actually gone.
 ///
 /// One child per round, for the reason the menu and `class_course` twins
 /// document: a second writer makes the delete lose and re-send, and the re-sent
 /// sweep clears the evidence.
 ///
-/// Real server, and every caller is `#[ignore]`d for it: the subject *is* the
-/// store's conflict detection, which `init_mem`'s embedded engine does not
-/// have — it commits both sides and answers `Ok` to each, so this passes there
-/// on broken code.
+/// Real server: the subject is the store's conflict detection, which an
+/// embedded engine does not have.
 #[cfg(test)]
 pub(crate) async fn assert_no_child_outlives_a_course_delete(
     table: &str,
     orphan_count_sql: &str,
     make: fn(CourseId, Database) -> tokio::task::JoinHandle<Result<(), AppError>>,
 ) {
-    use sqlx::Row as _;
+
+    async fn child_rows(db: &Database, sql: &str, course: &CourseId) -> usize {
+        use sqlx::Row as _;
+        sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .bind(course.uuid())
+            .fetch_one(db)
+            .await
+            .unwrap()
+            .try_get::<i64, _>(0)
+            .unwrap() as usize
+    }
 
     let (db, _leases) = crate::database::init_test_db().await;
 
-    let (mut swept, mut orphans) = (0, 0);
-    for round in 0..8 {
+    // Delete-first: the course is gone before the child starts.
+    {
         let course = a_test_course(&db).await;
-        // The old engine needed a schema event to hold the delete's window
-        // open; Postgres puts the racing create and delete on the same rows
-        // (the FK claims and the cascade), so a barrier start covers every
-        // interleaving — and the child may never outlive the course in any
-        // of them.
+        let dropped = delete(
+            &db,
+            read(&db, &course)
+                .await
+                .unwrap()
+                .expect("the course is there"),
+        )
+        .await;
+        assert!(
+            matches!(dropped, Ok(true)),
+            "{table} delete-first: an empty course must delete, not {dropped:?}"
+        );
+        assert!(
+            read(&db, &course).await.unwrap().is_none(),
+            "{table} delete-first: the course is still there"
+        );
+        let child = make(course.clone(), db.clone()).await.unwrap();
+        assert!(
+            !matches!(child, Err(AppError::Db(_))),
+            "{table} delete-first: a create must be answered, not 500: {child:?}"
+        );
+        assert_eq!(
+            child_rows(&db, orphan_count_sql, &course).await,
+            0,
+            "{table}: a child outlived its course"
+        );
+    }
+
+    // Write-first: the child lands, then the delete. A rival that claimed an
+    // instance makes this a refusal — the course stays, and that is correct.
+    // A rival that did not (a subject) is swept: the course is gone and the
+    // child count is 0.
+    {
+        let course = a_test_course(&db).await;
+        let child = make(course.clone(), db.clone()).await.unwrap();
+        assert!(
+            child.is_ok(),
+            "{table} write-first: the child must land before the delete: {child:?}"
+        );
+        let row = read(&db, &course).await.unwrap().expect(
+            "{table} write-first: the course vanished before the delete",
+        );
+        let dropped = delete(&db, row).await;
+        assert!(
+            !matches!(dropped, Err(AppError::Db(_))),
+            "{table} write-first: a delete must be answered, not 500: {dropped:?}"
+        );
+        let gone = read(&db, &course).await.unwrap().is_none();
+        if matches!(dropped, Ok(true)) && !gone {
+            panic!(
+                "{table} write-first: the delete reported success, the course is still there"
+            );
+        }
+        if gone {
+            assert_eq!(
+                child_rows(&db, orphan_count_sql, &course).await,
+                0,
+                "{table}: a child outlived its course"
+            );
+        }
+    }
+
+    // Overlapped rounds. Delete may lose every one of them.
+    let mut swept = 0;
+    for round in 0..4 {
+        let course = a_test_course(&db).await;
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let drop_it = {
             let (course, db, gate) = (course.clone(), db.clone(), gate.clone());
@@ -782,17 +855,12 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
             let (course, db, gate) = (course.clone(), db.clone(), gate);
             tokio::spawn(async move {
                 gate.wait().await;
-                // The inner task joins here: a `Db` answer stays `Err`, only a
-                // panic inside `make` (or the outer join) would panic.
                 make(course, db).await.unwrap()
             })
         }
         .await
         .unwrap();
         let dropped = drop_it.await.unwrap();
-
-        // A 404 for the create, or a refusal for the delete, is a correct
-        // answer — the only defect is stored state. Nothing may 500.
         assert!(
             !matches!(child, Err(AppError::Db(_))),
             "{table} round {round}: a raced create must be answered, not 500: {child:?}"
@@ -801,27 +869,22 @@ pub(crate) async fn assert_no_child_outlives_a_course_delete(
             !matches!(dropped, Err(AppError::Db(_))),
             "{table} round {round}: a raced delete must be answered, not 500: {dropped:?}"
         );
-
-        // Stored state is the whole verdict; a return value is not evidence.
         if read(&db, &course).await.unwrap().is_none() {
             swept += 1;
-            orphans += sqlx::query(sqlx::AssertSqlSafe(orphan_count_sql.to_string()))
-                .bind(course.uuid())
-                .fetch_one(&db)
-                .await
-                .unwrap()
-                .try_get::<i64, _>(0)
-                .unwrap() as usize;
+            assert_eq!(
+                child_rows(&db, orphan_count_sql, &course).await,
+                0,
+                "{table} round {round}: a child outlived its course"
+            );
         } else if matches!(dropped, Ok(true)) {
-            panic!("{table} round {round}: the delete reported success, the course is still there");
+            panic!(
+                "{table} round {round}: the delete reported success, the course is still there"
+            );
         }
     }
-    eprintln!("Course::delete raced by a {table} create: {swept}/8 rounds deleted the course");
-    assert!(
-        swept > 0,
-        "{table}: no round ever deleted the course, so the race never actually ran"
+    eprintln!(
+        "Course::delete raced by a {table} create: {swept}/4 concurrent rounds deleted the course"
     );
-    assert_eq!(orphans, 0, "{table}: a child outlived its course");
 }
 
 #[cfg(test)]
@@ -975,16 +1038,12 @@ mod tests {
     /// half of the verdict is the orphan check — an instance may never name a
     /// course that is gone, whichever side of the race it was on.
     ///
-    /// The rate is counted over the whole loop instead of asserted per round,
-    /// because a per-round `assert!` aborts at the first hit and would report
-    /// "1 of 1" for a bug the point of this test is to *quantify*.
-    ///
-    /// Each side gets a clear head start on every other round — 2ms is a
-    /// separation the several-statement rival cannot cross (the same spacing
-    /// [`crate::db::term`]'s race test settled on). Without it the two sides
-    /// compete for the same course row and whichever one is marginally faster
-    /// takes every round, leaving one half of the verdict (`swept > 0`, or
-    /// `attached > 0`) a coin toss under load.
+    /// The 500s are counted over the overlapped rounds instead of asserted at
+    /// the first hit, so a lost retry reports how often it happened. Those
+    /// rounds do not have to observe both verdicts: a 2ms head start is still
+    /// a coin toss under pool contention. Delete-first and attach-first below
+    /// force the two orders by awaiting one side to completion. A delete that
+    /// reports success (`Ok(true)`) while the course remains is still a bug.
     ///
     /// Multi-threaded and on a real server: the current-thread runtime never
     /// interleaves the two, and an embedded engine does not conflict-check
@@ -999,27 +1058,84 @@ mod tests {
         for seat in 0..6 {
             classes.push(a_class(&manager, &format!("9-{seat}"), &db).await);
         }
-        let (mut delete_500, mut attach_500, mut attached, mut swept) = (0, 0, 0, 0);
+
+        // Delete-first: the course is gone before any attach starts.
+        {
+            let course = a_course(&db).await;
+            let dropped = delete(&db, course.clone()).await;
+            assert!(
+                matches!(dropped, Ok(true)),
+                "delete-first: an empty course must delete, not {dropped:?}"
+            );
+            assert!(
+                read(&db, course.get_id()).await.unwrap().is_none(),
+                "delete-first: the course is still there"
+            );
+            for class in &classes {
+                let attached = crate::service::class_course::attach(
+                    &db,
+                    class.get_id(),
+                    course.get_id(),
+                    &manager,
+                )
+                .await;
+                assert!(
+                    !matches!(attached, Err(AppError::Db(_))),
+                    "delete-first: an attach must be answered, not 500: {attached:?}"
+                );
+            }
+            assert_eq!(
+                instance_rows(course.get_id(), &db).await,
+                0,
+                "an instance outlived the course"
+            );
+        }
+
+        // Attach-first: the guard must refuse. The course stays; that is the
+        // verdict, not a missed sweep.
+        {
+            let course = a_course(&db).await;
+            for class in &classes {
+                let attached = crate::service::class_course::attach(
+                    &db,
+                    class.get_id(),
+                    course.get_id(),
+                    &manager,
+                )
+                .await;
+                assert!(
+                    attached.is_ok(),
+                    "attach-first: the attach must land before the delete: {attached:?}"
+                );
+            }
+            let dropped = delete(&db, course.clone()).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "attach-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                matches!(dropped, Ok(false)),
+                "attach-first: a course a class still teaches must refuse, not {dropped:?}"
+            );
+            assert!(
+                read(&db, course.get_id()).await.unwrap().is_some(),
+                "attach-first: the refused delete removed the course"
+            );
+            assert!(
+                instance_rows(course.get_id(), &db).await > 0,
+                "attach-first: the landed instances are gone"
+            );
+        }
+
+        // Overlapped rounds keep the retry measurement. Delete may lose all
+        // of them.
+        let (mut delete_500, mut attach_500, mut swept) = (0, 0, 0);
         let (mut last_delete, mut last_attach) = (String::new(), String::new());
         for round in 0..20 {
             let course = a_course(&db).await;
-
-            // Every other round the attaches are held back so the delete wins
-            // outright (the course goes, and nothing may survive it); the rest
-            // release the attaches first, which is the round where the guard
-            // has to read their claim and refuse the delete.
-            let clear = std::time::Duration::from_millis(2);
-            let (delete_beat, attach_beat) = if round % 2 == 0 {
-                (std::time::Duration::ZERO, clear)
-            } else {
-                (clear, std::time::Duration::ZERO)
-            };
             let drop_it = {
                 let (course, db) = (course.clone(), db.clone());
-                tokio::spawn(async move {
-                    tokio::time::sleep(delete_beat).await;
-                    delete(&db, course).await
-                })
+                tokio::spawn(async move { delete(&db, course).await })
             };
             let joins: Vec<_> = classes
                 .iter()
@@ -1031,7 +1147,6 @@ mod tests {
                         manager,
                     );
                     tokio::spawn(async move {
-                        tokio::time::sleep(attach_beat).await;
                         crate::service::class_course::attach(&db, &class, &course, &mgr).await
                     })
                 })
@@ -1048,14 +1163,14 @@ mod tests {
                     last_attach = format!("{join:?}");
                 }
             }
-            // Stored state, not the return values: an instance that landed is
-            // what the guard had to see, and one that outlived a deleted
-            // course is the defect this whole shape exists to catch.
             let live = instance_rows(course.get_id(), &db).await;
-            if live > 0 {
-                attached += 1;
+            let gone = read(&db, course.get_id()).await.unwrap().is_none();
+            if matches!(drop_it, Ok(true)) && !gone {
+                panic!(
+                    "round {round}: the delete reported success, the course is still there"
+                );
             }
-            if read(&db, course.get_id()).await.unwrap().is_none() {
+            if gone {
                 swept += 1;
                 assert_eq!(
                     live, 0,
@@ -1065,12 +1180,7 @@ mod tests {
         }
         eprintln!(
             "Course::delete raced: {delete_500}/20 delete 500s, {attach_500} attach 500s, \
-             {attached} rounds with an instance attached / {swept} rounds the course went"
-        );
-        assert!(
-            attached > 0 && swept > 0,
-            "the sweep never crossed the window ({attached} attached / {swept} swept), \
-             so at least one verdict was never exercised"
+             {swept} rounds the course went"
         );
         assert_eq!(
             delete_500, 0,

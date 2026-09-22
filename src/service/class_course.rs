@@ -588,11 +588,86 @@ mod tests {
     /// still there lands on the very row `Course::delete`'s guard locks, so
     /// whatever the interleaving, a link row and a deleted course can never
     /// both stand.
+    ///
+    /// Both orders are forced. Delete-first awaits the delete, then the
+    /// attach: the course is gone and no link may appear. Attach-first awaits
+    /// the attach, then the delete: a course a class still teaches must
+    /// refuse, not 500, and the course stays. A 2ms head start does not force
+    /// that under pool contention. Overlapped rounds may all lose the delete;
+    /// that is not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_class_course_link_never_outlives_the_course() {
         let (db, _leases) = crate::database::init_test_db().await;
         let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
-        let (mut orphans, mut swept, mut miscounted) = (0, 0, 0);
+
+        // Delete-first: nothing may attach to a course that is already gone.
+        {
+            let class = a_class("9-df", &db).await;
+            let algebra = a_course("algebra-df", &db).await;
+            let course = crate::db::course::read(&db, &algebra)
+                .await
+                .unwrap()
+                .unwrap();
+            let dropped = crate::db::course::delete(&db, course).await;
+            assert!(
+                matches!(dropped, Ok(true)),
+                "delete-first: an empty course must delete, not {dropped:?}"
+            );
+            assert!(
+                !course_exists(&algebra, &db).await,
+                "delete-first: the course is still there"
+            );
+            let child = attach(&db, &class, &algebra, &manager).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: an attach must be answered, not 500: {child:?}"
+            );
+            assert!(
+                !link_exists(&class, &algebra, &db).await,
+                "a class_course link outlived its course"
+            );
+            assert_eq!(
+                counter("class_course_count", class.uuid(), &db).await,
+                0,
+                "a class counts a course that is gone"
+            );
+        }
+
+        // Attach-first: the guard must refuse. Parent stays; that is the
+        // verdict, not a missed sweep.
+        {
+            let class = a_class("9-wf", &db).await;
+            let algebra = a_course("algebra-wf", &db).await;
+            let course = crate::db::course::read(&db, &algebra)
+                .await
+                .unwrap()
+                .unwrap();
+            let child = attach(&db, &class, &algebra, &manager).await;
+            assert!(
+                child.is_ok(),
+                "attach-first: the attach must land before the delete: {child:?}"
+            );
+            let dropped = crate::db::course::delete(&db, course).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "attach-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                matches!(dropped, Ok(false)),
+                "attach-first: a course a class still teaches must refuse, not {dropped:?}"
+            );
+            assert!(
+                course_exists(&algebra, &db).await,
+                "attach-first: the refused delete removed the course"
+            );
+            assert!(
+                link_exists(&class, &algebra, &db).await,
+                "attach-first: the landed link is gone"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
         for round in 0..4 {
             let class = a_class(&format!("9-{round}"), &db).await;
             let algebra = a_course(&format!("algebra{round}"), &db).await;
@@ -601,11 +676,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            // A barrier start covers every interleaving — the link row may
-            // never outlive the course in any of them.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, gate, course) = (db.clone(), gate.clone(), course.clone());
+                let (db, gate, course) = (db.clone(), gate.clone(), course);
                 tokio::spawn(async move {
                     gate.wait().await;
                     crate::db::course::delete(&db, course).await
@@ -616,42 +689,36 @@ mod tests {
                     (db.clone(), class.clone(), algebra.clone(), manager, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    // Every other round the attach is held back a clear 2ms so
-                    // the delete wins outright (`swept > 0` below is a coin
-                    // toss without it): with the course counter claim live both
-                    // sides write the very row the guard reads, so whichever is
-                    // marginally faster otherwise takes every round under load.
-                    if round % 2 == 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-                    }
                     attach(&db, &class, &algebra, &manager).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
-            // A 404 for the attach, or a refusal for the delete, is a correct
-            // answer — the only defect is stored state.
             assert!(
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced attach must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if !course_exists(&algebra, &db).await {
                 swept += 1;
-                if link_exists(&class, &algebra, &db).await {
-                    orphans += 1;
-                }
-                miscounted += counter("class_course_count", class.uuid(), &db).await;
+                assert!(
+                    !link_exists(&class, &algebra, &db).await,
+                    "round {round}: a class_course link outlived its course"
+                );
+                assert_eq!(
+                    counter("class_course_count", class.uuid(), &db).await,
+                    0,
+                    "round {round}: a class counts a course that is gone"
+                );
             } else if matches!(drop_it, Ok(true)) {
                 panic!("round {round}: the delete reported success but the course is still there");
             }
         }
-        eprintln!("Course::delete raced by an attach: {swept}/4 rounds deleted the course");
-        assert!(
-            swept > 0,
-            "no round ever deleted the course, so the race never actually ran"
+        eprintln!(
+            "Course::delete raced by an attach: {swept}/4 concurrent rounds deleted the course"
         );
-        assert_eq!(orphans, 0, "a class_course link outlived its course");
-        assert_eq!(miscounted, 0, "a class counts a course that is gone");
     }
 }

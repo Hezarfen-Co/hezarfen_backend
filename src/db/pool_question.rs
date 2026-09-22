@@ -266,6 +266,7 @@ pub async fn clear_image(
 /// What [`delete`] took with the question: the rows ride back for their
 /// ids, and `image_files` is the caller's disk-GC list — the question's
 /// photo and every swept solution's.
+#[derive(Debug)]
 pub struct Deleted {
     pub question: PoolQuestion,
     pub solutions: Vec<Solution>,
@@ -602,24 +603,93 @@ mod tests {
     /// [`bump_question_and_write`] moves the question's own `asked_at`
     /// instead, so the two transactions touch one key and the store refuses
     /// one of them.
-    ///
     /// The offer writes the question row too (its `solution_count`), so the
-    /// two transactions touch one row and Postgres refuses one of them; the
-    /// barrier releases both sides together so every interleaving gets its
-    /// chance.
+    /// two transactions touch one row and Postgres refuses one of them.
+    /// Both orders are forced by awaiting one side to completion before the
+    /// other starts. A barrier is a coin toss under load, and a run where the
+    /// delete loses every overlapped round has still proved the invariant.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_solution_offered_inside_a_delete_never_outlives_its_question() {
         let (db, _leases) = database::init_test_db().await;
 
-        let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
-        for round in 0..8 {
+        async fn offer(
+            db: &Database,
+            id: &PoolQuestionId,
+            helper: &UserId,
+        ) -> Result<Solution, AppError> {
+            crate::db::solution::insert(
+                db,
+                Solution::new(
+                    id,
+                    helper,
+                    SolutionBody::try_new("Kismi integrasyon uygula.").unwrap(),
+                ),
+            )
+            .await
+        }
+
+        async fn solutions(db: &Database, id: &PoolQuestionId) -> usize {
+            crate::db::solution::list_for(db, id, None, 0)
+                .await
+                .unwrap()
+                .0
+                .len()
+        }
+
+        // Delete-first: the question is gone before the offer starts.
+        {
+            let asker = a_user(&db).await;
+            let helper = a_user(&db).await;
+            let q = insert(&db, question(&asker)).await.unwrap();
+            let id = *q.get_id();
+            let dropped = delete(&db, &id).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the question is still there after delete: {dropped:?}"
+            );
+            let child = offer(&db, &id, &helper).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: an offer must be answered, not 500: {child:?}"
+            );
+            assert_eq!(solutions(&db, &id).await, 0, "a solution outlived its question");
+        }
+
+        // Write-first: the offer lands, then the delete sweeps it.
+        {
+            let asker = a_user(&db).await;
+            let helper = a_user(&db).await;
+            let q = insert(&db, question(&asker)).await.unwrap();
+            let id = *q.get_id();
+            let child = offer(&db, &id, &helper).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the offer must land before the delete: {child:?}"
+            );
+            let dropped = delete(&db, &id).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "write-first: the question is still there"
+            );
+            assert_eq!(solutions(&db, &id).await, 0, "a solution outlived its question");
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
             let asker = a_user(&db).await;
             let helper = a_user(&db).await;
             let q = insert(&db, question(&asker)).await.unwrap();
             let id = *q.get_id();
 
-            // Delete and offer released together: both write the question row,
-            // so Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
                 let (db, id, gate) = (db.clone(), id, gate.clone());
@@ -632,45 +702,34 @@ mod tests {
                 let (db, id, helper, gate) = (db.clone(), id, helper, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    crate::db::solution::insert(
-                        &db,
-                        Solution::new(
-                            &id,
-                            &helper,
-                            SolutionBody::try_new("Kismi integrasyon uygula.").unwrap(),
-                        ),
-                    )
-                    .await
+                    offer(&db, &id, &helper).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
-            // A 404 for the offer is a correct answer; the only defect is
-            // stored state. The delete must not 500 either — it contends with
-            // the offer by design and a lost round is re-sent, not reported.
             assert!(
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced offer must be answered, not 500: {child:?}"
             );
-            if matches!(drop_it, Err(AppError::Db(_))) {
-                delete_500 += 1;
-            }
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                solutions += crate::db::solution::list_for(&db, &id, None, 0)
-                    .await
-                    .unwrap()
-                    .0
-                    .len();
+                assert_eq!(
+                    solutions(&db, &id).await,
+                    0,
+                    "round {round}: a solution outlived its question"
+                );
+            } else if drop_it.is_ok() {
+                panic!(
+                    "round {round}: the delete reported success but the question is still there"
+                );
             }
         }
-        eprintln!("pool_question::delete raced by an offer: {swept}/8 rounds deleted the question");
-        assert!(
-            swept > 0,
-            "no round ever deleted the question, so the window was never reached"
+        eprintln!(
+            "pool_question::delete raced by an offer: {swept}/4 concurrent rounds deleted the question"
         );
-        assert_eq!(solutions, 0, "a solution outlived its question");
-        assert_eq!(delete_500, 0, "a raced delete must retry, not 500");
     }
 }

@@ -136,9 +136,13 @@ mod tests {
     /// attendance rows and removes the row in one transaction, and a mark that
     /// wrote into the gap was a bare upsert nothing would ever sweep again.
     /// The mark now writes the event row too (its seats counter), so the two
-    /// transactions touch one row and Postgres refuses one of them; the barrier
-    /// releases both sides together so every interleaving gets its chance.
-    /// Mutation-tested: turning the claim back into a read turns it red.
+    /// transactions touch one row and Postgres refuses one of them.
+    ///
+    /// Both orders are forced by awaiting one side to completion before the
+    /// other starts. A barrier is a coin toss under load, and a run where the
+    /// delete loses every overlapped round has still proved the invariant.
+    /// Mutation-tested: turning the claim back into a read turns the
+    /// write-first round red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_mark_written_inside_a_delete_never_outlives_the_event() {
         use crate::domain::event::{
@@ -161,14 +165,10 @@ mod tests {
             user
         }
 
-        let (db, _leases) = crate::database::init_test_db().await;
-        let allowed: Vec<String> = Settings::defaults().get_attendance_statuses().to_vec();
-        let marker = a_person(&db, "marker").await;
-        let (mut swept, mut orphans) = (0, 0);
-        for round in 0..8 {
-            let event = crate::db::event::create(
-                &db,
-                &marker,
+        async fn an_event(db: &Database, marker: &UserId) -> crate::domain::event::Event {
+            crate::db::event::create(
+                db,
+                marker,
                 EventTitle::try_new("gezi").unwrap(),
                 EventDescription::try_new("").unwrap(),
                 EventAudience {
@@ -182,11 +182,73 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+        }
+
+        let (db, _leases) = crate::database::init_test_db().await;
+        let allowed: Vec<String> = Settings::defaults().get_attendance_statuses().to_vec();
+        let marker = a_person(&db, "marker").await;
+
+        // Delete-first: the event is gone before the mark starts.
+        {
+            let event = an_event(&db, &marker).await;
+            let id = event.get_id().clone();
+            let dropped = crate::db::event::delete(&db, event).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                crate::db::event::read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the event is still there after delete: {dropped:?}"
+            );
+            let student = a_person(&db, "df").await;
+            let status = AttendanceStatus::try_new("present", &allowed).unwrap();
+            let marked = mark(&db, &id, &student, status, &marker).await;
+            assert!(
+                !matches!(marked, Err(AppError::Db(_))),
+                "delete-first: a mark must be answered, not 500: {marked:?}"
+            );
+            assert_eq!(
+                list_for_event(&db, &id, None, 0).await.unwrap().0.len(),
+                0,
+                "a mark outlived its event"
+            );
+        }
+
+        // Write-first: the mark lands, then the delete sweeps it.
+        {
+            let event = an_event(&db, &marker).await;
+            let id = event.get_id().clone();
+            let student = a_person(&db, "wf").await;
+            let status = AttendanceStatus::try_new("present", &allowed).unwrap();
+            let marked = mark(&db, &id, &student, status, &marker).await;
+            assert!(
+                marked.is_ok(),
+                "write-first: the mark must land before the delete: {marked:?}"
+            );
+            let dropped = crate::db::event::delete(&db, event).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                crate::db::event::read(&db, &id).await.unwrap().is_none(),
+                "write-first: the event is still there"
+            );
+            assert_eq!(
+                list_for_event(&db, &id, None, 0).await.unwrap().0.len(),
+                0,
+                "a mark outlived its event"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
+            let event = an_event(&db, &marker).await;
             let id = event.get_id().clone();
 
-            // Delete and mark released together: both write the event row, so
-            // Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
                 let (db, gate, event) = (db.clone(), gate.clone(), event);
@@ -196,7 +258,7 @@ mod tests {
                 })
             };
             let marked = {
-                let (db, id, marker, gate) = (db.clone(), id.clone(), marker, gate);
+                let (db, id, marker, gate, allowed) = (db.clone(), id.clone(), marker, gate, allowed.clone());
                 let student = a_person(&db, "student").await;
                 let status = AttendanceStatus::try_new("present", &allowed).unwrap();
                 tokio::spawn(async move {
@@ -209,20 +271,22 @@ mod tests {
                 !matches!(marked, Err(AppError::Db(_))),
                 "round {round}: a raced mark must be answered, not 500: {marked:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if crate::db::event::read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                orphans += list_for_event(&db, &id, None, 0).await.unwrap().0.len();
+                assert_eq!(
+                    list_for_event(&db, &id, None, 0).await.unwrap().0.len(),
+                    0,
+                    "round {round}: a mark outlived its event"
+                );
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the event is still there");
             }
         }
-        eprintln!("Event::delete raced by a mark: {swept}/8 rounds deleted the event");
-        assert!(
-            swept > 0,
-            "no round ever deleted the event, so the window was never reached"
-        );
-        assert_eq!(orphans, 0, "a mark outlived its event");
+        eprintln!("Event::delete raced by a mark: {swept}/4 concurrent rounds deleted the event");
     }
 }

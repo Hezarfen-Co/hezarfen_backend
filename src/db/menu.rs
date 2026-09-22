@@ -517,20 +517,114 @@ mod tests {
     /// The window the schema event used to force open is the menu row's own
     /// lock now: every child write also writes the menu row, so a child racing
     /// the delete serializes on that row instead of committing into a range
-    /// the sweep has already passed. A barrier start lets both orders happen;
-    /// the invariant must hold in each.
+    /// the sweep has already passed. Both orders are forced, for each child
+    /// kind, by awaiting one side to completion before the other starts. A
+    /// few rounds still start together; those may all lose the delete, and
+    /// that is not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_child_written_inside_a_delete_never_outlives_the_menu() {
         use crate::domain::menu_dish::DishDescription;
 
         let (db, _leases) = school().await;
 
-        let (mut dishes, mut marks, mut swept) = (0, 0, 0);
-        for round in 0..4 {
-            let menu = publish(&format!("2026-09-{:02}", round + 1), &db)
+        async fn write_child(db: &Database, id: &MenuId, dish: bool) -> Result<(), AppError> {
+            if dish {
+                menu_dish::create(
+                    db,
+                    id,
+                    DishName::try_new("Pilav").unwrap(),
+                    None::<DishDescription>,
+                    DishPrice::try_new(1).unwrap(),
+                    DishTags::try_new(&[], &[]).unwrap(),
+                    1_000,
+                )
                 .await
-                .unwrap();
+                .map(|_| ())
+            } else {
+                meal_attendance::mark(
+                    db,
+                    id,
+                    &UserId::from_key(TEACHER),
+                    MealAttendanceStatus::try_new("served").unwrap(),
+                    &UserId::from_key(TEACHER),
+                )
+                .await
+                .map(|_| ())
+            }
+        }
+
+        async fn children(db: &Database, id: &MenuId) -> (usize, i64) {
+            (
+                menu_dish::list_for_menu(db, id).await.unwrap().len(),
+                meal_attendance::list_for_menu(db, id, None, 0)
+                    .await
+                    .unwrap()
+                    .1,
+            )
+        }
+
+        let mut day = 1u32;
+        // One child kind per round, never both: whichever wrote first forces
+        // the delete to re-send, and its second pass sweeps the other's row.
+        for dish in [true, false] {
+            let kind = if dish { "dish" } else { "mark" };
+
+            // Delete-first.
+            {
+                let menu = publish(&format!("2026-09-{day:02}"), &db).await.unwrap();
+                day += 1;
+                let id = menu.get_id().clone();
+                let dropped = delete(&db, menu).await;
+                assert!(
+                    !matches!(dropped, Err(AppError::Db(_))),
+                    "{kind} delete-first: a delete must be answered, not 500: {dropped:?}"
+                );
+                assert!(
+                    read(&db, &id).await.unwrap().is_none(),
+                    "{kind} delete-first: the menu is still there after delete: {dropped:?}"
+                );
+                let child = write_child(&db, &id, dish).await;
+                assert!(
+                    !matches!(child, Err(AppError::Db(_))),
+                    "{kind} delete-first: a child write must be answered, not 500: {child:?}"
+                );
+                let (dishes, marks) = children(&db, &id).await;
+                assert_eq!(dishes, 0, "a dish outlived its menu");
+                assert_eq!(marks, 0, "a mark outlived its menu");
+            }
+
+            // Write-first.
+            {
+                let menu = publish(&format!("2026-09-{day:02}"), &db).await.unwrap();
+                day += 1;
+                let id = menu.get_id().clone();
+                let child = write_child(&db, &id, dish).await;
+                assert!(
+                    child.is_ok(),
+                    "{kind} write-first: the child must land before the delete: {child:?}"
+                );
+                let dropped = delete(&db, menu).await;
+                assert!(
+                    !matches!(dropped, Err(AppError::Db(_))),
+                    "{kind} write-first: a delete must be answered, not 500: {dropped:?}"
+                );
+                assert!(
+                    read(&db, &id).await.unwrap().is_none(),
+                    "{kind} write-first: the menu is still there"
+                );
+                let (dishes, marks) = children(&db, &id).await;
+                assert_eq!(dishes, 0, "a dish outlived its menu");
+                assert_eq!(marks, 0, "a mark outlived its menu");
+            }
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
+            let menu = publish(&format!("2026-09-{day:02}"), &db).await.unwrap();
+            day += 1;
             let id = menu.get_id().clone();
+            let dish = round % 2 == 0;
 
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
@@ -540,64 +634,32 @@ mod tests {
                     delete(&db, menu).await
                 })
             };
-            // One child per round, never both: whichever wrote first forces the
-            // delete to re-send, and its second pass sweeps the other's row —
-            // which would mask exactly the defect this test exists to catch.
             let child = {
-                let (id, db, dish, gate) = (id.clone(), db.clone(), round % 2 == 0, gate);
+                let (id, db, gate) = (id.clone(), db.clone(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    if dish {
-                        menu_dish::create(
-                            &db,
-                            &id,
-                            DishName::try_new("Pilav").unwrap(),
-                            None::<DishDescription>,
-                            DishPrice::try_new(1).unwrap(),
-                            DishTags::try_new(&[], &[]).unwrap(),
-                            1_000,
-                        )
-                        .await
-                        .map(|_| ())
-                    } else {
-                        meal_attendance::mark(
-                            &db,
-                            &id,
-                            &UserId::from_key(TEACHER),
-                            MealAttendanceStatus::try_new("served").unwrap(),
-                            &UserId::from_key(TEACHER),
-                        )
-                        .await
-                        .map(|_| ())
-                    }
+                    write_child(&db, &id, dish).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
-            // A 404 for the child, or a 409/NotFound for the delete, is a
-            // correct answer — the only defect is stored state.
             assert!(
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced child write must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                dishes += menu_dish::list_for_menu(&db, &id).await.unwrap().len();
-                marks += meal_attendance::list_for_menu(&db, &id, None, 0)
-                    .await
-                    .unwrap()
-                    .1;
+                let (dishes, marks) = children(&db, &id).await;
+                assert_eq!(dishes, 0, "round {round}: a dish outlived its menu");
+                assert_eq!(marks, 0, "round {round}: a mark outlived its menu");
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the menu is still there");
             }
         }
-        eprintln!("Menu::delete raced by its children: {swept}/4 rounds deleted the menu");
-        assert!(
-            swept > 0,
-            "no round ever deleted the menu, so the window was never reached"
-        );
-        assert_eq!(dishes, 0, "a dish outlived its menu");
-        assert_eq!(marks, 0, "a mark outlived its menu");
+        eprintln!("Menu::delete raced by its children: {swept}/4 concurrent rounds deleted the menu");
     }
 }

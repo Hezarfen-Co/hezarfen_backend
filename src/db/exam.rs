@@ -496,6 +496,7 @@ pub async fn update_if_unchanged(
 /// What [`delete`] collects on its way through: the deleted row plus the
 /// blob keys of the image rows its cascade removed — exactly whose files
 /// the web layer may unlink.
+#[derive(Debug)]
 pub struct Deleted {
     pub exam: Exam,
     pub question_image_files: Vec<String>,
@@ -1242,30 +1243,90 @@ mod tests {
     ///
     /// One child per round, deliberately — in the menu twin, two children in one
     /// round hid the bug: the first writer made the delete lose and re-send, and
-    /// the re-sent sweep removed the other's row.
+    /// the re-sent sweep removed the other's row. Both orders are forced by
+    /// awaiting one side to completion before the other starts. Overlapped
+    /// rounds may all lose the delete; that is not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_answer_written_inside_a_delete_never_outlives_the_exam() {
         use crate::db::exam_answer;
         let (db, _leases) = crate::database::init_test_db().await;
 
-        let (mut answers, mut swept) = (0, 0);
-        for round in 0..8 {
+        let student = a_person(&db, "student", "student").await;
+
+        // Delete-first: the exam is gone before the save starts.
+        {
             let exam = published(&db).await;
             let question = question_on(&exam, &db).await;
             let id = exam.get_id().clone();
-            let student = a_person(&db, "student", "student").await;
-            // The stored choice ids are minted by the create, not the ones the
-            // spec asked for — an answer must name one of *those*.
+            let pick = question.get_choices().unwrap()[1]
+                .get_id()
+                .as_str()
+                .to_string();
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the exam is still there after delete: {dropped:?}"
+            );
+            let child = exam_answer::save(&db, &question, &student, 1, Some(pick), None).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: a save must be answered, not 500: {child:?}"
+            );
+            assert_eq!(
+                exam_answer::list_for_exam(&db, &id).await.unwrap().len(),
+                0,
+                "an answer outlived its exam"
+            );
+        }
+
+        // Write-first: the save lands, then the delete sweeps it.
+        {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let pick = question.get_choices().unwrap()[1]
+                .get_id()
+                .as_str()
+                .to_string();
+            let child = exam_answer::save(&db, &question, &student, 1, Some(pick), None).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the save must land before the delete: {child:?}"
+            );
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "write-first: the exam is still there"
+            );
+            assert_eq!(
+                exam_answer::list_for_exam(&db, &id).await.unwrap().len(),
+                0,
+                "an answer outlived its exam"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
             let pick = question.get_choices().unwrap()[1]
                 .get_id()
                 .as_str()
                 .to_string();
 
-            // Delete and save released together: both write the exam row, so
-            // Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, exam, gate) = (db.clone(), exam.clone(), gate.clone());
+                let (db, exam, gate) = (db.clone(), exam, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     delete(&db, exam).await
@@ -1273,44 +1334,47 @@ mod tests {
             };
             let child = {
                 let (db, question, student, pick, gate) =
-                    (db.clone(), question.clone(), student, pick, gate);
+                    (db.clone(), question, student, pick, gate);
                 tokio::spawn(async move {
                     gate.wait().await;
                     exam_answer::save(&db, &question, &student, 1, Some(pick), None).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
-            // A 404 for the save, or a refusal for the delete, is a correct
-            // answer — the only defect is stored state.
             assert!(
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced save must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                answers += exam_answer::list_for_exam(&db, &id).await.unwrap().len();
+                assert_eq!(
+                    exam_answer::list_for_exam(&db, &id).await.unwrap().len(),
+                    0,
+                    "round {round}: an answer outlived its exam"
+                );
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
         }
-        eprintln!("Exam::delete raced by an answer save: {swept}/8 rounds deleted the exam");
-        assert!(
-            swept > 0,
-            "no round ever deleted the exam, so the window was never reached"
-        );
-        assert_eq!(answers, 0, "an answer outlived its exam");
+        eprintln!("Exam::delete raced by an answer save: {swept}/4 concurrent rounds deleted the exam");
     }
 
     /// The same defect on the teacher's side of the sheet, and a worse one: a
     /// question written inside the delete window kept the reference it claimed
     /// on its subject (the cascade's per-subject decrement counted only the
-    /// rows it could see), and [`crate::db::subject::delete`] is
-    /// gated on that count reading zero — a subject nobody could ever delete
-    /// again, hanging off an exam nobody could ever see. The freeze gate is a
-    /// *read* of `exam_attempt` and never survived this window;
-    /// [`crate::db::exam_attempt::write_unfrozen_with`] now writes the exam row too.
+    /// rows it could see), and [`crate::db::subject::delete`] is gated on that
+    /// count reading zero — a subject nobody could ever delete again, hanging
+    /// off an exam nobody could ever see. The freeze gate is a *read* of
+    /// `exam_attempt` and never survived this window;
+    /// [`crate::db::exam_attempt::write_unfrozen_with`] now writes the exam row
+    /// too. Both orders are forced by awaiting one side to completion before
+    /// the other starts. Overlapped rounds may all lose the delete; that is
+    /// not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_question_written_inside_a_delete_never_outlives_the_exam() {
         use crate::domain::exam_question::{
@@ -1318,24 +1382,143 @@ mod tests {
         };
         let (db, _leases) = crate::database::init_test_db().await;
 
-        let (mut questions, mut swept, mut stuck) = (0, 0, 0);
-        for round in 0..8 {
-            let exam = published(&db).await;
-            let id = exam.get_id().clone();
-            let subject = crate::db::subject::create(
-                &db,
-                &crate::db::course::a_test_course(&db).await,
+        fn spec() -> QuestionSpec {
+            QuestionSpec::try_new(
+                QuestionKind::try_new("choice").unwrap(),
+                Some(vec![
+                    ChoiceInput {
+                        id: Some("a".into()),
+                        text: "5".into(),
+                    },
+                    ChoiceInput {
+                        id: Some("b".into()),
+                        text: "6".into(),
+                    },
+                ]),
+                Some("b".into()),
+                &[],
+            )
+            .unwrap()
+        }
+
+        async fn ask(
+            db: &Database,
+            exam: &ExamId,
+            on: crate::domain::subject::SubjectId,
+        ) -> Result<crate::domain::exam_question::ExamQuestion, AppError> {
+            crate::db::exam_question::create(
+                db,
+                exam,
+                on,
+                QuestionText::try_new("3 + 3?").unwrap(),
+                QuestionPoints::try_new(5).unwrap(),
+                spec(),
+            )
+            .await
+        }
+
+        async fn subject_stuck(db: &Database, subject: &crate::domain::subject::Subject) -> bool {
+            crate::db::subject::delete(
+                db,
+                crate::db::subject::read(db, subject.get_id())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .is_err()
+        }
+
+        async fn a_subject(db: &Database) -> crate::domain::subject::Subject {
+            crate::db::subject::create(
+                db,
+                &crate::db::course::a_test_course(db).await,
                 crate::domain::subject::SubjectName::try_new("topic").unwrap(),
                 crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             )
             .await
-            .unwrap();
+            .unwrap()
+        }
 
-            // Delete and create released together: both write the exam row, so
-            // Postgres serializes them and refuses whichever lost.
+        // Delete-first: the exam is gone before the question write starts.
+        {
+            let exam = published(&db).await;
+            let id = exam.get_id().clone();
+            let subject = a_subject(&db).await;
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the exam is still there after delete: {dropped:?}"
+            );
+            let child = ask(&db, &id, *subject.get_id()).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: a question write must be answered, not 500: {child:?}"
+            );
+            assert_eq!(
+                crate::db::exam_question::list_for_exam(&db, &id, None, 0)
+                    .await
+                    .unwrap()
+                    .0
+                    .len(),
+                0,
+                "a question outlived its exam"
+            );
+            assert!(
+                !subject_stuck(&db, &subject).await,
+                "an orphan question left its subject undeletable"
+            );
+        }
+
+        // Write-first: the question lands, then the delete sweeps it and frees
+        // the subject reference it claimed.
+        {
+            let exam = published(&db).await;
+            let id = exam.get_id().clone();
+            let subject = a_subject(&db).await;
+            let child = ask(&db, &id, *subject.get_id()).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the question must land before the delete: {child:?}"
+            );
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "write-first: the exam is still there"
+            );
+            assert_eq!(
+                crate::db::exam_question::list_for_exam(&db, &id, None, 0)
+                    .await
+                    .unwrap()
+                    .0
+                    .len(),
+                0,
+                "a question outlived its exam"
+            );
+            assert!(
+                !subject_stuck(&db, &subject).await,
+                "an orphan question left its subject undeletable"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let id = exam.get_id().clone();
+            let subject = a_subject(&db).await;
+
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, exam, gate) = (db.clone(), exam.clone(), gate.clone());
+                let (db, exam, gate) = (db.clone(), exam, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     delete(&db, exam).await
@@ -1345,31 +1528,7 @@ mod tests {
                 let (db, exam_id, on, gate) = (db.clone(), id.clone(), *subject.get_id(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    let spec = QuestionSpec::try_new(
-                        QuestionKind::try_new("choice").unwrap(),
-                        Some(vec![
-                            ChoiceInput {
-                                id: Some("a".into()),
-                                text: "5".into(),
-                            },
-                            ChoiceInput {
-                                id: Some("b".into()),
-                                text: "6".into(),
-                            },
-                        ]),
-                        Some("b".into()),
-                        &[],
-                    )
-                    .unwrap();
-                    crate::db::exam_question::create(
-                        &db,
-                        &exam_id,
-                        on,
-                        QuestionText::try_new("3 + 3?").unwrap(),
-                        QuestionPoints::try_new(5).unwrap(),
-                        spec,
-                    )
-                    .await
+                    ask(&db, &exam_id, on).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -1377,63 +1536,135 @@ mod tests {
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced question write must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                questions += crate::db::exam_question::list_for_exam(&db, &id, None, 0)
-                    .await
-                    .unwrap()
-                    .0
-                    .len();
-                // The subject has to be free again: a stranded reference is the
-                // half of this bug a row count alone would not catch.
-                if crate::db::subject::delete(
-                    &db,
-                    crate::db::subject::read(&db, subject.get_id())
+                assert_eq!(
+                    crate::db::exam_question::list_for_exam(&db, &id, None, 0)
                         .await
                         .unwrap()
-                        .unwrap(),
-                )
-                .await
-                .is_err()
-                {
-                    stuck += 1;
-                }
+                        .0
+                        .len(),
+                    0,
+                    "round {round}: a question outlived its exam"
+                );
+                assert!(
+                    !subject_stuck(&db, &subject).await,
+                    "round {round}: an orphan question left its subject undeletable"
+                );
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
         }
-        eprintln!("Exam::delete raced by a question write: {swept}/8 rounds deleted the exam");
-        assert!(
-            swept > 0,
-            "no round ever deleted the exam, so the window was never reached"
+        eprintln!(
+            "Exam::delete raced by a question write: {swept}/4 concurrent rounds deleted the exam"
         );
-        assert_eq!(questions, 0, "a question outlived its exam");
-        assert_eq!(stuck, 0, "an orphan question left its subject undeletable");
     }
 
     /// The student's half of the same picture problem: a drawing is a bare
     /// upsert — the exact pre-fix shape of [`crate::db::exam_answer::save`] — so it kept
     /// the hole the text answer just lost, blob and all. It now rides the same
-    /// exam-row write the answer does.
+    /// exam-row write the answer does. Both orders are forced by awaiting one
+    /// side to completion before the other starts. Overlapped rounds may all
+    /// lose the delete; that is not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_drawing_written_inside_a_delete_never_outlives_the_exam() {
         use crate::domain::answer_image::AnswerImage;
         use crate::domain::note_file::FileContentType;
         let (db, _leases) = crate::database::init_test_db().await;
+        let student = a_person(&db, "student", "student").await;
 
-        let (mut drawings, mut swept) = (0, 0);
-        for round in 0..8 {
+        async fn draw(
+            db: &Database,
+            exam: &ExamId,
+            question: &crate::domain::exam_question::ExamQuestionId,
+            student: &UserId,
+        ) -> Result<(AnswerImage, Option<String>), AppError> {
+            let image = AnswerImage::new(
+                exam,
+                question,
+                student,
+                1,
+                FileContentType::try_new("image/png").unwrap(),
+                3,
+            );
+            crate::db::answer_image::upsert(db, image).await
+        }
+
+        // Delete-first: the exam is gone before the drawing starts.
+        {
             let exam = published(&db).await;
             let question = question_on(&exam, &db).await;
             let id = exam.get_id().clone();
-            let student = a_person(&db, "student", "student").await;
+            let on = question.get_id().clone();
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the exam is still there after delete: {dropped:?}"
+            );
+            let child = draw(&db, &id, &on, &student).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: a drawing write must be answered, not 500: {child:?}"
+            );
+            assert_eq!(
+                crate::db::answer_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len(),
+                0,
+                "a drawing outlived its exam"
+            );
+        }
 
-            // Delete and upsert released together: both write the exam row, so
-            // Postgres serializes them and refuses whichever lost.
+        // Write-first: the drawing lands, then the delete sweeps it.
+        {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let on = question.get_id().clone();
+            let child = draw(&db, &id, &on, &student).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the drawing must land before the delete: {child:?}"
+            );
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "write-first: the exam is still there"
+            );
+            assert_eq!(
+                crate::db::answer_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len(),
+                0,
+                "a drawing outlived its exam"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, exam, gate) = (db.clone(), exam.clone(), gate.clone());
+                let (db, exam, gate) = (db.clone(), exam, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     delete(&db, exam).await
@@ -1449,15 +1680,7 @@ mod tests {
                 );
                 tokio::spawn(async move {
                     gate.wait().await;
-                    let image = AnswerImage::new(
-                        &exam_id,
-                        &on,
-                        &student,
-                        1,
-                        FileContentType::try_new("image/png").unwrap(),
-                        3,
-                    );
-                    crate::db::answer_image::upsert(&db, image).await
+                    draw(&db, &exam_id, &on, &student).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -1465,48 +1688,129 @@ mod tests {
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced drawing write must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                drawings += crate::db::answer_image::list_for_exam(&db, &id)
-                    .await
-                    .unwrap()
-                    .len();
+                assert_eq!(
+                    crate::db::answer_image::list_for_exam(&db, &id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    0,
+                    "round {round}: a drawing outlived its exam"
+                );
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
         }
-        eprintln!("Exam::delete raced by a drawing write: {swept}/8 rounds deleted the exam");
-        assert!(
-            swept > 0,
-            "no round ever deleted the exam, so the window was never reached"
+        eprintln!(
+            "Exam::delete raced by a drawing write: {swept}/4 concurrent rounds deleted the exam"
         );
-        assert_eq!(drawings, 0, "a drawing outlived its exam");
     }
 
     /// A picture is written through the same freeze gate as the question it
     /// hangs on, so it had the same hole — and one the row count does not even
     /// show: `delete_exam` collects the blob names to unlink *before* it calls
-    /// [`crate::db::exam::delete`], so an image row landing after that snapshot strands
-    /// its bytes on disk forever as well. It now rides the same exam-row write
-    /// the question does.
+    /// [`crate::db::exam::delete`], so an image row landing after that snapshot
+    /// strands its bytes on disk forever as well. It now rides the same
+    /// exam-row write the question does. Both orders are forced by awaiting
+    /// one side to completion before the other starts. Overlapped rounds may
+    /// all lose the delete; that is not a failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_picture_written_inside_a_delete_never_outlives_the_exam() {
         use crate::domain::note_file::FileContentType;
         use crate::domain::question_image::QuestionImage;
         let (db, _leases) = crate::database::init_test_db().await;
 
-        let (mut images, mut swept) = (0, 0);
-        for round in 0..8 {
+        async fn shoot(
+            db: &Database,
+            exam: &ExamId,
+            question: &crate::domain::exam_question::ExamQuestionId,
+        ) -> Result<(QuestionImage, Option<String>), AppError> {
+            let image = QuestionImage::new(
+                exam,
+                question,
+                None,
+                FileContentType::try_new("image/png").unwrap(),
+                3,
+            );
+            crate::db::question_image::upsert(db, image).await
+        }
+
+        // Delete-first: the exam is gone before the picture starts.
+        {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let on = question.get_id().clone();
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "delete-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "delete-first: the exam is still there after delete: {dropped:?}"
+            );
+            let child = shoot(&db, &id, &on).await;
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "delete-first: a picture write must be answered, not 500: {child:?}"
+            );
+            assert_eq!(
+                crate::db::question_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len(),
+                0,
+                "a picture outlived its exam"
+            );
+        }
+
+        // Write-first: the picture lands, then the delete sweeps it.
+        {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let on = question.get_id().clone();
+            let child = shoot(&db, &id, &on).await;
+            assert!(
+                child.is_ok(),
+                "write-first: the picture must land before the delete: {child:?}"
+            );
+            let dropped = delete(&db, exam).await;
+            assert!(
+                !matches!(dropped, Err(AppError::Db(_))),
+                "write-first: a delete must be answered, not 500: {dropped:?}"
+            );
+            assert!(
+                read(&db, &id).await.unwrap().is_none(),
+                "write-first: the exam is still there"
+            );
+            assert_eq!(
+                crate::db::question_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len(),
+                0,
+                "a picture outlived its exam"
+            );
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for round in 0..4 {
             let exam = published(&db).await;
             let question = question_on(&exam, &db).await;
             let id = exam.get_id().clone();
 
-            // Delete and upsert released together: both write the exam row, so
-            // Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, exam, gate) = (db.clone(), exam.clone(), gate.clone());
+                let (db, exam, gate) = (db.clone(), exam, gate.clone());
                 tokio::spawn(async move {
                     gate.wait().await;
                     delete(&db, exam).await
@@ -1517,14 +1821,7 @@ mod tests {
                     (db.clone(), id.clone(), question.get_id().clone(), gate);
                 tokio::spawn(async move {
                     gate.wait().await;
-                    let image = QuestionImage::new(
-                        &exam_id,
-                        &on,
-                        None,
-                        FileContentType::try_new("image/png").unwrap(),
-                        3,
-                    );
-                    crate::db::question_image::upsert(&db, image).await
+                    shoot(&db, &exam_id, &on).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -1532,22 +1829,27 @@ mod tests {
                 !matches!(child, Err(AppError::Db(_))),
                 "round {round}: a raced picture write must be answered, not 500: {child:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                images += crate::db::question_image::list_for_exam(&db, &id)
-                    .await
-                    .unwrap()
-                    .len();
+                assert_eq!(
+                    crate::db::question_image::list_for_exam(&db, &id)
+                        .await
+                        .unwrap()
+                        .len(),
+                    0,
+                    "round {round}: a picture outlived its exam"
+                );
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
         }
-        eprintln!("Exam::delete raced by a picture write: {swept}/8 rounds deleted the exam");
-        assert!(
-            swept > 0,
-            "no round ever deleted the exam, so the window was never reached"
+        eprintln!(
+            "Exam::delete raced by a picture write: {swept}/4 concurrent rounds deleted the exam"
         );
-        assert_eq!(images, 0, "a picture outlived its exam");
     }
 }

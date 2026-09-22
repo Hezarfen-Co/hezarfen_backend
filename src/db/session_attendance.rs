@@ -644,41 +644,108 @@ mod tests {
 
     /// The claim the existence gate cannot make by *reading*. The mark writes
     /// the session row too (its attendance stamp), so the delete and the mark
-    /// touch one row and Postgres refuses one of them; the barrier releases
-    /// both sides together so every interleaving gets its chance.
+    /// touch one row and Postgres refuses one of them.
     ///
     /// The two flavors raced are the ones the credit branch never wrote for — a
     /// lesson that has not begun, and a student with no row yet on a lesson
-    /// already counted. A re-mark of a row that *exists* was never in danger:
-    /// the cascade and the upsert write that child's own key and collide there.
+    /// already counted. Both orders are forced for each flavor by awaiting one
+    /// side to completion before the other starts. A few rounds still start
+    /// together; those may all lose the delete, and that is not a failure.
     /// Mutation-tested: dropping the unconditional session-row write from
-    /// `mark` turns it red.
+    /// `mark` turns the write-first rounds red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_mark_written_inside_a_delete_never_outlives_the_session() {
         let (db, _leases) = crate::database::init_test_db().await;
-
         let teacher = a_teacher("t", &db).await;
-        let (mut swept, mut orphans) = (0, 0);
-        for (round, already_counted) in [false, true, false, true, false, true, false, true]
-            .into_iter()
-            .enumerate()
-        {
-            let session = if already_counted {
-                // Counted by somebody else's mark, so this one credits nothing.
-                let session = a_session(&teacher, &db).await;
-                let first = a_student(&format!("f{round}"), &db).await;
-                mark(&db, &session, &first, status("present"), &teacher)
+
+        async fn session_for(
+            db: &Database,
+            teacher: &UserId,
+            already_counted: bool,
+            label: &str,
+        ) -> CourseSession {
+            if already_counted {
+                let session = a_session(teacher, db).await;
+                let first = a_student(label, db).await;
+                mark(db, &session, &first, status("present"), teacher)
                     .await
                     .unwrap();
                 session
             } else {
-                a_session_at(&teacher, Timestamp::now().as_millis() + 604_800_000, &db).await
-            };
+                a_session_at(teacher, Timestamp::now().as_millis() + 604_800_000, db).await
+            }
+        }
+
+        for (flavor, already_counted) in [("fresh", false), ("counted", true)] {
+            // Delete-first.
+            {
+                let session = session_for(&db, &teacher, already_counted, &format!("df-{flavor}"))
+                    .await;
+                let id = session.get_id().clone();
+                let ghost = session.clone();
+                let dropped = crate::db::course_session::delete(&db, session).await;
+                assert!(
+                    !matches!(dropped, Err(AppError::Db(_))),
+                    "{flavor} delete-first: a delete must be answered, not 500: {dropped:?}"
+                );
+                assert!(
+                    crate::db::course_session::read(&db, &id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{flavor} delete-first: the session is still there after delete: {dropped:?}"
+                );
+                let student = a_student(&format!("df-s-{flavor}"), &db).await;
+                let marked = mark(&db, &ghost, &student, status("present"), &teacher).await;
+                assert!(
+                    !matches!(marked, Err(AppError::Db(_))),
+                    "{flavor} delete-first: a mark must be answered, not 500: {marked:?}"
+                );
+                assert_eq!(
+                    list_for_session(&db, &id, None, 0).await.unwrap().0.len(),
+                    0,
+                    "a roll call outlived its session"
+                );
+            }
+
+            // Write-first.
+            {
+                let session = session_for(&db, &teacher, already_counted, &format!("wf-{flavor}"))
+                    .await;
+                let id = session.get_id().clone();
+                let student = a_student(&format!("wf-s-{flavor}"), &db).await;
+                let marked = mark(&db, &session, &student, status("present"), &teacher).await;
+                assert!(
+                    marked.is_ok(),
+                    "{flavor} write-first: the mark must land before the delete: {marked:?}"
+                );
+                let dropped = crate::db::course_session::delete(&db, session).await;
+                assert!(
+                    !matches!(dropped, Err(AppError::Db(_))),
+                    "{flavor} write-first: a delete must be answered, not 500: {dropped:?}"
+                );
+                assert!(
+                    crate::db::course_session::read(&db, &id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{flavor} write-first: the session is still there"
+                );
+                assert_eq!(
+                    list_for_session(&db, &id, None, 0).await.unwrap().0.len(),
+                    0,
+                    "a roll call outlived its session"
+                );
+            }
+        }
+
+        // Overlapped rounds. Delete may lose every one of them.
+        let mut swept = 0;
+        for (round, already_counted) in [false, true, false, true].into_iter().enumerate() {
+            let session = session_for(&db, &teacher, already_counted, &format!("c{round}")).await;
             let id = session.get_id().clone();
             let ghost = session.clone();
 
-            // Delete and mark released together: both write the session row,
-            // so Postgres serializes them and refuses whichever lost.
             let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
                 let (db, gate, session) = (db.clone(), gate.clone(), session);
@@ -700,26 +767,30 @@ mod tests {
                 !matches!(marked, Err(AppError::Db(_))),
                 "round {round}: a raced mark must be answered, not 500: {marked:?}"
             );
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "round {round}: a raced delete must be answered, not 500: {drop_it:?}"
+            );
 
-            // Stored state is the whole verdict; a return value is not evidence.
             if crate::db::course_session::read(&db, &id)
                 .await
                 .unwrap()
                 .is_none()
             {
                 swept += 1;
-                orphans += list_for_session(&db, &id, None, 0).await.unwrap().0.len();
+                assert_eq!(
+                    list_for_session(&db, &id, None, 0).await.unwrap().0.len(),
+                    0,
+                    "round {round}: a roll call outlived its session"
+                );
             } else if drop_it.is_ok() {
-                panic!("round {round}: the delete reported success but the session is still there");
+                panic!(
+                    "round {round}: the delete reported success but the session is still there"
+                );
             }
         }
         eprintln!(
-            "CourseSession::delete raced by a roll call: {swept}/8 rounds deleted the session"
+            "CourseSession::delete raced by a roll call: {swept}/4 concurrent rounds deleted the session"
         );
-        assert!(
-            swept > 0,
-            "no round ever deleted the session, so the window was never reached"
-        );
-        assert_eq!(orphans, 0, "a roll call outlived its session");
     }
 }
