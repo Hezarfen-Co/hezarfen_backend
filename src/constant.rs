@@ -559,6 +559,10 @@ pub const AI_DEFAULT_CONCURRENT_PER_WORKER: usize = 8;
 /// well under the idle timeout so an idle-but-healthy service is never dropped
 /// for being quiet; a service that actually died is deregistered within the
 /// idle window without any application-level heartbeat frame.
+///
+/// Must stay strictly above [`AI_BLOB_WRITE_STALL_SECS`]. A stalled blob write
+/// resets that stream; if the two bounds are equal, a busy runtime lets the
+/// idle timeout win and the whole connection dies as `TimedOut` instead.
 pub const AI_IDLE_TIMEOUT_SECS: u64 = 30;
 pub const AI_KEEPALIVE_SECS: u64 = 10;
 
@@ -568,7 +572,16 @@ pub const AI_KEEPALIVE_SECS: u64 = 10;
 /// takes, while a service that opens a blob stream and never reads it stops
 /// pinning a task and an open file descriptor once the QUIC stream window
 /// fills. A wall-clock deadline on the transfer could not tell the two apart.
-pub const AI_BLOB_WRITE_STALL_SECS: u64 = 30;
+///
+/// Strictly under [`AI_IDLE_TIMEOUT_SECS`]: the stream reset has to land
+/// before the connection idle timeout, or a stalled reader kills every other
+/// stream on that connection.
+pub const AI_BLOB_WRITE_STALL_SECS: u64 = 15;
+
+const _: () = assert!(
+    AI_BLOB_WRITE_STALL_SECS + 5 < AI_IDLE_TIMEOUT_SECS,
+    "a stalled blob write must reset the stream before the connection idle timeout"
+);
 
 /// The capability an AI service declares to answer chatbot turns. The bridge
 /// routes a chat request to any worker carrying it; with none registered the

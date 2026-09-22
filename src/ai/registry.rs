@@ -191,9 +191,13 @@ impl<C> Registry<C> {
         let chosen = offering
             .filter(|w| w.inflight() < w.max_concurrent)
             .min_by(|a, b| {
-                a.inflight()
-                    .cmp(&b.inflight())
-                    .then_with(|| a.id.cmp(&b.id))
+                a.inflight().cmp(&b.inflight()).then_with(|| {
+                    // A reconnect keeps the dying connection in the registry
+                    // until its idle timeout. Equal load must prefer the
+                    // newer id, or the replay that fires on register is sent
+                    // to the connection that is about to time out.
+                    b.id.cmp(&a.id)
+                })
             })
             .ok_or_else(|| AiError::Busy(capability.to_string()))?;
         chosen.inflight.fetch_add(1, Ordering::Relaxed);
@@ -335,6 +339,20 @@ mod tests {
         assert_eq!(reg.snapshot()[0].inflight, 0);
         reg.pick("ocr.extract").expect("slot came back");
     }
+
+    #[tokio::test]
+    async fn equal_load_prefers_the_newer_worker() {
+        // A reconnect leaves the dying connection registered until its idle
+        // timeout. The replay that fires on the new Hello must not be handed
+        // to that older id.
+        let reg = registry_with(&[
+            ("01a0cafe-old", &["rag.index"], 4),
+            ("01a0cb0f-new", &["rag.index"], 4),
+        ]);
+        let lease = reg.pick("rag.index").unwrap();
+        assert_eq!(lease.worker().id, "01a0cb0f-new");
+    }
+
 
     #[tokio::test]
     async fn picks_spread_across_workers_by_least_inflight() {
