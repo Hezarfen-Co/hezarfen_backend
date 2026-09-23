@@ -210,3 +210,61 @@ async fn omitted_keeps_empty_clears_and_validation_still_bites() {
         "bad palette color refused"
     );
 }
+
+/// The new profile extras ride the same three-state merge: omitted (and
+/// `null`) keeps, `""` clears, and an out-of-vocabulary value is a `400` —
+/// the field inventory must not grow into a second, looser code path.
+#[tokio::test]
+async fn extra_profile_fields_merge_field_by_field() {
+    let (app, db) = app_and_db().await;
+    let who = login_as(&app, &db, "ece", "student").await;
+
+    let set = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&who),
+        Some(json!({ "gender": "other", "address": "Deniz Mah." })),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+
+    // An explicit null keeps, and the field not named survives untouched.
+    let kept = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&who),
+        Some(json!({ "address": null })),
+    )
+    .await;
+    assert_eq!(kept.status, StatusCode::OK);
+    assert_eq!(kept.body["gender"], "other", "omitted gender kept");
+    assert_eq!(kept.body["address"], "Deniz Mah.", "null keeps address");
+
+    // `""` clears one field; the other stays.
+    let cleared = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&who),
+        Some(json!({ "address": "" })),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(cleared.body["address"], json!(null));
+    assert_eq!(cleared.body["gender"], "other", "gender lost to the clear");
+
+    // The gender vocabulary is closed: an unknown word is a 400.
+    let refused = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&who),
+        Some(json!({ "gender": "woman" })),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    let after = send(&app, "GET", "/auth/me", Some(&who), None).await.body;
+    assert_eq!(after["gender"], "other", "a refused patch writes nothing");
+}

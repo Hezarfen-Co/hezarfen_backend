@@ -503,6 +503,7 @@ const MOVED_TABLES: &[(&str, &str)] = &[
     ("src/domain/role.rs", "ROLES"),
     ("src/domain/preferences.rs", "THEMES"),
     ("src/domain/preferences.rs", "LANGUAGES"),
+    ("src/domain/profile.rs", "GENDERS"),
     ("src/domain/message.rs", "SENDER_FOLDERS"),
     ("src/domain/message.rs", "RECIPIENT_FOLDERS"),
     ("src/domain/badge.rs", "BADGES"),

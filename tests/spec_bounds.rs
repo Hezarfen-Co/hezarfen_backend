@@ -246,6 +246,15 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             MAX_DISPLAY_NAME_LEN as i64,
         ),
         ("UpdateProfile", "bio", "maxLength", MAX_BIO_LEN as i64),
+        // Free text with the same length cap the bio has.
+        ("UpdateProfile", "address", "maxLength", MAX_ADDRESS_LEN as i64),
+        // The emergency contact is a person's name, held to the same bound.
+        (
+            "UpdateProfile",
+            "emergency_contact_name",
+            "maxLength",
+            MAX_NAME_LEN as i64,
+        ),
         // A branş is one entry of the school's `branches` list, so it is
         // bounded by the same per-entry length the list itself is.
         (

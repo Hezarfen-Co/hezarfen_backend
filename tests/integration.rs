@@ -5649,6 +5649,111 @@ async fn profile_rejects_invalid_fields() {
     }
 }
 
+// --- users: gender, address, emergency contact ------------------------------
+
+#[tokio::test]
+async fn profile_extra_fields_round_trip_via_users_me() {
+    let app = mem_app().await;
+    let bob = login(&app, "bob").await;
+
+    // A fresh account carries none of the extras.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    assert_eq!(me.status, StatusCode::OK);
+    for field in [
+        "gender",
+        "address",
+        "emergency_contact_name",
+        "emergency_contact_phone",
+    ] {
+        assert!(me.body[field].is_null(), "{field} should start null");
+    }
+
+    // Set all four in one patch.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&bob),
+        Some(json!({
+            "gender": "female",
+            "address": "  Çamlık Mah. 2. Sk. No: 7  ",
+            "emergency_contact_name": "Mehmet Yılmaz",
+            "emergency_contact_phone": "+90 555 987 65 43",
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["gender"], "female");
+    assert_eq!(res.body["address"], "Çamlık Mah. 2. Sk. No: 7"); // trimmed
+    assert_eq!(res.body["emergency_contact_name"], "Mehmet Yılmaz");
+    assert_eq!(res.body["emergency_contact_phone"], "+90 555 987 65 43");
+
+    // Partial patch: only the address changes, everything else survives.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&bob),
+        Some(json!({ "address": "Yeni Mah." })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["address"], "Yeni Mah.");
+    assert_eq!(res.body["gender"], "female");
+    assert_eq!(res.body["emergency_contact_name"], "Mehmet Yılmaz");
+    assert_eq!(res.body["emergency_contact_phone"], "+90 555 987 65 43");
+
+    // Empty string clears exactly the field it was sent for.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&bob),
+        Some(json!({ "gender": "" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["gender"].is_null());
+    assert_eq!(res.body["address"], "Yeni Mah.");
+
+    // The merged state is what /auth/me reports afterwards.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    assert!(me.body["gender"].is_null());
+    assert_eq!(me.body["address"], "Yeni Mah.");
+    assert_eq!(me.body["emergency_contact_phone"], "+90 555 987 65 43");
+}
+
+#[tokio::test]
+async fn profile_rejects_invalid_extra_fields() {
+    let app = mem_app().await;
+    let bob = login(&app, "bob").await;
+
+    let bad = [
+        json!({ "gender": "woman" }),          // not in the vocabulary
+        json!({ "gender": "FEMALE" }),         // the vocabulary is lowercase
+        json!({ "address": "x".repeat(501) }), // one over the bound
+        json!({ "address": "   " }),           // whitespace-only is not a value
+        json!({ "emergency_contact_phone": "123" }),
+        json!({ "emergency_contact_phone": "letters" }),
+        json!({ "emergency_contact_name": "   " }),
+    ];
+    for body in bad {
+        let res = send(&app, "PATCH", "/users/me", Some(&bob), Some(body.clone())).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
+    }
+
+    // A rejected patch must not have half-applied.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    for field in [
+        "gender",
+        "address",
+        "emergency_contact_name",
+        "emergency_contact_phone",
+    ] {
+        assert!(me.body[field].is_null(), "{field} should still be null");
+    }
+}
+
 #[tokio::test]
 async fn admin_reads_and_edits_any_profile_with_guards() {
     let (app, db) = app_and_db().await;

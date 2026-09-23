@@ -1,7 +1,7 @@
 //! Personal-info newtypes shared by every account role — student, teacher,
 //! manager, and admin records all carry the same optional contact fields.
 
-use crate::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN, MAX_NAME_LEN};
+use crate::constant::{MAX_ADDRESS_LEN, MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN, MAX_NAME_LEN};
 use crate::domain::badge::BadgeStats;
 use crate::domain::timestamp::Timestamp;
 use crate::error::ValidationError;
@@ -123,6 +123,69 @@ pub struct Bio(String);
 impl Bio {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
         validate_optional("bio", value, MAX_BIO_LEN)?;
+        Ok(Self(value.trim().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A person's gender, self-declared and deliberately coarse — the school
+/// office needs a word for a form, not an identity system. One of four fixed
+/// wire values (`female`, `male`, `other`, `undisclosed`), stored as the same
+/// string; `NULL` (never chosen) is a row state, not a fifth value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum Gender {
+    Female,
+    Male,
+    Other,
+    Undisclosed,
+}
+
+impl Gender {
+    /// The wire/storage form. Must stay in lockstep with `rename_all = "lowercase"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gender::Female => "female",
+            Gender::Male => "male",
+            Gender::Other => "other",
+            Gender::Undisclosed => "undisclosed",
+        }
+    }
+
+    /// Parse a wire string into a gender — the inverse of [`Gender::as_str`].
+    /// The vocabulary is closed, so an unknown value is a plain 400, the same
+    /// refusal an out-of-vocabulary `theme` gets.
+    pub fn try_from_str(value: &str) -> Result<Self, ValidationError> {
+        GENDERS
+            .into_iter()
+            .find(|gender| gender.as_str() == value)
+            .ok_or(ValidationError::Invalid {
+                field: "gender",
+                reason: "must be one of: female, male, other, undisclosed",
+            })
+    }
+}
+
+pub const GENDERS: [Gender; 4] = [
+    Gender::Female,
+    Gender::Male,
+    Gender::Other,
+    Gender::Undisclosed,
+];
+
+/// A postal address, [`MAX_ADDRESS_LEN`] characters at most. Free text on
+/// purpose — addresses do not fit a shape the way a phone number does, and
+/// enforcing one would only reject real ones. Stored trimmed.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct Address(String);
+
+impl Address {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_required("address", value, MAX_ADDRESS_LEN)?;
         Ok(Self(value.trim().to_string()))
     }
 
@@ -258,5 +321,34 @@ mod tests {
         assert_eq!(Bio::try_new("   ").unwrap().as_str(), "");
         assert!(Bio::try_new(&"é".repeat(MAX_BIO_LEN)).is_ok());
         assert!(Bio::try_new(&"é".repeat(MAX_BIO_LEN + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn gender_parses_the_closed_vocabulary() {
+        assert_eq!(Gender::try_from_str("female").unwrap(), Gender::Female);
+        assert_eq!(Gender::try_from_str("male").unwrap().as_str(), "male");
+        assert_eq!(Gender::try_from_str("other").unwrap(), Gender::Other);
+        assert_eq!(
+            Gender::try_from_str("undisclosed").unwrap(),
+            Gender::Undisclosed
+        );
+        // The vocabulary is closed: no synonyms, no case play, no blank.
+        assert!(Gender::try_from_str("woman").is_err());
+        assert!(Gender::try_from_str("FEMALE").is_err());
+        assert!(Gender::try_from_str("").is_err());
+    }
+
+    #[tokio::test]
+    async fn address_trims_and_respects_the_bound() {
+        assert_eq!(
+            Address::try_new("  Çamlık Mah. 2. Sk. No: 7  ")
+                .unwrap()
+                .as_str(),
+            "Çamlık Mah. 2. Sk. No: 7"
+        );
+        // Blank is "not given" — the three-state PATCH clears it, never stores it.
+        assert!(Address::try_new("   ").is_err());
+        assert!(Address::try_new(&"x".repeat(MAX_ADDRESS_LEN)).is_ok());
+        assert!(Address::try_new(&"x".repeat(MAX_ADDRESS_LEN + 1)).is_err());
     }
 }

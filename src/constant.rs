@@ -35,10 +35,11 @@ pub const MAX_PASSWORD_LEN: usize = 128;
 
 pub const MAX_NAME_LEN: usize = 100;
 
-/// Profile fields: the self-chosen name a user is shown under, and the free
-/// text under it.
+/// Profile fields: the self-chosen name a user is shown under, the free
+/// text under it, and the postal address.
 pub const MAX_DISPLAY_NAME_LEN: usize = 50;
 pub const MAX_BIO_LEN: usize = 500;
+pub const MAX_ADDRESS_LEN: usize = 500;
 
 /// How many course and class references one profile read embeds. A cap on the
 /// response, not on membership — the full lists stay at `/courses/me` and

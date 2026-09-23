@@ -21,6 +21,7 @@ use utoipa_axum::routes;
 use crate::constant::*;
 use crate::domain::badge::BADGES;
 use crate::domain::preferences::{LANGUAGES, THEMES};
+use crate::domain::profile::GENDERS;
 use crate::domain::role::ROLES;
 use crate::state::AppState;
 
@@ -47,6 +48,8 @@ struct UserLimits {
     max_display_name_len: usize,
     /// Free text under a profile's name.
     max_bio_len: usize,
+    /// A postal address's length bound.
+    max_address_len: usize,
     /// A student number's length bound (free text; unique inside the school,
     /// and only ever held by a `student` account).
     max_student_number_len: usize,
@@ -68,6 +71,9 @@ struct UserLimits {
     /// Accepted `language` preference values (`null` clears it).
     #[schema(example = json!(["tr", "en"]))]
     languages: Vec<&'static str>,
+    /// Accepted `gender` profile values (`null` = never chosen).
+    #[schema(example = json!(["female", "male", "other", "undisclosed"]))]
+    genders: Vec<&'static str>,
     /// Shape a `palette_color` preference must match, as a regular expression
     /// (`null` clears it). Open on purpose — any hex accent color, not a fixed
     /// palette — so this is a pattern, not a value list like `themes`. Matches
@@ -538,6 +544,7 @@ impl LimitsResponse {
                 max_name_len: MAX_NAME_LEN,
                 max_display_name_len: MAX_DISPLAY_NAME_LEN,
                 max_bio_len: MAX_BIO_LEN,
+                max_address_len: MAX_ADDRESS_LEN,
                 max_student_number_len: MAX_STUDENT_NUMBER_LEN,
                 max_profile_courses: MAX_PROFILE_COURSES,
                 max_profile_classes: MAX_PROFILE_CLASSES,
@@ -547,6 +554,7 @@ impl LimitsResponse {
                 roles: ROLES.iter().map(|role| role.as_str()).collect(),
                 themes: THEMES.iter().map(|theme| theme.as_str()).collect(),
                 languages: LANGUAGES.iter().map(|language| language.as_str()).collect(),
+                genders: GENDERS.iter().map(|gender| gender.as_str()).collect(),
                 palette_color_pattern: PALETTE_COLOR_PATTERN,
                 palette_color_len: PALETTE_COLOR_LEN,
                 session_duration_days: SESSION_DURATION_DAYS,

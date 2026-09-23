@@ -18,7 +18,9 @@ use crate::domain::badge::{self, BadgeAward};
 use crate::domain::class_group::ClassGroupId;
 
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
+use crate::domain::profile::{
+    Address, Bio, BirthDate, DisplayName, Email, Gender, PersonName, Phone, ProfileStats,
+};
 use crate::domain::role::Role;
 use crate::domain::user::{Password, StudentNumber, User, UserId, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -94,6 +96,19 @@ struct UpdateProfile {
     /// Free text under the profile's name.
     #[schema(example = "Sınıfın en hızlı pomodorocusu.", max_length = 500)]
     bio: Option<String>,
+    /// Self-declared gender: `female`, `male`, `other`, or `undisclosed`.
+    /// A closed vocabulary — anything else is a `400`.
+    #[schema(example = "female")]
+    gender: Option<String>,
+    /// Postal address, at most `max_address_len` characters (from `GET /limits`).
+    #[schema(example = "Çamlık Mah. 2. Sk. No: 7, Bornova / İzmir", max_length = 500)]
+    address: Option<String>,
+    /// Who to call when the person is unreachable. Same rules as `name`.
+    #[schema(example = "Mehmet Yılmaz", max_length = 100)]
+    emergency_contact_name: Option<String>,
+    /// The emergency contact's phone, same shape as `phone`.
+    #[schema(example = "+90 555 987 65 43")]
+    emergency_contact_phone: Option<String>,
     /// The teacher's subject specialisation: one of the school's `branches` from
     /// `GET /settings`, by name. Omit to keep the current value; send `""` to
     /// clear it (a school that lists no subjects stores none).
@@ -220,6 +235,13 @@ async fn apply_profile(
     let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
     let display_name = merge_field(req.display_name.as_deref(), DisplayName::try_new)?;
     let bio = merge_field(req.bio.as_deref(), Bio::try_new)?;
+    let gender = merge_field(req.gender.as_deref(), Gender::try_from_str)?;
+    let address = merge_field(req.address.as_deref(), Address::try_new)?;
+    let emergency_contact_name = merge_field(req.emergency_contact_name.as_deref(), |v| {
+        PersonName::try_new("emergency_contact_name", v)
+    })?;
+    let emergency_contact_phone =
+        merge_field(req.emergency_contact_phone.as_deref(), Phone::try_new)?;
     let student_number = merge_student_number(req.student_number.as_deref(), user.get_role())?;
     // Only a request that actually names a branch pays the settings read.
     let branch = match req.branch {
@@ -239,6 +261,10 @@ async fn apply_profile(
         birth_date,
         display_name,
         bio,
+        gender,
+        address,
+        emergency_contact_name,
+        emergency_contact_phone,
         branch,
         student_number,
     )

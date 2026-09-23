@@ -14,7 +14,9 @@ use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
+use crate::domain::profile::{
+    Address, Bio, BirthDate, DisplayName, Email, Gender, PersonName, Phone,
+};
 use crate::domain::role::Role;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_required, validate_username};
@@ -264,6 +266,13 @@ pub struct User {
     pub(crate) email: Option<Email>,
     pub(crate) phone: Option<Phone>,
     pub(crate) birth_date: Option<BirthDate>,
+    /// Self-declared gender, a postal address, and who to call when this
+    /// person is unreachable. Optional like everything above — the same
+    /// "filled in later, `None` = never chose" contract.
+    pub(crate) gender: Option<Gender>,
+    pub(crate) address: Option<Address>,
+    pub(crate) emergency_contact_name: Option<PersonName>,
+    pub(crate) emergency_contact_phone: Option<Phone>,
     // Frontend UI preferences. Optional like the personal info: `None` means
     // "never chose", which the frontend renders as the device preference.
     pub(crate) theme: Option<Theme>,
@@ -306,6 +315,10 @@ impl User {
             email: None,
             phone: None,
             birth_date: None,
+            gender: None,
+            address: None,
+            emergency_contact_name: None,
+            emergency_contact_phone: None,
             theme: None,
             language: None,
             palette_color: None,
@@ -359,6 +372,22 @@ impl User {
 
     pub fn get_birth_date(&self) -> Option<&BirthDate> {
         self.birth_date.as_ref()
+    }
+
+    pub fn get_gender(&self) -> Option<Gender> {
+        self.gender
+    }
+
+    pub fn get_address(&self) -> Option<&Address> {
+        self.address.as_ref()
+    }
+
+    pub fn get_emergency_contact_name(&self) -> Option<&PersonName> {
+        self.emergency_contact_name.as_ref()
+    }
+
+    pub fn get_emergency_contact_phone(&self) -> Option<&Phone> {
+        self.emergency_contact_phone.as_ref()
     }
 
     pub fn get_theme(&self) -> Option<Theme> {

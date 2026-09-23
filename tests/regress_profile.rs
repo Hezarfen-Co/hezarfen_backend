@@ -99,6 +99,10 @@ async fn a_peer_profile_carries_no_contact_fields() {
             "email": "ada@example.com",
             "phone": "+90 555 123 45 67",
             "birth_date": "1990-01-02",
+            "gender": "female",
+            "address": "Çamlık Mah. 2. Sk. No: 7, Bornova / İzmir",
+            "emergency_contact_name": "Mehmet Yılmaz",
+            "emergency_contact_phone": "+90 555 987 65 43",
         })),
     )
     .await;
@@ -107,7 +111,15 @@ async fn a_peer_profile_carries_no_contact_fields() {
     let seen = profile(&app, &peer, &ada_id).await;
     assert_eq!(seen.status, StatusCode::OK, "{}", seen.body);
     assert_eq!(seen.body["username"], "ada");
-    for private in ["email", "phone", "birth_date"] {
+    for private in [
+        "email",
+        "phone",
+        "birth_date",
+        "gender",
+        "address",
+        "emergency_contact_name",
+        "emergency_contact_phone",
+    ] {
         assert!(
             seen.body.get(private).is_none(),
             "{private} must not ride on a profile: {}",

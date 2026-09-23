@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: UserId\",\n                  username AS \"username: Username\",\n                  person AS \"person: PersonId\",\n                  role AS \"role: Role\",\n                  name AS \"name: PersonName\",\n                  surname AS \"surname: PersonName\",\n                  email AS \"email: Email\",\n                  phone AS \"phone: Phone\",\n                  birth_date AS \"birth_date: BirthDate\",\n                  theme AS \"theme: Theme\",\n                  language AS \"language: Language\",\n                  palette_color AS \"palette_color: PaletteColor\",\n                  display_name AS \"display_name: DisplayName\",\n                  bio AS \"bio: Bio\",\n                  avatar_file,\n                  avatar_content_type AS \"avatar_content_type: FileContentType\",\n                  branch,\n                  student_number AS \"student_number: StudentNumber\",\n                  avatar_size\n           FROM app_user WHERE role = $1 ORDER BY id DESC",
+  "query": "SELECT id AS \"id: UserId\",\n                  username AS \"username: Username\",\n                  person AS \"person: PersonId\",\n                  role AS \"role: Role\",\n                  name AS \"name: PersonName\",\n                  surname AS \"surname: PersonName\",\n                  email AS \"email: Email\",\n                  phone AS \"phone: Phone\",\n                  birth_date AS \"birth_date: BirthDate\",\n                  gender AS \"gender: Gender\",\n                  address AS \"address: Address\",\n                  emergency_contact_name AS \"emergency_contact_name: PersonName\",\n                  emergency_contact_phone AS \"emergency_contact_phone: Phone\",\n                  theme AS \"theme: Theme\",\n                  language AS \"language: Language\",\n                  palette_color AS \"palette_color: PaletteColor\",\n                  display_name AS \"display_name: DisplayName\",\n                  bio AS \"bio: Bio\",\n                  avatar_file,\n                  avatar_content_type AS \"avatar_content_type: FileContentType\",\n                  branch,\n                  student_number AS \"student_number: StudentNumber\",\n                  avatar_size\n           FROM app_user WHERE role = $1 ORDER BY id DESC",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,50 @@
       },
       {
         "ordinal": 9,
+        "name": "gender: Gender",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "gender"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "address: Address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "emergency_contact_name: PersonName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "emergency_contact_name"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "emergency_contact_phone: Phone",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "emergency_contact_phone"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
         "name": "theme: Theme",
         "type_info": "Text",
         "origin": {
@@ -114,7 +158,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 14,
         "name": "language: Language",
         "type_info": "Text",
         "origin": {
@@ -125,7 +169,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "palette_color: PaletteColor",
         "type_info": "Text",
         "origin": {
@@ -136,7 +180,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "display_name: DisplayName",
         "type_info": "Text",
         "origin": {
@@ -147,7 +191,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 17,
         "name": "bio: Bio",
         "type_info": "Text",
         "origin": {
@@ -158,7 +202,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 18,
         "name": "avatar_file",
         "type_info": "Text",
         "origin": {
@@ -169,7 +213,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 19,
         "name": "avatar_content_type: FileContentType",
         "type_info": "Text",
         "origin": {
@@ -180,7 +224,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 20,
         "name": "branch",
         "type_info": "Text",
         "origin": {
@@ -191,7 +235,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 21,
         "name": "student_number: StudentNumber",
         "type_info": "Text",
         "origin": {
@@ -202,7 +246,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 22,
         "name": "avatar_size",
         "type_info": "Int8",
         "origin": {
@@ -237,8 +281,12 @@
       true,
       true,
       true,
+      true,
+      true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "c8eeec6b17943f913ed919e8663e44fc9d0e85ac9eaa6a7f2c9b012237381d5c"
+  "hash": "56cb33247c6d8b90a8f8adbf74020e68e743aafd2373a5ba08d2340edfea70f6"
 }

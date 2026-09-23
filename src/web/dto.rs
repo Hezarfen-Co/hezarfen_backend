@@ -182,6 +182,20 @@ pub struct UserResponse {
     pub phone: Option<String>,
     #[schema(example = "1990-01-02")]
     pub birth_date: Option<String>,
+    /// Self-declared gender: `female`, `male`, `other`, or `undisclosed`;
+    /// `null` = never chosen.
+    #[schema(example = "female")]
+    pub gender: Option<String>,
+    /// Postal address; `null` when unset, at most `max_address_len` characters.
+    #[schema(example = "Çamlık Mah. 2. Sk. No: 7, Bornova / İzmir")]
+    pub address: Option<String>,
+    /// Who to call when this person is unreachable; `null` when unset. Same
+    /// gate as the other contact fields — never on the public profile.
+    #[schema(example = "Mehmet Yılmaz")]
+    pub emergency_contact_name: Option<String>,
+    /// The emergency contact's phone, same shape as `phone`; `null` when unset.
+    #[schema(example = "+90 555 987 65 43")]
+    pub emergency_contact_phone: Option<String>,
     /// UI color scheme: `light` or `dark`. `null` = never chosen — the client
     /// should fall back to the device preference.
     #[schema(example = "dark")]
@@ -218,6 +232,14 @@ impl UserResponse {
             email: user.get_email().map(|v| v.as_str().to_string()),
             phone: user.get_phone().map(|v| v.as_str().to_string()),
             birth_date: user.get_birth_date().map(|v| v.as_str().to_string()),
+            gender: user.get_gender().map(|v| v.as_str().to_string()),
+            address: user.get_address().map(|v| v.as_str().to_string()),
+            emergency_contact_name: user
+                .get_emergency_contact_name()
+                .map(|v| v.as_str().to_string()),
+            emergency_contact_phone: user
+                .get_emergency_contact_phone()
+                .map(|v| v.as_str().to_string()),
             theme: user.get_theme().map(|v| v.as_str().to_string()),
             language: user.get_language().map(|v| v.as_str().to_string()),
             palette_color: user.get_palette_color().map(|v| v.as_str().to_string()),

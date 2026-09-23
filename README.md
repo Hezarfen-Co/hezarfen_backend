@@ -645,12 +645,13 @@ response in the same commit.
                      "reserved_usernames": ["admin", "…"],
                      "min_password_len": 6, "max_password_len": 128,
                      "max_name_len": 100, "max_display_name_len": 50,
-                     "max_bio_len": 500,
+                     "max_bio_len": 500, "max_address_len": 500,
                      "max_profile_courses": 20, "max_profile_classes": 5,
                      "max_email_len": 254,
                      "min_phone_digits": 7, "max_phone_digits": 15,
                      "roles": ["parent", "student", "teacher", "manager", "admin"],
                      "themes": ["light", "dark"], "languages": ["tr", "en"],
+                     "genders": ["female", "male", "other", "undisclosed"],
                      "palette_color_pattern": "^#[0-9a-fA-F]{6}$", "palette_color_len": 7,
                      "session_duration_days": 7 },
   "badges":        { "catalog": [ { "id": "homework_submitted_10",
@@ -722,7 +723,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 218 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 220 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -1601,7 +1602,12 @@ is independent: omitted (or `null`) keeps the current value, an empty string
 `""` clears it, anything else is validated — email must look like
 `name@example.com`, phone is 7–15 digits with an optional `+` and cosmetic
 separators, `birth_date` is a real `YYYY-MM-DD` calendar date not in the
-future. Names allow unicode; usernames are strict: lowercase letters and
+future. The profile extras ride the same patch with the same semantics:
+`gender` is one of the four fixed words `female`/`male`/`other`/`undisclosed`
+(a closed vocabulary — anything else is a `400`), `address` is free text up to
+`max_address_len` (500), and `emergency_contact_name` /
+`emergency_contact_phone` follow the `name` and `phone` rules respectively.
+Names allow unicode; usernames are strict: lowercase letters and
 digits plus non-consecutive interior `.`, `_`, `-` separators, starting and
 ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
 `administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
@@ -1650,8 +1656,11 @@ the school. `GET /users/me/profile` is the caller's own copy of it,
 ```
 
 **Contact fields are absent by design.** `email`, `phone` and `birth_date` are
-not on this document at any role — they keep exactly the gate they have today
-(`GET /auth/me` for oneself, `GET /users/{id}` for an admin). A school-wide
+not on this document at any role, and neither are the profile extras that say
+where a person lives or who to call for them (`gender`, `address`,
+`emergency_contact_name`, `emergency_contact_phone`) — they keep exactly the
+gate the other contact fields have (`GET /auth/me` for oneself,
+`GET /users/{id}` for an admin). A school-wide
 read surface is not the place to widen where a phone number is reachable.
 
 **Visibility** is every authenticated account reading every profile, with one

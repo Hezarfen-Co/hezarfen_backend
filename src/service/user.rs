@@ -9,7 +9,9 @@ use crate::domain::board::Board;
 use crate::domain::note_file::FileContentType;
 use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
+use crate::domain::profile::{
+    Address, Bio, BirthDate, DisplayName, Email, Gender, PersonName, Phone,
+};
 use crate::domain::role::Role;
 use crate::domain::user::{Password, StudentNumber, User, UserId, Username};
 use crate::error::AppError;
@@ -176,6 +178,10 @@ pub async fn set_profile(
     birth_date: Option<Option<BirthDate>>,
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
+    gender: Option<Option<Gender>>,
+    address: Option<Option<Address>>,
+    emergency_contact_name: Option<Option<PersonName>>,
+    emergency_contact_phone: Option<Option<Phone>>,
     // The subject specialisation, clearable like `bio`; membership in the
     // school's `Settings::get_branches()` list is the caller's check, not this
     // one's.
@@ -195,6 +201,10 @@ pub async fn set_profile(
         birth_date,
         display_name,
         bio,
+        gender,
+        address,
+        emergency_contact_name,
+        emergency_contact_phone,
         branch,
         student_number,
     )

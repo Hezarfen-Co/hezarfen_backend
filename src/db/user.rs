@@ -15,7 +15,7 @@ use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::note_file::FileContentType;
 use crate::domain::person::PersonId;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
+use crate::domain::profile::{Address, Bio, BirthDate, DisplayName, Email, Gender, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
@@ -92,6 +92,10 @@ pub async fn create_with_role(
                      email AS "email: Email",
                      phone AS "phone: Phone",
                      birth_date AS "birth_date: BirthDate",
+                     gender AS "gender: Gender",
+                     address AS "address: Address",
+                     emergency_contact_name AS "emergency_contact_name: PersonName",
+                     emergency_contact_phone AS "emergency_contact_phone: Phone",
                      theme AS "theme: Theme",
                      language AS "language: Language",
                      palette_color AS "palette_color: PaletteColor",
@@ -146,6 +150,10 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
                   email AS "email: Email",
                   phone AS "phone: Phone",
                   birth_date AS "birth_date: BirthDate",
+                  gender AS "gender: Gender",
+                  address AS "address: Address",
+                  emergency_contact_name AS "emergency_contact_name: PersonName",
+                  emergency_contact_phone AS "emergency_contact_phone: Phone",
                   theme AS "theme: Theme",
                   language AS "language: Language",
                   palette_color AS "palette_color: PaletteColor",
@@ -192,6 +200,10 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
                   email AS "email: Email",
                   phone AS "phone: Phone",
                   birth_date AS "birth_date: BirthDate",
+                  gender AS "gender: Gender",
+                  address AS "address: Address",
+                  emergency_contact_name AS "emergency_contact_name: PersonName",
+                  emergency_contact_phone AS "emergency_contact_phone: Phone",
                   theme AS "theme: Theme",
                   language AS "language: Language",
                   palette_color AS "palette_color: PaletteColor",
@@ -225,6 +237,10 @@ pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppErr
                   email AS "email: Email",
                   phone AS "phone: Phone",
                   birth_date AS "birth_date: BirthDate",
+                  gender AS "gender: Gender",
+                  address AS "address: Address",
+                  emergency_contact_name AS "emergency_contact_name: PersonName",
+                  emergency_contact_phone AS "emergency_contact_phone: Phone",
                   theme AS "theme: Theme",
                   language AS "language: Language",
                   palette_color AS "palette_color: PaletteColor",
@@ -456,6 +472,10 @@ pub async fn set_role_cascade(
                          email AS "email: Email",
                          phone AS "phone: Phone",
                          birth_date AS "birth_date: BirthDate",
+                         gender AS "gender: Gender",
+                         address AS "address: Address",
+                         emergency_contact_name AS "emergency_contact_name: PersonName",
+                         emergency_contact_phone AS "emergency_contact_phone: Phone",
                          theme AS "theme: Theme",
                          language AS "language: Language",
                          palette_color AS "palette_color: PaletteColor",
@@ -722,6 +742,10 @@ pub async fn set_profile(
     birth_date: Option<Option<BirthDate>>,
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
+    gender: Option<Option<Gender>>,
+    address: Option<Option<Address>>,
+    emergency_contact_name: Option<Option<PersonName>>,
+    emergency_contact_phone: Option<Option<Phone>>,
     branch: Option<Option<String>>,
     student_number: Option<Option<StudentNumber>>,
 ) -> Result<User, AppError> {
@@ -762,6 +786,30 @@ pub async fn set_profile(
         .set(
             "bio",
             text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "gender",
+            text(gender.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "address",
+            text(address.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))),
+        )
+        .set(
+            "emergency_contact_name",
+            text(
+                emergency_contact_name
+                    .as_ref()
+                    .map(|n| n.as_ref().map(|x| x.as_str())),
+            ),
+        )
+        .set(
+            "emergency_contact_phone",
+            text(
+                emergency_contact_phone
+                    .as_ref()
+                    .map(|n| n.as_ref().map(|x| x.as_str())),
+            ),
         )
         // The subject area is plain text, not a newtype: the school's own list is
         // settings data, so its membership check belongs to the write path
@@ -840,6 +888,10 @@ pub async fn set_avatar(
                       email AS "email: Email",
                       phone AS "phone: Phone",
                       birth_date AS "birth_date: BirthDate",
+                      gender AS "gender: Gender",
+                      address AS "address: Address",
+                      emergency_contact_name AS "emergency_contact_name: PersonName",
+                      emergency_contact_phone AS "emergency_contact_phone: Phone",
                       theme AS "theme: Theme",
                       language AS "language: Language",
                       palette_color AS "palette_color: PaletteColor",
@@ -890,6 +942,10 @@ pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, Ap
                       email AS "email: Email",
                       phone AS "phone: Phone",
                       birth_date AS "birth_date: BirthDate",
+                      gender AS "gender: Gender",
+                      address AS "address: Address",
+                      emergency_contact_name AS "emergency_contact_name: PersonName",
+                      emergency_contact_phone AS "emergency_contact_phone: Phone",
                       theme AS "theme: Theme",
                       language AS "language: Language",
                       palette_color AS "palette_color: PaletteColor",
@@ -954,6 +1010,10 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
                   email AS "email: Email",
                   phone AS "phone: Phone",
                   birth_date AS "birth_date: BirthDate",
+                  gender AS "gender: Gender",
+                  address AS "address: Address",
+                  emergency_contact_name AS "emergency_contact_name: PersonName",
+                  emergency_contact_phone AS "emergency_contact_phone: Phone",
                   theme AS "theme: Theme",
                   language AS "language: Language",
                   palette_color AS "palette_color: PaletteColor",
@@ -1016,6 +1076,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1048,14 +1112,8 @@ mod tests {
         set_profile(
             &db,
             user.get_id(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, // name..bio
+            None, None, None, None, // gender..emergency_contact_phone
             Some(Some(number.clone())),
         )
         .await
@@ -1071,14 +1129,8 @@ mod tests {
         let refused = set_profile(
             &db,
             stale.get_id(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, // name..bio
+            None, None, None, None, // gender..emergency_contact_phone
             Some(Some(number)),
         )
         .await;
@@ -1120,6 +1172,10 @@ mod tests {
             None,
             None,
             Some(Some(display_name.clone())),
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
