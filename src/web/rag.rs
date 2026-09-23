@@ -1032,12 +1032,18 @@ impl From<RagQuestionsReply> for RagQuestionsResponse {
 /// The one `(sınıf, ders)` pair a study request may address, resolved against
 /// the asker's own derived pairs — the body only *names* a target inside them.
 ///
-/// A named grade must be a pair the asker holds **exactly**; anything else is a
-/// `403`, because a corpus the asker cannot study must not be summarized on
-/// their behalf. An absent or empty grade resolves the subject alone: exactly
-/// one pair for that `ders` is the target, none is a `403`, and more than one
-/// is a `400` — the caller must name the şube, since picking one for them would
-/// answer from a corpus they did not name.
+/// A named ders matches a pair **exactly** first — a picker's own spelling is
+/// never re-rolled — and only then through [`crate::domain::text_fold::search_fold`],
+/// the fold the RAG slug vocabulary rides: a citation names its course by slug
+/// (`biyoloji`), the pair carries the course title (`Biyoloji`), and the two
+/// spellings must resolve to one pair. A named grade must still be a pair the
+/// asker holds; anything else is a `403`, because a corpus the asker cannot
+/// study must not be summarized on their behalf. An absent or empty grade
+/// resolves the subject alone: exactly one pair for that `ders` is the target,
+/// none is a `403`, and more than one is a `400` — the caller must name the
+/// şube, since picking one for them would answer from a corpus they did not
+/// name. Two *distinct* courses folding to one key refuse the same way rather
+/// than routing on a guess.
 fn resolve_study_pair(
     pairs: &[RagScopePair],
     ders: &str,
@@ -1046,30 +1052,41 @@ fn resolve_study_pair(
     if ders.trim().is_empty() {
         return Err(AppError::Validation(ValidationError::Empty("ders")));
     }
-    match sinif.filter(|grade| !grade.trim().is_empty()) {
-        Some(grade) => pairs
+    let grade = sinif.filter(|grade| !grade.trim().is_empty());
+    let in_grade =
+        |pair: &&RagScopePair| grade.is_none() || pair.sinif.as_deref() == grade;
+    let mut matches: Vec<&RagScopePair> =
+        pairs.iter().filter(|pair| in_grade(pair) && pair.ders == ders).collect();
+    if matches.is_empty() {
+        let folded = crate::domain::text_fold::search_fold(ders);
+        matches = pairs
             .iter()
-            .find(|pair| pair.ders == ders && pair.sinif.as_deref() == Some(grade))
-            .cloned()
-            .ok_or(AppError::Forbidden(
-                "the requested ders/sinif pair is not in your scope",
-            )),
-        None => {
-            let mut candidates = pairs.iter().filter(|pair| pair.ders == ders);
-            let Some(first) = candidates.next() else {
-                return Err(AppError::Forbidden(
-                    "the requested ders is not in your scope",
-                ));
-            };
-            if candidates.next().is_some() {
-                return Err(AppError::Validation(ValidationError::Invalid {
-                    field: "sinif",
-                    reason: "name the grade: this ders is taught in more than one",
-                }));
-            }
-            Ok(first.clone())
-        }
+            .filter(|pair| {
+                in_grade(pair) && crate::domain::text_fold::search_fold(&pair.ders) == folded
+            })
+            .collect();
     }
+    let Some(first) = matches.first() else {
+        return Err(AppError::Forbidden(match grade {
+            Some(_) => "the requested ders/sinif pair is not in your scope",
+            None => "the requested ders is not in your scope",
+        }));
+    };
+    if matches.len() > 1 {
+        // One title across several grades is the name-the-grade refusal;
+        // distinct titles folding equal cannot be settled by naming anything,
+        // so the ders itself is judged ambiguous — never a first-wins guess.
+        let one_title = matches.iter().all(|pair| pair.ders == first.ders);
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: if one_title { "sinif" } else { "ders" },
+            reason: if one_title {
+                "name the grade: this ders is taught in more than one"
+            } else {
+                "more than one course matches this name; name the course exactly"
+            },
+        }));
+    }
+    Ok((*first).clone())
 }
 
 /// Summarize one range of one corpus the caller may study.
@@ -1308,5 +1325,78 @@ mod tests {
             Err(AppError::Validation(ValidationError::Invalid { field: "sinif", .. }))
         ));
         assert!(resolve_study_pair(&two, "Fizik", Some("10")).is_ok());
+    }
+    /// A citation names its course by the RAG slug vocabulary (lowercase,
+    /// diacritic-stripped) while the pair carries the course title: the body's
+    /// `biyoloji` must resolve the pair whose title is `Biyoloji`, with the
+    /// derived title — never the body's slug — being what travels.
+    #[test]
+    fn a_study_pair_matches_the_slug_spelling_through_the_search_fold() {
+        let pairs = vec![
+            pair(Some("10"), "Biyoloji"),
+            pair(Some("9"), "İngilizce"),
+            pair(Some("11"), "Coğrafya"),
+        ];
+
+        // The slug spelling resolves, with and without a named grade.
+        let resolved = resolve_study_pair(&pairs, "biyoloji", None).unwrap();
+        assert_eq!(resolved.ders, "Biyoloji");
+        assert_eq!(resolved.sinif.as_deref(), Some("10"));
+        assert_eq!(
+            resolve_study_pair(&pairs, "biyoloji", Some("10")).unwrap().ders,
+            "Biyoloji"
+        );
+
+        // The fold is Turkish-correct both ways: dotted İ folds, and the
+        // slug's stripped diacritics still reach the accented title.
+        assert_eq!(
+            resolve_study_pair(&pairs, "ingilizce", None).unwrap().ders,
+            "İngilizce"
+        );
+        assert_eq!(
+            resolve_study_pair(&pairs, "cografya", Some("11")).unwrap().ders,
+            "Coğrafya"
+        );
+
+        // A grade the asker holds no folded pair for, and a ders no course
+        // folds to, are still the same scope refusal — never widened access.
+        assert!(matches!(
+            resolve_study_pair(&pairs, "biyoloji", Some("11")),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            resolve_study_pair(&pairs, "fizik", None),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    /// Two *distinct* courses folding to one key refuse rather than route on
+    /// a guess — the same multi-match verdict family as the multi-grade
+    /// refusal, judged on `ders` since naming a grade cannot settle it.
+    #[test]
+    fn folded_ambiguity_refuses_instead_of_guessing() {
+        // `Kâğıt` and `Kagit` fold to one key, and no exact spelling of the
+        // slug settles which one the caller meant.
+        let folded_twins = vec![pair(Some("9"), "Kâğıt"), pair(Some("9"), "Kagit")];
+        assert!(matches!(
+            resolve_study_pair(&folded_twins, "kagit", None),
+            Err(AppError::Validation(ValidationError::Invalid { field: "ders", .. }))
+        ));
+        assert!(matches!(
+            resolve_study_pair(&folded_twins, "kagit", Some("9")),
+            Err(AppError::Validation(ValidationError::Invalid { field: "ders", .. }))
+        ));
+
+        // One course taught in two grades, named by slug: the caller must
+        // still name the grade.
+        let two_grades = vec![pair(Some("9"), "Biyoloji"), pair(Some("10"), "Biyoloji")];
+        assert!(matches!(
+            resolve_study_pair(&two_grades, "biyoloji", None),
+            Err(AppError::Validation(ValidationError::Invalid { field: "sinif", .. }))
+        ));
+        assert_eq!(
+            resolve_study_pair(&two_grades, "biyoloji", Some("10")).unwrap().ders,
+            "Biyoloji"
+        );
     }
 }

@@ -3499,6 +3499,44 @@ async fn the_summarize_request_carries_the_askers_scope_and_role() {
     );
 }
 
+/// A study request launched off an answer's citation names the course by the
+/// RAG slug vocabulary — lowercase, diacritic-stripped (`satranc kulubu` for
+/// `Satranç Kulübü`) — not by the course title a picker would send. The door
+/// folds both spellings through the same search fold, so the slug resolves;
+/// the pair that reaches the service is still the derived title.
+#[tokio::test]
+async fn a_slug_spelled_ders_resolves_to_the_derived_pair() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY, AI_RAG_QUESTIONS_CAPABILITY]),
+        Behaviour::Answer(json!({ "text": "özet", "items": [] })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, cookie, _student) = study_user(&bridge).await;
+
+    for path in ["/rag/summarize", "/rag/questions"] {
+        let res = common::send(
+            &app,
+            "POST",
+            path,
+            Some(&cookie),
+            Some(json!({ "ders": "satranc kulubu" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{path}: {}", res.body);
+    }
+    let seen = service.seen();
+    assert_eq!(seen.len(), 2, "one dispatch per call, never a re-send");
+    for dispatch in &seen {
+        assert_eq!(
+            dispatch.payload["scope"]["ders"], "Satranç Kulübü",
+            "the derived pair travels, never the body's slug spelling"
+        );
+    }
+}
+
 /// The questions wire contract: the same scope, plus the shape of the set, and
 /// the service's own `soru`/`cevap`/`zorluk` rows mapped onto this API's
 /// `question`/`answer`/`difficulty` (the wire keeps the service's vocabulary).
