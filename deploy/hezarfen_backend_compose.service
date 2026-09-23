@@ -26,6 +26,13 @@
 # Env-only restart (restart re-runs `compose up -d`, recreating containers
 # whose environment changed):
 #   systemctl --user restart hezarfen_backend_compose
+#
+# A failed ExecStart (boot-time `compose up`, or a restart) is retried after
+# 1500s until one succeeds. systemd 259 honors Restart= on Type=oneshot.
+# Attached `podman compose up` is not used: podman-compose 1.6 only runs
+# `down` on SIGINT, and a container that fails to start exits 0, so Restart=
+# would never see that failure. 1500s is past the longest deploy health gate
+# (rag, 960s) so a background retry cannot undo a rollback.
 
 [Unit]
 Description=Hezarfen backend compose stack (postgres + backend + openobserve)
@@ -35,6 +42,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=1500s
 WorkingDirectory=%h/hezarfen_backend
 # ORTAM IKI KANALDAN GELIR -- bu bir tercih degil, saglayicinin siniridir:
 #   * operatorun ayar dosyasi -> `EnvironmentFile=` (systemd dosyayi unit'in
