@@ -135,6 +135,11 @@ struct JobArtifacts {
     duration_secs: Option<f64>,
     /// The resolved narration format.
     format: Option<String>,
+    /// The episode transcript, chapters joined by blank lines. `null` when the
+    /// service that produced the episode did not report one — every job
+    /// finished before the column existed, and any later job whose done report
+    /// omitted the field.
+    transcript: Option<String>,
 }
 
 /// The verdict on a cancel.
@@ -466,6 +471,7 @@ async fn result(
         audio_id,
         duration_secs: job.get_duration_secs(),
         format: job.get_format().map(str::to_string),
+        transcript: job.get_transcript().map(str::to_string),
     })
     .into_response())
 }

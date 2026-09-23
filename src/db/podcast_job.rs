@@ -36,7 +36,7 @@ pub async fn insert(db: &Database, job: &PodcastJob) -> Result<PodcastJob, AppEr
              eta_secs, created_at, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15) \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         job.get_id().uuid(),
@@ -65,7 +65,7 @@ pub async fn read(db: &Database, id: &PodcastJobId) -> Result<Option<PodcastJob>
     Ok(query_as!(
         PodcastJob,
         "SELECT id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" \
          FROM podcast_job WHERE id = $1",
@@ -87,7 +87,7 @@ pub async fn read_for(
     Ok(query_as!(
         PodcastJob,
         "SELECT id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" \
          FROM podcast_job WHERE id = $1 AND user_id = $2",
@@ -177,9 +177,11 @@ async fn with_source_titles(
 /// concurrent write (a cancel, another report) moved it first — the caller
 /// re-reads and answers the truth.
 ///
-/// `format` fills the column once and never rewrites it: the service's default
-/// resolution arrives on the first report, and a later report disagreeing with
-/// it is refused by the service layer, not silently stored.
+/// `format` and `transcript` fill their columns once and never rewrite them:
+/// the service's default resolution arrives on the first report, and a later
+/// report disagreeing with the format is refused by the service layer, not
+/// silently stored. A later transcript is ignored the same way — the first
+/// non-null value stands.
 #[allow(clippy::too_many_arguments)]
 pub async fn report(
     db: &Database,
@@ -190,15 +192,17 @@ pub async fn report(
     progress: f64,
     error_code: Option<&str>,
     format: Option<&str>,
+    transcript: Option<&str>,
 ) -> Result<Option<PodcastJob>, AppError> {
     let now = Timestamp::now().as_millis();
     Ok(query_as!(
         PodcastJob,
         "UPDATE podcast_job SET state = $3, stage = $4, progress = $5, error_code = $6, \
-             format = COALESCE(format, $7::text), updated_at = $8 \
+             format = COALESCE(format, $7::text), transcript = COALESCE(transcript, $8::text), \
+             updated_at = $9 \
          WHERE id = $1 AND state = $2 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+             source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -208,6 +212,7 @@ pub async fn report(
         progress,
         error_code,
         format,
+        transcript,
         now,
     )
     .fetch_optional(db)
@@ -228,7 +233,7 @@ pub async fn set_cancelled(
         "UPDATE podcast_job SET state = 'cancelled', stage = '', updated_at = $2 \
          WHERE id = $1 AND state IN ('queued', 'running') \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -253,7 +258,7 @@ pub async fn set_failed(
         "UPDATE podcast_job SET state = 'failed', error_code = $2, stage = '', updated_at = $3 \
          WHERE id = $1 AND state IN ('queued', 'running') \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -284,7 +289,7 @@ pub async fn set_audio(
              audio_bytes = $5, duration_secs = $6, updated_at = $7 \
          WHERE id = $1 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -311,7 +316,7 @@ pub async fn set_eta(
         PodcastJob,
         "UPDATE podcast_job SET eta_secs = $2 WHERE id = $1 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -355,6 +360,7 @@ mod tests {
             user_id: *user,
             source_id: "src".to_string(),
             format: None,
+            transcript: None,
             state: PodcastJobState::Queued,
             stage: String::new(),
             progress: 0.0,
@@ -379,7 +385,9 @@ mod tests {
         let row = insert(&db, &job(&user)).await.expect("insert");
         let id = row.get_id().clone();
 
-        // The running report lands, and carries the resolved format with it.
+        // The running report lands, and carries the resolved format and the
+        // transcript with it. A later report that does not match the row
+        // cannot clear either.
         let running = report(
             &db,
             &id,
@@ -389,12 +397,14 @@ mod tests {
             0.25,
             None,
             Some("duz_okuma"),
+            Some("bolum bir\n\nbolum iki"),
         )
         .await
         .expect("report")
         .expect("row was queued");
         assert_eq!(running.get_state(), PodcastJobState::Running);
         assert_eq!(running.get_format(), Some("duz_okuma"));
+        assert_eq!(running.get_transcript(), Some("bolum bir\n\nbolum iki"));
 
         // A second report claiming the row is still queued matches nothing.
         let stale = report(
@@ -406,6 +416,7 @@ mod tests {
             0.5,
             None,
             None,
+            Some("should not land"),
         )
         .await
         .expect("report");
@@ -422,6 +433,7 @@ mod tests {
             1.0,
             None,
             None,
+            Some("also not"),
         )
         .await
         .expect("report");
@@ -429,6 +441,15 @@ mod tests {
         assert_eq!(
             read(&db, &id).await.expect("read").unwrap().get_state(),
             PodcastJobState::Cancelled
+        );
+        assert_eq!(
+            read(&db, &id)
+                .await
+                .expect("read")
+                .unwrap()
+                .get_transcript(),
+            Some("bolum bir\n\nbolum iki"),
+            "a report that matched nothing did not clear the stored transcript"
         );
         // A terminal row refuses the backend's own writes too.
         assert!(set_failed(&db, &id, "interrupted").await.unwrap().is_none());
@@ -473,6 +494,7 @@ mod tests {
             1.0,
             None,
             None,
+            None,
         )
         .await;
         assert!(refused.is_err(), "the CHECK backstops the service layer");
@@ -497,6 +519,7 @@ mod tests {
             1.0,
             None,
             None,
+            Some("metin"),
         )
         .await
         .expect("report")
@@ -505,5 +528,6 @@ mod tests {
         assert_eq!(done.get_audio_key(), Some("podcast/x.mp3"));
         assert_eq!(done.get_duration_secs(), Some(3.5));
         assert_eq!(done.get_audio_bytes(), Some(12));
+        assert_eq!(done.get_transcript(), Some("metin"));
     }
 }

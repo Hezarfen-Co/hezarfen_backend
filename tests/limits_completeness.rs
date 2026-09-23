@@ -551,12 +551,20 @@ fn moved_value_tables_are_still_published_or_deliberately_excluded() {
 /// constant: every former entry now lives there and is excused (or published)
 /// through `EXCLUDED` above instead. A new name here is a claim that a bound
 /// belongs somewhere else, which needs an argument.
-const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[(
-    "MAX_CODE_LEN",
-    "bound on the length of a podcast report's `stage`/`error_code` — values \
+const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[
+    (
+        "MAX_CODE_LEN",
+        "bound on the length of a podcast report's `stage`/`error_code` — values \
      the AI *service* writes onto the job row; a browser reads the stored \
      string back, it never sizes one against this",
-)];
+    ),
+    (
+        "MAX_TRANSCRIPT_LEN",
+        "bound on a podcast report's `transcript` — the AI service writes it, \
+     the result door returns the stored text; a browser never sizes a \
+     transcript against this",
+    ),
+];
 
 #[test]
 fn validation_bounds_live_in_constant_rs() {

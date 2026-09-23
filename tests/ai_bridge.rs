@@ -4810,14 +4810,15 @@ async fn seed_podcast_job(db: &Database) -> (String, String) {
 }
 
 /// The row's own answers to what the tests ask of it:
-/// (state, stage, progress, audio_key, duration_secs).
+/// (state, stage, progress, audio_key, duration_secs, transcript).
 async fn podcast_row(
     db: &Database,
     job: &str,
-) -> (String, String, f64, Option<String>, Option<f64>) {
+) -> (String, String, f64, Option<String>, Option<f64>, Option<String>) {
     use sqlx::Row as _;
     let row = sqlx::query(
-        "SELECT state, stage, progress, audio_key, duration_secs FROM podcast_job WHERE id = $1",
+        "SELECT state, stage, progress, audio_key, duration_secs, transcript \
+         FROM podcast_job WHERE id = $1",
     )
     .bind(uuid::Uuid::parse_str(job).expect("a job uuid"))
     .fetch_one(db)
@@ -4829,6 +4830,7 @@ async fn podcast_row(
         row.get("progress"),
         row.get("audio_key"),
         row.get("duration_secs"),
+        row.get("transcript"),
     )
 }
 
@@ -4840,19 +4842,35 @@ fn report_call(
     stage: &str,
     progress: f64,
 ) -> CapabilityRequest {
+    report_call_with(school, job, user, state, stage, progress, None)
+}
+
+fn report_call_with(
+    school: &str,
+    job: &str,
+    user: &str,
+    state: &str,
+    stage: &str,
+    progress: f64,
+    transcript: Option<&str>,
+) -> CapabilityRequest {
+    let mut payload = json!({
+        "job_id": job,
+        "source_id": "kaynak-1",
+        "format": "duz_okuma",
+        "user_id": user,
+        "state": state,
+        "stage": stage,
+        "progress": progress,
+    });
+    if let Some(text) = transcript {
+        payload["transcript"] = json!(text);
+    }
     CapabilityRequest {
         id: format!("trace-report-{job}-{state}"),
         school: school.to_string(),
         capability: AI_PODCAST_REPORT_CAPABILITY.to_string(),
-        payload: json!({
-            "job_id": job,
-            "source_id": "kaynak-1",
-            "format": "duz_okuma",
-            "user_id": user,
-            "state": state,
-            "stage": stage,
-            "progress": progress,
-        }),
+        payload,
     }
 }
 
@@ -4928,6 +4946,10 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     assert_eq!(ok_capability(answer)["job_id"], job);
     assert_eq!(podcast_row(&db, &job).await.0, "running");
     assert_eq!(podcast_row(&db, &job).await.1, "script");
+    assert!(
+        podcast_row(&db, &job).await.5.is_none(),
+        "a report that omits transcript still stores, and the column stays null"
+    );
 
     // `done` means a stored episode: a report that claims one before the
     // upload is refused, and nothing about the row moves.
@@ -4977,18 +4999,29 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     assert_eq!(row.3.as_deref(), Some(key.as_str()));
     assert_eq!(row.4, Some(12.5));
 
-    // Now — and only now — `done` is accepted.
+    // Now — and only now — `done` is accepted, and the transcript it carries
+    // is what the row holds.
     assert_eq!(
         ok_capability(
             capability_call(
                 conn,
-                report_call(DEMO_SCHOOL_ID, &job, &user, "done", "done", 1.0)
+                report_call_with(
+                    DEMO_SCHOOL_ID,
+                    &job,
+                    &user,
+                    "done",
+                    "done",
+                    1.0,
+                    Some("bolum bir\n\nbolum iki"),
+                )
             )
             .await
         )["stored"],
         true
     );
-    assert_eq!(podcast_row(&db, &job).await.0, "done");
+    let done = podcast_row(&db, &job).await;
+    assert_eq!(done.0, "done");
+    assert_eq!(done.5.as_deref(), Some("bolum bir\n\nbolum iki"));
 
     // And a job the backend never minted is `unknown_job`.
     let stranger = hezarfen_backend::domain::monotonic_id::next_uuid().to_string();

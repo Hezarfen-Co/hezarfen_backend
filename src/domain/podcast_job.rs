@@ -136,6 +136,9 @@ pub struct PodcastJob {
     pub(crate) user_id: UserId,
     pub(crate) source_id: String,
     pub(crate) format: Option<String>,
+    /// The episode transcript, chapters joined with blank lines. `None` until
+    /// a report carries one, and forever for a job whose service never did.
+    pub(crate) transcript: Option<String>,
     pub(crate) state: PodcastJobState,
     pub(crate) stage: String,
     pub(crate) progress: f64,
@@ -165,6 +168,10 @@ impl PodcastJob {
 
     pub fn get_format(&self) -> Option<&str> {
         self.format.as_deref()
+    }
+
+    pub fn get_transcript(&self) -> Option<&str> {
+        self.transcript.as_deref()
     }
 
     pub fn get_state(&self) -> PodcastJobState {
@@ -326,6 +333,7 @@ mod tests {
             user_id: UserId::from_key("00000000-0000-7000-8000-000000000000"),
             source_id: "src".to_string(),
             format: None,
+            transcript: None,
             state,
             stage: String::new(),
             progress: 0.0,

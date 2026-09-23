@@ -114,6 +114,12 @@ pub struct PodcastReportPayload {
     pub progress: f64,
     #[serde(default)]
     pub error_code: Option<String>,
+    /// The finished episode's transcript: one text blob, chapters already
+    /// joined with blank lines. Absent on a report that is not `done`, and on
+    /// a service that has not learned the field yet — `#[serde(default)]`
+    /// keeps that older payload valid.
+    #[serde(default)]
+    pub transcript: Option<String>,
 }
 
 /// The answer to one report. `stored` is always `true` on an `Ok` — an
@@ -148,7 +154,8 @@ pub async fn cancel(
 ///
 /// The decode is deliberately strict: a payload that does not fit
 /// [`PodcastReportPayload`] is `invalid_payload`, never coerced into a
-/// half-filled report.
+/// half-filled report. `transcript` is the one defaulted field, so a service
+/// that omits it still reports.
 pub async fn report(db: &Database, payload: Value) -> Result<Value, (&'static str, String)> {
     let report: PodcastReportPayload = serde_json::from_value(payload).map_err(|err| {
         (
@@ -165,6 +172,7 @@ pub async fn report(db: &Database, payload: Value) -> Result<Value, (&'static st
         stage: &report.stage,
         progress: report.progress,
         error_code: report.error_code.as_deref(),
+        transcript: report.transcript.as_deref(),
     };
     match crate::service::podcast_job::report(db, &input).await {
         Ok(job) => Ok(serde_json::to_value(PodcastReportReply {

@@ -23,6 +23,11 @@ use crate::validate::validate_required;
 /// service cannot write a paragraph into a column a UI renders inline.
 const MAX_CODE_LEN: usize = 64;
 
+/// The most characters a report may put in `transcript`. A finished episode's
+/// text is a few kilobytes; past a million characters the payload is not a
+/// transcript, and it must not land in a column a result door returns whole.
+const MAX_TRANSCRIPT_LEN: usize = 1_000_000;
+
 /// Why one `podcast.report` (or an audio ingest) was refused. `code()` is the
 /// flat, stable, machine-readable string the bridge answers in the
 /// capability's `code` field — the same vocabulary the protocol's other
@@ -95,6 +100,7 @@ pub struct ReportInput<'a> {
     pub stage: &'a str,
     pub progress: f64,
     pub error_code: Option<&'a str>,
+    pub transcript: Option<&'a str>,
 }
 
 /// Mint and store one freshly submitted job. The id is the backend's (the
@@ -113,6 +119,7 @@ pub async fn create(
         user_id: *user,
         source_id: source_id.to_string(),
         format: format.map(str::to_string),
+        transcript: None,
         state: PodcastJobState::Queued,
         stage: String::new(),
         progress: 0.0,
@@ -201,6 +208,13 @@ pub async fn report(
             "error_code is longer than 64 characters".to_string(),
         ));
     }
+    if let Some(transcript) = input.transcript
+        && transcript.chars().count() > MAX_TRANSCRIPT_LEN
+    {
+        return Err(PodcastRefusal::InvalidPayload(format!(
+            "transcript is longer than {MAX_TRANSCRIPT_LEN} characters"
+        )));
+    }
 
     let Some(row) = podcast_job::read(db, &id).await? else {
         return Err(PodcastRefusal::UnknownJob);
@@ -235,6 +249,10 @@ pub async fn report(
     if target == PodcastJobState::Done && row.get_audio_key().is_none() {
         return Err(PodcastRefusal::AudioMissing);
     }
+    // A progress report carries `""` (no text yet). `COALESCE` would store
+    // that empty string and then ignore the done report's text, so a blank
+    // or all-whitespace transcript is absent, not a value.
+    let transcript = input.transcript.filter(|text| !text.trim().is_empty());
 
     match podcast_job::report(
         db,
@@ -245,6 +263,7 @@ pub async fn report(
         input.progress,
         input.error_code,
         input.format,
+        transcript,
     )
     .await?
     {
@@ -346,4 +365,93 @@ pub async fn set_audio(
     duration_secs: Option<f64>,
 ) -> Result<Option<PodcastJob>, AppError> {
     podcast_job::set_audio(db, id, key, name, content_type, bytes, duration_secs).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cap is checked before any query, so an oversized transcript never
+    /// reaches the row — and a missing field is not this refusal.
+    #[tokio::test]
+    async fn a_transcript_over_one_million_characters_is_refused() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let huge = "a".repeat(MAX_TRANSCRIPT_LEN + 1);
+        let input = ReportInput {
+            job_id: "019732e3-7b00-7000-8000-00000000dead",
+            source_id: "src",
+            format: None,
+            user_id: "00000000-0000-7000-8000-000000000000",
+            state: "running",
+            stage: "",
+            progress: 0.0,
+            error_code: None,
+            transcript: Some(&huge),
+        };
+        let err = report(&db, &input).await.expect_err("over the cap");
+        assert_eq!(err.code(), "invalid_payload");
+        assert!(
+            err.message().contains("1000000"),
+            "names the cap: {}",
+            err.message()
+        );
+    }
+
+    /// The service sends `transcript: ""` on every report until the episode
+    /// is done. That blank must not fill the column, or the done text is
+    /// dropped by `COALESCE`.
+    #[tokio::test]
+    async fn a_blank_progress_transcript_does_not_block_the_done_text() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let user = UserId::from_key(&crate::domain::monotonic_id::next_uuid().to_string());
+        sqlx::query("INSERT INTO app_user (id, username, created_at) VALUES ($1, $2, 0)")
+            .bind(user.uuid())
+            .bind(format!("u{}", &user.key()[..8]))
+            .execute(&db)
+            .await
+            .expect("insert user");
+        let job = create(&db, &user, "src", None).await.expect("create");
+        let job_id = job.get_id().key();
+        let user_id = user.key();
+        let progress = ReportInput {
+            job_id: &job_id,
+            source_id: "src",
+            format: None,
+            user_id: &user_id,
+            state: "running",
+            stage: "script",
+            progress: 0.2,
+            error_code: None,
+            transcript: Some(""),
+        };
+        let running = report(&db, &progress).await.expect("progress report");
+        assert_eq!(running.get_state(), PodcastJobState::Running);
+        assert!(running.get_transcript().is_none(), "a blank transcript is absent");
+
+        set_audio(
+            &db,
+            job.get_id(),
+            "podcast/x.mp3",
+            "episode.mp3",
+            "audio/mpeg",
+            12,
+            Some(1.5),
+        )
+        .await
+        .expect("stamp audio")
+        .expect("row");
+        let done = ReportInput {
+            job_id: &job_id,
+            source_id: "src",
+            format: None,
+            user_id: &user_id,
+            state: "done",
+            stage: "done",
+            progress: 1.0,
+            error_code: None,
+            transcript: Some("bolum bir\n\nbolum iki"),
+        };
+        let finished = report(&db, &done).await.expect("done report");
+        assert_eq!(finished.get_transcript(), Some("bolum bir\n\nbolum iki"));
+    }
 }

@@ -814,12 +814,10 @@ async fn a_finished_job_serves_the_uploaded_bytes() {
     assert_eq!(answer["key"], format!("podcast/{job_id}.mp3"));
     assert_eq!(answer["size"], bytes.len() as u64);
 
+    let mut done = report_frame(&job_id, &note, &user, "done", "", 1.0);
+    done["payload"]["transcript"] = json!("bolum bir\n\nbolum iki");
     assert_report_stored(
-        &capability_call(
-            &service.conn,
-            report_frame(&job_id, &note, &user, "done", "", 1.0),
-        )
-        .await,
+        &capability_call(&service.conn, done).await,
         &job_id,
     );
 
@@ -829,6 +827,7 @@ async fn a_finished_job_serves_the_uploaded_bytes() {
     assert_eq!(res.body["audio_id"], format!("podcast/{job_id}.mp3"));
     assert_eq!(res.body["duration_secs"], DURATION_SECS);
     assert_eq!(res.body["format"], FORMAT);
+    assert_eq!(res.body["transcript"], "bolum bir\n\nbolum iki");
 
     let (status, headers, body) = audio_of(&app, &cookie, &job_id).await;
     assert_eq!(status, StatusCode::OK, "{:?}", String::from_utf8_lossy(&body));
@@ -1529,6 +1528,10 @@ async fn the_audio_door_reports_a_missing_blob() {
     let res = result_of(&app, &cookie, &job.to_string()).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["audio_id"], key);
+    assert!(
+        res.body["transcript"].is_null(),
+        "a job finished before the column existed answers null, not an empty string"
+    );
 
     let (status, _, body) = audio_of(&app, &cookie, &job.to_string()).await;
     assert_eq!(
