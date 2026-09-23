@@ -854,14 +854,11 @@ async fn the_result_door_exposes_the_reported_sources() {
     let (note, _key) = note_with_pdf(&app, &db).await;
     let job_id = submit_job(&app, &cookie, &note).await;
 
-    assert_report_stored(
-        &capability_call(
-            &service.conn,
-            report_frame(&job_id, &note, &user, "running", "tts", 0.25),
-        )
-        .await,
-        &job_id,
-    );
+    let mut running = report_frame(&job_id, &note, &user, "running", "tts", 0.25);
+    running["payload"]["sources"] = json!([
+        { "key": "019732e3-7b00-7000-8000-00000000beef", "name": "tanim.pdf", "status": "pending" },
+    ]);
+    assert_report_stored(&capability_call(&service.conn, running).await, &job_id);
 
     let bytes = episode_bytes();
     let answer = blob_upload(

@@ -203,7 +203,7 @@ pub async fn report(
         PodcastJob,
         "UPDATE podcast_job SET state = $3, stage = $4, progress = $5, error_code = $6, \
              format = COALESCE(format, $7::text), transcript = COALESCE(transcript, $8::text), \
-             sources = COALESCE(sources, $9::jsonb), updated_at = $10 \
+            sources = COALESCE($9::jsonb, sources), updated_at = $10 \
         WHERE id = $1 AND state = $2 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
              source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
