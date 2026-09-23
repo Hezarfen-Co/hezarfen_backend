@@ -76,6 +76,11 @@ ALTER TABLE class_group ADD COLUMN year uuid REFERENCES academic_year(id) ON DEL
 UPDATE class_group c SET year = t.year FROM term t WHERE t.id = c.term;
 ALTER TABLE class_group DROP COLUMN term;
 
+-- The class's place on the grade ladder: 0 = anaokulu, 1..12 = 1. sinif..12. sinif.
+ALTER TABLE class_group ADD COLUMN grade_level SMALLINT NOT NULL
+    CHECK (grade_level BETWEEN 0 AND 12);
+CREATE INDEX class_group_grade_level ON class_group (grade_level);
+
 UPDATE academic_year SET class_count = (SELECT count(*) FROM class_group WHERE year = academic_year.id);
 
 -- ---------------------------------------------------------------------------
@@ -134,25 +139,66 @@ UPDATE class_group SET class_member_count = 0, class_course_count = 0;
 UPDATE subject SET exam_question_count = 0, homework_count = 0;
 UPDATE kind_ref SET count = 0;
 
--- The instance. It now carries the teachers (a junction), the weekly hours
--- and whether it counts toward the karne; `source` still marks blueprint vs
--- hand-placed. `enrollment_count` is the instance roster size — a counter,
--- not a capacity gate (the seat-claim 409 is deleted with D4/D5).
+-- The grade-level course template. One `course_offering` row per
+-- (course × grade_level) holds the content every section at that grade
+-- teaches from; every `class_course` instance points at exactly one
+-- offering and may override any content field. Unset = inherit from the
+-- offering; the offering's unset = inherit from the catalog row / the
+-- constants (1 weekly hour, counted toward the karne). Override-or-inherit,
+-- never merge. Timestamps follow the repo idiom (epoch millis, app-stamped
+-- by `Timestamp::now`).
+CREATE TABLE course_offering (
+    id                          uuid PRIMARY KEY,
+    course                      uuid NOT NULL REFERENCES course(id) ON DELETE CASCADE,
+    grade_level                 SMALLINT NOT NULL CHECK (grade_level BETWEEN 0 AND 12),
+    title                       TEXT, -- NULL -> course.title
+    description                 TEXT, -- NULL -> course.description
+    default_ders_saati          SMALLINT CHECK (default_ders_saati BETWEEN 1 AND 40), -- NULL -> 1
+    default_counts_toward_karne BOOLEAN, -- NULL -> TRUE
+    created_by                  uuid NOT NULL REFERENCES app_user(id),
+    created_at                  BIGINT NOT NULL,
+    updated_at                  BIGINT NOT NULL,
+    CONSTRAINT course_offering_course_grade_level UNIQUE (course, grade_level)
+);
+
+CREATE INDEX course_offering_course ON course_offering (course);
+
+-- The instance. It now carries the teachers (a junction), the offering it
+-- teaches from, and the per-section overrides of the template fields
+-- (NULL = inherit from the offering chain; a set value is the section's
+-- own). The set-valued policies (subjects, exam weights, weekly plan)
+-- cannot be NULL, so their override is a flag: TRUE = inherit the
+-- offering's set, FALSE = this section's own table is authoritative,
+-- including when empty. `source` still marks blueprint vs hand-placed.
+-- `enrollment_count` is the instance roster size — a counter, not a
+-- capacity gate (the seat-claim 409 is deleted with D4/D5).
 CREATE TABLE class_course (
-    id                  uuid PRIMARY KEY,
-    class               uuid NOT NULL REFERENCES class_group(id) ON DELETE NO ACTION,
-    course              uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
-    attached_by         uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
-    source              uuid NULL REFERENCES class_blueprint(id) ON DELETE NO ACTION,
-    ders_saati          SMALLINT NOT NULL DEFAULT 1,
-    counts_toward_karne BOOLEAN NOT NULL DEFAULT TRUE,
-    enrollment_count    BIGINT NOT NULL DEFAULT 0,
-    attached_at         BIGINT NOT NULL,
+    id                     uuid PRIMARY KEY,
+    class                  uuid NOT NULL REFERENCES class_group(id) ON DELETE NO ACTION,
+    course                 uuid NOT NULL REFERENCES course(id) ON DELETE NO ACTION,
+    attached_by            uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    source                 uuid NULL REFERENCES class_blueprint(id) ON DELETE NO ACTION,
+    ders_saati             SMALLINT,
+    counts_toward_karne    BOOLEAN,
+    enrollment_count       BIGINT NOT NULL DEFAULT 0,
+    attached_at            BIGINT NOT NULL,
+    -- Every instance teaches FROM an offering — the one the (course,
+    -- grade_level) pair of the attaching class resolves to, auto-created
+    -- empty by the attach pump when missing. `RESTRICT` (not CASCADE): an
+    -- offering a section still teaches cannot go — the delete route answers
+    -- 409 `offering_in_use` first.
+    offering               uuid NOT NULL REFERENCES course_offering(id) ON DELETE RESTRICT,
+    title                  TEXT,
+    description            TEXT,
+    subjects_inherited     BOOLEAN NOT NULL DEFAULT TRUE,
+    exam_weights_inherited BOOLEAN NOT NULL DEFAULT TRUE,
+    weekly_plan_inherited  BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT class_course_class_course UNIQUE (class, course)
 );
 
-CREATE INDEX class_course_course ON class_course (course);
-CREATE INDEX class_course_class  ON class_course (class);
+CREATE INDEX class_course_course   ON class_course (course);
+CREATE INDEX class_course_class    ON class_course (class);
+CREATE INDEX class_course_offering ON class_course (offering);
 
 -- D6: teacher assignment moves off the catalog course onto the instance.
 CREATE TABLE class_course_teacher (
@@ -162,6 +208,82 @@ CREATE TABLE class_course_teacher (
 );
 
 CREATE INDEX class_course_teacher_teacher ON class_course_teacher (teacher);
+
+-- ---------------------------------------------------------------------------
+-- 5c. The template's set-valued policies.
+--
+--     Which of a course's subjects an offering teaches, and which one a
+--     class section teaches: pure membership junctions over the subjects
+--     the catalog course already owns, so a selection can never name a
+--     topic the course does not have (the service checks the same
+--     precondition up front to answer 400 instead of letting the foreign
+--     key answer 500). Every class-side write flips the section's
+--     `*_inherited` flag in the same statement it writes a row; the reset
+--     door deletes the rows and flips it back.
+--
+--     All of these are pure rows: no id, no stamps — the composite key is
+--     the whole row, and the cascades mean a deleted course/offering/
+--     section takes its selections with it.
+-- ---------------------------------------------------------------------------
+CREATE TABLE offering_subject (
+    offering uuid NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    subject  uuid NOT NULL REFERENCES subject(id) ON DELETE CASCADE,
+    CONSTRAINT offering_subject_offering_subject PRIMARY KEY (offering, subject)
+);
+
+CREATE TABLE class_course_subject (
+    class_course uuid NOT NULL REFERENCES class_course(id) ON DELETE CASCADE,
+    subject      uuid NOT NULL REFERENCES subject(id) ON DELETE CASCADE,
+    CONSTRAINT class_course_subject_class_course_subject PRIMARY KEY (class_course, subject)
+);
+
+-- Per-offering and per-class exam-kind weights. The school's
+-- `settings.exam_kinds` stays the *default* weight of every kind; these two
+-- tables override it per grade-level template and per class section. The
+-- weight column mirrors the settings rule (1..=100); no timestamps — a
+-- weight override is a set row keyed by its owner and kind, like the
+-- subject set.
+CREATE TABLE offering_exam_weight (
+    offering uuid NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL,
+    weight   SMALLINT NOT NULL CHECK (weight BETWEEN 1 AND 100),
+    PRIMARY KEY (offering, kind)
+);
+
+CREATE TABLE class_course_exam_weight (
+    class_course uuid NOT NULL REFERENCES class_course(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    weight       SMALLINT NOT NULL CHECK (weight BETWEEN 1 AND 100),
+    PRIMARY KEY (class_course, kind)
+);
+
+-- The weekly plan: an offering's (and a section's) timetable template.
+-- A slot is where one of the week's lesson hours lands. `weekday` is the
+-- ISO day (1 = Monday .. 7 = Sunday); `starts_at`/`ends_at` are times of
+-- day (Postgres `TIME`, carried over the API as minutes past midnight).
+-- Two slots of one owner may touch (one may start the minute another
+-- ends) but never overlap; the exact (weekday, starts_at) duplicate is the
+-- UNIQUE key. `CASCADE`: the slots are template data — a detach must never
+-- be blocked by timetable rows.
+CREATE TABLE offering_slot (
+    id        uuid PRIMARY KEY,
+    offering  uuid NOT NULL REFERENCES course_offering(id) ON DELETE CASCADE,
+    weekday   SMALLINT NOT NULL CHECK (weekday BETWEEN 1 AND 7), -- 1 = Monday
+    starts_at TIME NOT NULL,
+    ends_at   TIME NOT NULL,
+    CHECK (ends_at > starts_at),
+    CONSTRAINT offering_slot_offering_weekday_starts_at UNIQUE (offering, weekday, starts_at)
+);
+
+CREATE TABLE class_course_slot (
+    id           uuid PRIMARY KEY,
+    class_course uuid NOT NULL REFERENCES class_course(id) ON DELETE CASCADE,
+    weekday      SMALLINT NOT NULL CHECK (weekday BETWEEN 1 AND 7),
+    starts_at    TIME NOT NULL,
+    ends_at      TIME NOT NULL,
+    CHECK (ends_at > starts_at),
+    CONSTRAINT class_course_slot_class_course_weekday_starts_at UNIQUE (class_course, weekday, starts_at)
+);
 
 -- D11: a history table with a surrogate id. `left_at` NULL is the live stint;
 -- the partial unique index enforces one live stint per (class, user) pair

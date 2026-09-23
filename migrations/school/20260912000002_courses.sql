@@ -150,7 +150,6 @@ CREATE INDEX session_attendance_course ON session_attendance (course);
 CREATE TABLE class_group (
     id                 uuid PRIMARY KEY,
     name               TEXT NOT NULL,
-    grade              TEXT NULL,
     term               uuid NULL REFERENCES term(id) ON DELETE NO ACTION,
     creator            uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     teacher            uuid NULL REFERENCES app_user(id) ON DELETE NO ACTION,
@@ -158,18 +157,18 @@ CREATE TABLE class_group (
     class_course_count BIGINT NOT NULL DEFAULT 0
 );
 
-CREATE INDEX class_group_grade ON class_group (grade);
-
--- A grade's course template. The grade label is the identity the whole API
--- speaks and it stays UNIQUE, but the row carries a surrogate uuid PK: it is
--- what class_course.source references, and a delete-and-recreate of the same
--- grade mints a new id, so links tagged by the old one were swept by that
--- delete instead of being adopted by the new blueprint (a TEXT grade tag
--- made the two indistinguishable).
+-- A grade-level course template. The grade level is the identity the whole
+-- API speaks and it stays UNIQUE, but the row carries a surrogate uuid PK:
+-- it is what class_course.source references, and a delete-and-recreate of
+-- the same grade mints a new id, so links tagged by the old one were swept
+-- by that delete instead of being adopted by the new blueprint. The UNIQUE
+-- name is load-bearing: db::class_blueprint matches it on SQLSTATE 23505.
 CREATE TABLE class_blueprint (
-    id      uuid PRIMARY KEY,
-    grade   TEXT NOT NULL CONSTRAINT class_blueprint_grade_key UNIQUE,
-    creator uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION
+    id          uuid PRIMARY KEY,
+    creator     uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
+    -- 0 = anaokulu, 1..12 = 1. sinif..12. sinif.
+    grade_level SMALLINT NOT NULL CONSTRAINT class_blueprint_grade_key UNIQUE
+        CHECK (grade_level BETWEEN 0 AND 12)
 );
 
 -- A template's course list. The old `courses uuid[]` on the blueprint row is
