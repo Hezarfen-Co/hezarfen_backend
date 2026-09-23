@@ -14,7 +14,7 @@ use hezarfen_backend::database::Database;
 use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
-use hezarfen_backend::tenant::{Slug, Tenants};
+use hezarfen_backend::tenant::Tenants;
 use hezarfen_backend::{build_router, database};
 use serde_json::json;
 
@@ -46,7 +46,7 @@ async fn reboot(db: &Database, tenants: &Tenants) -> Router {
 async fn settings_and_terms_survive_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
 
-    let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
+    let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "boss", "password": "secret1" });
     send(&app, "POST", "/auth/register", None, Some(creds)).await;
     set_role(&db, "boss", "manager").await;
     let login = json!({ "username": "boss", "password": "secret1" });
@@ -128,8 +128,8 @@ async fn appointments_survive_remigration() {
     const PROPOSED_END: i64 = START + 8_000_003;
 
     let (app, db, tenants) = common::app_and_tenants().await;
-    let teacher_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
+    let teacher_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ayse", "password": "secret1" });
     for creds in [&teacher_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -274,8 +274,8 @@ async fn appointments_survive_remigration() {
 #[tokio::test]
 async fn attempt_history_survives_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let teacher_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
+    let teacher_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ayse", "password": "secret1" });
     for creds in [&teacher_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -565,7 +565,7 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
 async fn settings_slots_without_a_serving_minute_still_patch() {
     let (app, db, tenants) = common::app_and_tenants().await;
 
-    let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
+    let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "boss", "password": "secret1" });
     send(&app, "POST", "/auth/register", None, Some(creds)).await;
     set_role(&db, "boss", "manager").await;
     let login = json!({ "username": "boss", "password": "secret1" });
@@ -618,8 +618,8 @@ async fn settings_slots_without_a_serving_minute_still_patch() {
 #[tokio::test]
 async fn fee_plans_and_their_charges_survive_remigration() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let manager_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
+    let manager_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ayse", "password": "secret1" });
     for creds in [&manager_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -859,14 +859,9 @@ async fn boards_and_their_strokes_survive_remigration() {
 #[tokio::test]
 async fn an_empty_module_list_survives_a_second_boot() {
     let tenants = database::init_test_tenants().await;
-    let slug = Slug::try_new("bare").unwrap();
+    let bare = hezarfen_backend::tenant::SchoolId::generate();
     tenants
-        .create(
-            hezarfen_backend::tenant::SchoolId::generate(),
-            &slug,
-            "Bare School",
-            ModuleSet::empty(),
-        )
+        .create(bare, "Bare School", ModuleSet::empty())
         .await
         .expect("a school with nothing switched on");
 
@@ -877,9 +872,9 @@ async fn an_empty_module_list_survives_a_second_boot() {
     let stored: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM school_module sm
          JOIN school s ON s.id = sm.school
-         WHERE s.slug = $1",
+         WHERE s.id = $1",
     )
-    .bind(slug.as_str())
+    .bind(bare.uuid())
     .fetch_one(tenants.control())
     .await
     .expect("read the row back");
@@ -909,7 +904,6 @@ async fn probe_control_migration_is_idempotent_over_aged_rows() {
         tenants
             .create(
                 hezarfen_backend::tenant::SchoolId::generate(),
-                &Slug::try_new(slug).unwrap(),
                 name,
                 modules,
             )
@@ -944,16 +938,14 @@ async fn probe_control_migration_is_idempotent_over_aged_rows() {
 async fn a_half_made_school_is_finished_by_the_next_boot() {
     let tenants = database::init_test_tenants().await;
     let control = tenants.control().clone();
-    let slug = Slug::try_new("half-made").unwrap();
     let id = hezarfen_backend::tenant::SchoolId::generate();
 
     // Exactly what `Tenants::create` commits before it mints a database: the
     // registry row (as `provisioning`) and its entitlements.
     sqlx::query(
-        "INSERT INTO school (id, slug, name, status, created_at) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO school (id, name, status, created_at) VALUES ($1, $2, $3, $4)",
     )
     .bind(id.uuid())
-    .bind(slug.as_str())
     .bind("Half Made")
     .bind("provisioning")
     .bind(hezarfen_backend::domain::timestamp::Timestamp::now().as_millis())
@@ -962,19 +954,19 @@ async fn a_half_made_school_is_finished_by_the_next_boot() {
     .expect("seed a half-made school row");
 
     assert!(
-        tenants.get(&slug).await.is_err(),
+        tenants.get(&id).await.is_err(),
         "a school that is still being made must not serve"
     );
-    assert_eq!(status_of(&control, "half-made").await, "provisioning");
+    assert_eq!(status_of(&control, &id.as_str()).await, "provisioning");
 
     tenants
         .reconcile_provisioning()
         .await
         .expect("the boot finishes what the previous one started");
 
-    assert_eq!(status_of(&control, "half-made").await, "active");
+    assert_eq!(status_of(&control, &id.as_str()).await, "active");
     let db = tenants
-        .get(&slug)
+        .get(&id)
         .await
         .expect("the finished school answers");
     let users: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
@@ -986,7 +978,7 @@ async fn a_half_made_school_is_finished_by_the_next_boot() {
     // The database the reconciliation minted is this test's, so it goes with
     // the test (the harness only drops what `create` minted).
     tenants
-        .drop(&slug)
+        .drop(&id)
         .await
         .expect("clean up the minted school");
 }
@@ -1009,11 +1001,9 @@ async fn a_half_made_school_is_finished_by_the_next_boot() {
 #[tokio::test]
 async fn a_school_behind_the_schema_head_is_migrated_by_the_next_boot() {
     let tenants = database::init_test_tenants().await;
-    let slug = Slug::try_new("behind-the-head").unwrap();
     let school = tenants
         .create(
             hezarfen_backend::tenant::SchoolId::generate(),
-            &slug,
             "Behind The Head",
             ModuleSet::all(),
         )
@@ -1062,9 +1052,10 @@ async fn a_school_behind_the_schema_head_is_migrated_by_the_next_boot() {
 }
 
 /// One school's stored status, straight off the registry row.
-async fn status_of(control: &Database, slug: &str) -> String {
-    sqlx::query_scalar("SELECT status FROM school WHERE slug = $1")
-        .bind(slug)
+async fn status_of(control: &Database, school: &str) -> String {
+    let id = uuid::Uuid::parse_str(school).expect("school id is a uuid");
+    sqlx::query_scalar("SELECT status FROM school WHERE id = $1")
+        .bind(id)
         .fetch_one(control)
         .await
         .unwrap()
@@ -1076,11 +1067,11 @@ async fn status_of(control: &Database, slug: &str) -> String {
 async fn school_rows(control: &Database) -> Vec<(String, String, String, Vec<String>)> {
     use sqlx::Row as _;
     sqlx::query(
-        "SELECT s.slug, s.name, s.status,
+        "SELECT s.id::text, s.name, s.status,
                 COALESCE(array_agg(sm.module) FILTER (WHERE sm.module IS NOT NULL), '{}')
          FROM school s LEFT JOIN school_module sm ON sm.school = s.id
          GROUP BY s.id
-         ORDER BY s.slug",
+         ORDER BY s.id",
     )
     .fetch_all(control)
     .await

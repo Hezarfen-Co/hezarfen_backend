@@ -1,12 +1,6 @@
 //! Validation limits, in one place.
 
-/// A school slug's length bounds — the name in front of the dot in the session
-/// cookie, which is also the school's database name and its blob directory
-/// (see [`crate::tenant::Slug`]).
-pub const MIN_SLUG_LEN: usize = 2;
-pub const MAX_SLUG_LEN: usize = 32;
-
-/// A school's display name — free text, unlike its slug.
+/// A school's display name.
 pub const MAX_SCHOOL_NAME_LEN: usize = 120;
 
 pub const MIN_USERNAME_LEN: usize = 3;

@@ -13,7 +13,7 @@
 //! The scope decides one thing only: whether the bridge resolves the frame's
 //! school before the operation runs. A [`Scope::School`] operation runs against
 //! the named school's own database — the frame's school is the *only* tenancy
-//! input, and a slug that matches nothing is `unknown_school`, never a
+//! input, and a school id that matches nothing is `unknown_school`, never a
 //! fallback to another school or to the control database.
 
 use serde_json::Value;

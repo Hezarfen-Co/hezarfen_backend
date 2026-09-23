@@ -19,7 +19,7 @@ use hezarfen_backend::ai::protocol::{
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
 use hezarfen_backend::constant::{AI_ALPN, AI_MAX_CONCURRENT_PER_WORKER, AI_PROTOCOL};
 use hezarfen_backend::module::ModuleSet;
-use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
+use hezarfen_backend::tenant::{DEMO_SCHOOL_ID, SchoolId};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "shared-ai-token";
@@ -71,8 +71,8 @@ fn client_endpoint(bridge: &AiBridge) -> quinn::Endpoint {
 }
 
 /// The demo school, which every dispatch in this suite is made on behalf of.
-fn demo() -> Slug {
-    Slug::try_new(DEMO_SLUG).expect("the demo slug")
+fn demo() -> SchoolId {
+    SchoolId::try_parse(DEMO_SCHOOL_ID).expect("the demo slug")
 }
 
 fn hello(service: &str, capabilities: &[&str]) -> Hello {
@@ -1519,7 +1519,7 @@ async fn api_read(conn: &quinn::Connection, request: ApiRequest) -> ApiResponse 
 
 /// A `GET` of `path` as `on_behalf_of` (or as the service itself).
 fn read_of(path: &str, on_behalf_of: Option<&str>) -> ApiRequest {
-    read_of_school(DEMO_SLUG, path, on_behalf_of)
+    read_of_school(DEMO_SCHOOL_ID, path, on_behalf_of)
 }
 
 /// The same, naming the school explicitly — the tenancy tests below.
@@ -1841,11 +1841,10 @@ async fn an_index_dispatch_names_the_notes_own_school_and_stores_the_answer_ther
     await_workers(&bridge, 1).await;
 
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
-    let beta = Slug::try_new("beta").unwrap();
+    let beta = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap();
     let beta_db = tenants
         .create(
-            hezarfen_backend::tenant::SchoolId::generate(),
-            &beta,
+            beta,
             "Beta College",
             ModuleSet::all(),
         )
@@ -1874,7 +1873,7 @@ async fn an_index_dispatch_names_the_notes_own_school_and_stores_the_answer_ther
     );
 
     let seen = service.seen();
-    assert_eq!(seen[0].school, "beta", "the frame named the wrong school");
+    assert_eq!(seen[0].school, hezarfen_backend::tenant::BETA_SCHOOL_ID, "the frame named the wrong school");
     assert_eq!(seen[0].payload["course_note"], note);
 }
 
@@ -1900,7 +1899,7 @@ async fn a_course_note_is_indexed_and_its_output_stored_with_its_sources() {
     let seen = service.seen();
     assert_eq!(seen[0].capability, AI_RAG_INDEX_CAPABILITY);
     assert_eq!(
-        seen[0].school, DEMO_SLUG,
+        seen[0].school, DEMO_SCHOOL_ID,
         "the frame names the caller's school"
     );
     assert_eq!(seen[0].payload["course_note"], note);
@@ -2053,7 +2052,7 @@ async fn a_service_reads_a_course_note_on_behalf_of_an_enrolled_student() {
 
     let request = ApiRequest {
         id: "trace-course-notes".into(),
-        school: DEMO_SLUG.into(),
+        school: DEMO_SCHOOL_ID.into(),
         path: "/course-notes".into(),
         query: Some(format!("course={course}")),
         on_behalf_of: Some(student),
@@ -2081,7 +2080,7 @@ async fn a_course_the_student_is_not_in_is_refused_by_the_handler() {
 
     let request = ApiRequest {
         id: "trace-foreign-course".into(),
-        school: DEMO_SLUG.into(),
+        school: DEMO_SCHOOL_ID.into(),
         path: "/course-notes".into(),
         query: Some(format!("course={foreign}")),
         on_behalf_of: Some(student),
@@ -2101,7 +2100,7 @@ async fn writing_a_course_note_is_refused_before_dispatch() {
 
     let request = ApiRequest {
         id: "trace-post".into(),
-        school: DEMO_SLUG.into(),
+        school: DEMO_SCHOOL_ID.into(),
         path: "/course-notes".into(),
         query: None,
         on_behalf_of: None,
@@ -2170,7 +2169,7 @@ async fn blob_read(conn: &quinn::Connection, request: BlobRequest) -> (BlobRespo
 }
 
 fn blob_of(file: &str, on_behalf_of: Option<&str>) -> BlobRequest {
-    blob_of_school(DEMO_SLUG, file, on_behalf_of)
+    blob_of_school(DEMO_SCHOOL_ID, file, on_behalf_of)
 }
 
 /// The same, naming the school explicitly.
@@ -2228,7 +2227,7 @@ async fn a_service_streams_a_course_note_file_on_behalf_of_an_enrolled_student()
         panic!("the enrolled student was refused: {}", blob_refusal(header));
     };
     assert_eq!(id, format!("trace-blob-{file}"), "the trace id is echoed");
-    assert_eq!(school, DEMO_SLUG, "the school is echoed too");
+    assert_eq!(school, DEMO_SCHOOL_ID, "the school is echoed too");
     assert_eq!(name, "recap.pdf");
     assert_eq!(content_type, "application/pdf");
     assert_eq!(size as usize, uploaded.len(), "the promised byte count");
@@ -2752,7 +2751,7 @@ async fn a_dispatch_is_traced_by_capability_and_a_refused_handshake_is_counted()
         });
     let attrs = attrs_of(request);
     assert!(
-        attrs.contains(&("school".to_string(), DEMO_SLUG.to_string())),
+        attrs.contains(&("school".to_string(), DEMO_SCHOOL_ID.to_string())),
         "the span names the school slug: {attrs:?}"
     );
     assert!(
@@ -3061,7 +3060,7 @@ async fn no_rag_worker_means_503_and_no_rows() {
 #[tokio::test]
 async fn a_school_without_the_chatbot_module_has_no_rag_nest() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = common::login_as(&app, &db, "ada", "admin").await;
 
     let res = common::send(&app, "GET", "/rag/threads", Some(&cookie), None).await;
@@ -3483,7 +3482,7 @@ async fn the_summarize_request_carries_the_askers_scope_and_role() {
     let seen = service.seen();
     assert_eq!(seen.len(), 1, "one dispatch per call, never a re-send");
     assert_eq!(seen[0].capability, AI_RAG_SUMMARIZE_CAPABILITY);
-    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the caller's school");
+    assert_eq!(seen[0].school, DEMO_SCHOOL_ID, "the frame names the caller's school");
     let payload = &seen[0].payload;
     assert_eq!(payload["asker"], student);
     assert_eq!(payload["asker_role"], "student");
@@ -3844,7 +3843,7 @@ async fn an_insight_student_dispatch_names_the_school_and_round_trips() {
     let seen = await_seen(&service, 1).await;
     assert_eq!(seen.len(), 1, "one dispatch per request, never a re-send");
     assert_eq!(seen[0].capability, AI_INSIGHT_STUDENT_CAPABILITY);
-    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the school");
+    assert_eq!(seen[0].school, DEMO_SCHOOL_ID, "the frame names the school");
     assert_eq!(seen[0].payload["user_id"], ali);
 
     // The same worker driven directly answers the contract's shape, so the
@@ -4292,7 +4291,6 @@ use hezarfen_backend::constant::{
 };
 use hezarfen_backend::domain::user::{Password, Username};
 use hezarfen_backend::service::builder;
-use hezarfen_backend::tenant::SchoolId;
 
 /// One capability call: a fresh client-initiated stream, one frame out, one
 /// back, stream dropped — the same lifecycle as `api_read` above.
@@ -4308,10 +4306,10 @@ async fn capability_call(
     frame_or_fail(&mut recv, "read CapabilityResponse").await
 }
 
-fn insight_call(capability: &str, school: &str, payload: Value) -> CapabilityRequest {
+fn insight_call(capability: &str, school: impl AsRef<str>, payload: Value) -> CapabilityRequest {
     CapabilityRequest {
         id: format!("trace-{capability}"),
-        school: school.to_string(),
+        school: school.as_ref().to_string(),
         capability: capability.to_string(),
         payload,
     }
@@ -4383,7 +4381,7 @@ async fn a_capability_call_writes_the_row_the_schools_own_read_door_serves() {
         &service.conn,
         insight_call(
             AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
-            DEMO_SLUG,
+            DEMO_SCHOOL_ID,
             summary_payload(&student, 1_800_000_000_000i64),
         ),
     )
@@ -4398,7 +4396,7 @@ async fn a_capability_call_writes_the_row_the_schools_own_read_door_serves() {
     };
     assert_eq!(id, format!("trace-{AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY}"));
     assert_eq!(
-        school, DEMO_SLUG,
+        school, DEMO_SCHOOL_ID,
         "the answer echoes the school the frame named"
     );
     assert_eq!(payload["written"], 1);
@@ -4428,7 +4426,7 @@ async fn the_insight_ledger_and_pending_list_round_trip_over_the_bridge() {
 
     let run = insight_call(
         AI_INSIGHT_RUN_UPSERT_CAPABILITY,
-        DEMO_SLUG,
+        DEMO_SCHOOL_ID,
         json!({ "run": {
             "run_day": "2026-09-17",
             "started_at": 1_700_000_000_000i64,
@@ -4453,7 +4451,7 @@ async fn the_insight_ledger_and_pending_list_round_trip_over_the_bridge() {
     let pending = ok_capability(
         capability_call(
             &service.conn,
-            insight_call(AI_INSIGHT_PENDING_LIST_CAPABILITY, DEMO_SLUG, json!({})),
+            insight_call(AI_INSIGHT_PENDING_LIST_CAPABILITY, DEMO_SCHOOL_ID, json!({})),
         )
         .await,
     );
@@ -4463,7 +4461,7 @@ async fn the_insight_ledger_and_pending_list_round_trip_over_the_bridge() {
     // CHECK violation dressed as a server fault.
     let bad_day = insight_call(
         AI_INSIGHT_RUN_UPSERT_CAPABILITY,
-        DEMO_SLUG,
+        DEMO_SCHOOL_ID,
         json!({ "run": {
             "run_day": "17.09.2026",
             "started_at": 1,
@@ -4489,7 +4487,7 @@ async fn the_sweep_and_purge_capabilities_answer_per_table_verdicts() {
         &service.conn,
         insight_call(
             AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
-            DEMO_SLUG,
+            DEMO_SCHOOL_ID,
             summary_payload(&student, 1), // long past
         ),
     )
@@ -4499,7 +4497,7 @@ async fn the_sweep_and_purge_capabilities_answer_per_table_verdicts() {
     let verdicts = ok_capability(
         capability_call(
             &service.conn,
-            insight_call(AI_INSIGHT_RETENTION_SWEEP_CAPABILITY, DEMO_SLUG, json!({})),
+            insight_call(AI_INSIGHT_RETENTION_SWEEP_CAPABILITY, DEMO_SCHOOL_ID, json!({})),
         )
         .await,
     );
@@ -4510,7 +4508,7 @@ async fn the_sweep_and_purge_capabilities_answer_per_table_verdicts() {
     // obeyed, it would delete every student's derived rows in one call.
     let empty = insight_call(
         "insight.departed.purge",
-        DEMO_SLUG,
+        DEMO_SCHOOL_ID,
         json!({ "students": [] }),
     );
     let (code, _) = refused_capability(capability_call(&service.conn, empty).await);
@@ -4531,11 +4529,10 @@ async fn a_capability_call_cannot_touch_another_schools_rows() {
     let _mudur = common::login_as(&app, &demo_db, "mudur", "manager").await;
     let ayse = common::login_as(&app, &demo_db, "ayse", "student").await;
     let student = common::me_id(&app, &ayse).await;
-    let beta = Slug::try_new("beta").unwrap();
+    let beta = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap();
     let beta_db = tenants
         .create(
-            SchoolId::generate(),
-            &beta,
+            SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap(),
             "Beta College",
             ModuleSet::all(),
         )
@@ -4578,7 +4575,7 @@ async fn a_capability_call_refuses_unknown_names_and_payloads_that_do_not_fit() 
     // would make this a generic door is the shape that is missing.
     let unknown = insight_call(
         "insight.database.query",
-        DEMO_SLUG,
+        DEMO_SCHOOL_ID,
         json!({ "sql": "SELECT 1" }),
     );
     let (code, message) = refused_capability(capability_call(&service.conn, unknown).await);
@@ -4588,7 +4585,7 @@ async fn a_capability_call_refuses_unknown_names_and_payloads_that_do_not_fit() 
     // A payload that does not fit the operation's contract.
     let bad = insight_call(
         AI_INSIGHT_SUMMARY_UPSERT_CAPABILITY,
-        DEMO_SLUG,
+        DEMO_SCHOOL_ID,
         json!({ "rows": [{ "student": "not-a-uuid", "confidence": "stable",
                            "computed_at": 1, "retain_until": 2 }] }),
     );
@@ -4617,11 +4614,10 @@ async fn the_school_directory_is_the_one_deployment_scoped_operation() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, _db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
-    let beta = Slug::try_new("beta").unwrap();
+    let beta = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap();
     tenants
         .create(
-            SchoolId::generate(),
-            &beta,
+            beta,
             "Beta College",
             ModuleSet::all(),
         )
@@ -4642,7 +4638,7 @@ async fn the_school_directory_is_the_one_deployment_scoped_operation() {
         .iter()
         .map(|s| s.as_str().expect("slug"))
         .collect();
-    assert_eq!(schools, vec!["beta", DEMO_SLUG], "active schools, sorted");
+    assert_eq!(schools, vec![hezarfen_backend::tenant::BETA_SCHOOL_ID, DEMO_SCHOOL_ID], "active schools, name order");
 
     // Over HTTP the same operation is the builder's: a school session must
     // not be able to enumerate the deployment's other customers.
@@ -4926,7 +4922,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
 
     let answer = capability_call(
         conn,
-        report_call(DEMO_SLUG, &job, &user, "running", "script", 0.5),
+        report_call(DEMO_SCHOOL_ID, &job, &user, "running", "script", 0.5),
     )
     .await;
     assert_eq!(ok_capability(answer)["job_id"], job);
@@ -4938,7 +4934,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     let (code, _) = refused_capability(
         capability_call(
             conn,
-            report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0),
+            report_call(DEMO_SCHOOL_ID, &job, &user, "done", "done", 1.0),
         )
         .await,
     );
@@ -4950,7 +4946,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
         capability_call(
             conn,
             report_call(
-                DEMO_SLUG,
+                DEMO_SCHOOL_ID,
                 &job,
                 "00000000-0000-7000-8000-000000000000",
                 "failed",
@@ -4963,7 +4959,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     assert_eq!(code, "not_permitted");
     // And so is a transition the service's own table forbids.
     let (code, _) = refused_capability(
-        capability_call(conn, report_call(DEMO_SLUG, &job, &user, "queued", "", 0.0)).await,
+        capability_call(conn, report_call(DEMO_SCHOOL_ID, &job, &user, "queued", "", 0.0)).await,
     );
     assert_eq!(code, "invalid_payload");
     assert_eq!(podcast_row(&db, &job).await.0, "running");
@@ -4972,10 +4968,10 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     // stamped with the reference and the duration.
     let body = blob_bytes(200 * 1024);
     let (key, size) =
-        upload_key(podcast_upload(conn, DEMO_SLUG, &job, "bolum.mp3", "audio/mpeg", &body).await);
+        upload_key(podcast_upload(conn, DEMO_SCHOOL_ID, &job, "bolum.mp3", "audio/mpeg", &body).await);
     assert_eq!(size, body.len() as u64);
     assert_eq!(key, format!("podcast/{job}.mp3"));
-    let stored = common::files_dir().join(DEMO_SLUG).join(&key);
+    let stored = common::files_dir().join(DEMO_SCHOOL_ID).join(&key);
     assert_eq!(std::fs::read(&stored).expect("the stored episode"), body);
     let row = podcast_row(&db, &job).await;
     assert_eq!(row.3.as_deref(), Some(key.as_str()));
@@ -4986,7 +4982,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
         ok_capability(
             capability_call(
                 conn,
-                report_call(DEMO_SLUG, &job, &user, "done", "done", 1.0)
+                report_call(DEMO_SCHOOL_ID, &job, &user, "done", "done", 1.0)
             )
             .await
         )["stored"],
@@ -4999,7 +4995,7 @@ async fn the_report_and_upload_handshake_lands_on_the_backends_own_row() {
     let (code, _) = refused_capability(
         capability_call(
             conn,
-            report_call(DEMO_SLUG, &stranger, &user, "running", "ocr", 0.1),
+            report_call(DEMO_SCHOOL_ID, &stranger, &user, "running", "ocr", 0.1),
         )
         .await,
     );
@@ -5019,11 +5015,10 @@ async fn a_report_or_upload_cannot_reach_another_schools_job() {
     .await;
     await_workers(&bridge, 1).await;
     let (_app, _demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
-    let beta = Slug::try_new("beta").unwrap();
+    let beta = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap();
     let beta_db = tenants
         .create(
-            hezarfen_backend::tenant::SchoolId::generate(),
-            &beta,
+            beta,
             "Beta College",
             ModuleSet::all(),
         )
@@ -5034,7 +5029,7 @@ async fn a_report_or_upload_cannot_reach_another_schools_job() {
     let (code, _) = refused_capability(
         capability_call(
             &service.conn,
-            report_call(DEMO_SLUG, &job, &user, "running", "script", 0.2),
+            report_call(DEMO_SCHOOL_ID, &job, &user, "running", "script", 0.2),
         )
         .await,
     );
@@ -5049,7 +5044,7 @@ async fn a_report_or_upload_cannot_reach_another_schools_job() {
     let (code, _) = upload_refusal(
         podcast_upload(
             &service.conn,
-            DEMO_SLUG,
+            DEMO_SCHOOL_ID,
             &job,
             "bolum.mp3",
             "audio/mpeg",
@@ -5059,7 +5054,7 @@ async fn a_report_or_upload_cannot_reach_another_schools_job() {
     );
     assert_eq!(code, "unknown_job");
     let leaked = common::files_dir()
-        .join(DEMO_SLUG)
+        .join(DEMO_SCHOOL_ID)
         .join(format!("podcast/{job}.mp3"));
     assert!(
         !leaked.exists(),
@@ -5091,7 +5086,7 @@ async fn an_upload_past_the_audio_ceiling_is_refused_before_a_byte_is_read() {
     let request = BlobUploadRequest {
         id: "trace-oversize".to_string(),
         upload: true,
-        school: DEMO_SLUG.to_string(),
+        school: DEMO_SCHOOL_ID.to_string(),
         job_id: job.clone(),
         name: "bolum.mp3".to_string(),
         content_type: "audio/mpeg".to_string(),

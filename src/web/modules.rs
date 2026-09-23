@@ -1,7 +1,7 @@
 //! Module entitlements as data, on the school side of the line.
 //!
 //! Two reads, no writes — selling a module is the vendor's act and lives on
-//! `/schools/{slug}/modules` in [`crate::web::builder`]. What stands here is
+//! `/schools/{id}/modules` in [`crate::web::builder`]. What stands here is
 //! what a client needs to draw the product: the deployment's catalog (which
 //! modules exist, what each one needs, how they are packaged) and the caller's
 //! own switched-on set, so a frontend hides a nest the school never bought

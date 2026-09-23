@@ -14,7 +14,7 @@ use crate::domain::monotonic_id::next_uuid;
 use crate::domain::session::SessionToken;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{PasswordHash, Username};
-use crate::tenant::{SchoolStatus, Slug};
+use crate::tenant::{SchoolId, SchoolStatus};
 
 /// Typed person row id (control database). A UUIDv7 minted by the
 /// process-wide monotonic generator, so `id` order is mint order.
@@ -60,14 +60,14 @@ impl Person {
 /// One school a person belongs to, joined off the control registry.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Membership {
-    pub(crate) slug: Slug,
+    pub(crate) id: SchoolId,
     pub(crate) name: String,
     pub(crate) status: SchoolStatus,
 }
 
 impl Membership {
-    pub fn slug(&self) -> &Slug {
-        &self.slug
+    pub fn id(&self) -> SchoolId {
+        self.id
     }
 
     pub fn name(&self) -> &str {

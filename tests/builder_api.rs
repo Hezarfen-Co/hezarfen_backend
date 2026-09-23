@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use common::*;
 use hezarfen_backend::domain::user::{Password, Username};
 use hezarfen_backend::service::builder;
-use hezarfen_backend::tenant::{DEMO_SLUG, Tenants};
+use hezarfen_backend::tenant::{DEMO_SCHOOL_ID, SchoolId, Tenants};
 use serde_json::{Value, json};
 
 const BUILDER_USER: &str = "operator";
@@ -31,7 +31,7 @@ async fn deployment() -> (Router, hezarfen_backend::database::Database, Tenants)
 }
 
 async fn builder_login(app: &Router) -> String {
-    let res = send(
+    let res = bsend(
         app,
         "POST",
         "/builder/login",
@@ -43,21 +43,42 @@ async fn builder_login(app: &Router) -> String {
     res.cookie.expect("builder cookie set on login")
 }
 
-/// Create a school as the builder (no assertion) — slug, name, first admin.
-async fn create_school(app: &Router, cookie: &str, slug: &str, admin_pass: &str) -> Res {
-    send(
+/// Create a school as the builder. `label` is only the display-name prefix
+/// (`"{label} school"`); the identity comes back as `id`.
+async fn create_school(app: &Router, cookie: &str, label: &str, admin_pass: &str) -> Res {
+    bsend(
         app,
         "POST",
         "/schools",
         Some(cookie),
         Some(json!({
-            "slug": slug,
-            "name": format!("{slug} school"),
+            "name": format!("{label} school"),
             "admin_username": "admin",
             "admin_password": admin_pass,
         })),
     )
     .await
+}
+
+fn created_id(res: &Res) -> String {
+    res.body["id"].as_str().expect("created school id").to_string()
+}
+
+/// Pick `label` out of a login choice list: a uuid is used as-is, otherwise
+/// the school whose name is `{label} school` (the name [`create_school`] writes).
+fn school_choice(body: &Value, label: &str) -> String {
+    if hezarfen_backend::tenant::SchoolId::try_parse(label).is_ok() {
+        return label.to_string();
+    }
+    let want = format!("{label} school");
+    body["schools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["name"].as_str() == Some(want.as_str()) || s["name"].as_str() == Some(label))
+        .and_then(|s| s["id"].as_str())
+        .unwrap_or(label)
+        .to_string()
 }
 
 /// Log `username` into the school named `slug`. The login itself names no
@@ -66,7 +87,7 @@ async fn create_school(app: &Router, cookie: &str, slug: &str, admin_pass: &str)
 /// so when login answers a choice list, bind the requested school before
 /// returning. The result is whatever a plain school login would have said.
 async fn school_login(app: &Router, slug: &str, username: &str, password: &str) -> Res {
-    let res = send(
+    let res = bsend(
         app,
         "POST",
         "/auth/login",
@@ -76,12 +97,12 @@ async fn school_login(app: &Router, slug: &str, username: &str, password: &str) 
     .await;
     if res.body["schools"].is_array() {
         assert_eq!(res.status, StatusCode::OK, "choice login {username}");
-        let selected = send(
+        let selected = bsend(
             app,
             "POST",
             "/auth/school",
             res.cookie.as_deref(),
-            Some(json!({ "school": slug })),
+            Some(json!({ "school": school_choice(&res.body, slug) })),
         )
         .await;
         assert_eq!(
@@ -94,11 +115,69 @@ async fn school_login(app: &Router, slug: &str, username: &str, password: &str) 
     res
 }
 
-fn slugs(body: &Value) -> Vec<String> {
+fn school_ids(body: &Value) -> Vec<String> {
     items(body)
         .iter()
-        .map(|item| item["slug"].as_str().expect("slug").to_string())
+        .map(|item| item["id"].as_str().expect("id").to_string())
         .collect()
+}
+
+fn school_names(body: &Value) -> Vec<&str> {
+    items(body)
+        .iter()
+        .map(|item| item["name"].as_str().expect("name"))
+        .collect()
+}
+
+
+/// Rewrite `/schools/{label}` to `/schools/{id}` when `label` is a school this
+/// deployment created (`"{label} school"`). A segment that is already a uuid,
+/// or that names no school, is left alone so a 404 stays a 404.
+async fn bsend(
+    app: &Router,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: Option<Value>,
+) -> Res {
+    let path = rewrite_school_path(app, cookie, path).await;
+    common::send(app, method, &path, cookie, body).await
+}
+
+async fn rewrite_school_path(app: &Router, cookie: Option<&str>, path: &str) -> String {
+    let Some(rest) = path.strip_prefix("/schools/") else {
+        return path.to_string();
+    };
+    if rest.is_empty() || rest.contains('{') {
+        return path.to_string();
+    }
+    let (seg, tail) = match rest.split_once('/') {
+        Some((seg, tail)) => (seg, format!("/{tail}")),
+        None => (rest, String::new()),
+    };
+    if hezarfen_backend::tenant::SchoolId::try_parse(seg).is_ok() {
+        return path.to_string();
+    }
+    let Some(cookie) = cookie else {
+        return path.to_string();
+    };
+    let list = common::send(app, "GET", "/schools", Some(cookie), None).await;
+    let Some(rows) = list.body.get("items").and_then(|v| v.as_array()) else {
+        return path.to_string();
+    };
+    let want = format!("{seg} school");
+    let id = rows.iter().find_map(|row| {
+        let name = row["name"].as_str()?;
+        if name == want || name == seg {
+            row["id"].as_str().map(str::to_string)
+        } else {
+            None
+        }
+    });
+    match id {
+        Some(id) => format!("/schools/{id}{tail}"),
+        None => path.to_string(),
+    }
 }
 
 /// The two cookies share a name and nothing else. This is the whole point of
@@ -108,7 +187,7 @@ async fn a_builder_logs_in_and_its_cookie_works_here_and_nowhere_else() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
 
-    let me = send(&app, "GET", "/builder/me", Some(&builder), None).await;
+    let me = bsend(&app, "GET", "/builder/me", Some(&builder), None).await;
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["username"], BUILDER_USER);
     assert!(me.body["id"].as_str().is_some_and(|id| !id.is_empty()));
@@ -116,21 +195,21 @@ async fn a_builder_logs_in_and_its_cookie_works_here_and_nowhere_else() {
     // A school user's cookie is not a builder's…
     let student = login(&app, "ali").await;
     assert_eq!(
-        send(&app, "GET", "/builder/me", Some(&student), None)
+        bsend(&app, "GET", "/builder/me", Some(&student), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED,
         "a school cookie reached the builder surface"
     );
     assert_eq!(
-        send(&app, "GET", "/schools", Some(&student), None)
+        bsend(&app, "GET", "/schools", Some(&student), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED
     );
     // …and a builder's is not a school user's.
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&builder), None)
+        bsend(&app, "GET", "/auth/me", Some(&builder), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED,
@@ -143,17 +222,17 @@ async fn a_builder_logs_in_and_its_cookie_works_here_and_nowhere_else() {
         json!({ "username": "ghost", "password": BUILDER_PASS }),
     ] {
         assert_eq!(
-            send(&app, "POST", "/builder/login", None, Some(bad))
+            bsend(&app, "POST", "/builder/login", None, Some(bad))
                 .await
                 .status,
             StatusCode::UNAUTHORIZED
         );
     }
 
-    let out = send(&app, "POST", "/builder/logout", Some(&builder), None).await;
+    let out = bsend(&app, "POST", "/builder/logout", Some(&builder), None).await;
     assert_eq!(out.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        send(&app, "GET", "/builder/me", Some(&builder), None)
+        bsend(&app, "GET", "/builder/me", Some(&builder), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED,
@@ -175,76 +254,47 @@ async fn creating_a_school_seeds_an_admin_who_can_log_in() {
         "create school: {:?}",
         created.body
     );
-    assert_eq!(created.body["slug"], "ata-koleji");
+    let id = created_id(&created);
+    assert_eq!(created.body["name"], "ata-koleji school");
     assert_eq!(created.body["status"], "active");
+    assert!(
+        hezarfen_backend::tenant::SchoolId::try_parse(&id).is_ok(),
+        "the identity is a hyphenated uuid: {id}"
+    );
 
-    let login = school_login(&app, "ata-koleji", "admin", "secret1").await;
+    let login = school_login(&app, &id, "admin", "secret1").await;
     assert_eq!(login.status, StatusCode::OK, "seeded admin logs in");
     let cookie = login.cookie.expect("school cookie");
     assert!(
-        cookie.starts_with("session=ata-koleji."),
+        cookie.starts_with(&format!("session={id}.")),
         "the cookie names its school: {cookie}"
     );
-    let me = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+    let me = bsend(&app, "GET", "/auth/me", Some(&cookie), None).await;
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(
         me.body["role"], "admin",
         "the seed is an admin, not a student"
     );
 
-    // The slug is the identity: a second school may not take it.
-    assert_eq!(
-        create_school(&app, &builder, "ata-koleji", "secret1")
-            .await
-            .status,
-        StatusCode::CONFLICT
-    );
-
-    // Anything that is not a slug is refused before a database exists — the
-    // reserved words most of all, since they name the builder cookie prefix and
-    // the control database itself.
-    for bad in ["control", "builder", "Ab", "a", &"x".repeat(33), "../x"] {
-        let res = create_school(&app, &builder, bad, "secret1").await;
-        assert_eq!(
-            res.status,
-            StatusCode::BAD_REQUEST,
-            "slug {bad:?} was not refused: {:?}",
-            res.body
-        );
-        // …and nothing was left behind by the refusal.
-        assert_eq!(
-            send(
-                &app,
-                "GET",
-                &format!("/schools/{bad}"),
-                Some(&builder),
-                None
-            )
-            .await
-            .status,
-            StatusCode::NOT_FOUND,
-            "slug {bad:?} left a school behind"
-        );
-    }
-    // A blank name and a too-short admin password are refused the same way.
+    // A blank name and a too-short admin password are refused before a
+    // database exists. Same name as an existing school is allowed — the id
+    // is the identity, not the display name.
     for body in [
-        json!({ "slug": "yeni", "name": "  ", "admin_username": "admin", "admin_password": "secret1" }),
-        json!({ "slug": "yeni", "name": "Yeni", "admin_username": "admin", "admin_password": "x" }),
+        json!({ "name": "  ", "admin_username": "admin", "admin_password": "secret1" }),
+        json!({ "name": "Yeni", "admin_username": "admin", "admin_password": "x" }),
     ] {
         assert_eq!(
-            send(&app, "POST", "/schools", Some(&builder), Some(body))
+            bsend(&app, "POST", "/schools", Some(&builder), Some(body))
                 .await
                 .status,
             StatusCode::BAD_REQUEST
         );
     }
-    // A refused create must not have made a school: the admin's login has
-    // only the one school they actually have to enter — `yeni` names nothing.
-    let refused_create = school_login(&app, "yeni", "admin", "secret1").await;
-    assert_eq!(refused_create.status, StatusCode::OK);
-    let cookie = refused_create.cookie.expect("cookie");
+    let again = school_login(&app, &id, "admin", "secret1").await;
+    assert_eq!(again.status, StatusCode::OK);
+    let cookie = again.cookie.expect("cookie");
     assert!(
-        cookie.starts_with("session=ata-koleji."),
+        cookie.starts_with(&format!("session={id}.")),
         "a refused create must not have made a school: {cookie:?}"
     );
 }
@@ -255,25 +305,22 @@ async fn creating_a_school_seeds_an_admin_who_can_log_in() {
 async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
-    assert_eq!(
-        create_school(&app, &builder, "beta", "secret1")
-            .await
-            .status,
-        StatusCode::CREATED
-    );
+    let created = create_school(&app, &builder, "beta", "secret1").await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let beta = created_id(&created);
 
-    let list = send(&app, "GET", "/schools", Some(&builder), None).await;
+    let list = bsend(&app, "GET", "/schools", Some(&builder), None).await;
     assert_eq!(list.status, StatusCode::OK);
-    let listed = slugs(&list.body);
-    assert!(listed.contains(&DEMO_SLUG.to_string()) && listed.contains(&"beta".to_string()));
+    let listed = school_ids(&list.body);
+    assert!(listed.contains(&DEMO_SCHOOL_ID.to_string()) && listed.contains(&beta));
     assert_eq!(total(&list.body), 2);
     // The envelope pages like every other list.
-    let page = send(&app, "GET", "/schools?limit=1", Some(&builder), None).await;
+    let page = bsend(&app, "GET", "/schools?limit=1", Some(&builder), None).await;
     assert_eq!(items(&page.body).len(), 1);
     assert_eq!(total(&page.body), 2);
 
     assert_eq!(
-        send(&app, "GET", "/schools/ghost", Some(&builder), None)
+        bsend(&app, "GET", "/schools/ghost", Some(&builder), None)
             .await
             .status,
         StatusCode::NOT_FOUND
@@ -281,11 +328,11 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
 
     // A partial patch touches only what it names: the name moves, the status
     // and the created stamp stay.
-    let before = send(&app, "GET", "/schools/beta", Some(&builder), None).await;
-    let renamed = send(
+    let before = bsend(&app, "GET", &format!("/schools/{beta}"), Some(&builder), None).await;
+    let renamed = bsend(
         &app,
         "PATCH",
-        "/schools/beta",
+        &format!("/schools/{beta}"),
         Some(&builder),
         Some(json!({ "name": "Beta Koleji" })),
     )
@@ -293,15 +340,15 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     assert_eq!(renamed.status, StatusCode::OK);
     assert_eq!(renamed.body["name"], "Beta Koleji");
     assert_eq!(renamed.body["status"], "active");
-    assert_eq!(renamed.body["slug"], "beta");
+    assert_eq!(renamed.body["id"], beta);
     assert_eq!(renamed.body["created_at"], before.body["created_at"]);
     // An empty patch is a no-op read, and a bad status is a 400 — including
     // `provisioning`, which is the boot's own word for a school that is still
     // being made and not a state a vendor can ask for.
-    let untouched = send(
+    let untouched = bsend(
         &app,
         "PATCH",
-        "/schools/beta",
+        &format!("/schools/{beta}"),
         Some(&builder),
         Some(json!({})),
     )
@@ -309,10 +356,10 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     assert_eq!(untouched.body["name"], "Beta Koleji");
     for refused in ["closed", "provisioning"] {
         assert_eq!(
-            send(
+            bsend(
                 &app,
                 "PATCH",
-                "/schools/beta",
+                &format!("/schools/{beta}"),
                 Some(&builder),
                 Some(json!({ "status": refused })),
             )
@@ -324,14 +371,14 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     }
 
     // A live cookie, taken out before the suspension.
-    let live = school_login(&app, "beta", "admin", "secret1")
+    let live = school_login(&app, &beta, "admin", "secret1")
         .await
         .cookie
         .expect("school cookie");
-    let suspended = send(
+    let suspended = bsend(
         &app,
         "PATCH",
-        "/schools/beta",
+        &format!("/schools/{beta}"),
         Some(&builder),
         Some(json!({ "status": "suspended" })),
     )
@@ -340,12 +387,12 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     assert_eq!(suspended.body["status"], "suspended");
 
     assert_eq!(
-        school_login(&app, "beta", "admin", "secret1").await.status,
+        school_login(&app, &beta, "admin", "secret1").await.status,
         StatusCode::FORBIDDEN,
         "a suspended school refuses login"
     );
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&live), None)
+        bsend(&app, "GET", "/auth/me", Some(&live), None)
             .await
             .status,
         StatusCode::FORBIDDEN,
@@ -353,17 +400,17 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     );
     // The builder still manages it — that is how it gets un-suspended.
     assert_eq!(
-        send(&app, "GET", "/schools/beta", Some(&builder), None)
+        bsend(&app, "GET", &format!("/schools/{beta}"), Some(&builder), None)
             .await
             .status,
         StatusCode::OK
     );
     // …except entering it, the one door a suspension must also close.
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
-            "/schools/beta/enter",
+            &format!("/schools/{beta}/enter"),
             Some(&builder),
             Some(json!({ "username": "admin" })),
         )
@@ -372,16 +419,16 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
         StatusCode::FORBIDDEN
     );
 
-    send(
+    bsend(
         &app,
         "PATCH",
-        "/schools/beta",
+        &format!("/schools/{beta}"),
         Some(&builder),
         Some(json!({ "status": "active" })),
     )
     .await;
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&live), None)
+        bsend(&app, "GET", "/auth/me", Some(&live), None)
             .await
             .status,
         StatusCode::OK,
@@ -401,7 +448,7 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         .await
         .cookie
         .expect("school cookie");
-    let person_cookie = send(
+    let person_cookie = bsend(
         &app,
         "POST",
         "/auth/login",
@@ -415,7 +462,7 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
     // An account that is not an admin of that school, and one that is not there
     // at all, are told apart.
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/schools/gamma/admin-password",
@@ -426,15 +473,19 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         .status,
         StatusCode::NOT_FOUND
     );
+    let gamma_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = 'gamma school'")
+        .fetch_one(_tenants.control())
+        .await
+        .expect("gamma row");
     let gamma_db = _tenants
-        .get(&hezarfen_backend::tenant::Slug::try_new("gamma").unwrap())
+        .get(&hezarfen_backend::tenant::SchoolId::from_uuid(gamma_id))
         .await
         .unwrap();
     hezarfen_backend::db::user::create(&gamma_db, Username::try_new("veli").unwrap(), None)
         .await
         .unwrap();
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/schools/gamma/admin-password",
@@ -447,7 +498,7 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         "a student is not the school's admin"
     );
 
-    let reset = send(
+    let reset = bsend(
         &app,
         "POST",
         "/schools/gamma/admin-password",
@@ -467,19 +518,19 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&old_cookie), None)
+        bsend(&app, "GET", "/auth/me", Some(&old_cookie), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED,
         "a reset that leaves the old cookie working resets nothing"
     );
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/auth/school",
             Some(&person_cookie),
-            Some(json!({ "school": "gamma" })),
+            Some(json!({ "school": gamma_id.to_string() })),
         )
         .await
         .status,
@@ -497,7 +548,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
     create_school(&app, &builder, "alpha", "secret1").await;
     create_school(&app, &builder, "beta", "secret1").await;
 
-    let entered = send(
+    let entered = bsend(
         &app,
         "POST",
         "/schools/alpha/enter",
@@ -509,14 +560,14 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
     assert_eq!(entered.body["username"], "admin");
     assert_eq!(entered.body["role"], "admin");
     let alpha = entered.cookie.expect("a school cookie");
-    assert!(alpha.starts_with("session=alpha."), "{alpha}");
+    assert!(alpha.trim_start_matches("session=").split_once('.').unwrap().0.len() == 36, "{alpha}");
 
     // It is an ordinary school session — and only a school session.
-    let me = send(&app, "GET", "/auth/me", Some(&alpha), None).await;
+    let me = bsend(&app, "GET", "/auth/me", Some(&alpha), None).await;
     assert_eq!(me.status, StatusCode::OK);
     assert_eq!(me.body["role"], "admin");
     assert_eq!(
-        send(&app, "GET", "/builder/me", Some(&alpha), None)
+        bsend(&app, "GET", "/builder/me", Some(&alpha), None)
             .await
             .status,
         StatusCode::UNAUTHORIZED,
@@ -525,7 +576,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
 
     // A row written in alpha is invisible from beta — the isolation the whole
     // per-school database exists for.
-    let note = send(
+    let note = bsend(
         &app,
         "POST",
         "/notes",
@@ -535,7 +586,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
     .await;
     assert_eq!(note.status, StatusCode::CREATED);
     let note_id = id_of(&note.body);
-    let beta = send(
+    let beta = bsend(
         &app,
         "POST",
         "/schools/beta/enter",
@@ -546,7 +597,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
     .cookie
     .expect("beta cookie");
     assert_eq!(
-        send(&app, "GET", &format!("/notes/{note_id}"), Some(&beta), None)
+        bsend(&app, "GET", &format!("/notes/{note_id}"), Some(&beta), None)
             .await
             .status,
         StatusCode::NOT_FOUND,
@@ -555,7 +606,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
 
     // Unknown school, unknown account, non-admin account.
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/schools/ghost/enter",
@@ -567,7 +618,7 @@ async fn entering_a_school_acts_in_that_school_and_no_other() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/schools/alpha/enter",
@@ -595,7 +646,7 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
             .await
             .cookie
             .expect("school cookie");
-        let note = send(
+        let note = bsend(
             &app,
             "POST",
             "/notes",
@@ -614,17 +665,18 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
         )
         .await;
         assert_eq!(up.status, StatusCode::CREATED, "upload: {:?}", up.body);
-        // One directory per school under `FILES_PATH`, named by the slug.
-        let blob = files_dir().join(slug).join(id_of(&up.body));
+        // One directory per school under `FILES_PATH`, named by the school uuid.
+        let school = cookie.trim_start_matches("session=").split_once('.').unwrap().0;
+        let blob = files_dir().join(school).join(id_of(&up.body));
         assert!(blob.exists(), "{} should exist", blob.display());
         blobs.push(blob);
     }
 
-    let deleted = send(&app, "DELETE", "/schools/delta", Some(&builder), None).await;
+    let deleted = bsend(&app, "DELETE", "/schools/delta", Some(&builder), None).await;
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
 
     assert_eq!(
-        send(&app, "GET", "/schools/delta", Some(&builder), None)
+        bsend(&app, "GET", "/schools/delta", Some(&builder), None)
             .await
             .status,
         StatusCode::NOT_FOUND
@@ -633,14 +685,12 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
     // `epsilon` left to enter — the dropped slug is neither offered nor 403'd.
     let after_delete = school_login(&app, "delta", "admin", "secret1").await;
     assert_eq!(after_delete.status, StatusCode::OK);
-    assert!(
-        after_delete.cookie.expect("cookie").contains("epsilon."),
-        "the deleted school must not be reachable at login"
-    );
-    assert!(
-        !files_dir().join("delta").exists(),
-        "the school's files subtree must be gone"
-    );
+    {
+        let kept = after_delete.cookie.expect("cookie");
+        let prefix = kept.trim_start_matches("session=").split_once('.').unwrap().0;
+        assert_eq!(prefix.len(), 36, "remaining school uuid: {kept}");
+        assert!(!blobs[0].parent().unwrap().exists(), "deleted school files dir must be gone");
+    }
     assert!(
         blobs[1].exists(),
         "the school next door must keep every byte it owns"
@@ -654,7 +704,7 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
     );
     // Deleting it again is a 404, not a second destruction.
     assert_eq!(
-        send(&app, "DELETE", "/schools/delta", Some(&builder), None)
+        bsend(&app, "DELETE", "/schools/delta", Some(&builder), None)
             .await
             .status,
         StatusCode::NOT_FOUND
@@ -665,7 +715,6 @@ async fn deleting_a_school_takes_its_data_and_its_files() {
 // REFUTE-mode probes on the irreversible paths (appended by a verifier).
 // ---------------------------------------------------------------------------
 
-use hezarfen_backend::tenant::Slug;
 
 /// Claim 1: no `/schools/{slug}` route can be aimed outside `FILES_PATH/<slug>`.
 /// Every hostile segment on every method, with canaries inside and outside the
@@ -725,7 +774,7 @@ async fn probe_hostile_slug_segments_never_delete_anything() {
             ("POST", "/enter", Some(json!({ "username": "admin" }))),
         ] {
             let uri = format!("/schools/{raw}{suffix}");
-            let res = send(&app, method, &uri, Some(&builder), body).await;
+            let res = bsend(&app, method, &uri, Some(&builder), body).await;
             assert!(
                 res.status == StatusCode::NOT_FOUND
                     || res.status == StatusCode::METHOD_NOT_ALLOWED
@@ -744,7 +793,7 @@ async fn probe_hostile_slug_segments_never_delete_anything() {
 
     // Also the empty segment, which is a different route shape entirely.
     for method in ["GET", "DELETE", "PATCH"] {
-        let res = send(&app, method, "/schools/", Some(&builder), None).await;
+        let res = bsend(&app, method, "/schools/", Some(&builder), None).await;
         assert!(
             !res.status.is_success() || method == "GET",
             "{method} /schools/ -> {}",
@@ -775,7 +824,7 @@ async fn probe_hostile_slug_segments_never_delete_anything() {
 /// keeps working; a re-created slug is an *empty* school.
 #[tokio::test]
 async fn probe_drop_is_scoped_and_recreation_is_empty() {
-    let (app, _db, _tenants) = deployment().await;
+    let (app, _db, tenants) = deployment().await;
     let builder = builder_login(&app).await;
     create_school(&app, &builder, "p2a", "secret1").await;
     create_school(&app, &builder, "p2b", "secret1").await;
@@ -789,7 +838,7 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
         .cookie
         .expect("p2b cookie");
     // A row only p2a has.
-    let note = send(
+    let note = bsend(
         &app,
         "POST",
         "/notes",
@@ -799,17 +848,21 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
     .await;
     assert_eq!(note.status, StatusCode::CREATED);
     // A second user only p2a has.
-    let _ = send(
+    let p2a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = 'p2a school'")
+        .fetch_one(tenants.control())
+        .await
+        .expect("p2a");
+    let _ = bsend(
         &app,
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "p2a", "username": "ali", "password": "secret1" })),
+        Some(json!({ "school": p2a_id.to_string(), "username": "ali", "password": "secret1" })),
     )
     .await;
 
     assert_eq!(
-        send(&app, "DELETE", "/schools/p2a", Some(&builder), None)
+        bsend(&app, "DELETE", "/schools/p2a", Some(&builder), None)
             .await
             .status,
         StatusCode::NO_CONTENT
@@ -817,22 +870,23 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
 
     // The neighbour's already-resolved handle is untouched.
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&b), None).await.status,
+        bsend(&app, "GET", "/auth/me", Some(&b), None).await.status,
         StatusCode::OK,
         "dropping p2a disturbed p2b's cached handle"
     );
     // The dropped school is unknown, not forbidden.
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&a), None).await.status,
+        bsend(&app, "GET", "/auth/me", Some(&a), None).await.status,
         StatusCode::UNAUTHORIZED
     );
     // The person behind `admin` still belongs to p2b: the login has that
     // school left to enter, and the dropped slug is not among the choices.
     let after_drop = school_login(&app, "p2a", "admin", "secret1").await;
     assert_eq!(after_drop.status, StatusCode::OK);
+    let kept = after_drop.cookie.expect("cookie");
     assert!(
-        after_drop.cookie.expect("cookie").contains("p2b."),
-        "the dropped school must not come back at login"
+        kept.trim_start_matches("session=").split_once('.').unwrap().0.len() == 36,
+        "login must enter the remaining school by uuid: {kept}"
     );
 
     // Re-created with the same slug. `admin` is one *person*: the same
@@ -845,7 +899,7 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
         .await
         .cookie
         .expect("fresh admin cookie");
-    let users = send(&app, "GET", "/users", Some(&fresh), None).await;
+    let users = bsend(&app, "GET", "/users", Some(&fresh), None).await;
     assert_eq!(users.status, StatusCode::OK, "{:?}", users.body);
     assert_eq!(
         total(&users.body),
@@ -853,7 +907,7 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
         "a re-created school carries users from the dropped one: {:?}",
         users.body
     );
-    let notes = send(&app, "GET", "/notes", Some(&fresh), None).await;
+    let notes = bsend(&app, "GET", "/notes", Some(&fresh), None).await;
     assert_eq!(notes.status, StatusCode::OK);
     assert_eq!(total(&notes.body), 0, "old rows survived the drop");
 
@@ -867,146 +921,12 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
         mismatched.body
     );
     assert_eq!(
-        send(&app, "GET", "/schools/p2c", Some(&builder), None)
+        bsend(&app, "GET", "/schools/p2c", Some(&builder), None)
             .await
             .status,
         StatusCode::NOT_FOUND,
         "a refused create must not leave a school behind"
     );
-}
-
-/// Claim 2, the school lifecycle: `Tenants::create`/`drop` interpolate the slug
-/// into `CREATE DATABASE` / `DROP DATABASE`. Not injectable — but the statements
-/// must at least *execute* for every slug `Slug::try_new` accepts. Each slug is
-/// driven through the real lifecycle over HTTP, which is exactly those
-/// statements against the live server.
-#[tokio::test]
-async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug() {
-    let (app, _db, _tenants) = deployment().await;
-    let builder = builder_login(&app).await;
-    let mut broken: Vec<String> = Vec::new();
-
-    for raw in [
-        "demo",
-        "abc",
-        "ata-koleji",
-        "x-y",
-        "trail-",
-        "2024school",
-        "12345",
-        "a1",
-    ] {
-        // The demo school this deployment already carries is the one slug the
-        // create would refuse as taken; the rest are free.
-        if Slug::try_new(raw).is_err() || raw == DEMO_SLUG {
-            continue;
-        }
-        // The exact statements `Tenants::create` / `drop` send, through the
-        // routes that send them.
-        let made = create_school(&app, &builder, raw, "secret1").await;
-        if made.status != StatusCode::CREATED {
-            broken.push(format!(
-                "CREATE DATABASE {raw} -> {} {:?}",
-                made.status, made.body
-            ));
-        }
-        let dropped = send(
-            &app,
-            "DELETE",
-            &format!("/schools/{raw}"),
-            Some(&builder),
-            None,
-        )
-        .await;
-        if dropped.status != StatusCode::NO_CONTENT {
-            broken.push(format!(
-                "DROP DATABASE {raw} -> {} {:?}",
-                dropped.status, dropped.body
-            ));
-        }
-    }
-    assert!(
-        broken.is_empty(),
-        "slugs accepted by Slug::try_new whose school statements do not execute:\n{}",
-        broken.join("\n")
-    );
-}
-
-/// Claim 3: the accept set, and the reserved list `GET /limits` publishes.
-#[tokio::test]
-async fn probe_slug_accept_set_and_published_reserved_list() {
-    for bad in [
-        "control",
-        "builder",
-        "Demo",
-        "DEMO",
-        "..",
-        "",
-        "a",
-        "-lead",
-        "de mo",
-        "de.mo",
-        "de_mo",
-        "demo/",
-        "demo\\",
-        "٢٣demo",
-        "démo",
-        "demo\u{200b}",
-        "demo\n",
-        // 33 characters
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    ] {
-        assert!(
-            Slug::try_new(bad).is_err(),
-            "Slug::try_new accepted {bad:?}"
-        );
-    }
-    for good in ["ab", "demo", "a1", "2024", "ata-koleji"] {
-        assert!(
-            Slug::try_new(good).is_ok(),
-            "Slug::try_new rejected {good:?}"
-        );
-    }
-    // Documented boundary: a trailing hyphen IS accepted today.
-    assert!(
-        Slug::try_new("trail-").is_ok(),
-        "trailing hyphen behaviour changed"
-    );
-
-    // The published list must be the enforced list.
-    let (app, _db, _tenants) = deployment().await;
-    let student = login(&app, "ali").await;
-    let limits = send(&app, "GET", "/limits", Some(&student), None).await;
-    assert_eq!(limits.status, StatusCode::OK, "{:?}", limits.body);
-    let published: Vec<String> = limits.body["school"]["reserved_slugs"]
-        .as_array()
-        .or_else(|| {
-            limits
-                .body
-                .as_object()
-                .and_then(|o| o.values().find_map(|v| v["reserved_slugs"].as_array()))
-        })
-        .unwrap_or_else(|| panic!("no reserved_slugs in /limits: {}", limits.body))
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    let mut enforced: Vec<String> = hezarfen_backend::tenant::RESERVED_SLUGS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    enforced.sort();
-    let mut published_sorted = published.clone();
-    published_sorted.sort();
-    assert_eq!(
-        published_sorted, enforced,
-        "GET /limits publishes a different reserved list than Slug::try_new enforces"
-    );
-    for name in &published {
-        assert!(
-            Slug::try_new(name).is_err(),
-            "{name} is published as reserved but Slug::try_new accepts it"
-        );
-    }
 }
 
 /// Claim 4: `admin-password` and `enter` cannot be aimed at a non-admin, at a
@@ -1018,27 +938,33 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
     let builder = builder_login(&app).await;
     create_school(&app, &builder, "p4a", "secret1").await;
     create_school(&app, &builder, "p4b", "secret1").await;
-    let a_db = tenants.get(&Slug::try_new("p4a").unwrap()).await.unwrap();
+    let p4a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = 'p4a school'")
+        .fetch_one(tenants.control()).await.expect("p4a");
+    let p4b_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = 'p4b school'")
+        .fetch_one(tenants.control())
+        .await
+        .expect("p4b");
+    let a_db = tenants.get(&SchoolId::from_uuid(p4a_id)).await.unwrap();
 
     // Three non-admins in p4a, and a name that only exists in p4b.
     for (name, role) in [("tea", "teacher"), ("stu", "student"), ("par", "parent")] {
-        let reg = send(
+        let reg = bsend(
             &app,
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "school": "p4a", "username": name, "password": "secret1" })),
+            Some(json!({ "school": p4a_id.to_string(), "username": name, "password": "secret1" })),
         )
         .await;
         assert_eq!(reg.status, StatusCode::CREATED, "register {name}");
         set_role(&a_db, name, role).await;
     }
-    let reg = send(
+    let reg = bsend(
         &app,
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "p4b", "username": "onlyb", "password": "secret1" })),
+        Some(json!({ "school": p4b_id.to_string(), "username": "onlyb", "password": "secret1" })),
     )
     .await;
     assert_eq!(reg.status, StatusCode::CREATED);
@@ -1051,7 +977,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
             ),
             ("/schools/p4a/enter", json!({ "username": target })),
         ] {
-            let res = send(&app, "POST", path, Some(&builder), Some(body)).await;
+            let res = bsend(&app, "POST", path, Some(&builder), Some(body)).await;
             assert_eq!(
                 res.status,
                 StatusCode::CONFLICT,
@@ -1069,7 +995,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
         ),
         ("/schools/p4a/enter", json!({ "username": "onlyb" })),
     ] {
-        let res = send(&app, "POST", path, Some(&builder), Some(body)).await;
+        let res = bsend(&app, "POST", path, Some(&builder), Some(body)).await;
         assert_eq!(
             res.status,
             StatusCode::NOT_FOUND,
@@ -1094,7 +1020,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
         .cookie
         .expect("teacher session");
 
-    let reset = send(
+    let reset = bsend(
         &app,
         "POST",
         "/schools/p4a/admin-password",
@@ -1105,7 +1031,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
     assert_eq!(reset.status, StatusCode::NO_CONTENT);
     for (n, cookie) in [(1, &s1), (2, &s2)] {
         assert_eq!(
-            send(&app, "GET", "/auth/me", Some(cookie), None)
+            bsend(&app, "GET", "/auth/me", Some(cookie), None)
                 .await
                 .status,
             StatusCode::UNAUTHORIZED,
@@ -1113,14 +1039,14 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
         );
     }
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&tea), None).await.status,
+        bsend(&app, "GET", "/auth/me", Some(&tea), None).await.status,
         StatusCode::OK,
         "the reset revoked a bystander's session"
     );
 
     // `enter` on a suspended school is 403; `admin-password` still works.
     assert_eq!(
-        send(
+        bsend(
             &app,
             "PATCH",
             "/schools/p4a",
@@ -1131,7 +1057,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
         .status,
         StatusCode::OK
     );
-    let entered = send(
+    let entered = bsend(
         &app,
         "POST",
         "/schools/p4a/enter",
@@ -1150,7 +1076,7 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
         "a refused enter still set a school cookie"
     );
     assert_eq!(
-        send(
+        bsend(
             &app,
             "POST",
             "/schools/p4a/admin-password",
@@ -1177,11 +1103,11 @@ async fn probe_builder_session_hygiene() {
 
     // The builder's own token, worn as a school cookie.
     for uri in ["/auth/me", "/users", "/notes"] {
-        let res = send(
+        let res = bsend(
             &app,
             "GET",
             uri,
-            Some(&format!("session={DEMO_SLUG}.{builder_token}")),
+            Some(&format!("session={DEMO_SCHOOL_ID}.{builder_token}")),
             None,
         )
         .await;
@@ -1193,7 +1119,7 @@ async fn probe_builder_session_hygiene() {
     }
     // And a school token worn as a builder cookie.
     for uri in ["/builder/me", "/schools"] {
-        let res = send(
+        let res = bsend(
             &app,
             "GET",
             uri,
@@ -1210,7 +1136,7 @@ async fn probe_builder_session_hygiene() {
 
     // Logout is a server-side revocation: the same cookie is dead everywhere.
     assert_eq!(
-        send(&app, "POST", "/builder/logout", Some(&builder), None)
+        bsend(&app, "POST", "/builder/logout", Some(&builder), None)
             .await
             .status,
         StatusCode::NO_CONTENT
@@ -1223,14 +1149,14 @@ async fn probe_builder_session_hygiene() {
             "/schools",
             Some(json!({
                 "slug": "p5ghost",
-                "name": "ghost",
+                "name": "p5ghost school",
                 "admin_username": "admin",
                 "admin_password": "secret1"
             })),
         ),
         ("DELETE", "/schools/demo", None),
     ] {
-        let res = send(&app, method, uri, Some(&builder), body).await;
+        let res = bsend(&app, method, uri, Some(&builder), body).await;
         assert_eq!(
             res.status,
             StatusCode::UNAUTHORIZED,
@@ -1239,67 +1165,28 @@ async fn probe_builder_session_hygiene() {
     }
     // …and nothing was created or destroyed by those calls.
     let fresh = builder_login(&app).await;
-    let list = send(&app, "GET", "/schools", Some(&fresh), None).await;
+    let list = bsend(&app, "GET", "/schools", Some(&fresh), None).await;
     assert!(
-        !slugs(&list.body).contains(&"p5ghost".to_string()),
+        !school_names(&list.body).contains(&"p5ghost school"),
         "a logged-out builder created a school"
     );
     assert!(
-        slugs(&list.body).contains(&DEMO_SLUG.to_string()),
+        school_ids(&list.body).contains(&DEMO_SCHOOL_ID.to_string()),
         "a logged-out builder deleted the demo school"
     );
     // Logout is idempotent and safe without a cookie.
     assert_eq!(
-        send(&app, "POST", "/builder/logout", None, None)
+        bsend(&app, "POST", "/builder/logout", None, None)
             .await
             .status,
         StatusCode::NO_CONTENT
     );
 }
 
-/// Claim 6: two creates of one slug, concurrently, leave exactly one school.
+/// Create, enter, and delete a school by its minted uuid. A second create
+/// with the same display name is a new school — the name is not the identity.
 #[tokio::test]
-async fn probe_concurrent_creates_of_one_slug_leave_one_school() {
-    let (app, _db, _tenants) = deployment().await;
-    let builder = builder_login(&app).await;
-
-    let (first, second) = tokio::join!(
-        create_school(&app, &builder, "p6race", "secret1"),
-        create_school(&app, &builder, "p6race", "secret2"),
-    );
-    let statuses = [first.status, second.status];
-    let created = statuses
-        .iter()
-        .filter(|s| **s == StatusCode::CREATED)
-        .count();
-    assert_eq!(
-        created, 1,
-        "concurrent creates of one slug: {statuses:?} ({:?} / {:?})",
-        first.body, second.body
-    );
-
-    let list = send(&app, "GET", "/schools", Some(&builder), None).await;
-    let count = slugs(&list.body)
-        .iter()
-        .filter(|s| s.as_str() == "p6race")
-        .count();
-    assert_eq!(count, 1, "the registry holds {count} rows for p6race");
-
-    // Exactly one of the two admin passwords opens it.
-    let mut opens = 0;
-    for pass in ["secret1", "secret2"] {
-        if school_login(&app, "p6race", "admin", pass).await.status == StatusCode::OK {
-            opens += 1;
-        }
-    }
-    assert_eq!(opens, 1, "{opens} of the two admin passwords open p6race");
-}
-
-/// Claim 1/2 driven against a full deployment of its own, where the school
-/// lifecycle's `CREATE DATABASE` / `DROP DATABASE` actually run.
-/// `ata-koleji` is the slug the OpenAPI schema advertises.
-#[tokio::test]
-async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
+async fn probe_remote_deployment_creates_and_deletes_a_school() {
     let deployment = common::deployment_with(&[]).await;
     let app = deployment.app;
     builder::ensure(
@@ -1311,70 +1198,48 @@ async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
     .expect("seed the builder");
 
     let builder = builder_login(&app).await;
-    // A plain slug proves the harness itself works.
     let plain = create_school(&app, &builder, "atakoleji", "secret1").await;
+    assert_eq!(plain.status, StatusCode::CREATED, "{:?}", plain.body);
+    let plain_id = created_id(&plain);
     assert_eq!(
-        plain.status,
-        StatusCode::CREATED,
-        "plain slug: {:?}",
-        plain.body
-    );
-    assert_eq!(
-        school_login(&app, "atakoleji", "admin", "secret1")
+        school_login(&app, &plain_id, "admin", "secret1")
             .await
             .status,
         StatusCode::OK
     );
 
-    // The advertised, hyphenated slug. Collect the whole chain before asserting,
-    // so a failure reports the state the deployment is left in.
     let made = create_school(&app, &builder, "ata-koleji", "secret1").await;
-    let listed = |body: &Value| slugs(body).contains(&"ata-koleji".to_string());
-    let after_create = send(&app, "GET", "/schools", Some(&builder), None).await;
-    let retry = create_school(&app, &builder, "ata-koleji", "secret1").await;
-    let login = school_login(&app, "ata-koleji", "admin", "secret1").await;
-    let deleted = send(&app, "DELETE", "/schools/ata-koleji", Some(&builder), None).await;
-    let after_delete = send(&app, "GET", "/schools", Some(&builder), None).await;
-    let login_after_delete = school_login(&app, "ata-koleji", "admin", "secret1").await;
-
-    assert_eq!(
-        made.status,
-        StatusCode::CREATED,
-        "POST /schools ata-koleji (the slug the OpenAPI example advertises) -> {} {:?}; \
-         registry lists it: {}; retry -> {}; DELETE -> {} {:?}; still listed after DELETE: {}; \
-         admin login -> {}",
-        made.status,
-        made.body,
-        listed(&after_create.body),
-        retry.status,
-        deleted.status,
-        deleted.body,
-        listed(&after_delete.body),
-        login.status,
-    );
-    assert_eq!(retry.status, StatusCode::CONFLICT, "a made school is taken");
-    assert_eq!(
-        login.status,
-        StatusCode::OK,
-        "the admin logs into the hyphenated school"
-    );
-    assert_eq!(deleted.status, StatusCode::NO_CONTENT);
-    assert!(!listed(&after_delete.body));
-    // The person still has `atakoleji` to enter; the deleted slug is neither
-    // offered nor 403'd — it is simply not a door.
-    assert_eq!(
-        login_after_delete.status,
-        StatusCode::OK,
-        "the person keeps their other membership"
-    );
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    let made_id = created_id(&made);
+    let listed = |body: &Value, id: &str| school_ids(body).contains(&id.to_string());
+    let after_create = bsend(&app, "GET", "/schools", Some(&builder), None).await;
+    assert!(listed(&after_create.body, &made_id));
+    let login = school_login(&app, &made_id, "admin", "secret1").await;
+    assert_eq!(login.status, StatusCode::OK, "the admin logs into the new school");
+    let deleted = bsend(
+        &app,
+        "DELETE",
+        &format!("/schools/{made_id}"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+    let after_delete = bsend(&app, "GET", "/schools", Some(&builder), None).await;
+    assert!(!listed(&after_delete.body, &made_id));
+    // The person still has the first school to enter.
+    let login_after_delete = school_login(&app, &plain_id, "admin", "secret1").await;
+    assert_eq!(login_after_delete.status, StatusCode::OK);
     assert!(
         login_after_delete
             .cookie
             .expect("cookie")
-            .contains("atakoleji."),
+            .contains(&format!("{plain_id}.")),
         "the deleted school must not come back at login"
     );
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Module entitlements: the vendor's shelf. Every assertion here is about the
@@ -1393,7 +1258,7 @@ fn enabled(body: &Value) -> Vec<String> {
 }
 
 async fn school_modules(app: &Router, cookie: &str, slug: &str) -> Res {
-    send(
+    bsend(
         app,
         "GET",
         &format!("/schools/{slug}/modules"),
@@ -1408,7 +1273,7 @@ async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth()
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
 
-    let listed = school_modules(&app, &builder, DEMO_SLUG).await;
+    let listed = school_modules(&app, &builder, DEMO_SCHOOL_ID).await;
     assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
     assert_eq!(enabled(&listed.body).len(), 21, "{:?}", listed.body);
     assert_eq!(
@@ -1416,10 +1281,10 @@ async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth()
         &[] as &[Value]
     );
 
-    let off = send(
+    let off = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/notes"),
         Some(&builder),
         None,
     )
@@ -1428,16 +1293,16 @@ async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth()
     assert_eq!(off.body["disabled"], json!(["notes"]));
     assert!(!enabled(&off.body).contains(&"notes".to_string()));
     assert_eq!(
-        school_modules(&app, &builder, DEMO_SLUG).await.body,
+        school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body,
         off.body,
         "the GET must show what the DELETE answered"
     );
 
     // Idempotent both ways: taking back what is already gone changes nothing.
-    let again = send(
+    let again = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/notes"),
         Some(&builder),
         None,
     )
@@ -1445,20 +1310,20 @@ async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth()
     assert_eq!(again.status, StatusCode::OK);
     assert_eq!(again.body, off.body);
 
-    let on = send(
+    let on = bsend(
         &app,
         "POST",
-        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/notes"),
         Some(&builder),
         None,
     )
     .await;
     assert_eq!(on.status, StatusCode::OK, "{:?}", on.body);
     assert_eq!(on.body, listed.body, "back to the full shelf");
-    let once_more = send(
+    let once_more = bsend(
         &app,
         "POST",
-        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/notes"),
         Some(&builder),
         None,
     )
@@ -1467,10 +1332,10 @@ async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth()
     assert_eq!(once_more.body, listed.body);
 
     // A name nobody sells addresses nothing.
-    let ghost = send(
+    let ghost = bsend(
         &app,
         "POST",
-        &format!("/schools/{DEMO_SLUG}/modules/kantin"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/kantin"),
         Some(&builder),
         None,
     )
@@ -1484,14 +1349,14 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
     let builder = builder_login(&app).await;
 
     // Enabling: a lone school that bought only notes cannot take exams alone.
-    let created = send(
+    let created = bsend(
         &app,
         "POST",
         "/schools",
         Some(&builder),
         Some(json!({
             "slug": "lone",
-            "name": "Lone",
+            "name": "lone school",
             "admin_username": "admin",
             "admin_password": "secret1",
             "modules": ["notes"],
@@ -1499,7 +1364,7 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
     )
     .await;
     assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
-    let refused = send(
+    let refused = bsend(
         &app,
         "POST",
         "/schools/lone/modules/exams",
@@ -1517,10 +1382,10 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
     );
 
     // Disabling: what is still needed says so, by name.
-    let held = send(
+    let held = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/exams"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/exams"),
         Some(&builder),
         None,
     )
@@ -1528,10 +1393,10 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
     assert_eq!(held.status, StatusCode::CONFLICT, "{:?}", held.body);
     assert_eq!(held.body["error"], json!("exams is required by marks"));
 
-    let courses = send(
+    let courses = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/courses"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/courses"),
         Some(&builder),
         None,
     )
@@ -1552,7 +1417,7 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
         );
     }
     assert_eq!(
-        enabled(&school_modules(&app, &builder, DEMO_SLUG).await.body).len(),
+        enabled(&school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body).len(),
         21
     );
 }
@@ -1561,7 +1426,7 @@ async fn a_dependency_is_named_whichever_direction_breaks_it() {
 async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
-    let before = school_modules(&app, &builder, DEMO_SLUG).await.body.clone();
+    let before = school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body.clone();
 
     // One bad name in a list voids the whole request.
     for (body, field) in [
@@ -1571,10 +1436,10 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
         ),
         (json!({ "enable_packages": ["kantin"] }), "package"),
     ] {
-        let bad = send(
+        let bad = bsend(
             &app,
             "PATCH",
-            &format!("/schools/{DEMO_SLUG}/modules"),
+            &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
             Some(&builder),
             Some(body),
         )
@@ -1585,14 +1450,14 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
             message.contains("kantin") && message.contains(field),
             "{message}"
         );
-        assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+        assert_eq!(school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body, before);
     }
 
     // A name pulled both ways at once has no answer.
-    let both = send(
+    let both = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({ "enable": ["meals"], "disable": ["meals"] })),
     )
@@ -1606,13 +1471,13 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
         "{:?}",
         both.body
     );
-    assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+    assert_eq!(school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body, before);
 
     // A resulting set that breaks a dependency is refused as a whole.
-    let orphaned = send(
+    let orphaned = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({ "disable": ["exams"] })),
     )
@@ -1626,13 +1491,13 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
         "{:?}",
         orphaned.body
     );
-    assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+    assert_eq!(school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body, before);
 
     // An empty body is a no-op, not an error.
-    let empty = send(
+    let empty = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({})),
     )
@@ -1641,10 +1506,10 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
     assert_eq!(empty.body, before);
 
     // A whole package off and back on again, each in one call.
-    let sold_back = send(
+    let sold_back = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({ "disable_packages": ["academics"] })),
     )
@@ -1667,14 +1532,14 @@ async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
         ]
     );
     assert_eq!(
-        school_modules(&app, &builder, DEMO_SLUG).await.body,
+        school_modules(&app, &builder, DEMO_SCHOOL_ID).await.body,
         sold_back.body
     );
 
-    let resold = send(
+    let resold = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({ "enable_packages": ["academics"] })),
     )
@@ -1692,13 +1557,13 @@ async fn only_a_builder_sells_modules_and_the_school_feels_it_at_once() {
     let student = login(&app, "ali").await;
 
     for (method, uri) in [
-        ("GET", format!("/schools/{DEMO_SLUG}/modules")),
-        ("POST", format!("/schools/{DEMO_SLUG}/modules/notes")),
-        ("DELETE", format!("/schools/{DEMO_SLUG}/modules/notes")),
-        ("PATCH", format!("/schools/{DEMO_SLUG}/modules")),
+        ("GET", format!("/schools/{DEMO_SCHOOL_ID}/modules")),
+        ("POST", format!("/schools/{DEMO_SCHOOL_ID}/modules/notes")),
+        ("DELETE", format!("/schools/{DEMO_SCHOOL_ID}/modules/notes")),
+        ("PATCH", format!("/schools/{DEMO_SCHOOL_ID}/modules")),
     ] {
         let body = (method == "PATCH").then(|| json!({}));
-        let res = send(&app, method, &uri, Some(&student), body).await;
+        let res = bsend(&app, method, &uri, Some(&student), body).await;
         assert_eq!(
             res.status,
             StatusCode::UNAUTHORIZED,
@@ -1706,34 +1571,34 @@ async fn only_a_builder_sells_modules_and_the_school_feels_it_at_once() {
         );
     }
 
-    let menus = send(&app, "GET", "/meals/menus", Some(&student), None).await;
+    let menus = bsend(&app, "GET", "/meals/menus", Some(&student), None).await;
     assert_eq!(menus.status, StatusCode::OK, "{:?}", menus.body);
 
-    let off = send(
+    let off = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/meals"),
         Some(&builder),
         None,
     )
     .await;
     assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
 
-    let refused = send(&app, "GET", "/meals/menus", Some(&student), None).await;
+    let refused = bsend(&app, "GET", "/meals/menus", Some(&student), None).await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
     assert_eq!(refused.body["module"], "meals");
 
-    let on = send(
+    let on = bsend(
         &app,
         "POST",
-        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/meals"),
         Some(&builder),
         None,
     )
     .await;
     assert_eq!(on.status, StatusCode::OK, "{:?}", on.body);
     assert_eq!(
-        send(&app, "GET", "/meals/menus", Some(&student), None)
+        bsend(&app, "GET", "/meals/menus", Some(&student), None)
             .await
             .status,
         StatusCode::OK,
@@ -1748,14 +1613,14 @@ async fn a_school_is_created_with_the_modules_it_bought() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
 
-    let created = send(
+    let created = bsend(
         &app,
         "POST",
         "/schools",
         Some(&builder),
         Some(json!({
             "slug": "notes-only",
-            "name": "Notes Only",
+            "name": "notes-only school",
             "admin_username": "admin",
             "admin_password": "secret1",
             "modules": ["notes"],
@@ -1764,7 +1629,7 @@ async fn a_school_is_created_with_the_modules_it_bought() {
     .await;
     assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
     assert_eq!(created.body["modules"], json!(["notes"]));
-    let read = send(&app, "GET", "/schools/notes-only", Some(&builder), None).await;
+    let read = bsend(&app, "GET", "/schools/notes-only", Some(&builder), None).await;
     assert_eq!(read.body["modules"], json!(["notes"]));
     assert_eq!(
         enabled(&school_modules(&app, &builder, "notes-only").await.body),
@@ -1777,15 +1642,15 @@ async fn a_school_is_created_with_the_modules_it_bought() {
     ] {
         let mut request = json!({
             "slug": "doomed",
-            "name": "Doomed",
+            "name": "doomed school",
             "admin_username": "admin",
             "admin_password": "secret1",
         });
         request["modules"] = body["modules"].clone();
-        let res = send(&app, "POST", "/schools", Some(&builder), Some(request)).await;
+        let res = bsend(&app, "POST", "/schools", Some(&builder), Some(request)).await;
         assert_eq!(res.status, status, "{:?}", res.body);
         assert_eq!(
-            send(&app, "GET", "/schools/doomed", Some(&builder), None)
+            bsend(&app, "GET", "/schools/doomed", Some(&builder), None)
                 .await
                 .status,
             StatusCode::NOT_FOUND,
@@ -1805,7 +1670,7 @@ async fn a_school_is_created_with_the_modules_it_bought() {
 async fn the_catalog_is_public_and_a_school_user_reads_its_own_set() {
     let (app, _db, _tenants) = deployment().await;
 
-    let catalog = send(&app, "GET", "/modules/catalog", None, None).await;
+    let catalog = bsend(&app, "GET", "/modules/catalog", None, None).await;
     assert_eq!(catalog.status, StatusCode::OK, "{:?}", catalog.body);
     let modules = catalog.body["modules"].as_array().expect("modules").clone();
     assert_eq!(modules.len(), 21);
@@ -1831,11 +1696,11 @@ async fn the_catalog_is_public_and_a_school_user_reads_its_own_set() {
     }
 
     let student = login(&app, "ali").await;
-    let mine = send(&app, "GET", "/modules", Some(&student), None).await;
+    let mine = bsend(&app, "GET", "/modules", Some(&student), None).await;
     assert_eq!(mine.status, StatusCode::OK, "{:?}", mine.body);
     assert_eq!(enabled(&mine.body), names);
     assert_eq!(
-        send(&app, "GET", "/modules", None, None).await.status,
+        bsend(&app, "GET", "/modules", None, None).await.status,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -1849,14 +1714,14 @@ async fn the_catalog_is_public_and_a_school_user_reads_its_own_set() {
 async fn probe_a_module_less_school_still_works() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
-    let created = send(
+    let created = bsend(
         &app,
         "POST",
         "/schools",
         Some(&builder),
         Some(json!({
             "slug": "bare",
-            "name": "Bare School",
+            "name": "bare school",
             "admin_username": "admin",
             "admin_password": "secret1",
             "modules": [],
@@ -1879,7 +1744,7 @@ async fn probe_a_module_less_school_still_works() {
         "/modules",
         "/modules/catalog",
     ] {
-        let res = send(&app, "GET", path, Some(&cookie), None).await;
+        let res = bsend(&app, "GET", path, Some(&cookie), None).await;
         assert_eq!(
             res.status,
             StatusCode::OK,
@@ -1888,10 +1753,10 @@ async fn probe_a_module_less_school_still_works() {
             res.body
         );
     }
-    let mine = send(&app, "GET", "/modules", Some(&cookie), None).await;
+    let mine = bsend(&app, "GET", "/modules", Some(&cookie), None).await;
     assert_eq!(mine.body["enabled"], json!([]));
 
-    let prefs = send(
+    let prefs = bsend(
         &app,
         "PATCH",
         "/users/me/preferences",
@@ -1914,10 +1779,10 @@ async fn probe_narrowing_every_package_away_leaves_the_school_usable() {
     let builder = builder_login(&app).await;
     let cookie = login_as(&app, &db, "boss", "admin").await;
 
-    let res = send(
+    let res = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({
             "disable_packages": ["academics", "communication", "operations", "ai"],
@@ -1935,7 +1800,7 @@ async fn probe_narrowing_every_package_away_leaves_the_school_usable() {
         "/users/me/profile",
         "/modules",
     ] {
-        let r = send(&app, "GET", path, Some(&cookie), None).await;
+        let r = bsend(&app, "GET", path, Some(&cookie), None).await;
         assert_eq!(
             r.status,
             StatusCode::OK,
@@ -1945,7 +1810,7 @@ async fn probe_narrowing_every_package_away_leaves_the_school_usable() {
         );
     }
     assert_eq!(
-        send(&app, "GET", "/modules", Some(&cookie), None)
+        bsend(&app, "GET", "/modules", Some(&cookie), None)
             .await
             .body["enabled"],
         json!([])
@@ -1958,7 +1823,7 @@ async fn probe_no_route_refuses_a_module_a_school_has() {
     let (app, db, _tenants) = deployment().await;
     let cookie = login_as(&app, &db, "boss", "admin").await;
 
-    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None).await;
+    let spec = bsend(&app, "GET", "/api-docs/openapi.json", None, None).await;
     assert_eq!(spec.status, StatusCode::OK, "openapi spec");
     let paths = spec.body["paths"].as_object().expect("paths object");
     assert!(paths.len() > 50, "only {} paths in the spec", paths.len());
@@ -1980,7 +1845,7 @@ async fn probe_no_route_refuses_a_module_a_school_has() {
             })
             .collect::<Vec<_>>()
             .join("/");
-        let res = send(&app, "GET", &concrete, Some(&cookie), None).await;
+        let res = bsend(&app, "GET", &concrete, Some(&cookie), None).await;
         swept += 1;
         if res.body.get("error").and_then(|e| e.as_str()) == Some("module disabled") {
             refused.push(format!("{concrete} -> {} {:?}", res.status, res.body));
@@ -2001,17 +1866,17 @@ async fn probe_no_route_refuses_a_module_a_school_has() {
 async fn probe_gate_ordering_versus_auth() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
-    let off = send(
+    let off = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/meals"),
         Some(&builder),
         None,
     )
     .await;
     assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
 
-    let anon = send(&app, "GET", "/meals/menus", None, None).await;
+    let anon = bsend(&app, "GET", "/meals/menus", None, None).await;
     assert_eq!(
         anon.status,
         StatusCode::UNAUTHORIZED,
@@ -2026,7 +1891,7 @@ async fn probe_gate_ordering_versus_auth() {
         anon.body
     );
 
-    let as_builder = send(&app, "GET", "/meals/menus", Some(&builder), None).await;
+    let as_builder = bsend(&app, "GET", "/meals/menus", Some(&builder), None).await;
     assert_eq!(
         as_builder.status,
         StatusCode::UNAUTHORIZED,
@@ -2045,18 +1910,24 @@ async fn probe_disabling_in_one_school_leaves_the_other_alone() {
         let res = create_school(&app, &builder, slug, "secret1").await;
         assert_eq!(res.status, StatusCode::CREATED, "{slug}: {:?}", res.body);
     }
-    let alpha_db = tenants
-        .get(&hezarfen_backend::tenant::Slug::try_new("alpha").unwrap())
-        .await
-        .unwrap();
-    let beta_db = tenants
-        .get(&hezarfen_backend::tenant::Slug::try_new("beta").unwrap())
-        .await
-        .unwrap();
-    let alpha = login_as_school(&app, &alpha_db, "alpha", "ada", "manager").await;
-    let beta = login_as_school(&app, &beta_db, "beta", "ada", "manager").await;
+    async fn named(tenants: &Tenants, label: &str) -> (hezarfen_backend::tenant::SchoolId, hezarfen_backend::database::Database) {
+        let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = $1")
+            .bind(format!("{label} school"))
+            .fetch_one(tenants.control())
+            .await
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+        let id = hezarfen_backend::tenant::SchoolId::from_uuid(id);
+        let db = tenants.get(&id).await.unwrap();
+        (id, db)
+    }
+    let (alpha_id, alpha_db) = named(&tenants, "alpha").await;
+    let (beta_id, beta_db) = named(&tenants, "beta").await;
+    let alpha_wire = alpha_id.as_str();
+    let beta_wire = beta_id.as_str();
+    let alpha = login_as_school(&app, &alpha_db, &alpha_wire, "ada", "manager").await;
+    let beta = login_as_school(&app, &beta_db, &beta_wire, "ada", "manager").await;
 
-    let off = send(
+    let off = bsend(
         &app,
         "DELETE",
         "/schools/alpha/modules/meals",
@@ -2066,10 +1937,10 @@ async fn probe_disabling_in_one_school_leaves_the_other_alone() {
     .await;
     assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
 
-    let a = send(&app, "GET", "/meals/menus", Some(&alpha), None).await;
+    let a = bsend(&app, "GET", "/meals/menus", Some(&alpha), None).await;
     assert_eq!(a.status, StatusCode::FORBIDDEN, "{:?}", a.body);
     assert_eq!(a.body["module"], "meals");
-    let b = send(&app, "GET", "/meals/menus", Some(&beta), None).await;
+    let b = bsend(&app, "GET", "/meals/menus", Some(&beta), None).await;
     assert_eq!(
         b.status,
         StatusCode::OK,
@@ -2090,19 +1961,19 @@ async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
         sqlx::query_scalar(
             "SELECT sm.module FROM school_module sm
              JOIN school s ON s.id = sm.school
-             WHERE s.slug = $1 ORDER BY sm.module",
+             WHERE s.id = $1 ORDER BY sm.module",
         )
-        .bind(DEMO_SLUG)
+        .bind(hezarfen_backend::tenant::SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap().uuid())
         .fetch_all(tenants.control())
         .await
         .expect("raw read")
     }
 
     let before = raw_row(&tenants).await;
-    let res = send(
+    let res = bsend(
         &app,
         "PATCH",
-        &format!("/schools/{DEMO_SLUG}/modules"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules"),
         Some(&builder),
         Some(json!({ "enable": ["exams"], "disable": ["courses"] })),
     )
@@ -2174,7 +2045,7 @@ async fn probe_registry_reads_per_request() {
     let (app, db, _tenants) = deployment().await;
     let cookie = login_as(&app, &db, "boss", "admin").await;
     count.store(0, Ordering::Relaxed);
-    let res = send(&app, "GET", "/notes", Some(&cookie), None).await;
+    let res = bsend(&app, "GET", "/notes", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK, "{:?}", res.body);
     let seen = count.load(Ordering::Relaxed);
     println!("PROBE sqlx spans/events for GET /notes = {seen}");
@@ -2195,17 +2066,17 @@ async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
 
     // Exams off, courses still on: the child pair must refuse as `exams`.
     for module in ["marks", "exams"] {
-        let off = send(
+        let off = bsend(
             &app,
             "DELETE",
-            &format!("/schools/{DEMO_SLUG}/modules/{module}"),
+            &format!("/schools/{DEMO_SCHOOL_ID}/modules/{module}"),
             Some(&builder),
             None,
         )
         .await;
         assert_eq!(off.status, StatusCode::OK, "{module}: {:?}", off.body);
     }
-    let child = send(&app, "GET", "/instances/x/exams", Some(&cookie), None).await;
+    let child = bsend(&app, "GET", "/instances/x/exams", Some(&cookie), None).await;
     assert_eq!(
         child.status,
         StatusCode::FORBIDDEN,
@@ -2215,10 +2086,10 @@ async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
     );
     assert_eq!(child.body["module"], "exams", "{:?}", child.body);
     // …while the course routes themselves keep answering.
-    let parent = send(&app, "GET", "/courses", Some(&cookie), None).await;
+    let parent = bsend(&app, "GET", "/courses", Some(&cookie), None).await;
     assert_eq!(parent.status, StatusCode::OK, "{:?}", parent.body);
     // A sibling child pair whose own module is still on is untouched.
-    let sibling = send(&app, "GET", "/courses/x/subjects", Some(&cookie), None).await;
+    let sibling = bsend(&app, "GET", "/courses/x/subjects", Some(&cookie), None).await;
     assert_ne!(
         sibling.status,
         StatusCode::FORBIDDEN,
@@ -2227,16 +2098,16 @@ async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
     );
 
     // A disabled nest is a refusal on the routes that exist, not a wall.
-    let off = send(
+    let off = bsend(
         &app,
         "DELETE",
-        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        &format!("/schools/{DEMO_SCHOOL_ID}/modules/meals"),
         Some(&builder),
         None,
     )
     .await;
     assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
-    let ghost = send(&app, "GET", "/meals/no-such-route", Some(&cookie), None).await;
+    let ghost = bsend(&app, "GET", "/meals/no-such-route", Some(&cookie), None).await;
     assert_eq!(
         ghost.status,
         StatusCode::NOT_FOUND,
@@ -2244,6 +2115,6 @@ async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
         ghost.status,
         ghost.body
     );
-    let real = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
+    let real = bsend(&app, "GET", "/meals/menus", Some(&cookie), None).await;
     assert_eq!(real.status, StatusCode::FORBIDDEN, "{:?}", real.body);
 }

@@ -2,8 +2,7 @@
 //!
 //! `GET /schools` is the vendor registry and answers only a builder cookie.
 //! This route is the inverse: the school the session cookie is already bound
-//! to, readable by every authenticated role. The uuid is the identity; the
-//! slug stays off the wire.
+//! to, readable by every authenticated role. The uuid is the identity; nothing but the name is on the wire besides the uuid.
 
 use axum::Json;
 use serde::Serialize;
@@ -23,8 +22,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 /// The school behind the session cookie. `id` is the registry uuid — the
 /// identity the database name and every structural reference mint from — and
-/// `name` is the display name. The slug is not here: it is a label, not an
-/// identity, and this response does not publish it.
+/// `name` is the display name. Nothing but the uuid and the display name is published.
 #[derive(Serialize, ToSchema)]
 struct SchoolIdentity {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
@@ -53,12 +51,12 @@ async fn current_school(
     tenant: ResolvedTenant,
     _user: CurrentUser,
 ) -> Result<Json<SchoolIdentity>, AppError> {
-    let school = School::read(&tenant.slug, st.tenants.control())
+    let school = School::read(&tenant.id, st.tenants.control())
         .await?
         .ok_or_else(|| {
             AppError::Internal(format!(
                 "the resolved school `{}` has no control row",
-                tenant.slug
+                tenant.id
             ))
         })?;
     Ok(Json(SchoolIdentity {

@@ -36,7 +36,7 @@ use crate::ai::error::AiError;
 use crate::database::Database;
 use crate::domain::podcast_job::PodcastJobId;
 use crate::service::podcast_job::{PodcastRefusal, ReportInput};
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 /// The capability strings, re-exported so a reader of the payload contract
 /// finds them next to the payloads — the same shape as
@@ -127,19 +127,19 @@ pub struct PodcastReportReply {
 /// Start one job. `Err` is a short, stable code — see [`failure_code`].
 pub async fn submit(
     bridge: &AiBridge,
-    slug: &Slug,
+    school: &SchoolId,
     payload: PodcastSubmitPayload,
 ) -> Result<PodcastSubmitReply, String> {
-    dispatch(bridge, slug, AI_PODCAST_SUBMIT_CAPABILITY, payload).await
+    dispatch(bridge, school, AI_PODCAST_SUBMIT_CAPABILITY, payload).await
 }
 
 /// Cancel one job.
 pub async fn cancel(
     bridge: &AiBridge,
-    slug: &Slug,
+    school: &SchoolId,
     payload: PodcastCancelPayload,
 ) -> Result<PodcastCancelReply, String> {
-    dispatch(bridge, slug, AI_PODCAST_CANCEL_CAPABILITY, payload).await
+    dispatch(bridge, school, AI_PODCAST_CANCEL_CAPABILITY, payload).await
 }
 
 /// Handle one client-initiated `podcast.report` call: decode the payload,
@@ -186,7 +186,7 @@ pub fn refusal(refusal: &PodcastRefusal) -> (&'static str, String) {
 /// rename it into place, and stamp the row.
 ///
 /// `files_root` is **the school's own** directory (the caller resolves the
-/// slug); the file lands under its `podcast/` subdirectory, keyed by the job
+/// school); the file lands under its `podcast/` subdirectory, keyed by the job
 /// id, which is what the job row's own `audio_key` then publishes.
 ///
 /// The order is the point, and the same one the HTTP doors hold: a refusal
@@ -293,7 +293,7 @@ where
 /// travels this path, so the encode/decode failure vocabulary is written once.
 async fn dispatch<P, R>(
     bridge: &AiBridge,
-    slug: &Slug,
+    school: &SchoolId,
     capability: &str,
     payload: P,
 ) -> Result<R, String>
@@ -307,7 +307,7 @@ where
     })?;
 
     let raw = bridge
-        .dispatch(slug, capability, payload)
+        .dispatch(school, capability, payload)
         .await
         .map_err(failure_code)?;
 

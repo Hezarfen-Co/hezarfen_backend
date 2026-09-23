@@ -9,7 +9,7 @@ use crate::db::person;
 use crate::domain::person::{Membership, Person, PersonId, PersonSession};
 use crate::domain::user::{PasswordHash, Username};
 use crate::error::AppError;
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 /// Create the person, or hand back the one already standing under
 /// `username`. The incoming hash is stored only on the create path — an
@@ -42,9 +42,9 @@ pub async fn create_or_load(
 pub async fn link_school(
     control: &Database,
     person: &PersonId,
-    slug: &Slug,
+    id: &SchoolId,
 ) -> Result<(), AppError> {
-    person::add_membership(control, person, slug).await
+    person::add_membership(control, person, id).await
 }
 
 pub async fn read(control: &Database, id: &PersonId) -> Result<Option<Person>, AppError> {
@@ -70,9 +70,9 @@ pub async fn memberships(
 pub async fn membership_of(
     control: &Database,
     person: &PersonId,
-    slug: &Slug,
+    id: &SchoolId,
 ) -> Result<Option<Membership>, AppError> {
-    person::membership_of(control, person, slug).await
+    person::membership_of(control, person, id).await
 }
 
 pub async fn create_session(

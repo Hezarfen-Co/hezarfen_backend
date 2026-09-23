@@ -61,8 +61,6 @@ async fn spec() -> Value {
 fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
     vec![
         // --- builder (the vendor surface) ---
-        ("CreateSchool", "slug", "minLength", MIN_SLUG_LEN as i64),
-        ("CreateSchool", "slug", "maxLength", MAX_SLUG_LEN as i64),
         (
             "CreateSchool",
             "name",
@@ -162,18 +160,6 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         // --- auth / users / notes / messages ---
         (
             "RegisterCredentials",
-            "school",
-            "minLength",
-            MIN_SLUG_LEN as i64,
-        ),
-        (
-            "RegisterCredentials",
-            "school",
-            "maxLength",
-            MAX_SLUG_LEN as i64,
-        ),
-        (
-            "RegisterCredentials",
             "username",
             "minLength",
             MIN_USERNAME_LEN as i64,
@@ -250,8 +236,6 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_STUDENT_NUMBER_LEN as i64,
         ),
-        ("SelectSchool", "school", "minLength", MIN_SLUG_LEN as i64),
-        ("SelectSchool", "school", "maxLength", MAX_SLUG_LEN as i64),
         ("UpdateProfile", "name", "maxLength", MAX_NAME_LEN as i64),
         ("UpdateProfile", "surname", "maxLength", MAX_NAME_LEN as i64),
         ("UpdateProfile", "email", "maxLength", MAX_EMAIL_LEN as i64),

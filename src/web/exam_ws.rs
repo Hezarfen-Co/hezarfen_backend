@@ -56,7 +56,7 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::{SchoolSlug, State};
+use crate::web::tenant_state::{SchoolIdCookie, State};
 use axum::extract::Path;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -75,7 +75,7 @@ use crate::service::exam_attempt::{
     set_left, writable_attempt,
 };
 use crate::state::AppState;
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 use crate::validate::validate_required;
 use crate::web::CurrentUser;
 use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
@@ -131,7 +131,7 @@ enum ClientMessage {
 /// stamp a student who was already reconnecting.
 pub async fn attempt_ws(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -147,7 +147,7 @@ pub async fn attempt_ws(
     crate::service::exam_attempt::require_open(&st.db, &exam).await?;
 
     let user_id = *user.get_id();
-    Ok(ws.on_upgrade(move |socket| room(socket, st, slug, exam, attempt, user_id)))
+    Ok(ws.on_upgrade(move |socket| room(socket, st, school, exam, attempt, user_id)))
 }
 
 /// The room loop: state ticks out, answer/finish/ping in, until the socket
@@ -156,7 +156,7 @@ pub async fn attempt_ws(
 async fn room(
     mut socket: WebSocket,
     st: AppState,
-    slug: Slug,
+    school: SchoolId,
     exam: Exam,
     attempt: ExamAttempt,
     user: UserId,
@@ -168,7 +168,7 @@ async fn room(
     let _connected = room::Connected::open(
         &st.metrics,
         "exam_room",
-        slug.as_str(),
+        school.as_str(),
         exam_id.key().as_str(),
     );
     // Join: this socket counts as presence in the sitting's room until it
@@ -178,7 +178,7 @@ async fn room(
     // predate a stamp that raced the upgrade; clearing regardless is what
     // keeps a reconnecting student unmarked. Best-effort — a failed clear
     // leaves the stamp for the next join or the teacher's door.
-    st.exam_presence.enter(&slug, attempt_id.key().as_str());
+    st.exam_presence.enter(&school, attempt_id.key().as_str());
     if let Err(err) = set_left(&st.db, attempt, None).await {
         tracing::warn!("exam room could not clear left_at on join: {err}");
     }
@@ -215,7 +215,7 @@ async fn room(
     // stamped. With `allow_rejoin` off this is what locks further
     // answering. Best-effort: a failed stamp only means it goes
     // unrecorded.
-    if st.exam_presence.leave(&slug, attempt_id.key().as_str()) {
+    if st.exam_presence.leave(&school, attempt_id.key().as_str()) {
         crate::db::exam_attempt::stamp_left_if_running(&st.db, &attempt_id, Timestamp::now())
             .await
             .unwrap_or_else(|err| {

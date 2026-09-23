@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use crate::tenant::ResolvedTenant;
-use crate::web::tenant_state::{SchoolSlug, State, TenantExt};
+use crate::web::tenant_state::{SchoolIdCookie, State, TenantExt};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -379,7 +379,7 @@ async fn list_messages(
 )]
 async fn send_message(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     tenant: ResolvedTenant,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
@@ -387,7 +387,7 @@ async fn send_message(
 ) -> Result<Response, AppError> {
     // Charged first: a rejected turn must cost nothing and leave no row.
     st.chatbot_limit
-        .enforce_user(&scoped_key(&slug, user.get_id().key().as_str()))?;
+        .enforce_user(&scoped_key(&school, user.get_id().key().as_str()))?;
 
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let settings = service::settings::load(&st.db).await?;
@@ -447,7 +447,7 @@ async fn send_message(
         // request was already resolved into, and one without the other is how
         // an answer lands in the wrong school.
         TenantExt {
-            slug,
+            id: school,
             db: st.db.clone(),
             modules: tenant.modules,
         },
@@ -573,7 +573,7 @@ async fn fetch_reply(
     })?;
 
     let raw = bridge
-        .dispatch(&tenant.slug, AI_CHAT_CAPABILITY, payload)
+        .dispatch(&tenant.id, AI_CHAT_CAPABILITY, payload)
         .await
         .map_err(failure_code)?;
     let reply: ChatReplyPayload = serde_json::from_value(raw).map_err(|err| {
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failure_codes_are_stable_slugs() {
+    async fn failure_codes_are_stable() {
         assert_eq!(
             failure_code(AiError::NoWorker("chat.reply".into())),
             "unavailable"

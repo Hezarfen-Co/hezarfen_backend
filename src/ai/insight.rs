@@ -46,7 +46,7 @@ use crate::constant::{
     AI_INSIGHT_REFRESH_TIMEOUT_SECS, AI_INSIGHT_REPORT_TIMEOUT_SECS,
     AI_INSIGHT_STUDENT_TIMEOUT_SECS,
 };
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 pub use crate::constant::{
     AI_INSIGHT_CLASS_CAPABILITY, AI_INSIGHT_REFRESH_CAPABILITY, AI_INSIGHT_REPORT_CAPABILITY,
@@ -218,7 +218,7 @@ pub struct ReportRequest {
     /// rendering reads nothing, but the service's logs name the requester.
     pub requested_by: String,
     /// The school's own identity, so the document prints a display name
-    /// rather than a slug.
+    /// rather than a raw id.
     pub school: ReportSchool,
     /// Every class (şube) of the school, id and display name: the summaries'
     /// evidence carries class **ids**, and a document that groups by class
@@ -272,7 +272,7 @@ pub struct ReportResponse {
 /// door that has already answered `503` for it ([`crate::web::insights`]).
 pub async fn compute_student(
     bridge: &AiBridge,
-    school: &Slug,
+    school: &SchoolId,
     request: &StudentRequest,
 ) -> Result<StudentResponse, AiError> {
     dispatch(
@@ -289,7 +289,7 @@ pub async fn compute_student(
 /// batch is over; the deadline is [`AI_INSIGHT_REFRESH_TIMEOUT_SECS`].
 pub async fn refresh(
     bridge: &AiBridge,
-    school: &Slug,
+    school: &SchoolId,
     request: &RefreshRequest,
 ) -> Result<RefreshResponse, AiError> {
     dispatch(
@@ -310,7 +310,7 @@ pub async fn refresh(
 /// document — this function only moves it.
 pub async fn report(
     bridge: &AiBridge,
-    school: &Slug,
+    school: &SchoolId,
     request: &ReportRequest,
 ) -> Result<ReportResponse, AiError> {
     dispatch(
@@ -332,7 +332,7 @@ pub async fn report(
 /// reporting the service out of step.
 async fn dispatch<T>(
     bridge: &AiBridge,
-    school: &Slug,
+    school: &SchoolId,
     capability: &str,
     timeout_secs: u64,
     request: &impl Serialize,
@@ -613,8 +613,7 @@ mod tests {
             run_day: "2026-09-17".into(),
             requested_by: "user-9".into(),
             school: ReportSchool {
-                id: "school-1".into(),
-                slug: "demo".into(),
+                id: "019732e3-7b00-7000-8000-00000000dead".into(),
                 name: "Demo Okulu".into(),
             },
             classes: vec![ClassLabel {
@@ -632,7 +631,7 @@ mod tests {
                 "kind": "okul",
                 "run_day": "2026-09-17",
                 "requested_by": "user-9",
-                "school": { "id": "school-1", "slug": "demo", "name": "Demo Okulu" },
+                "school": { "id": "019732e3-7b00-7000-8000-00000000dead", "name": "Demo Okulu" },
                 "classes": [{ "id": "class-1", "name": "8-A" }],
                 "summaries": [],
                 "recommendations": [],

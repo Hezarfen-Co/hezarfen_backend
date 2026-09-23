@@ -13,7 +13,7 @@ use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Pho
 use crate::domain::role::Role;
 use crate::domain::user::{Password, StudentNumber, User, UserId, Username};
 use crate::error::AppError;
-use crate::tenant::{Slug, Tenants};
+use crate::tenant::{SchoolId, Tenants};
 
 /// Idempotent startup seed: guarantee an admin account with this username.
 /// Missing → created directly with [`Role::Admin`]. Already an admin →
@@ -23,11 +23,11 @@ use crate::tenant::{Slug, Tenants};
 /// be a privilege escalation, so that conflict is resolved out-of-band.
 pub async fn ensure_admin(
     tenants: &Tenants,
-    slug: &Slug,
+    id: &SchoolId,
     username: Username,
     password: Password,
 ) -> Result<(), AppError> {
-    let db = tenants.get(slug).await?;
+    let db = tenants.get(id).await?;
     // The person half runs first, so the school row can carry the person id
     // it is the join key to. Login reads the control-plane credential, so the
     // seeded admin needs their `person` row and the membership too. Both
@@ -40,7 +40,7 @@ pub async fn ensure_admin(
     let person =
         crate::service::person::create_or_load(tenants.control(), username.clone(), password_hash)
             .await?;
-    crate::service::person::link_school(tenants.control(), person.get_id(), slug).await?;
+    crate::service::person::link_school(tenants.control(), person.get_id(), id).await?;
     match user::find_by_username(&db, username.as_str()).await? {
         Some(user) if user.role == Role::Admin => {}
         Some(_) => {

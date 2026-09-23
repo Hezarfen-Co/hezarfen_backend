@@ -24,14 +24,14 @@ use std::time::Duration;
 
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
 use hezarfen_backend::module::ModuleSet;
-use hezarfen_backend::tenant::{SchoolStatus, Slug, Tenants};
+use hezarfen_backend::tenant::{SchoolStatus, SchoolId, Tenants};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "shared-ai-token";
 
 /// The school every frame in this suite names. A literal for the same reason
 /// `PROTOCOL` is one: a service spells the slug out, it is not a Rust constant.
-const SCHOOL: &str = "demo";
+const SCHOOL: &str = "019732e3-7b00-7000-8000-00000000dead";
 
 /// The protocol identifier this suite pins. Deliberately a literal, not
 /// `AI_PROTOCOL`: importing the constant would let a rename sail through, and
@@ -269,7 +269,7 @@ fn dispatch(
 ) -> tokio::task::JoinHandle<Result<Value, AiError>> {
     let bridge = bridge.clone();
     let capability = capability.to_string();
-    let school = hezarfen_backend::tenant::Slug::try_new(SCHOOL).expect("the demo slug");
+    let school = hezarfen_backend::tenant::SchoolId::try_parse(SCHOOL).expect("the demo slug");
     tokio::spawn(async move { bridge.dispatch(&school, &capability, payload).await })
 }
 
@@ -814,7 +814,7 @@ async fn closing_the_control_stream_deregisters_the_service() {
     assert!(matches!(
         bridge
             .dispatch(
-                &hezarfen_backend::tenant::Slug::try_new(SCHOOL).unwrap(),
+                &hezarfen_backend::tenant::SchoolId::try_parse(SCHOOL).unwrap(),
                 "ocr.extract",
                 json!(null)
             )
@@ -967,7 +967,7 @@ async fn a_chat_request_names_the_askers_school_role() {
 
     let tenants = hezarfen_backend::database::init_test_tenants().await;
     let db = tenants
-        .get(&hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap())
+        .get(&hezarfen_backend::tenant::SchoolId::try_parse(hezarfen_backend::tenant::DEMO_SCHOOL_ID).unwrap())
         .await
         .expect("the demo school");
     let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
@@ -1179,7 +1179,7 @@ async fn only_id_and_path_are_required_of_an_api_request() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        br#"{"id":"trace-1","school":"demo","path":"/auth/me","unknown_field":true}"#,
+        br#"{"id":"trace-1","school":"019732e3-7b00-7000-8000-00000000dead","path":"/auth/me","unknown_field":true}"#,
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1201,43 +1201,43 @@ async fn the_api_refusal_frame_carries_exactly_the_published_keys_and_codes() {
     let cases = [
         (
             "method_not_allowed",
-            r#"{"id":"t1","school":"demo","path":"/notes","method":"DELETE"}"#.to_string(),
+            r#"{"id":"t1","school":"019732e3-7b00-7000-8000-00000000dead","path":"/notes","method":"DELETE"}"#.to_string(),
         ),
         (
             "method_not_allowed",
             // Lowercase is not the method: the literal is exactly `GET`.
-            r#"{"id":"t2","school":"demo","path":"/notes","method":"get"}"#.to_string(),
+            r#"{"id":"t2","school":"019732e3-7b00-7000-8000-00000000dead","path":"/notes","method":"get"}"#.to_string(),
         ),
         (
             "path_not_allowed",
-            r#"{"id":"t3","school":"demo","path":"/courses"}"#.to_string(),
+            r#"{"id":"t3","school":"019732e3-7b00-7000-8000-00000000dead","path":"/courses"}"#.to_string(),
         ),
         (
             // Order pin: both refusals apply, the method one wins.
             "method_not_allowed",
-            r#"{"id":"t4","school":"demo","path":"/nope","method":"POST"}"#.to_string(),
+            r#"{"id":"t4","school":"019732e3-7b00-7000-8000-00000000dead","path":"/nope","method":"POST"}"#.to_string(),
         ),
         (
             "unknown_user",
-            r#"{"id":"t5","school":"demo","path":"/auth/me","on_behalf_of":"nobodyatall"}"#
+            r#"{"id":"t5","school":"019732e3-7b00-7000-8000-00000000dead","path":"/auth/me","on_behalf_of":"nobodyatall"}"#
                 .to_string(),
         ),
         (
             "malformed",
-            r#"{"id":"t6","school":"demo","path":42}"#.to_string(),
+            r#"{"id":"t6","school":"019732e3-7b00-7000-8000-00000000dead","path":42}"#.to_string(),
         ),
         // A frame that names no school at all: required, never defaulted.
         ("malformed", r#"{"id":"t7","path":"/auth/me"}"#.to_string()),
-        // A string that is no slug — the service's own bug, not a missing
-        // customer, so it is `malformed` rather than `unknown_school`.
-        (
-            "malformed",
-            r#"{"id":"t8","school":"NOT A SLUG","path":"/auth/me"}"#.to_string(),
-        ),
-        // A well-formed slug this deployment does not serve.
+        // A string that is not a hyphenated uuid is `unknown_school`, not
+        // `malformed`. `malformed` stays the frame-shape error (t7, above).
         (
             "unknown_school",
-            r#"{"id":"t9","school":"nope","path":"/auth/me"}"#.to_string(),
+            r#"{"id":"t8","school":"NOT A SLUG","path":"/auth/me"}"#.to_string(),
+        ),
+        // A hyphenated uuid this deployment does not serve.
+        (
+            "unknown_school",
+            r#"{"id":"t9","school":"019732e3-7b00-7000-8000-00000000eeee","path":"/auth/me"}"#.to_string(),
         ),
     ];
 
@@ -1304,8 +1304,7 @@ async fn two_schools(bridge: &AiBridge) -> (axum::Router, Tenants, String, Strin
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta_db = tenants
         .create(
-            hezarfen_backend::tenant::SchoolId::generate(),
-            &Slug::try_new("beta").unwrap(),
+            hezarfen_backend::tenant::SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap(),
             "Beta College",
             ModuleSet::all(),
         )
@@ -1334,7 +1333,7 @@ async fn an_api_read_answers_out_of_the_school_the_frame_named() {
     await_workers(&bridge, 1).await;
     let (_app, _tenants, demo_ayse, beta_ayse) = two_schools(&bridge).await;
 
-    for (school, who) in [("demo", &demo_ayse), ("beta", &beta_ayse)] {
+    for (school, who) in [("019732e3-7b00-7000-8000-00000000dead", &demo_ayse), ("019732e3-7b00-7000-8000-00000000beef", &beta_ayse)] {
         let (answer, _) = raw::api_read(
             &service.conn,
             format!(
@@ -1350,7 +1349,7 @@ async fn an_api_read_answers_out_of_the_school_the_frame_named() {
     }
 
     // And crossed over: the other school's id names nobody here.
-    for (school, who) in [("demo", &beta_ayse), ("beta", &demo_ayse)] {
+    for (school, who) in [("019732e3-7b00-7000-8000-00000000dead", &beta_ayse), ("019732e3-7b00-7000-8000-00000000beef", &demo_ayse)] {
         let (answer, _) = raw::api_read(
             &service.conn,
             format!(
@@ -1376,13 +1375,13 @@ async fn a_suspended_school_is_refused_with_its_own_code() {
     let (_app, tenants, _demo_ayse, beta_ayse) = two_schools(&bridge).await;
 
     let read = format!(
-        r#"{{"id":"t-susp","school":"beta","path":"/auth/me","on_behalf_of":"{beta_ayse}"}}"#
+        r#"{{"id":"t-susp","school":"019732e3-7b00-7000-8000-00000000beef","path":"/auth/me","on_behalf_of":"{beta_ayse}"}}"#
     );
     let (answer, _) = raw::api_read(&service.conn, read.as_bytes()).await;
     assert_eq!(answer["outcome"], "ok", "the school starts out active");
 
     tenants
-        .set_status(&Slug::try_new("beta").unwrap(), SchoolStatus::Suspended)
+        .set_status(&SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap(), SchoolStatus::Suspended)
         .await
         .expect("suspend beta");
 
@@ -1390,7 +1389,7 @@ async fn a_suspended_school_is_refused_with_its_own_code() {
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "school_suspended", "{answer}");
     assert_eq!(
-        answer["school"], "beta",
+        answer["school"], "019732e3-7b00-7000-8000-00000000beef",
         "the refusal names the school back"
     );
     assert_eq!(answer["id"], "t-susp");
@@ -1398,7 +1397,7 @@ async fn a_suspended_school_is_refused_with_its_own_code() {
     // The demo school is untouched by its neighbour's suspension.
     let (answer, _) = raw::api_read(
         &service.conn,
-        br#"{"id":"t-neighbour","school":"demo","path":"/auth/me"}"#,
+        br#"{"id":"t-neighbour","school":"019732e3-7b00-7000-8000-00000000dead","path":"/auth/me"}"#,
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1424,7 +1423,7 @@ async fn a_blob_read_names_its_school_too() {
     assert_eq!(header["status"], "ok", "{header}");
     assert_eq!(body.len(), uploaded.len());
 
-    for (school, code) in [("nope", "unknown_school"), ("NOT A SLUG", "malformed")] {
+    for (school, code) in [("019732e3-7b00-7000-8000-00000000eeee", "unknown_school"), ("NOT A SLUG", "unknown_school")] {
         let (header, _, body) = raw::blob_read(
             &service.conn,
             format!(
@@ -1575,7 +1574,7 @@ async fn a_blob_refusal_frame_carries_exactly_the_published_keys_and_no_bytes() 
     let mut modules = ModuleSet::all();
     modules.remove(hezarfen_backend::module::Module::CourseNotes);
     tenants
-        .set_modules(&Slug::try_new(SCHOOL).unwrap(), &modules)
+        .set_modules(&SchoolId::try_parse(SCHOOL).unwrap(), &modules)
         .await
         .expect("take course_notes off the demo school");
 
@@ -1637,7 +1636,7 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
     assert_eq!(answer["status"], 200);
 
     // Neither shape: still the api read's refusal, with its `outcome` tag.
-    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
+    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"019732e3-7b00-7000-8000-00000000dead"}"#).await;
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "malformed");
     assert_eq!(answer["id"], "t-neither");
@@ -1744,7 +1743,7 @@ async fn the_capability_shape_does_not_steal_the_shapes_that_existed_before() {
     assert_eq!(answer["payload"]["students"], json!([]), "{answer}");
 
     // Neither: the same api-read refusal as before this shape existed.
-    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
+    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"019732e3-7b00-7000-8000-00000000dead"}"#).await;
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "malformed");
 }

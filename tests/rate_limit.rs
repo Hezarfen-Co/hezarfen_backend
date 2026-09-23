@@ -105,7 +105,7 @@ async fn login_attempts_hit_the_auth_limit() {
 #[tokio::test]
 async fn register_and_login_share_the_auth_bucket() {
     let app = app_with(auth_only(2)).await;
-    let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
+    let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ada", "password": "secret1" });
 
     let (status, _, _) = send_as(&app, "1.1.1.1", "POST", "/auth/register", Some(creds)).await;
     assert_eq!(status, StatusCode::CREATED);

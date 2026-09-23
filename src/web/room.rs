@@ -49,12 +49,13 @@ impl Connected {
     /// `kind` is the room's telemetry name (`exam_room`, `board`), `id` a
     /// **resource** id — the exam, the board — and never the person on the
     /// socket, which telemetry may not carry.
-    pub(crate) fn open(metrics: &Metrics, kind: &'static str, school: &str, id: &str) -> Self {
+    pub(crate) fn open(metrics: &Metrics, kind: &'static str, school: impl AsRef<str>, id: &str) -> Self {
         metrics
             .ws_connections
             .add(1, &[opentelemetry::KeyValue::new("kind", kind)]);
-        // `id` is a resource id (exam, board) and `school` a slug — both are
-        // allowed on telemetry. A user id never is.
+        // `id` is a resource id (exam, board) and `school` the school uuid —
+        // both are allowed on telemetry. A user id never is.
+        let school = school.as_ref();
         tracing::info!(kind, school, id, "websocket opened");
         Self {
             metrics: metrics.clone(),

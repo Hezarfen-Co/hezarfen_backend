@@ -93,7 +93,7 @@ async fn time_serves_server_clock_without_auth() {
 async fn get_school_returns_uuid_and_name_without_slug() {
     let (app, db, tenants) = app_and_tenants().await;
     let (id, name): (Uuid, String) =
-        sqlx::query_as("SELECT id, name FROM school WHERE slug = 'demo'")
+        sqlx::query_as("SELECT id, name FROM school WHERE id = '019732e3-7b00-7000-8000-00000000dead'")
             .fetch_one(tenants.control())
             .await
             .expect("demo school");
@@ -229,7 +229,7 @@ async fn limits_publishes_the_bounds_the_api_actually_enforces() {
         .as_u64()
         .expect("max_username_len is an integer") as usize;
     let too_long =
-        json!({ "school": "demo", "username": "a".repeat(max + 1), "password": "secret1" });
+        json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "a".repeat(max + 1), "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(too_long)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 }
@@ -273,25 +273,25 @@ async fn register_validates_input() {
     let app = mem_app().await;
 
     // Password too short -> 400.
-    let short = json!({ "school": "demo", "username": "bob", "password": "123" });
+    let short = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "bob", "password": "123" });
     let res = send(&app, "POST", "/auth/register", None, Some(short)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
     // Blank username -> 400.
-    let blank = json!({ "school": "demo", "username": "   ", "password": "secret1" });
+    let blank = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "   ", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(blank)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
     // Uppercase anywhere in the username -> 400.
     for bad in ["Bob", "bOb", "BOB"] {
-        let upper = json!({ "school": "demo", "username": bad, "password": "secret1" });
+        let upper = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(upper)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
 
     // Username must start and end with a letter or digit -> 400.
     for bad in ["-bob", "bob-", "_bob", "bob_", ".bob"] {
-        let edge = json!({ "school": "demo", "username": bad, "password": "secret1" });
+        let edge = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(edge)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
@@ -306,26 +306,26 @@ async fn register_validates_input() {
         "a/b",
         "a\"b",
     ] {
-        let ugly = json!({ "school": "demo", "username": bad, "password": "secret1" });
+        let ugly = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(ugly)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad:?} accepted");
     }
 
     // Consecutive separators -> 400.
     for bad in ["a--b", "a..b", "a__b", "a.-b"] {
-        let doubled = json!({ "school": "demo", "username": bad, "password": "secret1" });
+        let doubled = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(doubled)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
 
     // Single separators between alphanumerics are fine -> 201.
-    let dotted = json!({ "school": "demo", "username": "ali.k_1-b", "password": "secret1" });
+    let dotted = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ali.k_1-b", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(dotted)).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["username"], "ali.k_1-b");
 
     // Valid -> 201, no password echoed back, defaults to the student role.
-    let ok = json!({ "school": "demo", "username": "bob", "password": "secret1" });
+    let ok = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "bob", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(ok)).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["username"], "bob");
@@ -336,7 +336,7 @@ async fn register_validates_input() {
     // deliberately indistinguishable — see tests/auth_enumeration.rs), but the
     // write is still rejected: the original password keeps working and the
     // second one never becomes valid.
-    let dup = json!({ "school": "demo", "username": "bob", "password": "hijack1" });
+    let dup = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "bob", "password": "hijack1" });
     let res = send(&app, "POST", "/auth/register", None, Some(dup)).await;
     assert_eq!(res.status, StatusCode::CREATED);
     let res = send(
@@ -381,7 +381,7 @@ async fn register_rejects_reserved_usernames() {
         "moderator",
         "staff",
     ] {
-        let creds = json!({ "school": "demo", "username": name, "password": "secret1" });
+        let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": name, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{name} accepted");
         let msg = res.body["error"].as_str().unwrap_or_default();
@@ -408,7 +408,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "demo", "username": "kate", "password": "secret1" })),
+        Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "kate", "password": "secret1" })),
     )
     .await;
 
@@ -452,6 +452,8 @@ const PUBLIC: &[(&str, &str)] = &[
     // Person-cookie gated, not a school session: OpenAPI declares no
     // session_cookie security, so the public-route audit lists it here.
     ("POST", "/auth/school"),
+    // Register's school picker: active `{id, name}` rows, no session.
+    ("GET", "/auth/schools"),
     // Idempotent: revokes the session if there is one, `204` either way.
     ("POST", "/auth/logout"),
     // A server certificate is handed to every peer in the TLS handshake, so
@@ -1355,13 +1357,13 @@ async fn malformed_json_bodies_answer_422_across_every_extractor_shape() {
         (
             "/auth/register",
             None,
-            r#"{"school": "demo", "username": 5, "password": "secret1"}"#,
+            r#"{"school": "019732e3-7b00-7000-8000-00000000dead", "username": 5, "password": "secret1"}"#,
             "plain Json, type mismatch",
         ),
         (
             "/auth/register",
             None,
-            r#"{"school": "demo", "username": "veli"}"#,
+            r#"{"school": "019732e3-7b00-7000-8000-00000000dead", "username": "veli"}"#,
             "plain Json, missing required field",
         ),
         (
@@ -1405,7 +1407,7 @@ async fn malformed_json_bodies_answer_422_across_every_extractor_shape() {
     for (body, why) in [
         ("not json at all", "unparseable JSON"),
         (
-            r#"{"school": "demo", "username": "a", "password": "secret1"}"#,
+            r#"{"school": "019732e3-7b00-7000-8000-00000000dead", "username": "a", "password": "secret1"}"#,
             "well-typed value refused by a domain rule",
         ),
     ] {
@@ -6450,7 +6452,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
         "/auth/register",
         None,
         Some(
-            json!({ "school": "demo", "school": "demo", "username": "ali", "password": "secret1" }),
+            json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ali", "password": "secret1" }),
         ),
     )
     .await;
@@ -6466,7 +6468,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "school": "demo", "username": spoof, "password": "spoof1" })),
+            Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": spoof, "password": "spoof1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{spoof:?}");
@@ -6517,7 +6519,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "demo", "username": " veli ", "password": "secret1" })),
+        Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": " veli ", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -6825,7 +6827,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
                 "POST",
                 "/auth/register",
                 None,
-                Some(json!({ "school": "demo", "username": "dup", "password": "secret1" })),
+                Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "dup", "password": "secret1" })),
             )
             .await
             .status
@@ -6855,7 +6857,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "demo", "username": "dup", "password": "hijack1" })),
+        Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "dup", "password": "hijack1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -6942,7 +6944,7 @@ async fn child_lists_of_missing_parents_are_404() {
 #[tokio::test]
 async fn session_cookie_secure_attribute_follows_config() {
     async fn login_set_cookie(app: &axum::Router) -> String {
-        let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
+        let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "ada", "password": "secret1" });
         assert_eq!(
             send(app, "POST", "/auth/register", None, Some(creds))
                 .await
@@ -7051,7 +7053,7 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"school": "demo", "username": "gulsah", "password": "sifre12345"})
+                    json!({"school": "019732e3-7b00-7000-8000-00000000dead", "username": "gulsah", "password": "sifre12345"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -7075,7 +7077,7 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"school": "demo", "username": "kerem", "password": "sifre12345"})
+                    json!({"school": "019732e3-7b00-7000-8000-00000000dead", "username": "kerem", "password": "sifre12345"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -7091,11 +7093,11 @@ async fn db_down_refuses_before_touching_the_database() {
 
     // Recovery is eviction: the dead pool leaves the cache, the next request
     // dials fresh — and the refused write is still not in the database.
-    let demo_id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE slug = 'demo'")
+    let demo_id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE id = '019732e3-7b00-7000-8000-00000000dead'")
         .fetch_one(tenants.control())
         .await
         .expect("demo id");
-    let slug = Slug::try_new("demo").expect("slug");
+    let slug = SchoolId::try_parse(hezarfen_backend::tenant::DEMO_SCHOOL_ID).expect("slug");
     tenants
         .evict(hezarfen_backend::tenant::SchoolId::from_uuid(demo_id))
         .await;
@@ -7112,7 +7114,7 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"school": "demo", "username": "kerem", "password": "sifre12345"})
+                    json!({"school": "019732e3-7b00-7000-8000-00000000dead", "username": "kerem", "password": "sifre12345"})
                         .to_string(),
                 ))
                 .unwrap(),
@@ -7346,7 +7348,7 @@ async fn admin_seed_creates_working_admin() {
     let password = Password::try_new("secret1").unwrap();
     hezarfen_backend::service::user::ensure_admin(
         &tenants,
-        &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+        &hezarfen_backend::tenant::SchoolId::try_parse(hezarfen_backend::tenant::DEMO_SCHOOL_ID).unwrap(),
         username,
         password,
     )
@@ -7373,7 +7375,7 @@ async fn admin_seed_is_idempotent() {
         let password = Password::try_new("secret1").unwrap();
         hezarfen_backend::service::user::ensure_admin(
             &tenants,
-            &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+            &hezarfen_backend::tenant::SchoolId::try_parse(hezarfen_backend::tenant::DEMO_SCHOOL_ID).unwrap(),
             username,
             password,
         )
@@ -7404,7 +7406,7 @@ async fn admin_seed_refuses_existing_non_admin() {
     let password = Password::try_new("attacker-pw").unwrap();
     hezarfen_backend::service::user::ensure_admin(
         &tenants,
-        &hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap(),
+        &hezarfen_backend::tenant::SchoolId::try_parse(hezarfen_backend::tenant::DEMO_SCHOOL_ID).unwrap(),
         username,
         password,
     )
@@ -28375,7 +28377,7 @@ async fn course_note_rag_reindex_reports_503_and_writes_nothing_without_a_servic
 // Multi-school isolation probes (REFUTE lane B). Two schools, same usernames.
 // =========================================================================
 
-use hezarfen_backend::tenant::{DEMO_SLUG, SchoolStatus, Slug, Tenants};
+use hezarfen_backend::tenant::{DEMO_SCHOOL_ID, SchoolStatus, SchoolId, Tenants};
 
 /// Demo (school A) plus a second school "beta" (school B), and the registry.
 async fn two_schools() -> (
@@ -28385,11 +28387,10 @@ async fn two_schools() -> (
     Tenants,
 ) {
     let (app, db_a, tenants) = common::app_and_tenants().await;
-    let slug_b = Slug::try_new("beta").expect("slug");
+    let slug_b = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).expect("beta id");
     let db_b = tenants
         .create(
-            hezarfen_backend::tenant::SchoolId::generate(),
-            &slug_b,
+            slug_b,
             "Beta Koleji",
             ModuleSet::all(),
         )
@@ -28406,7 +28407,7 @@ const TWO_SCHOOLS: &[(&str, &str)] = &[("beta", "Beta Koleji")];
 /// One school's handle out of the registry.
 async fn school_db(tenants: &Tenants, slug: &str) -> hezarfen_backend::database::Database {
     tenants
-        .get(&Slug::try_new(slug).expect("a school slug"))
+        .get(&common::school_id(slug))
         .await
         .unwrap_or_else(|err| panic!("the {slug} handle: {err}"))
 }
@@ -28548,9 +28549,9 @@ async fn remote_probe_cross_school_lists_show_only_own_rows() {
 }
 
 async fn probe_cross_school_lists_show_only_own_rows_on(app: &axum::Router, tenants: &Tenants) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ada", "admin").await;
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
 
     let mut before = Vec::new();
@@ -28609,9 +28610,9 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie_on(
     app: &axum::Router,
     tenants: &Tenants,
 ) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ada", "admin").await;
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     let ids = seed_school_b(app, &b).await;
     let s = |k: &str| ids[k].as_str().unwrap().to_string();
@@ -28715,11 +28716,11 @@ async fn remote_probe_cross_school_ids_in_bodies_are_refused() {
 }
 
 async fn probe_cross_school_ids_in_bodies_are_refused_on(app: &axum::Router, tenants: &Tenants) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a_admin = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let a_student = common::login_as_school(app, &db_a, DEMO_SLUG, "ali", "student").await;
-    let a_parent = common::login_as_school(app, &db_a, DEMO_SLUG, "veli", "parent").await;
+    let a_admin = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ada", "admin").await;
+    let a_student = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ali", "student").await;
+    let a_parent = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "veli", "parent").await;
     let b_admin = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     common::login_as_school(app, &db_b, "beta", "bstudent", "student").await;
 
@@ -28821,7 +28822,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
     tenants: &Tenants,
 ) {
     let db_b = school_db(tenants, "beta").await;
-    let slug_b = Slug::try_new("beta").unwrap();
+    let slug_b = SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).unwrap();
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
 
     // Alive first.
@@ -28877,7 +28878,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": "beta", "username": "newcomer", "password": "secret1" })),
+        Some(json!({ "school": common::school_wire("beta"), "username": "newcomer", "password": "secret1" })),
     )
     .await;
     assert_eq!(
@@ -28920,9 +28921,9 @@ async fn remote_probe_cookie_confusion_is_impossible_both_ways() {
 }
 
 async fn probe_cookie_confusion_is_impossible_both_ways_on(app: &axum::Router, tenants: &Tenants) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ada", "admin").await;
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     let token_a = common::cookie_token(&a).to_string();
 
@@ -28990,8 +28991,8 @@ async fn probe_cookie_confusion_is_impossible_both_ways_on(app: &axum::Router, t
     }
     // (4) a builder token wearing a school prefix.
     for raw in [
-        format!("session=demo.{builder_token}"),
-        format!("session=beta.{builder_token}"),
+        format!("session={DEMO_SCHOOL_ID}.{builder_token}"),
+        format!("session={}.{}", hezarfen_backend::tenant::BETA_SCHOOL_ID, builder_token),
     ] {
         let res = send(app, "GET", "/auth/me", Some(&raw), None).await;
         assert_eq!(
@@ -29005,8 +29006,8 @@ async fn probe_cookie_confusion_is_impossible_both_ways_on(app: &axum::Router, t
     // (5) THE one: A's live token under B's prefix, and B's under A's.
     let token_b = common::cookie_token(&b).to_string();
     for (raw, whose) in [
-        (format!("session=beta.{token_a}"), "A's token under B"),
-        (format!("session=demo.{token_b}"), "B's token under A"),
+        (format!("session={}.{token_a}", hezarfen_backend::tenant::BETA_SCHOOL_ID), "A's token under B"),
+        (format!("session={DEMO_SCHOOL_ID}.{token_b}"), "B's token under A"),
     ] {
         for route in ["/auth/me", "/users", "/notes", "/settings"] {
             let res = send(app, "GET", route, Some(&raw), None).await;
@@ -29048,7 +29049,7 @@ async fn remote_probe_register_is_scoped_to_the_named_school() {
 }
 
 async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, tenants: &Tenants) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
 
     // Missing `school` is a 4xx, not a silent default.
@@ -29068,13 +29069,13 @@ async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, ten
     );
 
     // The same username in both schools, independently.
-    for (slug, db) in [(DEMO_SLUG, &db_a), ("beta", &db_b)] {
+    for (slug, db) in [(DEMO_SCHOOL_ID, &db_a), ("beta", &db_b)] {
         let res = send(
             app,
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "school": slug, "username": "ayse", "password": "secret1" })),
+            Some(json!({ "school": common::school_wire(slug), "username": "ayse", "password": "secret1" })),
         )
         .await;
         assert_eq!(
@@ -29162,9 +29163,9 @@ async fn probe_uploaded_files_are_school_scoped_on(
     tenants: &Tenants,
     files: &std::path::Path,
 ) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ali", "student").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ali", "student").await;
     let b = common::login_as_school(app, &db_b, "beta", "ali", "student").await;
 
     let note = send(
@@ -29183,8 +29184,8 @@ async fn probe_uploaded_files_are_school_scoped_on(
     let file_id = id_of(&up.body);
 
     // It landed under the school's own directory, and nowhere else.
-    let a_dir = files.join(DEMO_SLUG);
-    let b_dir = files.join("beta");
+    let a_dir = files.join(DEMO_SCHOOL_ID);
+    let b_dir = files.join(common::school_wire("beta"));
     let count = |dir: &std::path::Path| {
         std::fs::read_dir(dir)
             .map(|it| it.count())
@@ -29240,9 +29241,9 @@ async fn probe_school_rows_never_reach_the_control_database_on(
     app: &axum::Router,
     tenants: &Tenants,
 ) {
-    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_a = school_db(tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(tenants, "beta").await;
-    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SCHOOL_ID, "ada", "admin").await;
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     common::login_as_school(app, &db_b, "beta", "bstudent", "student").await;
     let ids = seed_school_b(app, &b).await;
@@ -29278,11 +29279,11 @@ async fn probe_school_rows_never_reach_the_control_database_on(
         );
     }
     // And the control database does hold the two schools.
-    let schools: Vec<String> = sqlx::query_scalar("SELECT slug FROM school ORDER BY slug")
+    let schools: Vec<String> = sqlx::query_scalar("SELECT name FROM school ORDER BY name")
         .fetch_all(control)
         .await
         .unwrap();
-    assert_eq!(schools, vec!["beta".to_string(), "demo".to_string()]);
+    assert_eq!(schools, vec!["Beta Koleji".to_string(), "Demo School".to_string()]);
 
     // User search never crosses the wall. Compare the returned names, not the
     // raw body: a substring match over the serialized JSON also hits the hex of
@@ -29357,8 +29358,8 @@ async fn probe_school_rows_never_reach_the_control_database_on(
 async fn remote_probe_remote_mode_keeps_two_schools_apart() {
     let d = common::deployment_with(&[("ata-koleji", "Ata"), ("2024school", "2024")]).await;
     let (app, tenants) = (&d.app, &d.tenants);
-    let slug_a = Slug::try_new("ata-koleji").unwrap();
-    let slug_b = Slug::try_new("2024school").unwrap();
+    let slug_a = SchoolId::try_parse("019732e3-7b00-7000-8000-00000000a7a1").unwrap();
+    let slug_b = SchoolId::try_parse("019732e3-7b00-7000-8000-000000002024").unwrap();
 
     // Same username in both schools is one person with two memberships.
     // Login into the second school therefore returns a person cookie; bind
@@ -29496,9 +29497,10 @@ async fn namespace_databases(tenants: &Tenants) -> Vec<String> {
 /// database's `heztest_` prefix runs the name one character past that — the
 /// server creates and dials the truncated name on both sides, so the
 /// expectation truncates with it.
-async fn school_db_by_slug(control_db: &str, slug: &str, control: &sqlx::PgPool) -> String {
-    let id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE slug = $1")
-        .bind(slug)
+async fn school_db_by_slug(control_db: &str, school: &str, control: &sqlx::PgPool) -> String {
+    let id = Uuid::parse_str(school).expect("school id is a uuid");
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE id = $1")
+        .bind(id)
         .fetch_one(control)
         .await
         .expect("school id");
@@ -29516,8 +29518,8 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
         .fetch_one(d.tenants.control())
         .await
         .expect("control name");
-    let demo_db = school_db_by_slug(&control_db, DEMO_SLUG, d.tenants.control()).await;
-    let beta_db = school_db_by_slug(&control_db, "beta", d.tenants.control()).await;
+    let demo_db = school_db_by_slug(&control_db, DEMO_SCHOOL_ID, d.tenants.control()).await;
+    let beta_db = school_db_by_slug(&control_db, common::school_wire("beta"), d.tenants.control()).await;
     let mut expected = vec![control_db.clone(), demo_db.clone(), beta_db];
     expected.sort();
     assert_eq!(
@@ -29544,7 +29546,7 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let builder = res.cookie.expect("builder cookie");
 
-    let res = send(&d.app, "DELETE", "/schools/beta", Some(&builder), None).await;
+    let res = send(&d.app, "DELETE", &format!("/schools/{}", common::school_wire("beta")), Some(&builder), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     let mut expected = vec![control_db.clone(), demo_db];
     expected.sort();
@@ -29562,7 +29564,7 @@ async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
     let d = common::deployment_with(TWO_SCHOOLS).await;
     // Different counts, so a leak cannot hide behind equal numbers.
     for (slug, users) in [
-        (DEMO_SLUG, ["ada", "ali", "ayse"].as_slice()),
+        (DEMO_SCHOOL_ID, ["ada", "ali", "ayse"].as_slice()),
         ("beta", &["boran"]),
     ] {
         for username in users {
@@ -29571,7 +29573,7 @@ async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
                 "POST",
                 "/auth/register",
                 None,
-                Some(json!({ "school": slug, "username": username, "password": "secret1" })),
+                Some(json!({ "school": common::school_wire(slug), "username": username, "password": "secret1" })),
             )
             .await;
             assert_eq!(
@@ -29589,7 +29591,7 @@ async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
             .await
             .expect("count query")
     };
-    let db_a = school_db(&d.tenants, DEMO_SLUG).await;
+    let db_a = school_db(&d.tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(&d.tenants, "beta").await;
     assert_eq!(count(&db_a).await, 3, "demo's own users");
     assert_eq!(count(&db_b).await, 1, "beta's own users");
@@ -29606,12 +29608,12 @@ async fn remote_probe_a_record_id_minted_in_one_school_is_absent_in_the_other() 
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": DEMO_SLUG, "username": "ada", "password": "secret1" })),
+        Some(json!({ "school": DEMO_SCHOOL_ID, "username": "ada", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
 
-    let db_a = school_db(&d.tenants, DEMO_SLUG).await;
+    let db_a = school_db(&d.tenants, DEMO_SCHOOL_ID).await;
     let db_b = school_db(&d.tenants, "beta").await;
     let id: Uuid = sqlx::query_scalar("SELECT id FROM app_user LIMIT 1")
         .fetch_one(&db_a)
@@ -29640,9 +29642,9 @@ async fn remote_probe_a_record_id_minted_in_one_school_is_absent_in_the_other() 
 #[tokio::test]
 async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
     let d = common::deployment_with(TWO_SCHOOLS).await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
-    let db = school_db(&d.tenants, DEMO_SLUG).await;
-    let cookie = common::login_as_school(&d.app, &db, DEMO_SLUG, "ada", "admin").await;
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
+    let db = school_db(&d.tenants, DEMO_SCHOOL_ID).await;
+    let cookie = common::login_as_school(&d.app, &db, DEMO_SCHOOL_ID, "ada", "admin").await;
     let note = send(
         &d.app,
         "POST",
@@ -29666,7 +29668,7 @@ async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
         .expect("resume");
 
     // A fresh connection (the old one was evicted) onto the same database.
-    let reconnected = school_db(&d.tenants, DEMO_SLUG).await;
+    let reconnected = school_db(&d.tenants, DEMO_SCHOOL_ID).await;
     let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM note")
         .fetch_all(&reconnected)
         .await
@@ -29702,7 +29704,7 @@ use hezarfen_backend::module::Module;
 #[tokio::test]
 async fn a_disabled_module_refuses_its_nest_and_leaves_the_rest_alone() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
 
     let res = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
@@ -29770,7 +29772,7 @@ fn all_without(module: Module) -> ModuleSet {
 #[tokio::test]
 async fn a_course_child_route_is_gated_by_its_own_module() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
     let course = create_course(&app, &cookie, "Fizik").await;
 
@@ -29815,7 +29817,7 @@ async fn a_course_child_route_is_gated_by_its_own_module() {
 #[tokio::test]
 async fn a_disabled_module_refuses_its_websocket_upgrade() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
 
     let mut without = all_without(Module::Exams);
@@ -29907,7 +29909,7 @@ const MODULE_ROUTES: [(Module, &str, &str); 21] = [
 #[tokio::test]
 async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
     let (app, db, tenants) = sweep_deployment().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
     let builder = sweep_builder_login(&app).await;
 
@@ -29920,7 +29922,7 @@ async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
             res.body
         );
 
-        let one = format!("/schools/{DEMO_SLUG}/modules/{module}");
+        let one = format!("/schools/{DEMO_SCHOOL_ID}/modules/{module}");
         if module.dependents().is_empty() {
             let res = send(&app, "DELETE", &one, Some(&builder), None).await;
             assert_eq!(
@@ -29993,7 +29995,7 @@ async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
 #[tokio::test]
 async fn every_course_child_route_names_its_own_module() {
     let (app, db, tenants) = common::app_and_tenants().await;
-    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let slug = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
     let course = create_course(&app, &cookie, "Fizik").await;
     let class = create_class(&app, &cookie, "9-F", json!({})).await;
@@ -30045,7 +30047,7 @@ async fn every_course_child_route_names_its_own_module() {
 /// and can be told what it has — none of that lives behind a module.
 #[tokio::test]
 async fn a_school_with_no_modules_can_still_use_the_core_routes() {
-    let (app, _db, _tenants) = sweep_deployment().await;
+    let (app, _db, tenants) = sweep_deployment().await;
     let builder = sweep_builder_login(&app).await;
 
     let res = send(
@@ -30054,8 +30056,7 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
         "/schools",
         Some(&builder),
         Some(json!({
-            "slug": "bare",
-            "name": "Bare School",
+            "name": "bare school",
             "admin_username": "admin",
             "admin_password": "secret1",
             "modules": [],
@@ -30065,12 +30066,16 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     assert_eq!(res.body["modules"], json!([]));
 
+    let bare_id: Uuid = sqlx::query_scalar("SELECT id FROM school WHERE name = 'bare school'")
+        .fetch_one(tenants.control())
+        .await
+        .expect("bare school");
     let res = send(
         &app,
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "bare", "username": "admin", "password": "secret1" })),
+        Some(json!({ "username": "admin", "password": "secret1" })),
     )
     .await;
     assert_eq!(
@@ -30079,7 +30084,20 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
         "a bare school still logs in: {}",
         res.body
     );
-    let cookie = res.cookie.expect("session cookie");
+    let cookie = if res.body["schools"].is_array() {
+        let selected = send(
+            &app,
+            "POST",
+            "/auth/school",
+            res.cookie.as_deref(),
+            Some(json!({ "school": bare_id.to_string() })),
+        )
+        .await;
+        assert_eq!(selected.status, StatusCode::OK, "{}", selected.body);
+        selected.cookie.expect("session cookie")
+    } else {
+        res.cookie.expect("session cookie")
+    };
 
     for route in [
         "/auth/me",
@@ -30268,7 +30286,7 @@ async fn login_without_school_enters_a_single_school_person() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": DEMO_SLUG, "username": "personada", "password": "secret1" })),
+        Some(json!({ "school": DEMO_SCHOOL_ID, "username": "personada", "password": "secret1" })),
     )
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.body);
@@ -30285,7 +30303,7 @@ async fn login_without_school_enters_a_single_school_person() {
     assert!(res.body["id"].is_string(), "the person's id: {}", res.body);
     assert_eq!(res.body["username"], "personada");
     let cookie = res.cookie.expect("school cookie");
-    assert!(cookie.starts_with("session=demo."), "cookie: {cookie}");
+    assert!(cookie.starts_with(&format!("session={DEMO_SCHOOL_ID}.")), "cookie: {cookie}");
 
     let res = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -30298,13 +30316,13 @@ async fn login_without_school_enters_a_single_school_person() {
 async fn a_multischool_person_selects_a_school() {
     let d = common::deployment_with(TWO_SCHOOLS).await;
     let app = &d.app;
-    for school in [DEMO_SLUG, "beta"] {
+    for school in [DEMO_SCHOOL_ID, "beta"] {
         let reg = send(
             app,
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "school": school, "username": "personada", "password": "secret1" })),
+            Some(json!({ "school": common::school_wire(school), "username": "personada", "password": "secret1" })),
         )
         .await;
         assert_eq!(
@@ -30325,14 +30343,16 @@ async fn a_multischool_person_selects_a_school() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["username"], "personada");
-    let mut slugs: Vec<&str> = res.body["schools"]
+    let mut ids: Vec<&str> = res.body["schools"]
         .as_array()
         .expect("schools list")
         .iter()
-        .map(|s| s["slug"].as_str().expect("school slug"))
+        .map(|s| s["id"].as_str().expect("school id"))
         .collect();
-    slugs.sort_unstable();
-    assert_eq!(slugs, ["beta", "demo"]);
+    ids.sort_unstable();
+    let mut expected = [DEMO_SCHOOL_ID, hezarfen_backend::tenant::BETA_SCHOOL_ID];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
     assert!(
         res.body.get("id").is_none(),
         "no school chosen yet: {}",
@@ -30350,13 +30370,13 @@ async fn a_multischool_person_selects_a_school() {
         "POST",
         "/auth/school",
         Some(&person),
-        Some(json!({ "school": DEMO_SLUG })),
+        Some(json!({ "school": DEMO_SCHOOL_ID })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body["id"].is_string(), "the person's id: {}", res.body);
     let cookie = res.cookie.expect("school cookie");
-    assert!(cookie.starts_with("session=demo."), "cookie: {cookie}");
+    assert!(cookie.starts_with(&format!("session={DEMO_SCHOOL_ID}.")), "cookie: {cookie}");
     let res = send(app, "GET", "/auth/me", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
@@ -30368,13 +30388,13 @@ async fn a_multischool_person_selects_a_school() {
 async fn school_selection_refuses_non_members_and_wrong_cookies() {
     let d = common::deployment_with(TWO_SCHOOLS).await;
     let app = &d.app;
-    for school in [DEMO_SLUG, "beta"] {
+    for school in [DEMO_SCHOOL_ID, "beta"] {
         let reg = send(
             app,
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "school": school, "username": "personada", "password": "secret1" })),
+            Some(json!({ "school": common::school_wire(school), "username": "personada", "password": "secret1" })),
         )
         .await;
         assert_eq!(
@@ -30412,7 +30432,7 @@ async fn school_selection_refuses_non_members_and_wrong_cookies() {
         "POST",
         "/auth/school",
         None,
-        Some(json!({ "school": DEMO_SLUG })),
+        Some(json!({ "school": DEMO_SCHOOL_ID })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
@@ -30423,7 +30443,7 @@ async fn school_selection_refuses_non_members_and_wrong_cookies() {
         "POST",
         "/auth/school",
         Some(&person),
-        Some(json!({ "school": DEMO_SLUG })),
+        Some(json!({ "school": DEMO_SCHOOL_ID })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -30435,7 +30455,7 @@ async fn school_selection_refuses_non_members_and_wrong_cookies() {
         "POST",
         "/auth/school",
         Some(&school_cookie),
-        Some(json!({ "school": DEMO_SLUG })),
+        Some(json!({ "school": DEMO_SCHOOL_ID })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
@@ -30451,7 +30471,7 @@ async fn login_ignores_a_leftover_school_field() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": DEMO_SLUG, "username": "personada", "password": "secret1" })),
+        Some(json!({ "school": DEMO_SCHOOL_ID, "username": "personada", "password": "secret1" })),
     )
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "{}", reg.body);
@@ -30461,7 +30481,7 @@ async fn login_ignores_a_leftover_school_field() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "school": "demo", "username": "personada", "password": "secret1" })),
+        Some(json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": "personada", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);

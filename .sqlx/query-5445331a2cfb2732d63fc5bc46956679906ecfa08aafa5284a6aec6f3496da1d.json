@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT s.slug AS \"slug: Slug\",\n                  s.name,\n                  s.status AS \"status: SchoolStatus\"\n           FROM person_school ps\n           JOIN school s ON s.id = ps.school\n           WHERE ps.person = $1\n           ORDER BY s.slug",
+  "query": "SELECT s.id AS \"id: SchoolId\",\n                  s.name,\n                  s.status AS \"status: SchoolStatus\"\n           FROM person_school ps\n           JOIN school s ON s.id = ps.school\n           WHERE ps.person = $1 AND s.id = $2",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "slug: Slug",
-        "type_info": "Text",
+        "name": "id: SchoolId",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
             "table": "school",
-            "name": "slug"
+            "name": "id"
           }
         }
       },
@@ -39,6 +39,7 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
@@ -48,5 +49,5 @@
       false
     ]
   },
-  "hash": "90ca4d8c108622034298f4da1ac3a4db6a284b2f95e0fe8a69bbec9117f5d0a0"
+  "hash": "5445331a2cfb2732d63fc5bc46956679906ecfa08aafa5284a6aec6f3496da1d"
 }

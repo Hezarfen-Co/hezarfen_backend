@@ -1,4 +1,4 @@
-use crate::web::tenant_state::{SchoolSlug, State};
+use crate::web::tenant_state::{SchoolIdCookie, State};
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::StatusCode;
@@ -416,7 +416,7 @@ struct CreateUser {
 )]
 async fn create_user(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     _admin: RequireAdmin,
     Json(req): Json<CreateUser>,
 ) -> Result<(StatusCode, Json<UserResponse>), AppError> {
@@ -467,7 +467,7 @@ async fn create_user(
         student_number,
     )
     .await?;
-    crate::service::person::link_school(control, person.get_id(), &slug).await?;
+    crate::service::person::link_school(control, person.get_id(), &school).await?;
     Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))
 }
 
@@ -670,7 +670,7 @@ async fn update_user_preferences(
 )]
 async fn set_role(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     RequireAdmin(admin): RequireAdmin,
     Path(id): Path<String>,
     Json(req): Json<SetRole>,
@@ -695,7 +695,7 @@ async fn set_role(
     // stroke came back refused.
     for board in boards {
         st.board_hub.publish(
-            &slug,
+            &school,
             board.get_id().key().as_str(),
             json!({
                 "type": "participants",
@@ -710,7 +710,7 @@ async fn set_role(
         );
         if let Some(closed_at) = board.get_closed_at() {
             st.board_hub.publish(
-                &slug,
+                &school,
                 board.get_id().key().as_str(),
                 json!({"type": "closed", "closed_at": closed_at.as_millis()}).to_string(),
             );

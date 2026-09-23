@@ -4,7 +4,7 @@
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
-use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
+use hezarfen_backend::tenant::{DEMO_SCHOOL_ID, SchoolId};
 use hezarfen_backend::{build_router, database};
 mod common;
 
@@ -23,7 +23,7 @@ async fn spawn_server() -> (String, Database) {
 async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (String, Database) {
     let tenants = database::init_test_tenants().await;
     let db = tenants
-        .get(&Slug::try_new(DEMO_SLUG).unwrap())
+        .get(&SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap())
         .await
         .expect("the demo school");
     // The deployment's operator, seeded exactly as `main` does from
@@ -86,7 +86,7 @@ fn client() -> Client {
 async fn register(client: &Client, base: &str, user: &str) -> reqwest::Response {
     client
         .post(format!("{base}/auth/register"))
-        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
+        .json(&json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap()
@@ -3925,7 +3925,6 @@ async fn a_builder_creates_a_school_over_tcp_and_its_admin_logs_in() {
     let res = vendor
         .post(format!("{base}/schools"))
         .json(&json!({
-            "slug": "tcp-koleji",
             "name": "TCP Koleji",
             "admin_username": "admin",
             "admin_password": "secret1",
@@ -3935,7 +3934,8 @@ async fn a_builder_creates_a_school_over_tcp_and_its_admin_logs_in() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     let school = res.json::<Value>().await.unwrap();
-    assert_eq!(school["slug"], "tcp-koleji");
+    assert!(school["id"].as_str().is_some_and(|id| id.len() == 36), "{school}");
+    assert!(school.get("slug").is_none());
     assert_eq!(school["status"], "active");
 
     // A separate jar: the school admin is a different principal on the wire.
@@ -4031,7 +4031,7 @@ async fn probe_a_suspended_school_refuses_websocket_upgrades() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let res = vendor
-        .patch(format!("{base}/schools/demo"))
+        .patch(format!("{base}/schools/{DEMO_SCHOOL_ID}"))
         .json(&json!({ "status": "suspended" }))
         .send()
         .await
@@ -4066,7 +4066,7 @@ async fn probe_a_suspended_school_refuses_websocket_upgrades() {
 
     // Resume: the same cookie, the same socket.
     let res = vendor
-        .patch(format!("{base}/schools/demo"))
+        .patch(format!("{base}/schools/{DEMO_SCHOOL_ID}"))
         .json(&json!({ "status": "active" }))
         .send()
         .await

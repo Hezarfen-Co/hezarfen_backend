@@ -17,7 +17,7 @@ use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::telemetry::Metrics;
-use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
+use hezarfen_backend::tenant::{BETA_SCHOOL_ID, DEMO_SCHOOL_ID, SchoolId, Tenants};
 use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -65,10 +65,29 @@ pub async fn app_and_tenants() -> (Router, Database, Tenants) {
     (app, db, tenants)
 }
 
+/// The hyphenated uuid a test label names. `demo` and `beta` are pinned to
+/// the ids [`init_test_tenants`] / [`deployment_with`] register; a value that
+/// is already a uuid is returned unchanged.
+pub fn school_wire(label: &str) -> &str {
+    match label {
+        "demo" => DEMO_SCHOOL_ID,
+        "beta" => BETA_SCHOOL_ID,
+        "ata-koleji" => "019732e3-7b00-7000-8000-00000000a7a1",
+        "2024school" => "019732e3-7b00-7000-8000-000000002024",
+        "gamma" => "019732e3-7b00-7000-8000-00000000a11a",
+        "p4a" => "019732e3-7b00-7000-8000-00000000a4a1",
+        other => other,
+    }
+}
+
+pub fn school_id(label: &str) -> SchoolId {
+    SchoolId::try_parse(school_wire(label)).unwrap_or_else(|_| panic!("{label} is not a school id"))
+}
+
 /// Where the demo school's blobs land: one directory per school under
 /// `FILES_PATH`, created on the school's first upload.
 pub fn blob_dir() -> PathBuf {
-    let dir = files_dir().join(DEMO_SLUG);
+    let dir = files_dir().join(DEMO_SCHOOL_ID);
     std::fs::create_dir_all(&dir).expect("blob dir");
     dir
 }
@@ -96,7 +115,7 @@ pub async fn mem_deployment() -> (Tenants, Database) {
 /// The demo school's handle out of a registry.
 pub async fn demo_db(tenants: &Tenants) -> Database {
     tenants
-        .get(&Slug::try_new(DEMO_SLUG).expect("the demo slug"))
+        .get(&SchoolId::try_parse(DEMO_SCHOOL_ID).expect("the demo school"))
         .await
         .expect("the demo school resolves")
 }
@@ -199,7 +218,7 @@ pub async fn set_role(db: &Database, username: &str, role: &str) {
 /// Register (password `secret1`), promote to `role`, then log in. Returns the
 /// session `Cookie` value.
 pub async fn login_as(app: &Router, db: &Database, username: &str, role: &str) -> String {
-    login_as_school(app, db, DEMO_SLUG, username, role).await
+    login_as_school(app, db, DEMO_SCHOOL_ID, username, role).await
 }
 
 /// [`login_as`] in a named school. `db` must be that school's own handle — the
@@ -217,7 +236,7 @@ pub async fn login_as_school(
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": school, "username": username, "password": "secret1" })),
+        Some(json!({ "school": school_wire(school), "username": username, "password": "secret1" })),
     )
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
@@ -240,7 +259,7 @@ pub async fn login_as_school(
             "POST",
             "/auth/school",
             res.cookie.as_deref(),
-            Some(json!({ "school": school })),
+            Some(json!({ "school": school_wire(school) })),
         )
         .await;
         assert_eq!(
@@ -425,7 +444,7 @@ pub async fn login(app: &Router, username: &str) -> String {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" })),
+        Some(json!({ "school": DEMO_SCHOOL_ID, "username": username, "password": "secret1" })),
     )
     .await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
@@ -855,16 +874,12 @@ pub struct TestDeployment {
 pub async fn deployment_with(schools: &[(&str, &str)]) -> TestDeployment {
     let files = tempfile::tempdir().expect("files tempdir");
     let tenants = database::init_test_tenants().await;
-    for (slug, name) in schools {
+    for (label, name) in schools {
+        let id = school_id(label);
         tenants
-            .create(
-                hezarfen_backend::tenant::SchoolId::generate(),
-                &Slug::try_new(slug).expect("a school slug"),
-                name,
-                ModuleSet::all(),
-            )
+            .create(id, name, ModuleSet::all())
             .await
-            .unwrap_or_else(|err| panic!("create school {slug}: {err}"));
+            .unwrap_or_else(|err| panic!("create school {label}: {err}"));
     }
     let app = build_router(AppState {
         db: tenants.control().clone(),

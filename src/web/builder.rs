@@ -6,7 +6,7 @@
 //!
 //! The two principals never mix: [`RequireBuilder`] takes only a
 //! `builder.<token>` cookie, and that cookie is `401` on every school surface
-//! (see `web::tenant_state::resolve_tenant`). `POST /schools/{slug}/enter` is
+//! (see `web::tenant_state::resolve_tenant`). `POST /schools/{id}/enter` is
 //! the one bridge, and it does not blur the line — it mints an ordinary school
 //! session for an admin account that already exists there.
 //!
@@ -34,7 +34,7 @@ use crate::module::{Module, ModuleSet, Package};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::service;
 use crate::state::AppState;
-use crate::tenant::{School, SchoolId, SchoolStatus, Slug};
+use crate::tenant::{School, SchoolId, SchoolStatus};
 use crate::validate::validate_required;
 use crate::web::tenant_state::school_files_path;
 
@@ -93,8 +93,8 @@ impl BuilderResponse {
 
 #[derive(Serialize, ToSchema)]
 struct SchoolResponse {
-    #[schema(example = "ata-koleji")]
-    slug: String,
+    #[schema(example = "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d")]
+    id: String,
     #[schema(example = "Ata Koleji")]
     name: String,
     /// `active` or `suspended` — plus `provisioning`, which a boot writes only
@@ -106,7 +106,7 @@ struct SchoolResponse {
     /// Registered at, UTC unix-milliseconds.
     created_at: i64,
     /// The modules this school has bought, sorted by name. The other half of
-    /// the catalog is on `GET /schools/{slug}/modules`.
+    /// the catalog is on `GET /schools/{id}/modules`.
     #[schema(example = json!(["courses", "meals", "notes"]))]
     modules: Vec<String>,
 }
@@ -114,7 +114,7 @@ struct SchoolResponse {
 impl SchoolResponse {
     fn new(school: &School) -> Self {
         Self {
-            slug: school.slug().as_str().to_string(),
+            id: school.get_id().as_str(),
             name: school.name().to_string(),
             status: school.status().as_str().to_string(),
             created_at: school.created_at().as_millis(),
@@ -125,12 +125,6 @@ impl SchoolResponse {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateSchool {
-    /// Lowercase `a-z`, `0-9` and `-`, starting with a letter or digit. Names
-    /// the school's blob directory and its cookie prefix. It is the school's
-    /// public label, not its identity — the uuid minted at create time is —
-    /// and it must stay unique across the deployment.
-    #[schema(example = "ata-koleji", min_length = 2, max_length = 32)]
-    slug: String,
     #[schema(example = "Ata Koleji", max_length = 120)]
     name: String,
     /// The school's first admin, created inside the new school's database.
@@ -210,18 +204,18 @@ struct EnterSchool {
     username: String,
 }
 
-/// A school's display name: free text, unlike its slug.
+/// A school's display name.
 fn school_name(value: &str) -> Result<String, AppError> {
     validate_required("name", value, MAX_SCHOOL_NAME_LEN)?;
     Ok(value.trim().to_string())
 }
 
-/// The slug in a path. Anything that is not a slug names no school, so it is
-/// the same `404` an unknown one gets — and it never reaches
+/// The school id in a path. Anything that is not a hyphenated uuid names no
+/// school, so it is the same `404` an unknown one gets — and it never reaches
 /// [`school_files_path`], which is exactly why that path is built from a
-/// validated [`Slug`] and never from the raw segment.
-fn path_slug(raw: &str) -> Result<Slug, AppError> {
-    Slug::try_new(raw).map_err(|_| AppError::NotFound)
+/// parsed [`SchoolId`] and never from the raw segment.
+fn path_id(raw: &str) -> Result<SchoolId, AppError> {
+    SchoolId::try_parse(raw).map_err(|_| AppError::NotFound)
 }
 
 /// The named account in `db`, which must be an admin of that school: unknown →
@@ -333,9 +327,9 @@ async fn builder_me(RequireBuilder(builder): RequireBuilder) -> Json<BuilderResp
     request_body = CreateSchool,
     responses(
         (status = 201, description = "School created, with its first admin", body = SchoolResponse),
-        (status = 400, description = "Invalid slug, name, admin credentials, or module name", body = ErrorResponse, example = json!({"error": "module: `kantin` is not a known module"})),
+        (status = 400, description = "Invalid name, admin credentials, or module name", body = ErrorResponse, example = json!({"error": "module: `kantin` is not a known module"})),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
-        (status = 409, description = "That slug is already taken, the module set is unsatisfiable, or the admin username exists under a different password", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
+        (status = 409, description = "The module set is unsatisfiable, or the admin username exists under a different password", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -347,7 +341,6 @@ async fn create_school(
     // Everything the request must get right is checked (and the admin password
     // hashed) *before* a database is defined, so the ordinary rejection never
     // creates anything to clean up.
-    let slug = Slug::try_new(&req.slug)?;
     let name = school_name(&req.name)?;
     let username = Username::try_new(&req.admin_username)?;
     let password = Password::try_new(&req.admin_password)?;
@@ -375,9 +368,9 @@ async fn create_school(
 
     // The school's uuid is minted here, on the one path that creates schools:
     // it becomes the registry row's PK and the database name's source, and
-    // the slug stays a label the wire keeps answering with.
+    // the minted id is what the wire answers with.
     let id = SchoolId::generate();
-    let db = st.tenants.create(id, &slug, &name, modules).await?;
+    let db = st.tenants.create(id, &name, modules).await?;
     let seeded = async {
         crate::service::user::create_with_role(
             &db,
@@ -389,20 +382,20 @@ async fn create_school(
         .await?;
         // The admin's person gets the membership the school row answers for —
         // idempotent, so a retried create after a torn pair completes it.
-        service::person::link_school(&st.db, person.get_id(), &slug).await?;
+        service::person::link_school(&st.db, person.get_id(), &id).await?;
         Ok::<(), AppError>(())
     }
     .await;
     if let Err(err) = seeded {
         // A school nobody can log into is worse than no school: take the
         // database back so the very same request can simply be retried.
-        if let Err(cleanup) = st.tenants.drop(&slug).await {
-            tracing::error!("failed to drop {slug} after its admin seed failed: {cleanup}");
+        if let Err(cleanup) = st.tenants.drop(&id).await {
+            tracing::error!("failed to drop {id} after its admin seed failed: {cleanup}");
         }
         return Err(err);
     }
 
-    let school = School::read(&slug, st.tenants.control())
+    let school = School::read(&id, st.tenants.control())
         .await?
         .ok_or_else(|| AppError::Internal("the school vanished as it was created".into()))?;
     Ok((StatusCode::CREATED, Json(SchoolResponse::new(&school))))
@@ -433,13 +426,13 @@ async fn list_schools(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// One school by slug.
+/// One school by id.
 #[utoipa::path(
     get,
-    path = "/schools/{slug}",
+    path = "/schools/{id}",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     responses(
         (status = 200, description = "The school", body = SchoolResponse),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
@@ -449,9 +442,9 @@ async fn list_schools(
 async fn get_school(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<SchoolResponse>, AppError> {
-    let school = School::read(&path_slug(&slug)?, st.tenants.control())
+    let school = School::read(&path_id(&id)?, st.tenants.control())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(SchoolResponse::new(&school)))
@@ -459,10 +452,8 @@ async fn get_school(
 
 /// Rename a school and/or flip it between `active` and `suspended`. Omitted
 /// fields keep their value — both land in one statement, so a request that
-/// carries both is one write and never half a patch. The slug itself is
-/// immutable in this cut — it is the cookie prefix and the blob directory —
-/// though it no longer names the database (the school's uuid does); a rename
-/// API is not offered yet.
+/// carries both is one write and never half a patch. The id is not a
+/// field a patch can move.
 ///
 /// `provisioning` is not a status a client can ask for: it is the boot's word
 /// for a school that is still being made, and asking for it is a `400`.
@@ -471,10 +462,10 @@ async fn get_school(
 /// request is a `403`, live session or not.
 #[utoipa::path(
     patch,
-    path = "/schools/{slug}",
+    path = "/schools/{id}",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     request_body = UpdateSchool,
     responses(
         (status = 200, description = "The updated school", body = SchoolResponse),
@@ -487,10 +478,10 @@ async fn get_school(
 async fn update_school(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<UpdateSchool>,
 ) -> Result<Json<SchoolResponse>, AppError> {
-    let slug = path_slug(&slug)?;
+    let id = path_id(&id)?;
     let name = req.name.as_deref().map(school_name).transpose()?;
     let status = req
         .status
@@ -502,7 +493,7 @@ async fn update_school(
     // a patch that carries both can never leave half of itself behind. An empty
     // patch on an unknown school is still a 404 — the update answers it, rather
     // than whichever field happened to be present.
-    let school = School::update(&slug, name.as_deref(), status, st.tenants.control()).await?;
+    let school = School::update(&id, name.as_deref(), status, st.tenants.control()).await?;
     if status == Some(SchoolStatus::Suspended) {
         // A suspension evicts the pool so nothing that already resolved keeps
         // serving; un-suspending needs no invalidation, the next request dials.
@@ -515,10 +506,10 @@ async fn update_school(
 /// Irreversible — suspension is the reversible door.
 #[utoipa::path(
     delete,
-    path = "/schools/{slug}",
+    path = "/schools/{id}",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
@@ -528,24 +519,24 @@ async fn update_school(
 async fn delete_school(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let slug = path_slug(&slug)?;
-    School::read(&slug, st.tenants.control())
+    let id = path_id(&id)?;
+    School::read(&id, st.tenants.control())
         .await?
         .ok_or(AppError::NotFound)?;
-    st.tenants.drop(&slug).await?;
+    st.tenants.drop(&id).await?;
 
     // Rows first, bytes second — the same order every blob delete here keeps, so
     // a crash between them strands unreachable files rather than rows pointing
-    // at nothing. The directory is built from the validated `Slug`, never from
+    // at nothing. The directory is built from the parsed id, never from
     // the raw path segment.
-    let dir = school_files_path(&st.files_path, &slug);
+    let dir = school_files_path(&st.files_path, &id);
     if let Err(err) = tokio::fs::remove_dir_all(&dir).await
         && err.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!(
-            "failed to remove the files of {slug} at {}: {err}",
+            "failed to remove the files of {id} at {}: {err}",
             dir.display()
         );
     }
@@ -553,7 +544,7 @@ async fn delete_school(
 }
 
 /// A module named in a path segment. Unknown → `404`, the same verdict an
-/// unknown slug gets: the segment names nothing this deployment sells, so
+/// unknown id gets: the segment names nothing this deployment sells, so
 /// there is no resource to act on. Inside a *body* the same name is a `400`
 /// instead — a bad field, not a bad address.
 fn path_module(raw: &str) -> Result<Module, AppError> {
@@ -564,10 +555,10 @@ fn path_module(raw: &str) -> Result<Module, AppError> {
 /// [`Tenants::resolve`]: that one is the school's own door and refuses a
 /// suspended school, and every route here keeps working on one.
 async fn school_modules(
-    slug: &Slug,
+    id: &SchoolId,
     control: &crate::database::Database,
 ) -> Result<ModuleSet, AppError> {
-    Ok(School::read(slug, control)
+    Ok(School::read(id, control)
         .await?
         .ok_or(AppError::NotFound)?
         .modules())
@@ -596,10 +587,10 @@ fn refuse_if_needed(module: Module, set: &ModuleSet) -> Result<(), AppError> {
 /// caller here has already decided.
 async fn store_modules(
     st: &AppState,
-    slug: &Slug,
+    id: &SchoolId,
     modules: ModuleSet,
 ) -> Result<Json<ModulesResponse>, AppError> {
-    st.tenants.set_modules(slug, &modules).await?;
+    st.tenants.set_modules(id, &modules).await?;
     Ok(Json(ModulesResponse::new(&modules)))
 }
 
@@ -607,10 +598,10 @@ async fn store_modules(
 /// school — entitlements are the vendor's ledger, not one of the school's doors.
 #[utoipa::path(
     get,
-    path = "/schools/{slug}/modules",
+    path = "/schools/{id}/modules",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     responses(
         (status = 200, description = "The school's enabled and disabled modules", body = ModulesResponse),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
@@ -620,9 +611,9 @@ async fn store_modules(
 async fn list_school_modules(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<ModulesResponse>, AppError> {
-    let modules = school_modules(&path_slug(&slug)?, st.tenants.control()).await?;
+    let modules = school_modules(&path_id(&id)?, st.tenants.control()).await?;
     Ok(Json(ModulesResponse::new(&modules)))
 }
 
@@ -631,11 +622,11 @@ async fn list_school_modules(
 /// off — enable those in the same `PATCH` instead.
 #[utoipa::path(
     post,
-    path = "/schools/{slug}/modules/{module}",
+    path = "/schools/{id}/modules/{module}",
     tag = "builder",
     security(("session_cookie" = [])),
     params(
-        ("slug" = String, Path, description = "School slug"),
+        ("id" = String, Path, description = "School uuid"),
         ("module" = String, Path, description = "Module name, as `GET /modules/catalog` publishes it"),
     ),
     responses(
@@ -648,17 +639,17 @@ async fn list_school_modules(
 async fn enable_school_module(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path((slug, module)): Path<(String, String)>,
+    Path((id, module)): Path<(String, String)>,
 ) -> Result<Json<ModulesResponse>, AppError> {
-    let slug = path_slug(&slug)?;
+    let id = path_id(&id)?;
     let module = path_module(&module)?;
-    let mut modules = school_modules(&slug, st.tenants.control()).await?;
+    let mut modules = school_modules(&id, st.tenants.control()).await?;
     if modules.contains(module) {
         return Ok(Json(ModulesResponse::new(&modules)));
     }
     modules.insert(module);
     modules.validate()?;
-    store_modules(&st, &slug, modules).await
+    store_modules(&st, &id, modules).await
 }
 
 /// Take one module back. Idempotent, and refused while a module the school
@@ -668,11 +659,11 @@ async fn enable_school_module(
 /// back with it. Only its routes stop answering.
 #[utoipa::path(
     delete,
-    path = "/schools/{slug}/modules/{module}",
+    path = "/schools/{id}/modules/{module}",
     tag = "builder",
     security(("session_cookie" = [])),
     params(
-        ("slug" = String, Path, description = "School slug"),
+        ("id" = String, Path, description = "School uuid"),
         ("module" = String, Path, description = "Module name, as `GET /modules/catalog` publishes it"),
     ),
     responses(
@@ -685,17 +676,17 @@ async fn enable_school_module(
 async fn disable_school_module(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path((slug, module)): Path<(String, String)>,
+    Path((id, module)): Path<(String, String)>,
 ) -> Result<Json<ModulesResponse>, AppError> {
-    let slug = path_slug(&slug)?;
+    let id = path_id(&id)?;
     let module = path_module(&module)?;
-    let mut modules = school_modules(&slug, st.tenants.control()).await?;
+    let mut modules = school_modules(&id, st.tenants.control()).await?;
     if !modules.contains(module) {
         return Ok(Json(ModulesResponse::new(&modules)));
     }
     refuse_if_needed(module, &modules)?;
     modules.remove(module);
-    store_modules(&st, &slug, modules).await
+    store_modules(&st, &id, modules).await
 }
 
 /// Re-sell a school's whole shelf in one call: any mix of modules and packages,
@@ -708,10 +699,10 @@ async fn disable_school_module(
 /// the whole request is accepted.
 #[utoipa::path(
     patch,
-    path = "/schools/{slug}/modules",
+    path = "/schools/{id}/modules",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     request_body = PatchModules,
     responses(
         (status = 200, description = "The school's modules after the change", body = ModulesResponse),
@@ -725,10 +716,10 @@ async fn disable_school_module(
 async fn patch_school_modules(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<PatchModules>,
 ) -> Result<Json<ModulesResponse>, AppError> {
-    let slug = path_slug(&slug)?;
+    let id = path_id(&id)?;
     let enable = req.side(req.enable.as_deref(), req.enable_packages.as_deref())?;
     let disable = req.side(req.disable.as_deref(), req.disable_packages.as_deref())?;
     // A name pulled both ways has no defensible resolution, and picking one
@@ -742,7 +733,7 @@ async fn patch_school_modules(
         .into());
     }
 
-    let current = school_modules(&slug, st.tenants.control()).await?;
+    let current = school_modules(&id, st.tenants.control()).await?;
     let mut result = current.clone();
     for module in enable.iter() {
         result.insert(module);
@@ -757,7 +748,7 @@ async fn patch_school_modules(
     if result == current {
         return Ok(Json(ModulesResponse::new(&current)));
     }
-    store_modules(&st, &slug, result).await
+    store_modules(&st, &id, result).await
 }
 
 /// Reset an admin's password inside a school — the "we are locked out" call.
@@ -765,10 +756,10 @@ async fn patch_school_modules(
 /// not survive the reset. Works on a suspended school.
 #[utoipa::path(
     post,
-    path = "/schools/{slug}/admin-password",
+    path = "/schools/{id}/admin-password",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     request_body = AdminPassword,
     responses(
         (status = 204, description = "Password reset; that account's sessions are revoked"),
@@ -782,11 +773,11 @@ async fn patch_school_modules(
 async fn reset_admin_password(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<AdminPassword>,
 ) -> Result<StatusCode, AppError> {
-    let slug = path_slug(&slug)?;
-    let (db, _status) = st.tenants.get_any_status(&slug).await?;
+    let id = path_id(&id)?;
+    let (db, _status) = st.tenants.get_any_status(&id).await?;
     let user = school_admin(&req.username, &db).await?;
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
 
@@ -806,16 +797,16 @@ async fn reset_admin_password(
 }
 
 /// Enter a school as one of its admins — support access, with the school's own
-/// session cookie (`<slug>.<token>`) and no builder power inside it.
+/// session cookie (`<uuid>.<token>`) and no builder power inside it.
 ///
 /// Refused on a suspended school (`403`): a suspension closes the school's
 /// doors, and this is one of them. Un-suspend it first.
 #[utoipa::path(
     post,
-    path = "/schools/{slug}/enter",
+    path = "/schools/{id}/enter",
     tag = "builder",
     security(("session_cookie" = [])),
-    params(("slug" = String, Path, description = "School slug")),
+    params(("id" = String, Path, description = "School uuid")),
     request_body = EnterSchool,
     responses(
         (status = 200, description = "Entered; that school's session cookie is set", body = UserResponse),
@@ -830,11 +821,11 @@ async fn enter_school(
     State(st): State<AppState>,
     RequireBuilder(_builder): RequireBuilder,
     jar: CookieJar,
-    Path(slug): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<EnterSchool>,
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
-    let slug = path_slug(&slug)?;
-    let (db, status) = st.tenants.get_any_status(&slug).await?;
+    let id = path_id(&id)?;
+    let (db, status) = st.tenants.get_any_status(&id).await?;
     if status == SchoolStatus::Suspended {
         return Err(AppError::Forbidden("school is suspended"));
     }
@@ -842,7 +833,7 @@ async fn enter_school(
 
     let session = service::session::create(&db, user.get_id()).await?;
     let cookie = session_cookie(
-        format!("{slug}.{}", session.token().as_str()),
+        format!("{id}.{}", session.token().as_str()),
         st.cookie_secure,
     );
     Ok((jar.add(cookie), Json(UserResponse::new(&user))))

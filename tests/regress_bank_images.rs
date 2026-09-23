@@ -65,7 +65,7 @@ async fn mem_app() -> (Router, Database, TempDir) {
 /// Every blob file currently on disk, by name.
 fn blobs(files: &TempDir) -> Vec<String> {
     // Blobs live under the school's own subdirectory of `FILES_PATH`.
-    let dir = files.path().join(hezarfen_backend::tenant::DEMO_SLUG);
+    let dir = files.path().join(hezarfen_backend::tenant::DEMO_SCHOOL_ID);
     if !dir.exists() {
         return Vec::new();
     }

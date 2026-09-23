@@ -213,9 +213,9 @@ async fn compute_student(
     if !bridge.has_capability(AI_INSIGHT_STUDENT_CAPABILITY) {
         return Ok(ai_unavailable("no AI service is connected right now"));
     }
-    let slug = tenant.slug.clone();
+    let school = tenant.id;
     tokio::spawn(async move {
-        match insight::compute_student(&bridge, &slug, &request).await {
+        match insight::compute_student(&bridge, &school, &request).await {
             Ok(answer) => tracing::info!(
                 "insight.student answered for {}: {} signal(s), {} recommendation(s)",
                 request.user_id,
@@ -286,10 +286,10 @@ async fn refresh(
         return Ok(ai_unavailable("no AI service is connected right now"));
     }
 
-    let slug = tenant.slug.clone();
+    let school = tenant.id;
     tokio::spawn(async move {
         let source = request.roster_source.clone();
-        match insight::refresh(&bridge, &slug, &request).await {
+        match insight::refresh(&bridge, &school, &request).await {
             Ok(answer) => tracing::info!(
                 "insight.refresh ({source} roster) answered: {} requested, {} computed, {} skipped, {} failed",
                 answer.requested.unwrap_or(0),
@@ -401,11 +401,11 @@ async fn generate_report(
         return Ok(ai_unavailable("no AI service is connected right now"));
     }
     let Some(school) =
-        db::insight::school_identity(st.tenants.control(), tenant.slug.as_str()).await?
+        db::insight::school_identity(st.tenants.control(), &tenant.id).await?
     else {
         return Err(AppError::Internal(format!(
             "the resolved school `{}` has no control row",
-            tenant.slug.as_str()
+            tenant.id.as_str()
         )));
     };
     let request = ReportRequest {
@@ -419,7 +419,7 @@ async fn generate_report(
         profiles: db::insight::all_profiles(&st.db).await?,
         runs: db::insight::runs_for_report(&st.db, &run_day).await?,
     };
-    let answer = match insight::report(&bridge, &tenant.slug, &request).await {
+    let answer = match insight::report(&bridge, &tenant.id, &request).await {
         Ok(answer) => answer,
         Err(AiError::Remote { code, message }) => {
             tracing::warn!("insight.report refused: {code}: {message}");
@@ -842,7 +842,7 @@ async fn purge_departed(
     ))
 }
 
-/// The deployment's active schools, by slug — the directory a shared AI fleet
+/// The deployment's active schools, by school — the directory a shared AI fleet
 /// schedules over.
 ///
 /// This is the one operation of the family that is not school-scoped, and the
@@ -858,7 +858,7 @@ async fn purge_departed(
     tag = "insights",
     security(("session_cookie" = [])),
     responses(
-        (status = 200, description = "Every active school on this deployment, by slug", body = SchoolDirectory),
+        (status = 200, description = "Every active school on this deployment, by school", body = SchoolDirectory),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
     ),
 )]

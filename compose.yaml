@@ -64,7 +64,7 @@ services:
       HOST: 0.0.0.0
       PORT: "7656"
       # The control database: the school registry + the builder accounts. Each
-      # school lives in a Postgres database of its own, named from its slug.
+      # school lives in a Postgres database of its own, named from its uuid (hex, no dashes).
       # Constructed from POSTGRES_* and always aimed at the compose postgres.
       DATABASE_URL: postgres://${POSTGRES_USER:-hezarfen}:${POSTGRES_PASSWORD:-hezarfen}@postgres:5432/${POSTGRES_DB:-hezarfen_control}
       # Hardcoded: must not pick up an old systemd host path from the env file.

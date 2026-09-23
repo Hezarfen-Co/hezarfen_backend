@@ -6,7 +6,7 @@
 //! identity, no client address, no URL path (which holds record ids), no
 //! request or response bodies, and no headers or cookies. What may leave: the
 //! route *template* (`/notes/{id}`), the HTTP method, the status code, the
-//! school slug, a random per-request id, and the id of a non-user resource
+//! school uuid, a random per-request id, and the id of a non-user resource
 //! (an exam room, a board) when an event is about that resource — never a
 //! user, session or attempt id, which name a person. Every attribute or event
 //! field added anywhere in this crate must fit that list — see the guard test
@@ -255,7 +255,7 @@ impl Metrics {
         );
     }
 
-    /// Count the request out and record how long it took. `school` is the slug
+    /// Count the request out and record how long it took. `school` is the uuid
     /// only — never a user, never a path.
     pub fn request_finished(
         &self,
@@ -291,11 +291,11 @@ impl Default for Metrics {
 /// A slot on the request for the school it turned out to belong to.
 ///
 /// The metrics middleware runs before anything knows which school a caller is
-/// in — the slug only becomes known when
+/// in — the uuid only becomes known when
 /// [`crate::web::tenant_state::resolve_tenant`] reads the session cookie, deep
 /// inside the handler, where the request has already been moved. So the
 /// middleware puts an empty slot in the request's extensions on the way in and
-/// reads it on the way out; `resolve_tenant` fills it in between. The slug is
+/// reads it on the way out; `resolve_tenant` fills it in between. The uuid is
 /// the only thing that ever goes in here.
 #[derive(Clone, Default)]
 pub struct SchoolSlot(Arc<OnceLock<String>>);
@@ -303,8 +303,8 @@ pub struct SchoolSlot(Arc<OnceLock<String>>);
 impl SchoolSlot {
     /// Name the school for this request. Later calls are ignored — a request
     /// belongs to exactly one school.
-    pub fn set(&self, slug: &str) {
-        let _ = self.0.set(slug.to_string());
+    pub fn set(&self, school: &str) {
+        let _ = self.0.set(school.to_string());
     }
 
     pub fn get(&self) -> Option<&str> {

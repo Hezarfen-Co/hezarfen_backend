@@ -154,7 +154,7 @@ where
 /// The deployment operator behind a `builder.<token>` cookie, resolved against
 /// the **control** database. Any school cookie is `401` here, and this cookie
 /// is `401` on every school surface (`resolve_tenant` refuses the `builder`
-/// prefix as a slug) — the two principals share a cookie name and nothing else.
+/// prefix as a school id) — the two principals share a cookie name and nothing else.
 pub struct RequireBuilder(pub Builder);
 
 impl<S> FromRequestParts<S> for RequireBuilder
@@ -189,14 +189,14 @@ where
     }
 }
 
-/// The cookie prefix a builder session carries in place of a school slug.
-/// `Slug::try_new` reserves this word, so it can never also name a school.
+/// The cookie prefix a builder session carries in place of a school uuid.
+/// A uuid parse never accepts this word, so it can never also name a school.
 pub const BUILDER_COOKIE_PREFIX: &str = "builder";
 
 /// The cookie prefix a not-yet-bound person session carries in place of a
-/// school slug: a person who belongs to several schools logs into the
+/// school uuid: a person who belongs to several schools logs into the
 /// control plane first and names a school afterwards (`POST /auth/school`).
-/// `Slug::try_new` reserves this word (`RESERVED_SLUGS`), so it can never
+/// A uuid parse never accepts this word, so it can never
 /// also name a school — a `person.` cookie is `401` on every school surface,
 /// exactly like `builder.`.
 pub const PERSON_COOKIE_PREFIX: &str = "person";

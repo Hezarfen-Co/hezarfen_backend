@@ -21,7 +21,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::module::ModuleSet;
 use crate::state::AppState;
-use crate::tenant::{ResolvedTenant, Slug};
+use crate::tenant::{ResolvedTenant, SchoolId};
 
 /// The school a request has already been resolved into, injected as a request
 /// extension by an in-process caller that has no cookie — today only the AI
@@ -30,16 +30,15 @@ use crate::tenant::{ResolvedTenant, Slug};
 /// [`crate::web::extractor::AiPrincipal`].
 #[derive(Clone)]
 pub struct TenantExt {
-    pub slug: Slug,
+    pub id: SchoolId,
     pub db: Database,
     pub modules: ModuleSet,
 }
 
 /// Split a `session` cookie into its school part and its token. `builder` in
-/// the first position is the deployment operator; anything else is a slug.
-///
-/// Splits at the **first** dot, so a token can never be mistaken for a slug no
-/// matter what it contains (it is hex today, and this does not depend on that).
+/// the first position is the deployment operator; anything else is a school
+/// uuid. Splits at the **first** dot, so a token can never be mistaken for
+/// the school no matter what it contains.
 pub fn split_cookie(value: &str) -> Option<(&str, &str)> {
     let (prefix, token) = value.split_once('.')?;
     (!prefix.is_empty() && !token.is_empty()).then_some((prefix, token))
@@ -64,7 +63,7 @@ where
     }
     if let Some(tenant) = parts.extensions.get::<TenantExt>() {
         return Ok(ResolvedTenant {
-            slug: tenant.slug.clone(),
+            id: tenant.id,
             db: tenant.db.clone(),
             modules: tenant.modules.clone(),
         });
@@ -77,16 +76,17 @@ where
     // at all. Both are `401` here: the builder surface is a different extractor
     // (`RequireBuilder`), and this one must never let it in.
     let (prefix, _) = split_cookie(cookie.value()).ok_or(AppError::Unauthorized)?;
-    let slug = Slug::try_new(prefix).map_err(|_| AppError::Unauthorized)?;
+    let id = SchoolId::try_parse(prefix).map_err(|_| AppError::Unauthorized)?;
 
     let app = AppState::from_ref(state);
-    let resolved = app.tenants.resolve(&slug).await?;
+    let resolved = app.tenants.resolve(&id).await?;
     // The one caller-derived label telemetry is allowed to carry: which school,
     // never which user. The span field and the metric slot are set together so
-    // a trace and its latency sample agree.
-    tracing::Span::current().record("school", slug.as_str());
+    // a trace and its latency sample agree. Field name stays `school`.
+    let label = id.as_str();
+    tracing::Span::current().record("school", label.as_str());
     if let Some(slot) = parts.extensions.get::<crate::telemetry::SchoolSlot>() {
-        slot.set(slug.as_str());
+        slot.set(&label);
     }
     // Memoized on the request, not just returned: the next extractor on this
     // same request (and the module gate ahead of both) reuses this verdict
@@ -115,7 +115,7 @@ where
         let app = AppState::from_ref(state);
         Ok(State(AppState {
             db: tenant.db,
-            files_path: school_files_path(&app.files_path, &tenant.slug),
+            files_path: school_files_path(&app.files_path, &tenant.id),
             ..app
         }))
     }
@@ -138,9 +138,9 @@ where
 
 /// Just the school, for the handlers that need it as a key prefix (the exam
 /// presence map, the whiteboard hub) rather than as a database handle.
-pub struct SchoolSlug(pub Slug);
+pub struct SchoolIdCookie(pub SchoolId);
 
-impl<S> FromRequestParts<S> for SchoolSlug
+impl<S> FromRequestParts<S> for SchoolIdCookie
 where
     S: Send + Sync,
     AppState: FromRef<S>,
@@ -148,15 +148,15 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        Ok(SchoolSlug(resolve_tenant(parts, state).await?.slug))
+        Ok(SchoolIdCookie(resolve_tenant(parts, state).await?.id))
     }
 }
 
 /// Where a school's uploaded blobs live: one directory per school under the
-/// deployment's `FILES_PATH`. The slug's character set is what makes this a
-/// plain `join` — it can contain no separator and no `..`.
-pub fn school_files_path(root: &std::path::Path, slug: &Slug) -> PathBuf {
-    root.join(slug.as_str())
+/// deployment's `FILES_PATH`. The id's hyphenated form contains no separator
+/// and no `..`, so this is a plain `join`.
+pub fn school_files_path(root: &std::path::Path, id: &SchoolId) -> PathBuf {
+    root.join(id.as_str())
 }
 
 #[cfg(test)]
@@ -171,7 +171,7 @@ mod tests {
     use crate::database::init_test_tenants;
     use crate::db::session;
     use crate::domain::user::{Password, Username};
-    use crate::tenant::DEMO_SLUG;
+    use crate::tenant::DEMO_SCHOOL_ID;
     use crate::web::{CurrentUser, RequireBuilder};
 
     async fn school_surface(State(_): State<AppState>, CurrentUser(_): CurrentUser) -> StatusCode {
@@ -187,7 +187,7 @@ mod tests {
     async fn harness() -> (Router, String, String, crate::tenant::Tenants) {
         let tenants = init_test_tenants().await;
         let school = tenants
-            .get(&Slug::try_new(DEMO_SLUG).unwrap())
+            .get(&SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap())
             .await
             .expect("the demo school");
 
@@ -195,7 +195,7 @@ mod tests {
             .await
             .unwrap();
         let session = session::create(&school, user.get_id()).await.unwrap();
-        let school_cookie = format!("session={DEMO_SLUG}.{}", session.token().as_str());
+        let school_cookie = format!("session={DEMO_SCHOOL_ID}.{}", session.token().as_str());
 
         crate::service::builder::ensure(
             tenants.control(),
@@ -273,7 +273,7 @@ mod tests {
 
         // A cookie with no school part names nothing resolvable — including the
         // pre-tenancy shape, which is deliberately not accepted anywhere.
-        let bare = school.replace(&format!("{DEMO_SLUG}."), "");
+        let bare = school.replace(&format!("{DEMO_SCHOOL_ID}."), "");
         for uri in ["/school", "/builder"] {
             assert_eq!(
                 status(&app, uri, Some(&bare)).await,
@@ -294,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn a_suspension_refuses_a_live_session() {
         let (app, school, _, tenants) = harness().await;
-        let demo = Slug::try_new(DEMO_SLUG).unwrap();
+        let demo = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
         assert_eq!(status(&app, "/school", Some(&school)).await, StatusCode::OK);
 
         tenants
@@ -325,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_resolves_its_school_exactly_once() {
         let tenants = init_test_tenants().await;
-        let demo = Slug::try_new(DEMO_SLUG).unwrap();
+        let demo = SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap();
         let state = AppState {
             db: tenants.control().clone(),
             tenants: tenants.clone(),
@@ -341,7 +341,7 @@ mod tests {
         };
         let request = Request::builder()
             .uri("/school")
-            .header("cookie", format!("session={DEMO_SLUG}.whatever"))
+            .header("cookie", format!("session={DEMO_SCHOOL_ID}.whatever"))
             .body(Body::empty())
             .unwrap();
         let (mut parts, _) = request.into_parts();
@@ -361,7 +361,7 @@ mod tests {
         let second = resolve_tenant(&mut parts, &state)
             .await
             .expect("a second read would have seen the suspension and refused");
-        assert_eq!(second.slug, demo);
+        assert_eq!(second.id, demo);
     }
 
     #[test]

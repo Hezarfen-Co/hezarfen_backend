@@ -43,7 +43,7 @@
 use std::time::Duration;
 
 use crate::tenant::ResolvedTenant;
-use crate::web::tenant_state::{SchoolSlug, State, TenantExt};
+use crate::web::tenant_state::{SchoolIdCookie, State, TenantExt};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -462,7 +462,7 @@ async fn list_messages(
 )]
 async fn send_message(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     tenant: ResolvedTenant,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
@@ -475,7 +475,7 @@ async fn send_message(
     // Then the tier. Charged before anything is written, so a refused turn
     // leaves no row behind.
     st.rag_limit
-        .enforce_user(&scoped_key(&slug, user.get_id().key().as_str()))?;
+        .enforce_user(&scoped_key(&school, user.get_id().key().as_str()))?;
 
     let settings = service::settings::load(&st.db).await?;
     let reply_cap = content_cap(&settings);
@@ -538,7 +538,7 @@ async fn send_message(
         // request was already resolved into, and one without the other is how
         // an answer lands in the wrong school.
         TenantExt {
-            slug,
+            id: school,
             db: st.db.clone(),
             modules: tenant.modules,
         },
@@ -619,7 +619,7 @@ async fn answer_turn(
     let settled = match crate::ai::rag_chat::answer(
         &db,
         &bridge,
-        &tenant.slug,
+        &tenant.id,
         &thread,
         &fresh,
         prompt.get_content().as_str().to_string(),
@@ -1107,7 +1107,7 @@ fn resolve_study_pair(
 )]
 async fn summarize(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Json(req): Json<StudyScopeRequest>,
 ) -> Result<Response, AppError> {
@@ -1134,7 +1134,7 @@ async fn summarize(
         asker_role: user.get_role().as_str().to_string(),
     };
 
-    match rag_study::summarize(&bridge, &slug, payload).await {
+    match rag_study::summarize(&bridge, &school, payload).await {
         Ok(reply) => Ok(Json(RagSummarizeResponse::from(reply)).into_response()),
         Err(code) => Ok(failure(&code)),
     }
@@ -1169,7 +1169,7 @@ async fn summarize(
 )]
 async fn questions(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Json(req): Json<QuestionsRequest>,
 ) -> Result<Response, AppError> {
@@ -1199,7 +1199,7 @@ async fn questions(
         seed_question: req.seed_question,
     };
 
-    match rag_study::questions(&bridge, &slug, payload).await {
+    match rag_study::questions(&bridge, &school, payload).await {
         Ok(reply) => Ok(Json(RagQuestionsResponse::from(reply)).into_response()),
         Err(code) => Ok(failure(&code)),
     }

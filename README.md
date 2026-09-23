@@ -364,29 +364,29 @@ podman run -d --name hezarfen -p 7656:7656 -v hezarfen_backend_data:/data hezarf
 ## Multi-school (SaaS)
 
 One deployment serves many schools. Every school gets a PostgreSQL
-**database** of its own, named `{control}_school_{slug}` after the
+**database** of its own, named `{control}_school_{uuid hex}` (the registry uuid with the dashes removed) after the
 **control** database `DATABASE_URL` points at (`hezarfen_control` by
 default), which holds the school registry, the builder accounts and the
 shared rate-limit window. Isolation is the store's, not the handlers': a
 school database sees only its own rows, so no query carries a
 `WHERE school = ...` somebody could forget.
 
-**Slugs.** 2-32 characters of `a-z`, `0-9` and `-`, starting with a letter or
-digit (`MIN_SLUG_LEN`/`MAX_SLUG_LEN`); `builder`, `control` and `person` are
-reserved and refused. A slug names the school's database, its blob directory
-and its cookie prefix, so it is immutable once taken — a rename changes the
-display name only.
+**Identity.** The wire id is the registry uuid, hyphenated
+(`01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d`) — the same string `GET /school` and
+`GET /auth/schools` publish. It is the cookie prefix, the blob directory under
+`FILES_PATH`, and the `school` value on every hab/2 frame. The database name
+is that uuid with the dashes removed. A rename changes the display name only.
 
-**Cookies.** A school session is `session=<slug>.<token>`, the vendor's is
+**Cookies.** A school session is `session=<uuid>.<token>`, the vendor's is
 `session=builder.<token>`, and a person who still has to pick a school carries
 `session=person.<token>` — all split at the *first* dot so a token can never
-be read as a slug. No cookie is accepted on another's surface (`401` all
+be read as a school id. No cookie is accepted on another's surface (`401` all
 ways), and a cookie with no dot names no school and is refused everywhere.
 
 **How a request finds its school.** Every school-scoped handler takes the
 tenancy `State` (`web::tenant_state`), which reads the cookie's prefix, looks
 the school up in the registry, and hands the handler a connection pinned to
-that database plus `FILES_PATH/<slug>/` as its blob directory. The AI bridge is
+that database plus `FILES_PATH/<uuid>/` as its blob directory. The AI bridge is
 the one caller with no cookie: it injects the school as a request extension
 instead, which nothing outside the process can forge. In-process state is keyed
 by school too — the exam presence map and the whiteboard hub — so two schools
@@ -396,7 +396,7 @@ never share a room.
 row is read on every request, so the next call after the switch answers `403`,
 live session or not, `POST /auth/login` included. The builder surface keeps
 working on a suspended school — that is how it comes back — except
-`POST /schools/{slug}/enter`, which is one of the school's own doors.
+`POST /schools/{id}/enter`, which is one of the school's own doors.
 
 **The builder lifecycle.** `BUILDER_USERNAME` + `BUILDER_PASSWORD` seed the
 operator account at boot (both or neither; half a pair aborts startup, and an
@@ -404,12 +404,12 @@ existing account is never rewritten). From there: `POST /builder/login` →
 `POST /schools` (registry row, database, schema and the school's first admin —
 one call or none of it) → that admin (a **person** in the control database)
 logs in at `POST /auth/login` with just username + password, and is entered
-into the school straight away → `PATCH /schools/{slug}` renames, suspends or
+into the school straight away → `PATCH /schools/{id}` renames, suspends or
 resumes →
-`POST /schools/{slug}/admin-password` re-keys a locked-out admin and revokes
-every session it held → `POST /schools/{slug}/enter` mints an ordinary school
+`POST /schools/{id}/admin-password` re-keys a locked-out admin and revokes
+every session it held → `POST /schools/{id}/enter` mints an ordinary school
 session for one of its admins (support access, no builder power inside) →
-`DELETE /schools/{slug}` destroys the school's database, its registry row and
+`DELETE /schools/{id}` destroys the school's database, its registry row and
 its uploaded files. Irreversible on purpose: suspension is the reversible door.
 
 **AI frames name the school.** One AI service serves the whole deployment, so
@@ -471,14 +471,14 @@ a set does not discover the problems one round trip at a time:
 {"error": "conflict: courses is required by exams, subjects"}
 ```
 
-**Selling.** `GET /schools/{slug}/modules` returns both halves (`enabled` +
+**Selling.** `GET /schools/{id}/modules` returns both halves (`enabled` +
 `disabled`, each sorted — together they are the whole catalog).
-`POST|DELETE /schools/{slug}/modules/{module}` moves one module and is
+`POST|DELETE /schools/{id}/modules/{module}` moves one module and is
 idempotent: a module the school already has (or already lacks) is a `200` with
 the unchanged set. An unknown module name in the path is a `404`, the same
 verdict an unknown school gets.
 
-`PATCH /schools/{slug}/modules` re-sells the whole shelf in one call, with any
+`PATCH /schools/{id}/modules` re-sells the whole shelf in one call, with any
 mix of the four optional lists `enable`, `disable`, `enable_packages`,
 `disable_packages` (a package expands to its modules). The lists are folded
 into **one** resulting set, which is validated **once** and written **once or
@@ -532,9 +532,9 @@ A walk-through — the vendor takes `meals` away and gives it back:
 
 ```bash
 curl -c v.txt -X POST localhost:6060/builder/login -H 'content-type: application/json' -d '{"username":"builder","password":"correct horse battery"}'
-curl -b v.txt -X DELETE localhost:6060/schools/demo/modules/meals      # 200, meals now in "disabled"
+curl -b v.txt -X DELETE localhost:6060/schools/01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d/modules/meals      # 200, meals now in "disabled"
 curl -b s.txt localhost:6060/meals/menus                               # 403 {"error":"module disabled","module":"meals"}
-curl -b v.txt -X POST localhost:6060/schools/demo/modules/meals        # 200, and the student's next call works again
+curl -b v.txt -X POST localhost:6060/schools/01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d/modules/meals        # 200, and the student's next call works again
 ```
 
 ## Auth model
@@ -544,19 +544,21 @@ control database, that can belong to any number of schools. Login never names
 a school — `POST /auth/login` takes `{username, password}` alone. A person
 with exactly one active membership is logged straight into it: the response is
 the full user object and the cookie is the school's own
-`session=<school-slug>.<token>`. A person with two or more active memberships
-answers `{username, schools: [{slug, name}]}` with a `session=person.<token>`
+`session=<uuid>.<token>`. A person with two or more active memberships
+answers `{username, schools: [{id, name}]}` with a `session=person.<token>`
 cookie instead, and names a school with `POST /auth/school`
-(`{"school": "<slug>"}`), which swaps the cookie for that school's
-`<slug>.<token>` and revokes the person session. Register still names the
-school: `POST /auth/register` takes `{school, username, password}` (see
+(`{"school": "<uuid>"}`), which swaps the cookie for that school's
+`<uuid>.<token>` and revokes the person session. Register picks its school
+from `GET /auth/schools` (public, no cookie): the active schools as
+`[{id, name}]`, sorted by name. `POST /auth/register` takes
+`{school, username, password}` where `school` is one of those ids (see
 "Multi-school (SaaS)").
 
 Login sets an `HttpOnly`, `SameSite=Lax` `session` cookie (7-day expiry,
 stored server-side), split at the *first* dot so a token can never be read as
-a slug. Send the cookie back on later requests. Every endpoint below whose
+a school id. Send the cookie back on later requests. Every endpoint below whose
 `Auth` column names a role requires a valid school session; the ones marked
-`no` (`/health`, the docs pages, `register` / `login` / `school` / `logout`)
+`no` (`/health`, the docs pages, `register` / `login` / `schools` / `school` / `logout`)
 don't (`logout` is idempotent — it clears whichever session the cookie names:
 school, person, or builder). `GET /auth/me` is school-cookie only: a person
 cookie answers `401`, because who you *are* depends on the school you have not
@@ -720,7 +722,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 224 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 218 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -998,7 +1000,7 @@ still left exactly as they stand.
 
 There is no self-service path to `admin` — registration always creates a
 `student`. A school's first admin is created *with* the school: the builder
-posts `POST /schools` with `{slug, name, admin_username, admin_password}` and
+posts `POST /schools` with `{name, admin_username, admin_password}` (optionally `modules`; the id is minted server-side) and
 that account lands inside the new school's database holding `admin`. The
 builder itself comes from the startup seed: set both
 
@@ -1027,7 +1029,7 @@ instant, since the guard is a predicate on the role write itself: the
 statement, so the count and the write it guards contend on the row lock
 like any other write.
 
-A locked-out school is the builder's `POST /schools/{slug}/admin-password`,
+A locked-out school is the builder's `POST /schools/{id}/admin-password`,
 which re-keys an admin that still exists. Manual fallback (the recovery path
 if an older build already emptied a school's admin set): run
 
@@ -1038,8 +1040,8 @@ UPDATE app_user SET role = 'admin' WHERE username = 'ada';
 against the **school's** database (`{control}_school_{uuid hex}` — the hex of
 the school's registry `id`, no dashes), not the control one. List the school
 databases with `\l` — e.g. `podman exec -it hezarfen_backend_postgres psql -U hezarfen
--d hezarfen_control -c "SELECT slug, id FROM school"` names each school and
-its database suffix for the compose stack.
+-d hezarfen_control -c "SELECT id, name FROM school"` names each school; its
+database suffix is that id with the dashes removed, for the compose stack.
 
 ## Endpoints
 
@@ -1170,11 +1172,12 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/appointments/{id}/reschedule/decline`                          | student | Refuse the teacher's counter-proposal. The requester's call alone, and it **cancels the booking**: the proposal replaced the time that was asked for, so there is nothing left to fall back to — book another slot instead. The slot frees up, and the original request stays readable as `cancelled` with the refused proposal still on it. Declining is a cancel, so it answers to the same deadline: `409` once the meeting's effective window has started. |
 | GET    | `/attendance/me`                                                 | student | The current user's attendance report: event tallies, lesson roll-call tallies, a per-instance breakdown with attendance rates, and the per-term absence breakdown. |
 | GET    | `/attendance/{user}`                                             | teacher | Any user's attendance report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every instance; a teacher sees the event tallies plus only the roll-call blocks — and the absence days — of the instances they run. |
-| POST   | `/auth/login`                                                    | no      | Log in with username + password — no school. Sets a `session` cookie on success: exactly one active membership enters that school right away (`<slug>.<token>` and the full [`UserResponse`], unchanged for single-school clients), several answer a [`SchoolChoiceResponse`] with a `person.<token>` cookie that `POST /auth/school` binds. |
+| POST   | `/auth/login`                                                    | no      | Log in with username + password — no school. Sets a `session` cookie on success: exactly one active membership enters that school right away (`<uuid>.<token>` and the full [`UserResponse`], unchanged for single-school clients), several answer a [`SchoolChoiceResponse`] with a `person.<token>` cookie that `POST /auth/school` binds. |
 | POST   | `/auth/logout`                                                   | no      | Log out: revoke the current session (if any) and clear the cookie. Idempotent — no session required; answers `204` either way. |
 | GET    | `/auth/me`                                                       | student | Return the currently authenticated user. |
 | POST   | `/auth/register`                                                 | no      | Register a new user account, or attach an existing person to one more school: `{school, username, password}` in, `{username, role}` back (no `id`; new accounts are `student`). Always `201` — see below. |
-| POST   | `/auth/school`                                                   | no      | Bind a `person.<token>` session to one of the person's schools: the cookie is replaced with that school's own `<slug>.<token>` and the person session is revoked. Deliberately outside the credential rate-limit tier — this is not a credential guess, and it requires a session cookie already. |
+| POST   | `/auth/school`                                                   | no      | Bind a `person.<token>` session to one of the person's schools: the cookie is replaced with that school's own `<uuid>.<token>` and the person session is revoked. Deliberately outside the credential rate-limit tier — this is not a credential guess, and it requires a session cookie already. |
+| GET    | `/auth/schools`                                                  | no      | Active schools open for registration. Unauthenticated, like register: the picker has no session yet. Sorted by name; empty when none are active. |
 | GET    | `/bank-questions`                                                | teacher | The bank the caller may see — their own templates plus the ones published to the school (admins see every one), **newest first**. `?subject=` narrows to one origin subject; `?owner=` to one owner (a user id, or `me` for the caller); `?q=` to a case-insensitive fragment of the question text; `?visibility=private\|school` to one shelf — it narrows what the caller may already see and never widens it, so `private` is "my drafts" and `school` the published library. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope, where `total` counts every match under the same filters, not just this page. Each item carries the resolved `subject_name`/`owner_name` so a client needn't look them up per row, plus `used_count` — how many exam questions were copied out of that template (one grouped query for the page, not one per row). |
 | POST   | `/bank-questions`                                                | teacher | Add a template to the bank. Requires teacher+. `subject_id` is origin metadata (any subject — the same-course rule lives at instantiate time), so it need only exist (an unknown subject is a `400`). `choice` templates carry 2–10 `choices` plus `correct` naming one of them by id; `text` templates carry neither. The caller becomes the owner. |
 | GET    | `/bank-questions/{bid}`                                          | teacher | One template by id. Visible ones only: a `private` template belonging to someone else is a 404, not a 403 — a 403 would confirm it exists. |
@@ -1334,7 +1337,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/insights/runs`                                                 | manager | Store one compute run's ledger row (with its pending students and failed modules, both replaced). |
 | GET    | `/insights/runs/{run_day}/report`                                | manager | The stored report document, streamed. |
 | POST   | `/insights/runs/{run_day}/report`                                | manager | Render the school's report for one run day, and store it. Synchronous, and deliberately so: the manager clicked one button, and the document is what they asked for — there is no queue to poll and no partial state, and the receipt says what was stored. |
-| GET    | `/insights/schools`                                              | builder | The deployment's active schools, by slug — the directory a shared AI fleet schedules over. |
+| GET    | `/insights/schools`                                              | builder | The deployment's active schools, by school — the directory a shared AI fleet schedules over. |
 | POST   | `/insights/segments`                                             | manager | Store a batch of ZEKA's question-segment labels (and each question's dimension split). |
 | GET    | `/insights/students/{user}`                                      | teacher | One student's insight, as an observer reads it. Teacher+ (narrowed to the students they reach) or a parent holding a live link to that student; everyone else — other students included — gets the same `404` a missing id gets. |
 | POST   | `/insights/students/{user}`                                      | teacher | Ask ZEKA to recompute one student's insight, detached. `202` means queued, not computed: the service works through the student's data and writes its `zeka_*` rows on its own, and `GET /insights/students/{id}` shows them as soon as they land. `503` when no service offers `insight.student` — and nothing is queued. |
@@ -1449,15 +1452,15 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/school`                                                        | student | The school the session cookie is bound to: its uuid and display name. |
 | GET    | `/schools`                                                       | builder | Every school this deployment serves, newest first. Paged via `?limit=&offset=` (omit `limit` for the full list). |
 | POST   | `/schools`                                                       | builder | Create a school: its registry row, its database, its schema, and its first admin account — one call, or none of it. |
-| GET    | `/schools/{slug}`                                                | builder | One school by slug. |
-| PATCH  | `/schools/{slug}`                                                | builder | Rename a school and/or flip it between `active` and `suspended`. Omitted fields keep their value — both land in one statement, so a request that carries both is one write and never half a patch. The slug itself is immutable in this cut — it is the cookie prefix and the blob directory — though it no longer names the database (the school's uuid does); a rename API is not offered yet. |
-| DELETE | `/schools/{slug}`                                                | builder | Delete a school: its database, its registry row, and its uploaded files. Irreversible — suspension is the reversible door. |
-| POST   | `/schools/{slug}/admin-password`                                 | builder | Reset an admin's password inside a school — the "we are locked out" call. Every session that account held is revoked with it, so a stolen cookie does not survive the reset. Works on a suspended school. |
-| POST   | `/schools/{slug}/enter`                                          | builder | Enter a school as one of its admins — support access, with the school's own session cookie (`<slug>.<token>`) and no builder power inside it. |
-| GET    | `/schools/{slug}/modules`                                        | builder | What a school has bought, and what is left to sell it. Works on a suspended school — entitlements are the vendor's ledger, not one of the school's doors. |
-| PATCH  | `/schools/{slug}/modules`                                        | builder | Re-sell a school's whole shelf in one call: any mix of modules and packages, in either direction. Every list is optional and an empty body is a no-op. |
-| POST   | `/schools/{slug}/modules/{module}`                               | builder | Sell a school one module. Idempotent: a module it already has is a `200` with the unchanged set. Refused while what the module structurally needs is off — enable those in the same `PATCH` instead. |
-| DELETE | `/schools/{slug}/modules/{module}`                               | builder | Take one module back. Idempotent, and refused while a module the school still has depends on it — the mirror of the enable direction. |
+| GET    | `/schools/{id}`                                                  | builder | One school by id. |
+| PATCH  | `/schools/{id}`                                                  | builder | Rename a school and/or flip it between `active` and `suspended`. Omitted fields keep their value — both land in one statement, so a request that carries both is one write and never half a patch. The id is not a field a patch can move. |
+| DELETE | `/schools/{id}`                                                  | builder | Delete a school: its database, its registry row, and its uploaded files. Irreversible — suspension is the reversible door. |
+| POST   | `/schools/{id}/admin-password`                                   | builder | Reset an admin's password inside a school — the "we are locked out" call. Every session that account held is revoked with it, so a stolen cookie does not survive the reset. Works on a suspended school. |
+| POST   | `/schools/{id}/enter`                                            | builder | Enter a school as one of its admins — support access, with the school's own session cookie (`<uuid>.<token>`) and no builder power inside it. |
+| GET    | `/schools/{id}/modules`                                          | builder | What a school has bought, and what is left to sell it. Works on a suspended school — entitlements are the vendor's ledger, not one of the school's doors. |
+| PATCH  | `/schools/{id}/modules`                                          | builder | Re-sell a school's whole shelf in one call: any mix of modules and packages, in either direction. Every list is optional and an empty body is a no-op. |
+| POST   | `/schools/{id}/modules/{module}`                                 | builder | Sell a school one module. Idempotent: a module it already has is a `200` with the unchanged set. Refused while what the module structurally needs is off — enable those in the same `PATCH` instead. |
+| DELETE | `/schools/{id}/modules/{module}`                                 | builder | Take one module back. Idempotent, and refused while a module the school still has depends on it — the mirror of the enable direction. |
 | GET    | `/sessions/{id}`                                                 | student | Fetch a single session by id. Visible to the instance's enrolled students, the session's own teacher, the instance's teachers, and managers/admins. |
 | PATCH  | `/sessions/{id}`                                                 | teacher | Update a session. Requires teacher+ with instance-management rights. Omitted fields keep their value; an explicit `null` clears `ends_at`. |
 | DELETE | `/sessions/{id}`                                                 | teacher | Delete a session and its roll-call rows. Requires teacher+ with instance-management rights. |
@@ -3888,14 +3891,14 @@ non-empty and contain none of `/ \ ? # %`.
 BASE=http://127.0.0.1:7656
 JAR=/tmp/hz.cookies
 
-# SCHOOL is the slug a builder gave this school (see "Multi-school (SaaS)").
-SCHOOL=demo
+# SCHOOL is the school's uuid, as `GET /auth/schools` publishes it.
+SCHOOL=01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d
 
 curl -s $BASE/auth/register -H 'content-type: application/json' \
   -d '{"school":"'$SCHOOL'","username":"ali","password":"secret1"}'
 
 curl -s -c $JAR $BASE/auth/login -H 'content-type: application/json' \
-  -d '{"school":"'$SCHOOL'","username":"ali","password":"secret1"}'
+  -d '{"username":"ali","password":"secret1"}'
 
 # notes
 curl -s -b $JAR $BASE/notes -H 'content-type: application/json' \
@@ -4040,7 +4043,7 @@ So the school cannot be bound at handshake time — a service pinned to one
 school would have to be run once per customer — and every *frame* names it
 instead.
 
-`school` is the school's slug, exactly as it appears in a login (`demo`), and
+`school` is the school's hyphenated uuid, exactly as `GET /school` returns it (`01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d`), and
 it is **required** on `Request`, `ApiRequest` and `BlobRequest`. Every answer
 echoes it, refusals included, so a service can tell which of its in-flight
 streams a refusal belongs to. There is no default and no fallback: a frame
@@ -4048,8 +4051,8 @@ naming no school is `malformed`.
 
 | `code` | Meaning |
 | ------ | ------- |
-| `malformed` | `school` is absent, or is not a slug at all |
-| `unknown_school` | A well-formed slug this deployment does not serve — not retryable without a config change |
+| `malformed` | `school` is absent — a frame-shape error, not a bad id |
+| `unknown_school` | The value is not a hyphenated uuid, or it is a uuid this deployment does not serve — not retryable without a config change |
 | `school_suspended` | The school exists and is switched off; worth retrying later |
 
 A read is answered out of that school's own database, `on_behalf_of` is
@@ -4065,14 +4068,14 @@ For each request the **backend** opens a bidi stream, writes one `Request`,
 finishes its send side, and reads one `Response`:
 
 ```json
-{ "id": "01J...", "school": "demo", "capability": "ocr.extract",
+{ "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "capability": "ocr.extract",
   "deadline_ms": 30000, "payload": { "image": "<base64>" } }
 ```
 
 ```json
-{ "status": "ok",  "id": "01J...", "school": "demo",
+{ "status": "ok",  "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d",
   "payload": { "text": "..." } }
-{ "status": "err", "id": "01J...", "school": "demo",
+{ "status": "err", "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d",
   "code": "unsupported_image", "message": "only png and jpeg" }
 ```
 
@@ -4221,7 +4224,7 @@ Same framing as every other `hab/2` frame; concurrency and correlation are the
 stream, exactly as for capability requests.
 
 ```json
-{ "id": "01J...", "school": "demo", "path": "/marks/me",
+{ "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "path": "/marks/me",
   "query": "limit=10&offset=0", "on_behalf_of": "user:01J...",
   "method": "GET" }
 ```
@@ -4235,9 +4238,9 @@ absent `method` means `GET`, and anything else is refused.
 The answer is tagged by `outcome`:
 
 ```json
-{ "outcome": "ok",  "id": "01J...", "school": "demo", "status": 200,
+{ "outcome": "ok",  "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "status": 200,
   "body": { } }
-{ "outcome": "err", "id": "01J...", "school": "demo",
+{ "outcome": "err", "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d",
   "code": "path_not_allowed",
   "message": "`/users` is not a path AI services may read" }
 ```
@@ -4250,10 +4253,10 @@ failure has misread the contract.
 
 | `code` | Meaning |
 | ------ | ------- |
-| `malformed` | The frame was not a readable `ApiRequest` (a missing `school` lands here), `school` is not a slug, or `path`+`query` do not form a request target |
+| `malformed` | The frame was not a readable `ApiRequest` (a missing `school` lands here), or `path`+`query` do not form a request target |
 | `method_not_allowed` | `method` was present and was not `GET` |
 | `path_not_allowed` | `path` is not in the read scope below |
-| `unknown_school` | `school` is a slug this deployment does not serve |
+| `unknown_school` | `school` is not a hyphenated uuid, or it is a uuid this deployment does not serve |
 | `school_suspended` | That school is suspended — retryable once it is not |
 | `unknown_user` | `on_behalf_of` names no user *of that school* (deleted since the service last saw them, or an id belonging to a different school) |
 | `unavailable` | The API is not serving yet, the database socket is down, or the read outran the request timeout — retryable |
@@ -4325,7 +4328,7 @@ the shape differs, and the two are told apart by the field each *requires*: an
 `ApiRequest` has `path`, a `BlobRequest` has `file`.
 
 ```json
-{ "id": "01J...", "school": "demo", "file": "01J8XZ0K3Q8G7X2M4N5P6R7S8V",
+{ "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "file": "01J8XZ0K3Q8G7X2M4N5P6R7S8V",
   "on_behalf_of": "user:01J..." }
 ```
 
@@ -4343,9 +4346,9 @@ tag `Response` uses, not the api read's `outcome`, since a blob header carries
 no HTTP status to collide with:
 
 ```json
-{ "status": "ok",  "id": "01J...", "school": "demo", "name": "recap.pdf",
+{ "status": "ok",  "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "name": "recap.pdf",
   "content_type": "application/pdf", "size": 204800 }
-{ "status": "err", "id": "01J...", "school": "demo", "code": "forbidden",
+{ "status": "err", "id": "01J...", "school": "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d", "code": "forbidden",
   "message": "`01J...` may not view the course this file belongs to" }
 ```
 
@@ -4363,7 +4366,7 @@ slow-but-reading service is never cut off.
 
 | `code` | Meaning |
 | ------ | ------- |
-| `malformed` | The frame was not a readable `BlobRequest`, or `school` is absent or not a slug |
+| `malformed` | The frame was not a readable `BlobRequest`, or `school` is absent |
 | `not_found` | No `course_note_file` with that key *in that school*, or its note or course is gone |
 | `forbidden` | The principal may not view that file's course |
 | `unknown_school` / `school_suspended` | As for an api read |
@@ -5049,9 +5052,9 @@ src/
                    while Postgres says "contended") + the two sqlx migrator
                    sets; init() brings up the control database, a mint
                    migrates a school's from the shared template
-  tenant.rs        Slug · SchoolStatus · School · Tenants: one Postgres
-                   database per school (`{control}_school_{slug}`), plus the
-                   control database that registers them (DEMO_SLUG is the
+  tenant.rs        SchoolId · SchoolStatus · School · Tenants: one Postgres
+                   database per school (`{control}_school_{uuid hex}`), plus the
+                   control database that registers them (DEMO_SCHOOL_ID is the
                    tests' school)
   db/              the only layer that executes queries: per-table SQL, one
                    file per resource · cap.rs (the count-cap CTE recipes and
@@ -5218,9 +5221,9 @@ src/
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
     tenant_state.rs State<AppState>: the shadow of axum's State that resolves the
-                   caller's school from the `<slug>.<token>` cookie, so every
+                   caller's school from the `<uuid>.<token>` cookie, so every
                    handler that imports it is school-scoped by construction
-                   (ResolvedTenant · TenantExt · SchoolSlug · split_cookie)
+                   (ResolvedTenant · TenantExt · SchoolIdCookie · split_cookie)
     module_gate.rs one route_layer per nest: a module the school has not bought
                    answers 403 {error, module} on every route in it, while an
                    unmatched path inside it still 404s

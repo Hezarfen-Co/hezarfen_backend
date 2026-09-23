@@ -29,7 +29,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, Username};
 use crate::error::AppError;
 use crate::module::ModuleSet;
-use crate::tenant::{DEMO_SLUG, SchoolId, SchoolStatus, Tenants, school_db_name};
+use crate::tenant::{DEMO_SCHOOL_ID, SchoolId, SchoolStatus, Tenants, school_db_name};
 
 /// The shared database handle.
 ///
@@ -101,7 +101,7 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
 }
 
 /// Parse `DATABASE_URL` into dial options plus the control database's name —
-/// the name every school database hangs off (`{control}_school_{slug}`).
+/// the name every school database hangs off (`{control}_school_{uuid hex}`).
 pub(crate) fn parse_base(cfg: &Config) -> Result<(PgConnectOptions, String), AppError> {
     let opts: PgConnectOptions = cfg.database_url.parse().map_err(|err| {
         AppError::Internal(format!(
@@ -754,7 +754,7 @@ impl Drop for TestLease {
 
 /// A complete test deployment: a fresh control database plus the demo school,
 /// whose database is cloned from the shared school template and registered in
-/// the control registry under the slug every suite names ([`DEMO_SLUG`]).
+/// the control registry under [`DEMO_SCHOOL_ID`].
 ///
 /// The databases die with the returned registry's last handle (see
 /// [`TestDatabases`]); the janitor sweeps anything a crashed run left behind.
@@ -773,7 +773,7 @@ pub async fn init_test_tenants() -> Tenants {
         .unwrap_or_else(|err| panic!("migrate the test control database {control_db}: {err}"));
 
     let template = ensure_test_template(&maintenance, &base).await;
-    let demo_id = SchoolId::generate();
+    let demo_id = SchoolId::try_parse(DEMO_SCHOOL_ID).expect("pinned demo school id");
     let school_db = school_db_name(&control_db, demo_id.uuid());
     create_database(&maintenance, &school_db, Some(&template)).await;
     lease.track(&school_db);
@@ -785,11 +785,10 @@ pub async fn init_test_tenants() -> Tenants {
     // without the per-school migration its `bring_up` runs, which the
     // template clone has just replaced.
     sqlx::query(
-        "INSERT INTO school (id, slug, name, status, created_at)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO school (id, name, status, created_at)
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(demo_id.uuid())
-    .bind(DEMO_SLUG)
     .bind("Demo School")
     .bind(SchoolStatus::Active)
     .bind(Timestamp::now().as_millis())

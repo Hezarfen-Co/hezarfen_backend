@@ -89,7 +89,7 @@ impl RagIndexPayload {
 /// answered. Silent no-op when the bridge is off or no worker offers
 /// `rag.index`.
 ///
-/// `tenant` is the caller's own school: its slug rides the `hab/2` frame, and
+/// `tenant` is the caller's own school: its uuid rides the `hab/2` frame, and
 /// `state.db` — the same school's database, since the caller reached this
 /// through the shadow `State` — is where the answer is stored.
 ///
@@ -108,11 +108,11 @@ pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: 
         tracing::debug!(
             "skipping rag.index for course note {}: the `{}` school has no `chatbot` module",
             note.get_id().key(),
-            tenant.slug
+            tenant.id
         );
         return;
     }
-    let school = &tenant.slug;
+    let school = &tenant.id;
     let Some(bridge) = state.ai.as_ref() else {
         return;
     };
@@ -256,43 +256,43 @@ async fn replay_indexed_notes(state: AppState) {
             return;
         }
     };
-    for slug in directory.schools {
-        replay_school(&state, &slug).await;
+    for school in directory.schools {
+        replay_school(&state, &school).await;
     }
 }
 
-async fn replay_school(state: &AppState, slug: &str) {
-    let slug = match crate::tenant::Slug::try_new(slug) {
-        Ok(slug) => slug,
+async fn replay_school(state: &AppState, school: &str) {
+    let id = match crate::tenant::SchoolId::try_parse(school) {
+        Ok(id) => id,
         Err(err) => {
-            tracing::warn!("rag.index replay skipped an unreadable school slug: {err}");
+            tracing::warn!("rag.index replay skipped an unreadable school id: {err}");
             return;
         }
     };
-    let tenant = match state.tenants.resolve(&slug).await {
+    let tenant = match state.tenants.resolve(&id).await {
         Ok(tenant) => tenant,
         Err(err) => {
-            tracing::warn!("rag.index replay skipped `{slug}`: {err}");
+            tracing::warn!("rag.index replay skipped `{id}`: {err}");
             return;
         }
     };
     if !tenant.modules.contains(Module::Chatbot) {
-        tracing::debug!("rag.index replay skipped `{slug}`: the school has no chatbot module");
+        tracing::debug!("rag.index replay skipped `{id}`: the school has no chatbot module");
         return;
     }
     let notes = match crate::db::course_note::list_with_files(&tenant.db).await {
         Ok(notes) => notes,
         Err(err) => {
-            tracing::warn!("rag.index replay could not list course notes in `{slug}`: {err}");
+            tracing::warn!("rag.index replay could not list course notes in `{id}`: {err}");
             return;
         }
     };
     if notes.is_empty() {
-        tracing::debug!("rag.index replay: `{slug}` has no course notes with files");
+        tracing::debug!("rag.index replay: `{id}` has no course notes with files");
         return;
     }
     tracing::info!(
-        school = %slug,
+        school = %id,
         notes = notes.len(),
         "replaying rag.index for course notes with files"
     );

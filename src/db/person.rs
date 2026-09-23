@@ -11,7 +11,7 @@ use crate::domain::session::{SessionId, SessionToken};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{PasswordHash, Username};
 use crate::error::AppError;
-use crate::tenant::{SchoolId, SchoolStatus, Slug};
+use crate::tenant::{SchoolId, SchoolStatus};
 
 /// The raw account insert behind [`crate::service::person::create_or_load`].
 /// The unique index on `username` is the whole availability check; the loser
@@ -65,19 +65,19 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Pe
     Ok(person)
 }
 
-/// Every school the person belongs to, slug order, with the registry's name
+/// Every school the person belongs to, name order, with the registry's name
 /// and status joined in. Suspended schools are part of the answer — the
 /// caller decides what to offer.
 pub async fn memberships(db: &Database, person: &PersonId) -> Result<Vec<Membership>, AppError> {
     let rows = sqlx::query_as!(
         Membership,
-        r#"SELECT s.slug AS "slug: Slug",
+        r#"SELECT s.id AS "id: SchoolId",
                   s.name,
                   s.status AS "status: SchoolStatus"
            FROM person_school ps
            JOIN school s ON s.id = ps.school
            WHERE ps.person = $1
-           ORDER BY s.slug"#,
+           ORDER BY s.name"#,
         person.uuid()
     )
     .fetch_all(db)
@@ -86,23 +86,23 @@ pub async fn memberships(db: &Database, person: &PersonId) -> Result<Vec<Members
 }
 
 /// The person's membership in exactly one school — the `POST /auth/school`
-/// gate. A slug the person does not hold is the same `None` a malformed one
-/// is: no existence signal either way.
+/// gate. An id the person does not hold is the same `None` a non-uuid is:
+/// no existence signal either way.
 pub async fn membership_of(
     db: &Database,
     person: &PersonId,
-    slug: &Slug,
+    id: &SchoolId,
 ) -> Result<Option<Membership>, AppError> {
     let row = sqlx::query_as!(
         Membership,
-        r#"SELECT s.slug AS "slug: Slug",
+        r#"SELECT s.id AS "id: SchoolId",
                   s.name,
                   s.status AS "status: SchoolStatus"
            FROM person_school ps
            JOIN school s ON s.id = ps.school
-           WHERE ps.person = $1 AND s.slug = $2"#,
+           WHERE ps.person = $1 AND s.id = $2"#,
         person.uuid(),
-        slug.as_str()
+        id.uuid()
     )
     .fetch_optional(db)
     .await?;
@@ -110,22 +110,31 @@ pub async fn membership_of(
 }
 
 /// Attach a person to a school. Idempotent by the primary key: a racing or
-/// repeated join is a no-op, not an error. The membership carries the
-/// school's uuid, resolved from the slug in the same statement — so a school
-/// deleted mid-flight joins nothing instead of erroring, which is the honest
-/// outcome (there is nothing left to join).
-pub async fn add_membership(db: &Database, person: &PersonId, slug: &Slug) -> Result<(), AppError> {
+/// repeated join is a no-op, not an error. A school deleted mid-flight joins
+/// nothing instead of erroring, which is the honest outcome.
+pub async fn add_membership(db: &Database, person: &PersonId, id: &SchoolId) -> Result<(), AppError> {
     sqlx::query!(
         "INSERT INTO person_school (person, school, created_at)
-         SELECT $1, s.id, $3 FROM school s WHERE s.slug = $2
+         SELECT $1, s.id, $3 FROM school s WHERE s.id = $2
          ON CONFLICT DO NOTHING",
         person.uuid(),
-        slug.as_str(),
+        id.uuid(),
         Timestamp::now().as_millis()
     )
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Active schools a registration picker may offer: id and display name,
+/// name order. Empty when none are active.
+pub async fn list_active_schools(db: &Database) -> Result<Vec<(uuid::Uuid, String)>, AppError> {
+    let rows = sqlx::query!(
+        "SELECT id, name FROM school WHERE status = 'active' ORDER BY name"
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| (row.id, row.name)).collect())
 }
 
 /// Drop every membership pointing at a school — the control-plane half of

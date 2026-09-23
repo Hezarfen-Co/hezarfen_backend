@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT slug FROM school WHERE status = 'active' ORDER BY slug",
+  "query": "SELECT id FROM school WHERE status = 'active' ORDER BY name",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "slug",
-        "type_info": "Text",
+        "name": "id",
+        "type_info": "Uuid",
         "origin": {
           "Table": {
             "table": "school",
-            "name": "slug"
+            "name": "id"
           }
         }
       }
@@ -22,5 +22,5 @@
       false
     ]
   },
-  "hash": "c0f04896f37ecdb45eefd6ff79ede315709a64b53ff6fd8f6837f61283f1001b"
+  "hash": "ae2c93f1bdfb98b697268a8b8f6be1aebabfbe3ab9a87122c337a306eb0447b0"
 }

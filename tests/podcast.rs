@@ -33,7 +33,7 @@ use hezarfen_backend::constant::{
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::module::{Module, ModuleSet};
-use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
+use hezarfen_backend::tenant::{DEMO_SCHOOL_ID, SchoolId};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -111,8 +111,8 @@ fn client_endpoint(bridge: &AiBridge) -> quinn::Endpoint {
     endpoint
 }
 
-fn demo() -> Slug {
-    Slug::try_new(DEMO_SLUG).expect("the demo slug")
+fn demo() -> SchoolId {
+    SchoolId::try_parse(DEMO_SCHOOL_ID).expect("the demo slug")
 }
 
 fn hello(service: &str, capabilities: &[&str]) -> Hello {
@@ -412,7 +412,7 @@ fn report_frame(
 ) -> Value {
     json!({
         "id": format!("report-{state}"),
-        "school": DEMO_SLUG,
+        "school": DEMO_SCHOOL_ID,
         "capability": "podcast.report",
         "payload": {
             "job_id": job_id,
@@ -433,7 +433,7 @@ fn upload_frame(job_id: &str, name: &str, content_type: &str, size: usize) -> Va
     json!({
         "id": format!("upload-{job_id}"),
         "upload": true,
-        "school": DEMO_SLUG,
+        "school": DEMO_SCHOOL_ID,
         "job_id": job_id,
         "name": name,
         "content_type": content_type,
@@ -650,7 +650,7 @@ async fn a_submit_writes_the_row_and_hands_the_service_its_own_job_id() {
     let seen = service.seen();
     assert_eq!(seen.len(), 1, "exactly one dispatch");
     assert_eq!(seen[0].capability, AI_PODCAST_SUBMIT_CAPABILITY);
-    assert_eq!(seen[0].school, DEMO_SLUG, "the school rides the frame");
+    assert_eq!(seen[0].school, DEMO_SCHOOL_ID, "the school rides the frame");
     assert_eq!(
         seen[0].payload["job_id"], job_id,
         "the service was handed the row's own id"
@@ -1239,10 +1239,10 @@ async fn the_history_never_shows_another_schools_jobs() {
     let demo_db = common::demo_db(&deployment.tenants).await;
     let beta_db = deployment
         .tenants
-        .get(&Slug::try_new("beta").expect("the beta slug"))
+        .get(&SchoolId::try_parse(hezarfen_backend::tenant::BETA_SCHOOL_ID).expect("the beta slug"))
         .await
         .expect("the beta school's handle");
-    let demo_cookie = common::login_as_school(app, &demo_db, DEMO_SLUG, "ali", "teacher").await;
+    let demo_cookie = common::login_as_school(app, &demo_db, DEMO_SCHOOL_ID, "ali", "teacher").await;
     let beta_cookie = common::login_as_school(app, &beta_db, "beta", "ali", "teacher").await;
     let demo_user = common::me_id(app, &demo_cookie).await;
     let beta_user = common::me_id(app, &beta_cookie).await;

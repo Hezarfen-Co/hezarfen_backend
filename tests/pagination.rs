@@ -16,7 +16,7 @@ use serde_json::json;
 async fn seed_students(app: &axum::Router, n: usize) {
     for i in 0..n {
         let name = format!("user{i:02}");
-        let creds = json!({ "school": "demo", "username": name, "password": "secret1" });
+        let creds = json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": name, "password": "secret1" });
         let res = send(app, "POST", "/auth/register", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::CREATED, "register {name}");
     }
@@ -330,7 +330,7 @@ async fn user_search_is_paged_not_capped() {
     // 12 accounts sharing the "grp" fragment — past the old cap.
     for i in 0..12 {
         let creds =
-            json!({ "school": "demo", "username": format!("grp{i:02}"), "password": "secret1" });
+            json!({ "school": "019732e3-7b00-7000-8000-00000000dead", "username": format!("grp{i:02}"), "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::CREATED);
     }

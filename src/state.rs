@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use crate::ai::AiBridge;
 use crate::database::Database;
 use crate::rate_limit::{RateLimitConfig, UserRateLimiter};
-use crate::tenant::{Slug, Tenants};
+use crate::tenant::{SchoolId, Tenants};
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
@@ -55,16 +55,16 @@ pub struct AppState {
     pub metrics: crate::telemetry::Metrics,
 }
 
-/// The map key for `key` inside `slug`'s school. One process serves every
+/// The map key for `key` inside `id`'s school. One process serves every
 /// school, but record keys are only unique *within* a database, so an
 /// unscoped key would put two schools' identical attempts (or boards) in the
 /// same room. The maps below are the only users of this, and their methods
-/// take a [`Slug`] rather than a ready-made key — there is no way to reach one
-/// with an unscoped string. The per-user chatbot limiter keys through here
-/// too, for the same reason. A slug cannot contain `:`, so the join is
-/// unambiguous.
-pub fn scoped_key(slug: &Slug, key: &str) -> String {
-    format!("{slug}:{key}")
+/// take a [`SchoolId`] rather than a ready-made key — there is no way to reach
+/// one with an unscoped string. The per-user chatbot limiter keys through here
+/// too, for the same reason. A hyphenated uuid cannot contain `:`, so the join
+/// is unambiguous.
+pub fn scoped_key(id: &SchoolId, key: &str) -> String {
+    format!("{id}:{key}")
 }
 
 /// How many exam-room sockets each attempt has open right now, keyed by the
@@ -82,15 +82,15 @@ pub struct ExamPresence(Arc<Mutex<HashMap<String, usize>>>);
 
 impl ExamPresence {
     /// Count one socket into `attempt`'s room.
-    pub fn enter(&self, slug: &Slug, attempt: &str) {
+    pub fn enter(&self, id: &SchoolId, attempt: &str) {
         let mut rooms = self.0.lock().expect("exam presence lock");
-        *rooms.entry(scoped_key(slug, attempt)).or_insert(0) += 1;
+        *rooms.entry(scoped_key(id, attempt)).or_insert(0) += 1;
     }
 
     /// Count one socket out of `attempt`'s room; `true` when it was the last
     /// one — the student has actually left.
-    pub fn leave(&self, slug: &Slug, attempt: &str) -> bool {
-        let attempt = &scoped_key(slug, attempt);
+    pub fn leave(&self, id: &SchoolId, attempt: &str) -> bool {
+        let attempt = &scoped_key(id, attempt);
         let mut rooms = self.0.lock().expect("exam presence lock");
         match rooms.get_mut(attempt) {
             Some(count) if *count > 1 => {
@@ -130,10 +130,10 @@ pub struct BoardHub(Arc<Mutex<BoardRooms>>);
 impl BoardHub {
     /// Count one socket into `board` and hand back its stream of other
     /// people's frames, creating the channel on the first join.
-    pub fn subscribe(&self, slug: &Slug, board: &str) -> broadcast::Receiver<String> {
+    pub fn subscribe(&self, id: &SchoolId, board: &str) -> broadcast::Receiver<String> {
         let mut boards = self.0.lock().expect("board hub lock");
         let room = boards
-            .entry(scoped_key(slug, board))
+            .entry(scoped_key(id, board))
             .or_insert_with(|| (broadcast::channel(crate::constant::BOARD_HUB_CAPACITY).0, 0));
         room.1 += 1;
         room.0.subscribe()
@@ -141,11 +141,11 @@ impl BoardHub {
 
     /// Push `frame` to every socket currently subscribed to `board`. A send
     /// with no receivers left is the normal empty-room case, not a failure.
-    pub fn publish(&self, slug: &Slug, board: &str, frame: String) {
+    pub fn publish(&self, id: &SchoolId, board: &str, frame: String) {
         let sender = {
             let boards = self.0.lock().expect("board hub lock");
             boards
-                .get(&scoped_key(slug, board))
+                .get(&scoped_key(id, board))
                 .map(|room| room.0.clone())
         };
         if let Some(sender) = sender {
@@ -154,8 +154,8 @@ impl BoardHub {
     }
 
     /// Count one socket out of `board`; the last one out drops the channel.
-    pub fn leave(&self, slug: &Slug, board: &str) {
-        let board = &scoped_key(slug, board);
+    pub fn leave(&self, id: &SchoolId, board: &str) {
+        let board = &scoped_key(id, board);
         let mut boards = self.0.lock().expect("board hub lock");
         match boards.get_mut(board) {
             Some(room) if room.1 > 1 => room.1 -= 1,
@@ -172,13 +172,13 @@ impl BoardHub {
 mod tests {
     use super::*;
 
-    fn slug(value: &str) -> Slug {
-        Slug::try_new(value).expect(value)
+    fn school(value: &str) -> SchoolId {
+        SchoolId::try_parse(value).expect(value)
     }
 
     #[tokio::test]
     async fn every_subscriber_gets_the_stroke_and_the_room_is_reclaimed() {
-        let a = slug("alpha");
+        let a = school("019732e3-7b00-7000-8000-00000000a11a");
         let hub = BoardHub::default();
         let mut alice = hub.subscribe(&a, "board-a");
         let mut bob = hub.subscribe(&a, "board-a");
@@ -188,11 +188,11 @@ mod tests {
 
         // Boards are independent, and publishing into an empty one is a no-op.
         hub.publish(&a, "board-b", "nobody home".to_string());
-        assert!(!hub.0.lock().unwrap().contains_key("alpha:board-b"));
+        assert!(!hub.0.lock().unwrap().contains_key(&scoped_key(&a, "board-b")));
 
         hub.leave(&a, "board-a");
         assert!(
-            hub.0.lock().unwrap().contains_key("alpha:board-a"),
+            hub.0.lock().unwrap().contains_key(&scoped_key(&a, "board-a")),
             "one socket of two out keeps the room"
         );
         hub.leave(&a, "board-a");
@@ -206,7 +206,7 @@ mod tests {
     /// same board key. One process serves both — nothing may cross.
     #[tokio::test]
     async fn a_stroke_never_crosses_into_another_school() {
-        let (a, b) = (slug("alpha"), slug("beta"));
+        let (a, b) = (school("019732e3-7b00-7000-8000-00000000a11a"), school("019732e3-7b00-7000-8000-00000000be7a"));
         let hub = BoardHub::default();
         let mut in_a = hub.subscribe(&a, "board-1");
         let mut in_b = hub.subscribe(&b, "board-1");
@@ -225,13 +225,13 @@ mod tests {
         // beta's room standing.
         hub.leave(&a, "board-1");
         let boards = hub.0.lock().unwrap();
-        assert!(!boards.contains_key("alpha:board-1"));
-        assert!(boards.contains_key("beta:board-1"));
+        assert!(!boards.contains_key(&scoped_key(&a, "board-1")));
+        assert!(boards.contains_key(&scoped_key(&b, "board-1")));
     }
 
     #[tokio::test]
     async fn only_the_last_socket_out_is_a_real_exit() {
-        let a = slug("alpha");
+        let a = school("019732e3-7b00-7000-8000-00000000a11a");
         let presence = ExamPresence::default();
         presence.enter(&a, "attempt-a");
         presence.enter(&a, "attempt-a");
@@ -254,7 +254,7 @@ mod tests {
     /// its walk-out would go unstamped.
     #[tokio::test]
     async fn presence_counts_are_per_school() {
-        let (a, b) = (slug("alpha"), slug("beta"));
+        let (a, b) = (school("019732e3-7b00-7000-8000-00000000a11a"), school("019732e3-7b00-7000-8000-00000000be7a"));
         let presence = ExamPresence::default();
         presence.enter(&a, "attempt-1");
         presence.enter(&b, "attempt-1");

@@ -16,7 +16,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::service;
 use crate::state::AppState;
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 use super::dto::Role;
 use super::tenant_state::split_cookie;
@@ -40,6 +40,7 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
             let limiter = limiter.clone();
             async move { limiter.enforce(req, next).await }
         }))
+        .routes(routes!(list_schools))
         .routes(routes!(select_school))
         .routes(routes!(logout))
         .routes(routes!(me))
@@ -51,9 +52,9 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
 /// `school` to login is merely ignored, not broken.
 #[derive(Deserialize, ToSchema)]
 struct RegisterCredentials {
-    /// The school's slug — where the new account (or the new membership of an
-    /// existing person) lives.
-    #[schema(example = "demo", min_length = 2, max_length = 32)]
+    /// The school's uuid — where the new account (or the new membership of an
+    /// existing person) lives. Hyphenated, as `GET /auth/schools` publishes it.
+    #[schema(example = "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d")]
     school: String,
     #[schema(example = "ada", min_length = 3, max_length = 32)]
     username: String,
@@ -75,15 +76,15 @@ struct LoginCredentials {
 /// One school offered to a multi-school person.
 #[derive(Serialize, ToSchema)]
 struct SchoolChoice {
-    #[schema(example = "demo")]
-    slug: String,
+    #[schema(example = "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d")]
+    id: String,
     #[schema(example = "Demo")]
     name: String,
 }
 
 /// What `POST /auth/login` answers when the person belongs to more than one
 /// active school: no `id` (no school is entered yet, so there is no school
-/// row to speak of), and no school cookie. The `schools` list is in slug
+/// row to speak of), and no school cookie. The `schools` list is in name
 /// order and omits suspended schools.
 #[derive(Serialize, ToSchema)]
 struct SchoolChoiceResponse {
@@ -93,7 +94,7 @@ struct SchoolChoiceResponse {
 }
 
 /// The two login outcomes, told apart by shape: a school was entered (a
-/// [`UserResponse`] and a `<slug>.<token>` cookie), or one must be chosen (a
+/// [`UserResponse`] and a `<uuid>.<token>` cookie), or one must be chosen (a
 /// [`SchoolChoiceResponse`] and a `person.<token>` cookie). Disjoint by the
 /// `id` field, so an untagged `oneOf` is unambiguous on the wire.
 #[derive(Serialize, ToSchema)]
@@ -106,7 +107,7 @@ enum LoginResponse {
 /// What `POST /auth/school` takes: which of the person's memberships to bind.
 #[derive(Deserialize, ToSchema)]
 struct SelectSchool {
-    #[schema(example = "demo", min_length = 2, max_length = 32)]
+    #[schema(example = "01a0b0a5-ffb5-7682-8726-7e4ef1a5c68d")]
     school: String,
 }
 
@@ -121,6 +122,28 @@ struct RegisterResponse {
     #[schema(example = "ada")]
     username: String,
     role: Role,
+}
+
+/// Active schools open for registration. Unauthenticated, like register:
+/// the picker has no session yet. Sorted by name; empty when none are active.
+#[utoipa::path(
+    get,
+    path = "/schools",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Active schools, id and display name, sorted by name", body = Vec<SchoolChoice>),
+    ),
+)]
+async fn list_schools(State(st): State<AppState>) -> Result<Json<Vec<SchoolChoice>>, AppError> {
+    let rows = crate::db::person::list_active_schools(&st.db).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, name)| SchoolChoice {
+                id: id.to_string(),
+                name,
+            })
+            .collect(),
+    ))
 }
 
 /// Register a new user account, or attach an existing person to one more
@@ -162,7 +185,7 @@ async fn register(
     // one that is suspended, must not reach the (expensive) hashing path — and
     // an unknown school answers `401` here for the same anti-enumeration reason
     // login does, rather than confirming which schools this deployment serves.
-    let school = Slug::try_new(&req.school).map_err(|_| AppError::Unauthorized)?;
+    let school = SchoolId::try_parse(&req.school).map_err(|_| AppError::Unauthorized)?;
     let db = st.tenants.get(&school).await?;
     let username = Username::try_new(&req.username)?;
     // Registration-level policy, not a `Username` invariant: these names read
@@ -216,7 +239,7 @@ async fn register(
 
 /// Log in with username + password — no school. Sets a `session` cookie on
 /// success: exactly one active membership enters that school right away
-/// (`<slug>.<token>` and the full [`UserResponse`], unchanged for
+/// (`<uuid>.<token>` and the full [`UserResponse`], unchanged for
 /// single-school clients), several answer a [`SchoolChoiceResponse`] with a
 /// `person.<token>` cookie that `POST /auth/school` binds.
 #[utoipa::path(
@@ -225,7 +248,7 @@ async fn register(
     tag = "auth",
     request_body = LoginCredentials,
     responses(
-        (status = 200, description = "Logged in — either straight into the one school (a `UserResponse` and a `<slug>.<token>` cookie), or as a multi-school person (a `{username, schools}` choice list and a `person.<token>` cookie to bind with `POST /auth/school`). Suspended schools appear in neither shape", body = LoginResponse),
+        (status = 200, description = "Logged in — either straight into the one school (a `UserResponse` and a `<uuid>.<token>` cookie), or as a multi-school person (a `{username, schools}` choice list and a `person.<token>` cookie to bind with `POST /auth/school`). Suspended schools appear in neither shape", body = LoginResponse),
         (status = 401, description = "Bad credentials — unknown username, wrong password, or no school membership left to enter, all deliberately indistinguishable", body = ErrorResponse),
         (status = 403, description = "Every school the person belongs to is suspended", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
@@ -275,7 +298,7 @@ async fn login(
         // including this one.
         [] => Err(AppError::Forbidden("school is suspended")),
         [only] => {
-            let db = st.tenants.get(only.slug()).await?;
+            let db = st.tenants.get(&only.id()).await?;
             // The school-side row the session binds to. A membership without
             // its `app_user` (a torn create) refuses like a bad credential
             // rather than confirm anything.
@@ -287,11 +310,11 @@ async fn login(
             // The caller is genuine; opportunistically drop expired session rows.
             let _ = service::session::purge_expired(&db).await;
             let session = service::session::create(&db, user.get_id()).await?;
-            // `<slug>.<token>`: the cookie carries the school, so every later
+            // `<uuid>.<token>`: the cookie carries the school, so every later
             // request finds its database without a second lookup path that
             // could disagree.
             let cookie = session_cookie(
-                format!("{}.{}", only.slug(), session.token().as_str()),
+                format!("{}.{}", only.id(), session.token().as_str()),
                 st.cookie_secure,
             );
             Ok((
@@ -302,7 +325,7 @@ async fn login(
         many => {
             // Not entering any school yet: the `person.<token>` cookie is the
             // not-chosen state, and `POST /auth/school` exchanges it. The
-            // list carries slug and display name, suspended schools omitted.
+            // list carries id and display name, suspended schools omitted.
             let session = service::person::create_session(&st.db, person.get_id()).await?;
             let cookie = session_cookie(
                 format!("{PERSON_COOKIE_PREFIX}.{}", session.token().as_str()),
@@ -311,7 +334,7 @@ async fn login(
             let schools = many
                 .iter()
                 .map(|m| SchoolChoice {
-                    slug: m.slug().as_str().to_string(),
+                    id: m.id().as_str(),
                     name: m.name().to_string(),
                 })
                 .collect();
@@ -327,7 +350,7 @@ async fn login(
 }
 
 /// Bind a `person.<token>` session to one of the person's schools: the
-/// cookie is replaced with that school's own `<slug>.<token>` and the person
+/// cookie is replaced with that school's own `<uuid>.<token>` and the person
 /// session is revoked. Deliberately outside the credential rate-limit tier —
 /// this is not a credential guess, and it requires a session cookie already.
 #[utoipa::path(
@@ -337,7 +360,7 @@ async fn login(
     request_body = SelectSchool,
     responses(
         (status = 200, description = "School selected; the person cookie is replaced by the school session cookie", body = UserResponse),
-        (status = 401, description = "No person session, or the school is not among the caller's memberships — deliberately indistinguishable (no cookie at all, a school or builder cookie, and a slug the person does not hold all answer the same)", body = ErrorResponse),
+        (status = 401, description = "No person session, or the school is not among the caller's memberships — deliberately indistinguishable (no cookie at all, a school or builder cookie, and an id the person does not hold all answer the same)", body = ErrorResponse),
         (status = 403, description = "The school is suspended", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
@@ -360,15 +383,15 @@ async fn select_school(
         .await?
         .filter(|s| !s.is_expired())
         .ok_or(AppError::Unauthorized)?;
-    // Membership required, and a slug that names nothing is the same refusal
+    // Membership required, and an id that names nothing is the same refusal
     // as one the person does not hold — the list login already gave them is
     // not a directory of the deployment.
-    let slug = Slug::try_new(&req.school).map_err(|_| AppError::Unauthorized)?;
-    service::person::membership_of(&st.db, session.person(), &slug)
+    let id = SchoolId::try_parse(&req.school).map_err(|_| AppError::Unauthorized)?;
+    service::person::membership_of(&st.db, session.person(), &id)
         .await?
         .ok_or(AppError::Unauthorized)?;
     // Suspended → `403` here, like on every school door.
-    let db = st.tenants.get(&slug).await?;
+    let db = st.tenants.get(&id).await?;
     let person = service::person::read(&st.db, session.person())
         .await?
         .ok_or(AppError::Unauthorized)?;
@@ -382,7 +405,7 @@ async fn select_school(
     let school_session = service::session::create(&db, user.get_id()).await?;
     service::person::delete_session_by_token(&st.db, token).await?;
     let cookie = session_cookie(
-        format!("{slug}.{}", school_session.token().as_str()),
+        format!("{id}.{}", school_session.token().as_str()),
         st.cookie_secure,
     );
     Ok((jar.add(cookie), Json(UserResponse::new(&user))))
@@ -391,7 +414,7 @@ async fn select_school(
 /// The `session` cookie, however it was earned. Shared by school login and the
 /// builder surface (`web::builder`) so the two can never drift apart on path,
 /// flags or lifetime — the value is the only difference between them
-/// (`<slug>.<token>` against `builder.<token>`).
+/// (`<uuid>.<token>` against `builder.<token>`).
 pub(crate) fn session_cookie(value: String, secure: bool) -> Cookie<'static> {
     Cookie::build(("session", value))
         .path("/")
@@ -425,8 +448,8 @@ async fn logout(
             crate::service::builder::delete_by_token(&st.db, token).await?;
         } else if prefix == PERSON_COOKIE_PREFIX {
             service::person::delete_session_by_token(&st.db, token).await?;
-        } else if let Ok(slug) = Slug::try_new(prefix)
-            && let Ok(db) = st.tenants.get(&slug).await
+        } else if let Ok(id) = SchoolId::try_parse(prefix)
+            && let Ok(db) = st.tenants.get(&id).await
         {
             service::session::delete_by_token(&db, token).await?;
         }

@@ -18,7 +18,7 @@
 //! mid-session keeps drawing over an already-open socket until the room hears
 //! about it, so a roster change *must* fan out.
 
-use crate::web::tenant_state::{SchoolSlug, State};
+use crate::web::tenant_state::{SchoolIdCookie, State};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -40,7 +40,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::course::can_manage_course;
 use crate::service::{board, board_stroke};
 use crate::state::AppState;
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 use super::{CurrentUser, Page, PageParams, RequireStudent, paginate, set_or_clear};
 
@@ -62,8 +62,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 /// Push one frame to whoever is in the room right now. An empty room is the
 /// normal case, not a failure.
-fn fan_out(st: &AppState, slug: &Slug, board: &BoardId, frame: serde_json::Value) {
-    st.board_hub.publish(slug, &board.key(), frame.to_string());
+fn fan_out(st: &AppState, school: &SchoolId, board: &BoardId, frame: serde_json::Value) {
+    st.board_hub.publish(school, &board.key(), frame.to_string());
 }
 
 /// The roster frame every path that changes the invite list must publish. A
@@ -438,7 +438,7 @@ struct UpdateBoard {
 )]
 async fn update_board(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateBoard>,
@@ -461,13 +461,13 @@ async fn update_board(
         let participants =
             board::resolve_participants(participants, board.get_participants(), &st.db).await?;
         board = board::set_participants(&st.db, &board, participants).await?;
-        fan_out(&st, &slug, board.get_id(), participants_frame(&board));
+        fan_out(&st, &school, board.get_id(), participants_frame(&board));
     }
     if let Some(locked) = req.locked {
         board = board::set_locked(&st.db, &board, locked, user.get_id()).await?;
         fan_out(
             &st,
-            &slug,
+            &school,
             board.get_id(),
             json!({"type": "locked", "locked": locked, "by": user.get_id().key()}),
         );
@@ -503,7 +503,7 @@ async fn update_board(
 )]
 async fn clear_board(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<StrokeResponse>), AppError> {
@@ -514,7 +514,7 @@ async fn clear_board(
     // next one.
     fan_out(
         &st,
-        &slug,
+        &school,
         board.get_id(),
         json!({
             "type": "cleared",
@@ -545,7 +545,7 @@ async fn clear_board(
 )]
 async fn close_board(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, AppError> {
@@ -554,7 +554,7 @@ async fn close_board(
     let board = board::close(&st.db, &board).await?;
     fan_out(
         &st,
-        &slug,
+        &school,
         board.get_id(),
         json!({
             "type": "closed",
@@ -719,7 +719,7 @@ impl InviteSource {
 )]
 async fn invite_board(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<InviteSource>,
@@ -734,7 +734,7 @@ async fn invite_board(
     board::ensure_creator(&board, &user)?;
     let invited = req.resolve(&user, &st.db).await?;
     let board = board::invite(&st.db, &board, invited).await?;
-    fan_out(&st, &slug, board.get_id(), participants_frame(&board));
+    fan_out(&st, &school, board.get_id(), participants_frame(&board));
     Ok(Json(BoardResponse::new(&board)))
 }
 
@@ -757,7 +757,7 @@ async fn invite_board(
 )]
 async fn delete_board(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
@@ -767,6 +767,6 @@ async fn delete_board(
     board::delete(&st.db, board).await?;
     // Told after the row is gone: a room that acts on this and then re-reads
     // must find nothing, not a board about to disappear.
-    fan_out(&st, &slug, &id, json!({"type": "deleted"}));
+    fan_out(&st, &school, &id, json!({"type": "deleted"}));
     Ok(StatusCode::NO_CONTENT)
 }

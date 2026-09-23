@@ -53,6 +53,7 @@ use crate::constant::{
 use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::domain::monotonic_id::next_uuid;
 use crate::error::{AppError, ValidationError};
+use crate::tenant::SchoolId;
 
 // ---- the wire rows ---------------------------------------------------------
 
@@ -308,21 +309,20 @@ pub struct TableVerdicts {
     pub tables: BTreeMap<String, bool>,
 }
 
-/// The deployment's active schools, by slug.
+/// The deployment's active schools, as hyphenated uuids.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SchoolDirectory {
     pub schools: Vec<String>,
 }
 
 /// One school's own identity, as a rendered report prints it. The bridge
-/// frame already names the school by slug, but a document that reaches a
-/// manager's screen carries the display name, and the control row is the only
-/// authority on it.
+/// frame already names the school by uuid, and a document that reaches a
+/// manager's screen also carries the display name. The control row is the
+/// only authority on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReportSchool {
-    /// `school.id` — the surrogate key, not the slug: a slug may be renamed.
+    /// `school.id`, hyphenated.
     pub id: String,
-    pub slug: String,
     pub name: String,
 }
 
@@ -855,31 +855,32 @@ pub async fn last_pending(db: &Database) -> Result<PendingList, AppError> {
     })
 }
 
-/// The deployment's active schools, by slug — the one read that is not
-/// scoped to a school, because it is how a shared AI fleet learns which
-/// schools exist.
+/// The deployment's active schools, as hyphenated uuids — the one read that
+/// is not scoped to a school, because it is how a shared AI fleet learns
+/// which schools exist.
 pub async fn active_schools(control: &Database) -> Result<SchoolDirectory, AppError> {
     let schools = sqlx::query_scalar!(
-        "SELECT slug FROM school WHERE status = 'active' ORDER BY slug"
+        "SELECT id FROM school WHERE status = 'active' ORDER BY name"
     )
     .fetch_all(control)
     .await?;
-    Ok(SchoolDirectory { schools })
+    Ok(SchoolDirectory {
+        schools: schools.into_iter().map(|id| id.to_string()).collect(),
+    })
 }
 
-/// One school's identity row, by slug. `None` only for a slug the control
+/// One school's identity row, by id. `None` only for an id the control
 /// database does not hold — a resolved tenant always has one, so a caller
 /// reads that as an internal fault, not as a refusal.
 pub async fn school_identity(
     control: &Database,
-    slug: &str,
+    id: &SchoolId,
 ) -> Result<Option<ReportSchool>, AppError> {
-    let row = sqlx::query!("SELECT id, name FROM school WHERE slug = $1", slug)
+    let row = sqlx::query!("SELECT id, name FROM school WHERE id = $1", id.uuid())
         .fetch_optional(control)
         .await?;
     Ok(row.map(|row| ReportSchool {
         id: row.id.to_string(),
-        slug: slug.to_string(),
         name: row.name,
     }))
 }

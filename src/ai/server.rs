@@ -35,7 +35,7 @@ use crate::module::Module;
 use crate::state::AppState;
 use crate::telemetry::Metrics;
 use crate::service::course::can_view_course;
-use crate::tenant::{ResolvedTenant, Slug, Tenants};
+use crate::tenant::{ResolvedTenant, SchoolId, Tenants};
 use crate::web::blob_path;
 use crate::web::extractor::AiPrincipal;
 use crate::web::tenant_state::{TenantExt, school_files_path};
@@ -68,40 +68,41 @@ struct ApiHandle {
 }
 
 impl ApiHandle {
-    /// Resolve the slug a frame named into that school's database, or the
-    /// refusal the service gets.
+    /// Resolve the school a frame named, or the refusal the service gets.
     ///
-    /// The three codes are distinct on purpose: `malformed` is the service's
-    /// own bug (that string is no slug), `unknown_school` means the deployment
-    /// has no such customer, and `school_suspended` means it has one that is
-    /// switched off — a service that retries the first two forever learns
-    /// nothing, while the third is worth retrying later.
+    /// A value that is not a hyphenated uuid is `unknown_school`, not
+    /// `malformed`: `malformed` stays the frame-shape error. `unknown_school`
+    /// means the deployment has no such customer, and `school_suspended`
+    /// means it has one that is switched off.
     async fn school(&self, school: &str) -> Result<ResolvedTenant, (&'static str, String)> {
-        let slug = Slug::try_new(school).map_err(|err| {
-            (
-                "malformed",
-                format!("`{school}` is not a school slug: {err}"),
-            )
-        })?;
-        self.tenants.resolve(&slug).await.map_err(|err| match err {
+        let id = match SchoolId::try_parse(school) {
+            Ok(id) => id,
+            Err(_) => {
+                return Err((
+                    "unknown_school",
+                    format!("this deployment serves no `{school}` school"),
+                ));
+            }
+        };
+        self.tenants.resolve(&id).await.map_err(|err| match err {
             AppError::Unauthorized => (
                 "unknown_school",
-                format!("this deployment serves no `{slug}` school"),
+                format!("this deployment serves no `{id}` school"),
             ),
             AppError::Forbidden(_) => (
                 "school_suspended",
-                format!("the `{slug}` school is suspended"),
+                format!("the `{id}` school is suspended"),
             ),
             other => (
                 "unavailable",
-                format!("the `{slug}` school is not reachable: {other}"),
+                format!("the `{id}` school is not reachable: {other}"),
             ),
         })
     }
 
     /// One school's blob directory.
-    fn files_dir(&self, slug: &Slug) -> std::path::PathBuf {
-        school_files_path(&self.files_path, slug)
+    fn files_dir(&self, id: &SchoolId) -> std::path::PathBuf {
+        school_files_path(&self.files_path, id)
     }
 }
 
@@ -243,7 +244,7 @@ impl AiBridge {
     /// the correlation, and a slow one cannot stall a fast one.
     pub async fn dispatch(
         &self,
-        school: &Slug,
+        school: &SchoolId,
         capability: &str,
         payload: Value,
     ) -> Result<Value, AiError> {
@@ -256,7 +257,7 @@ impl AiBridge {
     /// generation).
     pub async fn dispatch_with_timeout(
         &self,
-        school: &Slug,
+        school: &SchoolId,
         capability: &str,
         payload: Value,
         timeout: Duration,
@@ -275,7 +276,7 @@ impl AiBridge {
             payload,
         };
 
-        // The span names the capability, the worker, the school slug and this
+        // The span names the capability, the worker, the school uuid and this
         // call's own id — never the payload, which is the user's own text.
         let span = tracing::info_span!(
             "ai.request",
@@ -532,7 +533,7 @@ async fn serve_client_stream(
         }
     };
     let id = string_field(&raw, "id");
-    // Echoed verbatim on a refusal, before it is known to be a slug at all:
+    // Echoed verbatim on a refusal, before it is known to be a school at all:
     // it is how the service tells which of its in-flight reads was refused.
     let school = string_field(&raw, "school");
     // Routed on the shape's required field rather than by parsing one and
@@ -740,18 +741,18 @@ async fn ingest_upload(
         "the api is not serving yet — retry".to_string(),
     ))?;
     let tenant = api.school(&request.school).await?;
-    let (slug, db) = (tenant.slug, tenant.db);
+    let (school, db) = (tenant.id, tenant.db);
     // This stream bypasses the router, so it also bypasses the route_layer the
     // module gate is — the entitlement is checked here by hand instead. The
     // podcast nest is the `chatbot` module's, exactly as it is over HTTP.
     if !tenant.modules.contains(Module::Chatbot) {
         return Err((
             "not_permitted",
-            format!("the `{slug}` school has no `chatbot` module"),
+            format!("the `{school}` school has no `chatbot` module"),
         ));
     }
     let refusal = crate::ai::podcast::refusal;
-    let root = api.files_dir(&slug);
+    let root = api.files_dir(&school);
     let (key, size) = crate::ai::podcast::ingest(&db, &root, request, body)
         .await
         .map_err(|r| refusal(&r))?;
@@ -790,7 +791,7 @@ async fn open_blob(
         "the api is not serving yet — retry".to_string(),
     ))?;
     let tenant = api.school(&request.school).await?;
-    let (slug, db) = (tenant.slug, tenant.db);
+    let (school, db) = (tenant.id, tenant.db);
     // This stream bypasses the router, so it also bypasses the route_layer the
     // module gate is — the entitlement is checked here by hand instead.
     // `chatbot` too: a school that did not buy the `ai` package sends no data
@@ -799,7 +800,7 @@ async fn open_blob(
         if !tenant.modules.contains(module) {
             return Err((
                 "module_disabled",
-                format!("the `{slug}` school has no `{module}` module"),
+                format!("the `{school}` school has no `{module}` module"),
             ));
         }
     }
@@ -839,7 +840,7 @@ async fn open_blob(
 
     // The row exists but its blob does not: server-side damage (a lost volume
     // path), exactly as `download_file` reads it — not the service's `404`.
-    let path = blob_path(&api.files_dir(&slug), &file.get_id().key());
+    let path = blob_path(&api.files_dir(&school), &file.get_id().key());
     let handle = tokio::fs::File::open(&path).await.map_err(|e| {
         (
             "unavailable",
@@ -955,7 +956,7 @@ async fn dispatch_api(
     } = request;
 
     // The school comes off the frame, so this is where a service naming a
-    // stranger's slug (or a suspended school's) is stopped — before a row of
+    // stranger's school (or a suspended school's) is stopped — before a row of
     // anyone's data is read.
     let tenant = api.school(&school).await?;
     let db = tenant.db.clone();
@@ -985,7 +986,7 @@ async fn dispatch_api(
     // Carries the school's entitlements too, so the router's module gate
     // refuses a disabled nest on this path exactly as it does over HTTP.
     dispatched.extensions_mut().insert(TenantExt {
-        slug: tenant.slug,
+        id: tenant.id,
         db,
         modules: tenant.modules,
     });
@@ -1397,7 +1398,7 @@ mod tests {
         refuse_before_dispatch,
     };
     use crate::ai::protocol::read_frame;
-    use crate::tenant::DEMO_SLUG;
+    use crate::tenant::DEMO_SCHOOL_ID;
 
     /// An armed handle serving `router`. The database is never touched by these
     /// reads (nobody is named, so the principal is synthetic), but the handle
@@ -1414,7 +1415,7 @@ mod tests {
     fn read_of(path: &str) -> ApiRequest {
         ApiRequest {
             id: "trace-1".to_string(),
-            school: DEMO_SLUG.to_string(),
+            school: DEMO_SCHOOL_ID.to_string(),
             path: path.to_string(),
             query: None,
             on_behalf_of: None,
@@ -1485,7 +1486,7 @@ mod tests {
         // frame may precede it on the stream.
         let big = ApiResponse::Ok {
             id: "trace-1".to_string(),
-            school: DEMO_SLUG.to_string(),
+            school: DEMO_SCHOOL_ID.to_string(),
             status: 200,
             body: serde_json::Value::String("x".repeat(AI_MAX_FRAME_BYTES)),
         };

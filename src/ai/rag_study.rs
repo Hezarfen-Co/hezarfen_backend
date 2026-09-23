@@ -27,7 +27,7 @@ use crate::constant::{
     AI_RAG_QUESTIONS_CAPABILITY, AI_RAG_QUESTIONS_TIMEOUT_SECS, AI_RAG_SUMMARIZE_CAPABILITY,
     AI_RAG_SUMMARIZE_TIMEOUT_SECS,
 };
-use crate::tenant::Slug;
+use crate::tenant::SchoolId;
 
 /// The one corpus a study request is addressed to, and where inside it.
 ///
@@ -198,14 +198,14 @@ pub struct RagQuestionsReply {
 /// reach the caller as a `502` — the same posture `rag.chat` takes.
 pub async fn summarize(
     bridge: &AiBridge,
-    slug: &Slug,
+    school: &SchoolId,
     payload: RagSummarizePayload,
 ) -> Result<RagSummarizeReply, String> {
     let asker = payload.asker.clone();
     let encoded = encode(&payload, AI_RAG_SUMMARIZE_CAPABILITY)?;
     let raw = bridge
         .dispatch_with_timeout(
-            slug,
+            school,
             AI_RAG_SUMMARIZE_CAPABILITY,
             encoded,
             Duration::from_secs(AI_RAG_SUMMARIZE_TIMEOUT_SECS),
@@ -221,14 +221,14 @@ pub async fn summarize(
 /// corpus. The refusal vocabulary is [`summarize`]'s, code for code.
 pub async fn questions(
     bridge: &AiBridge,
-    slug: &Slug,
+    school: &SchoolId,
     payload: RagQuestionsPayload,
 ) -> Result<RagQuestionsReply, String> {
     let asker = payload.asker.clone();
     let encoded = encode(&payload, AI_RAG_QUESTIONS_CAPABILITY)?;
     let raw = bridge
         .dispatch_with_timeout(
-            slug,
+            school,
             AI_RAG_QUESTIONS_CAPABILITY,
             encoded,
             Duration::from_secs(AI_RAG_QUESTIONS_TIMEOUT_SECS),

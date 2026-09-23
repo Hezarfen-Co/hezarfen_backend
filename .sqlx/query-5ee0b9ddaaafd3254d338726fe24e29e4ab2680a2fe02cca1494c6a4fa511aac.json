@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name FROM school WHERE slug = $1",
+  "query": "SELECT id, name FROM school WHERE status = 'active' ORDER BY name",
   "describe": {
     "columns": [
       {
@@ -27,14 +27,12 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Text"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
       false
     ]
   },
-  "hash": "4a50c4e5b4c369736b0a5b55dfd143b69def99f1e2113817ff6b9b2bbfc8a2b9"
+  "hash": "5ee0b9ddaaafd3254d338726fe24e29e4ab2680a2fe02cca1494c6a4fa511aac"
 }

@@ -26,7 +26,7 @@ use hezarfen_backend::constant::{
 };
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
-use hezarfen_backend::tenant::DEMO_SLUG;
+use hezarfen_backend::tenant::DEMO_SCHOOL_ID;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -453,11 +453,9 @@ async fn a_generated_report_is_stored_and_served_to_its_manager() {
         request.payload["requested_by"], manager_id,
         "the dispatch names the authenticated caller, not the school"
     );
-    assert_eq!(request.payload["school"]["slug"], DEMO_SLUG);
-    assert!(
-        request.payload["school"]["id"].as_str().is_some_and(|id| !id.is_empty()),
-        "the school's own id travels"
-    );
+    assert!(request.payload["school"].get("slug").is_none(), "the report school has no slug");
+    assert_eq!(request.payload["school"]["id"], DEMO_SCHOOL_ID);
+    assert_eq!(request.payload["school"]["name"], "Demo School");
     assert!(
         request.payload["school"]["name"]
             .as_str()

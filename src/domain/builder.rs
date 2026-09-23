@@ -3,7 +3,7 @@
 //! A builder creates, suspends and drops schools; it is **not** a user of any
 //! school and holds no role there. The two principals are kept apart by
 //! construction: a builder row lives in a different database and its cookie
-//! carries a different prefix (`builder.<token>` against `<slug>.<token>`), so
+//! carries a different prefix (`builder.<token>` against `<uuid>.<token>`), so
 //! neither extractor can be fed the other's cookie.
 //!
 //! The credential newtypes are [`crate::domain::user`]'s — same rules, same

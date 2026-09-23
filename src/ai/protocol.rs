@@ -60,7 +60,7 @@
 //!
 //! * `malformed` — the frame is not this shape (a missing or mistyped field).
 //! * `unknown_capability` — no operation this backend serves has that name.
-//! * `unknown_school` — the named slug is not a school on this deployment.
+//! * `unknown_school` — the named id is not a school on this deployment.
 //! * `school_suspended` — it exists and is switched off; worth retrying later.
 //! * `not_permitted` — the school's own feature set refuses the operation.
 //! * `invalid_payload` — the payload does not fit the operation's contract
@@ -75,13 +75,13 @@
 //!
 //! # School scoping
 //!
-//! Every request frame names its school by slug, and every answer echoes it:
+//! Every request frame names its school by uuid, and every answer echoes it:
 //! [`Request::school`], [`ApiRequest::school`], [`BlobRequest::school`] and
 //! their responses. The AI fleet is *shared* across the deployment — one
 //! service serves every school — so the school cannot be bound once at
 //! handshake time and [`Hello`] deliberately carries none: a service pinned to
 //! one school would have to be run once per customer. A frame without a
-//! `school` is `malformed`, an unknown slug is `unknown_school`, a suspended
+//! `school` is `malformed`, an unknown id is `unknown_school`, a suspended
 //! one `school_suspended`; there is no default and no fallback, because a read
 //! answered out of the wrong school's database is the one failure this field
 //! exists to make impossible.
@@ -175,7 +175,8 @@ pub enum RejectCode {
 pub struct Request {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
-    /// Slug of the school this work belongs to. Required — see this module's
+    /// Uuid of the school this work belongs to (hyphenated form). Required —
+    /// see this module's
     /// "School scoping".
     pub school: String,
     /// Which capability from the worker's [`Hello::capabilities`] to invoke.
@@ -215,7 +216,8 @@ pub enum Response {
 pub struct ApiRequest {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
-    /// Slug of the school to read. Required — see this module's "School
+    /// Uuid of the school to read (hyphenated form). Required — see this
+    /// module's "School
     /// scoping"; the answer comes out of that school's own database.
     pub school: String,
     /// Path as the REST API spells it, e.g. `"/users/me"`. No host, no query.
@@ -250,7 +252,7 @@ pub enum ApiResponse {
     Err {
         id: String,
         /// Echo of the school the frame named — as sent, even when it named no
-        /// school a slug could be made of, so a service can tell which of its
+        /// school a uuid could be made of, so a service can tell which of its
         /// in-flight reads was refused.
         school: String,
         /// Bridge-defined, stable, machine-readable (`"path_not_allowed"`,
@@ -267,7 +269,8 @@ pub enum ApiResponse {
 pub struct BlobRequest {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
-    /// Slug of the school the file belongs to. Required — see this module's
+    /// Uuid of the school the file belongs to (hyphenated form). Required —
+    /// see this module's
     /// "School scoping"; the bytes come out of that school's blob directory.
     pub school: String,
     /// The `course_note_file` record key, as `GET /course-notes/{id}/files`
@@ -317,7 +320,8 @@ pub enum BlobResponse {
 pub struct CapabilityRequest {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
-    /// Slug of the school the call is scoped to. Required, exactly as on
+    /// Uuid of the school the call is scoped to (hyphenated form). Required,
+    /// exactly as on
     /// every other frame — one capability is deployment-scoped
     /// (`insight.schools.list`, whose answer *is* the school directory) and
     /// sends the empty string there.
@@ -372,7 +376,8 @@ pub struct BlobUploadRequest {
     pub id: String,
     /// The shape marker. Must be `true`; any other value is `malformed`.
     pub upload: bool,
-    /// Slug of the school the artifact belongs to. Required — the bytes land
+    /// Uuid of the school the artifact belongs to (hyphenated form). Required
+    /// — the bytes land
     /// in that school's own blob directory, never anywhere else.
     pub school: String,
     /// The backend-minted podcast job the artifact belongs to.

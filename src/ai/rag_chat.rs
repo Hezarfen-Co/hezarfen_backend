@@ -149,7 +149,7 @@ pub struct RagChatReplyPayload {
 pub async fn answer(
     db: &crate::database::Database,
     bridge: &crate::ai::AiBridge,
-    slug: &crate::tenant::Slug,
+    school: &crate::tenant::SchoolId,
     thread: &crate::domain::rag_thread::RagThreadId,
     fresh: &[crate::domain::rag_message::RagMessageId; 2],
     prompt: String,
@@ -178,7 +178,7 @@ pub async fn answer(
 
     let raw = bridge
         .dispatch_with_timeout(
-            slug,
+            school,
             AI_RAG_CHAT_CAPABILITY,
             payload,
             std::time::Duration::from_secs(AI_RAG_CHAT_TIMEOUT_SECS),

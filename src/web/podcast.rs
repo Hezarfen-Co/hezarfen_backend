@@ -69,7 +69,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::course_note_file as note_files;
 use crate::service::podcast_job as jobs;
 use crate::state::AppState;
-use crate::web::tenant_state::{SchoolSlug, State};
+use crate::web::tenant_state::{SchoolIdCookie, State};
 
 use super::{CurrentUser, Page, PageParams, ai_unavailable, pump};
 
@@ -179,7 +179,7 @@ struct CancelVerdict {
 )]
 async fn submit(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Json(req): Json<SubmitPodcast>,
 ) -> Result<Response, AppError> {
@@ -226,7 +226,7 @@ async fn submit(
         format: req.format.clone(),
         user_id: user.get_id().key(),
     };
-    match podcast::submit(&bridge, &slug, payload).await {
+    match podcast::submit(&bridge, &school, payload).await {
         // The echo is checked, not trusted: this id is the only handle every
         // later call uses, so an answer about some other job is a protocol
         // failure, not a receipt.
@@ -556,7 +556,7 @@ async fn audio(
 )]
 async fn cancel(
     State(st): State<AppState>,
-    SchoolSlug(slug): SchoolSlug,
+    SchoolIdCookie(school): SchoolIdCookie,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
@@ -582,7 +582,7 @@ async fn cancel(
     };
     match podcast::cancel(
         &bridge,
-        &slug,
+        &school,
         PodcastCancelPayload {
             job_id: job_id.clone(),
         },
