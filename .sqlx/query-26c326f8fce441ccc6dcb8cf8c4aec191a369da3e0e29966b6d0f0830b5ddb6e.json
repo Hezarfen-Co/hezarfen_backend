@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE podcast_job SET state = $3, stage = $4, progress = $5, error_code = $6, format = COALESCE(format, $7::text), transcript = COALESCE(transcript, $8::text), updated_at = $9 WHERE id = $1 AND state = $2 RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+  "query": "UPDATE podcast_job SET state = 'cancelled', stage = '', updated_at = $2 WHERE id = $1 AND state IN ('queued', 'running') RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "sources: Json<Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "sources"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "state: PodcastJobState",
         "type_info": "Text",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "stage",
         "type_info": "Text",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "progress",
         "type_info": "Float8",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "error_code",
         "type_info": "Text",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "audio_key",
         "type_info": "Text",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "audio_name",
         "type_info": "Text",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "audio_type",
         "type_info": "Text",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "audio_bytes",
         "type_info": "Int8",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "duration_secs",
         "type_info": "Float8",
         "origin": {
@@ -158,7 +169,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "eta_secs",
         "type_info": "Int8",
         "origin": {
@@ -169,7 +180,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "created_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "updated_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -194,13 +205,6 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Float8",
-        "Text",
-        "Text",
-        "Text",
         "Int8"
       ]
     },
@@ -208,6 +212,7 @@
       false,
       false,
       false,
+      true,
       true,
       true,
       false,
@@ -224,5 +229,5 @@
       false
     ]
   },
-  "hash": "f40008ce74997412bd8099f21cc58579d2c6efc73d04072849fe650a737e7a4c"
+  "hash": "26c326f8fce441ccc6dcb8cf8c4aec191a369da3e0e29966b6d0f0830b5ddb6e"
 }

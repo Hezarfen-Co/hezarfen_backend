@@ -36,13 +36,13 @@
 //! window (see [`PodcastJob::projected`]): the projection writes nothing, and
 //! the service's next report overwrites it.
 //!
-//! The **source** is resolved here, not by the service: `source_id` names a
+//! The **sources** are resolved here, not by the service: `source_id` names a
 //! course note in the caller's own school, and the submit door hands the
-//! service the blob key of that note's newest `application/pdf` attachment
-//! (`source_key`) — the file it reads under its shared media root. A note with
-//! no such attachment, or one whose blob is missing from this host, is refused
-//! `409 source_missing` before the row is written, so a job that could only
-//! fail is never queued.
+//! service that note's attachments — every one whose blob is on this host, in
+//! upload order — as `sources` (`source_key` rides on as the first source's
+//! key, one-release compat). A note with no attachments, or one whose blobs
+//! are all missing from this host, is refused `409 source_missing` before the
+//! row is written, so a job that could only fail is never queued.
 
 use axum::Json;
 use axum::body::Body;
@@ -58,7 +58,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::ai::AiBridge;
-use crate::ai::podcast::{self, PodcastCancelPayload, PodcastSubmitPayload};
+use crate::ai::podcast::{self, PodcastCancelPayload, PodcastSource, PodcastSubmitPayload};
 use crate::constant::{
     AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY, PODCAST_INTERRUPTED_CODE,
 };
@@ -124,6 +124,20 @@ struct JobStatus {
     error_code: Option<String>,
 }
 
+/// One attachment's outcome in the finished episode, as the service reported
+/// it.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct JobSourceStatus {
+    /// The attachment's blob key — the id `GET /course-notes/{id}/files`
+    /// lists.
+    key: String,
+    /// The file name the upload declared.
+    name: String,
+    /// `ok`, or `skipped:<code>` when the source failed extraction and was
+    /// left out of the episode.
+    status: String,
+}
+
 /// A finished job's artifacts.
 #[derive(Serialize, ToSchema)]
 struct JobArtifacts {
@@ -140,6 +154,10 @@ struct JobArtifacts {
     /// finished before the column existed, and any later job whose done report
     /// omitted the field.
     transcript: Option<String>,
+    /// Per-source outcomes for a multi-document episode, exactly as the
+    /// service reported them. `null` for episodes finished before the field
+    /// existed, or by a service that has not learned it.
+    sources: Option<Vec<JobSourceStatus>>,
 }
 
 /// The verdict on a cancel.
@@ -162,11 +180,12 @@ struct CancelVerdict {
 /// far as a row either (see below).
 ///
 /// `source_id` names a course note in this school, and the door resolves it
-/// first: what the service narrates is that note's **newest
-/// `application/pdf` attachment**, whose blob key rides the dispatch as
-/// `source_key`. A note with no PDF — or one whose blob is missing from this
-/// host — is a `409 source_missing` before anything is written, so a job that
-/// is guaranteed to fail is never queued for the service to discover later.
+/// first: what the service narrates is that note's **attachments** — every
+/// one whose blob is on this host, dispatched as `sources` in upload order
+/// (a missing blob is skipped with a log line, not a refusal). A note with
+/// no attachments — or none whose blob is on this host — is a `409
+/// source_missing` before anything is written, so a job that is guaranteed
+/// to fail is never queued for the service to discover later.
 #[utoipa::path(
     post,
     path = "/jobs",
@@ -177,7 +196,7 @@ struct CancelVerdict {
         (status = 202, description = "The job is queued; `job_id` names it from here on", body = JobReceipt),
         (status = 400, description = "Empty `source_id`, or a `format` the service does not serve", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 409, description = "The note has no `application/pdf` attachment, or that attachment's blob is missing from this host (`source_missing`)", body = ErrorResponse),
+        (status = 409, description = "The note has no attachments at all, or none of its attachment blobs are present on this host (`source_missing`)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing", body = ErrorResponse),
         (status = 503, description = "No AI service offers `podcast.submit` (or the service is at capacity)", body = ErrorResponse),
     ),
@@ -203,24 +222,51 @@ async fn submit(
         }));
     }
 
-    // The source is resolved here, before anything is written: what the
-    // service narrates is the note's own newest PDF, and the key of those
-    // bytes is what rides the dispatch. Both shapes of "no source" are refused
-    // now — queueing the job would only buy a failure in the service's own
-    // `kaynak` stage, with the caller already holding a job id.
-    let file = note_files::newest_pdf(&st.db, &CourseNoteId::from_key(source_id))
-        .await?
-        .ok_or_else(|| source_missing("this course note has no PDF attachment to narrate"))?;
-    let source_key = file.get_id().key();
-    match tokio::fs::try_exists(crate::web::blob_path(&st.files_path, &source_key)).await {
-        Ok(true) => {}
-        Ok(false) => return Err(source_missing("this note's PDF is missing on this host")),
-        Err(err) => {
-            return Err(AppError::Internal(format!(
-                "could not stat the note's PDF blob: {err}"
-            )));
+    // The sources are resolved here, before anything is written: what the
+    // service narrates is the note's own attachments — every one whose blob
+    // is on this host, in upload order (id ASC) — and those keys are what
+    // ride the dispatch. A blob that is gone is skipped with a log line, not
+    // a refusal: the episode just narrates fewer documents. Both shapes of
+    // "no source at all" are refused now — queueing the job would only buy a
+    // failure in the service's own `kaynak` stage, with the caller already
+    // holding a job id.
+    let (mut files, _) =
+        note_files::list_for(&st.db, &CourseNoteId::from_key(source_id), None, 0).await?;
+    let attachments = files.len();
+    // `list_for` is newest first; the payload carries upload order (id ASC),
+    // the order the service narrates in.
+    files.sort_by_key(|file| file.get_id().uuid());
+    let mut sources = Vec::with_capacity(files.len());
+    for file in files {
+        let key = file.get_id().key();
+        match tokio::fs::try_exists(crate::web::blob_path(&st.files_path, &key)).await {
+            Ok(true) => sources.push(PodcastSource {
+                key,
+                name: file.get_name().as_str().to_string(),
+                content_type: file.get_content_type().as_str().to_string(),
+            }),
+            // The row is intact, the bytes are not: leave this one document
+            // out rather than refusing a note whose other attachments are
+            // fine.
+            Ok(false) => tracing::warn!(
+                key = %key,
+                "podcast source's blob is missing from this host; skipping it"
+            ),
+            Err(err) => {
+                return Err(AppError::Internal(format!(
+                    "could not stat a note attachment blob: {err}"
+                )));
+            }
         }
     }
+    if sources.is_empty() {
+        return Err(source_missing(if attachments == 0 {
+            "this course note has no attachments to narrate"
+        } else {
+            "none of this note's attachments are on this host"
+        }));
+    }
+    let source_key = sources[0].key.clone();
 
     let job = jobs::create(&st.db, user.get_id(), source_id, req.format.as_deref()).await?;
     let job_id = job.get_id().key();
@@ -228,6 +274,7 @@ async fn submit(
         job_id: job_id.clone(),
         source_id: source_id.to_string(),
         source_key,
+        sources,
         format: req.format.clone(),
         user_id: user.get_id().key(),
     };
@@ -472,6 +519,10 @@ async fn result(
         duration_secs: job.get_duration_secs(),
         format: job.get_format().map(str::to_string),
         transcript: job.get_transcript().map(str::to_string),
+        sources: job.get_sources().map(|sources| {
+            serde_json::from_value(sources.clone())
+                .expect("the report decode guarantees the stored sources shape")
+        }),
     })
     .into_response())
 }
@@ -665,10 +716,10 @@ fn worker_for(st: &AppState, capability: &str) -> Result<AiBridge, NoWorker> {
 }
 
 /// The submit door's own refusal: the note behind `source_id` cannot be
-/// narrated — it has no PDF attachment, or the bytes the row names are gone
-/// from this host. One code (`source_missing`) for both, a message that says
-/// which side is missing, and a `409` either way, so a client branches on the
-/// code instead of parsing the sentence.
+/// narrated — it has no attachments, or the bytes every one of them names are
+/// gone from this host. One code (`source_missing`) for both, a message that
+/// says which side is missing, and a `409` either way, so a client branches on
+/// the code instead of parsing the sentence.
 fn source_missing(message: &str) -> AppError {
     AppError::ConflictCoded {
         code: "source_missing",

@@ -23,6 +23,8 @@ use crate::domain::podcast_job::{PodcastJob, PodcastJobId, PodcastJobState};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use serde_json::Value;
+use sqlx::types::Json;
 use sqlx::{query, query_as};
 
 /// Write one freshly minted job. The id and timestamps are the caller's — the
@@ -33,10 +35,10 @@ pub async fn insert(db: &Database, job: &PodcastJob) -> Result<PodcastJob, AppEr
         PodcastJob,
         "INSERT INTO podcast_job (id, user_id, source_id, format, state, stage, progress, \
              error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, \
-             eta_secs, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15) \
+             eta_secs, created_at, updated_at, sources) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16) \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         job.get_id().uuid(),
@@ -54,6 +56,7 @@ pub async fn insert(db: &Database, job: &PodcastJob) -> Result<PodcastJob, AppEr
         job.get_duration_secs(),
         job.get_eta_secs(),
         job.get_created_at().as_millis(),
+        job.get_sources(),
     )
     .fetch_one(db)
     .await?)
@@ -65,7 +68,7 @@ pub async fn read(db: &Database, id: &PodcastJobId) -> Result<Option<PodcastJob>
     Ok(query_as!(
         PodcastJob,
         "SELECT id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" \
          FROM podcast_job WHERE id = $1",
@@ -87,7 +90,7 @@ pub async fn read_for(
     Ok(query_as!(
         PodcastJob,
         "SELECT id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" \
          FROM podcast_job WHERE id = $1 AND user_id = $2",
@@ -177,11 +180,11 @@ async fn with_source_titles(
 /// concurrent write (a cancel, another report) moved it first — the caller
 /// re-reads and answers the truth.
 ///
-/// `format` and `transcript` fill their columns once and never rewrite them:
-/// the service's default resolution arrives on the first report, and a later
-/// report disagreeing with the format is refused by the service layer, not
-/// silently stored. A later transcript is ignored the same way — the first
-/// non-null value stands.
+/// `format`, `transcript` and `sources` fill their columns once and never
+/// rewrite them: the service's default resolution arrives on the first
+/// report, and a later report disagreeing with the format is refused by the
+/// service layer, not silently stored. A later transcript is ignored the same
+/// way — the first non-null value stands.
 #[allow(clippy::too_many_arguments)]
 pub async fn report(
     db: &Database,
@@ -193,16 +196,17 @@ pub async fn report(
     error_code: Option<&str>,
     format: Option<&str>,
     transcript: Option<&str>,
+    sources: Option<&Value>,
 ) -> Result<Option<PodcastJob>, AppError> {
     let now = Timestamp::now().as_millis();
     Ok(query_as!(
         PodcastJob,
         "UPDATE podcast_job SET state = $3, stage = $4, progress = $5, error_code = $6, \
              format = COALESCE(format, $7::text), transcript = COALESCE(transcript, $8::text), \
-             updated_at = $9 \
-         WHERE id = $1 AND state = $2 \
+             sources = COALESCE(sources, $9::jsonb), updated_at = $10 \
+        WHERE id = $1 AND state = $2 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-             source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+             source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -213,6 +217,7 @@ pub async fn report(
         error_code,
         format,
         transcript,
+        sources,
         now,
     )
     .fetch_optional(db)
@@ -233,7 +238,7 @@ pub async fn set_cancelled(
         "UPDATE podcast_job SET state = 'cancelled', stage = '', updated_at = $2 \
          WHERE id = $1 AND state IN ('queued', 'running') \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -258,7 +263,7 @@ pub async fn set_failed(
         "UPDATE podcast_job SET state = 'failed', error_code = $2, stage = '', updated_at = $3 \
          WHERE id = $1 AND state IN ('queued', 'running') \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -289,7 +294,7 @@ pub async fn set_audio(
              audio_bytes = $5, duration_secs = $6, updated_at = $7 \
          WHERE id = $1 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -316,7 +321,7 @@ pub async fn set_eta(
         PodcastJob,
         "UPDATE podcast_job SET eta_secs = $2 WHERE id = $1 \
          RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", \
-            source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, \
+            source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, \
              audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, \
              created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
         id.uuid(),
@@ -361,6 +366,7 @@ mod tests {
             source_id: "src".to_string(),
             format: None,
             transcript: None,
+            sources: None,
             state: PodcastJobState::Queued,
             stage: String::new(),
             progress: 0.0,
@@ -398,6 +404,7 @@ mod tests {
             None,
             Some("duz_okuma"),
             Some("bolum bir\n\nbolum iki"),
+            None,
         )
         .await
         .expect("report")
@@ -417,6 +424,7 @@ mod tests {
             None,
             None,
             Some("should not land"),
+            None,
         )
         .await
         .expect("report");
@@ -434,6 +442,7 @@ mod tests {
             None,
             None,
             Some("also not"),
+            None,
         )
         .await
         .expect("report");
@@ -495,6 +504,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(refused.is_err(), "the CHECK backstops the service layer");
@@ -520,6 +530,7 @@ mod tests {
             None,
             None,
             Some("metin"),
+            None,
         )
         .await
         .expect("report")

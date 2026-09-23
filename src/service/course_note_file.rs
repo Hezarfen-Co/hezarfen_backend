@@ -32,15 +32,6 @@ pub async fn read_for(
     course_note_file::read_for(db, id, note).await
 }
 
-/// The note's newest `application/pdf` attachment — what the podcast submit
-/// door narrates, resolved before any job row is written.
-pub async fn newest_pdf(
-    db: &Database,
-    note: &CourseNoteId,
-) -> Result<Option<CourseNoteFile>, AppError> {
-    course_note_file::newest_pdf(db, note).await
-}
-
 pub async fn list_for(
     db: &Database,
     note: &CourseNoteId,

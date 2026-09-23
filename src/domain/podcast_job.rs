@@ -27,6 +27,8 @@ use crate::constant::{
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
+use serde_json::Value;
+use sqlx::types::Json;
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
@@ -139,6 +141,10 @@ pub struct PodcastJob {
     /// The episode transcript, chapters joined with blank lines. `None` until
     /// a report carries one, and forever for a job whose service never did.
     pub(crate) transcript: Option<String>,
+    /// The per-source outcomes the service reported on `podcast.report` — a
+    /// JSON array of `{key, name, status}`, stored verbatim. `None` until a
+    /// report carries one, and forever for a job whose service never did.
+    pub(crate) sources: Option<Json<Value>>,
     pub(crate) state: PodcastJobState,
     pub(crate) stage: String,
     pub(crate) progress: f64,
@@ -172,6 +178,11 @@ impl PodcastJob {
 
     pub fn get_transcript(&self) -> Option<&str> {
         self.transcript.as_deref()
+    }
+
+    /// The verbatim per-source report, if the service ever sent one.
+    pub fn get_sources(&self) -> Option<&Value> {
+        self.sources.as_ref().map(|sources| &sources.0)
     }
 
     pub fn get_state(&self) -> PodcastJobState {
@@ -334,6 +345,7 @@ mod tests {
             source_id: "src".to_string(),
             format: None,
             transcript: None,
+            sources: None,
             state,
             stage: String::new(),
             progress: 0.0,

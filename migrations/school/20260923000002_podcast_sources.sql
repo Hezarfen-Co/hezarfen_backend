@@ -1,0 +1,11 @@
+-- The per-source outcomes the service reports on `podcast.report` for a
+-- multi-document episode: one JSONB array of `{key, name, status}`, stored
+-- verbatim and replayed by `GET /podcast/jobs/{id}/result`.
+--
+-- WHERE THIS FILE BELONGS: `migrations/school/` in the backend repo. APPEND-ONLY
+-- relative to the existing school migrations: one new nullable column, no
+-- backfill. A job finished before this column existed stays NULL, and a report
+-- that omits the field (a service that has not learned it yet) leaves it NULL.
+-- The report statement fills it once (`COALESCE`), the same way `transcript`
+-- is filled, and never rewrites a value that already landed.
+ALTER TABLE podcast_job ADD COLUMN sources JSONB NULL;

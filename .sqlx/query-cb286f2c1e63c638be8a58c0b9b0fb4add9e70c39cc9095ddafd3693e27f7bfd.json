@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO podcast_job (id, user_id, source_id, format, state, stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15) RETURNING id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", source_id, format, transcript, state AS \"state: PodcastJobState\", stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+  "query": "SELECT id AS \"id: PodcastJobId\", user_id AS \"user_id: UserId\", source_id, format, transcript, sources AS \"sources: Json<Value>\", state AS \"state: PodcastJobState\", stage, progress, error_code, audio_key, audio_name, audio_type, audio_bytes, duration_secs, eta_secs, created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM podcast_job WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "sources: Json<Value>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "podcast_job",
+            "name": "sources"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "state: PodcastJobState",
         "type_info": "Text",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "stage",
         "type_info": "Text",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "progress",
         "type_info": "Float8",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "error_code",
         "type_info": "Text",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "audio_key",
         "type_info": "Text",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "audio_name",
         "type_info": "Text",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "audio_type",
         "type_info": "Text",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "audio_bytes",
         "type_info": "Int8",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "duration_secs",
         "type_info": "Float8",
         "origin": {
@@ -158,7 +169,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "eta_secs",
         "type_info": "Int8",
         "origin": {
@@ -169,7 +180,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "created_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "updated_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -193,27 +204,14 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Float8",
-        "Text",
-        "Text",
-        "Text",
-        "Text",
-        "Int8",
-        "Float8",
-        "Int8",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
       false,
+      true,
       true,
       true,
       false,
@@ -230,5 +228,5 @@
       false
     ]
   },
-  "hash": "cabbdce4f24ffcd7792dc8b9b9f72d02d920bf9fabc10c61584b0bd64c7712ff"
+  "hash": "cb286f2c1e63c638be8a58c0b9b0fb4add9e70c39cc9095ddafd3693e27f7bfd"
 }

@@ -9,6 +9,8 @@
 //! enum), the retention window, and the "done means audio" rule — in that
 //! order — before a single statement runs.
 
+use crate::ai::podcast::PodcastSourceStatus;
+use crate::constant::MAX_COURSE_NOTE_FILES;
 use crate::database::Database;
 use crate::db::podcast_job;
 use crate::domain::course_note::CourseNoteId;
@@ -101,6 +103,9 @@ pub struct ReportInput<'a> {
     pub progress: f64,
     pub error_code: Option<&'a str>,
     pub transcript: Option<&'a str>,
+    /// The per-source outcomes, as the report carried them. `None` from a
+    /// service that has not learned the field yet.
+    pub sources: Option<&'a [PodcastSourceStatus]>,
 }
 
 /// Mint and store one freshly submitted job. The id is the backend's (the
@@ -120,6 +125,7 @@ pub async fn create(
         source_id: source_id.to_string(),
         format: format.map(str::to_string),
         transcript: None,
+        sources: None,
         state: PodcastJobState::Queued,
         stage: String::new(),
         progress: 0.0,
@@ -215,6 +221,15 @@ pub async fn report(
             "transcript is longer than {MAX_TRANSCRIPT_LEN} characters"
         )));
     }
+    // A note cannot hold more than [`MAX_COURSE_NOTE_FILES`] attachments, so
+    // a longer source list is not a report this backend could have asked for.
+    if let Some(sources) = input.sources
+        && sources.len() > MAX_COURSE_NOTE_FILES
+    {
+        return Err(PodcastRefusal::InvalidPayload(format!(
+            "sources carries more than the {MAX_COURSE_NOTE_FILES} attachments a note can hold"
+        )));
+    }
 
     let Some(row) = podcast_job::read(db, &id).await? else {
         return Err(PodcastRefusal::UnknownJob);
@@ -253,6 +268,11 @@ pub async fn report(
     // that empty string and then ignore the done report's text, so a blank
     // or all-whitespace transcript is absent, not a value.
     let transcript = input.transcript.filter(|text| !text.trim().is_empty());
+    // Stored verbatim, like the transcript: a service-owned shape this side
+    // neither interprets nor rewrites.
+    let sources = input
+        .sources
+        .map(|sources| serde_json::to_value(sources).expect("a source list is always encodable"));
 
     match podcast_job::report(
         db,
@@ -264,6 +284,7 @@ pub async fn report(
         input.error_code,
         input.format,
         transcript,
+        sources.as_ref(),
     )
     .await?
     {
@@ -387,6 +408,7 @@ mod tests {
             progress: 0.0,
             error_code: None,
             transcript: Some(&huge),
+            sources: None,
         };
         let err = report(&db, &input).await.expect_err("over the cap");
         assert_eq!(err.code(), "invalid_payload");
@@ -423,6 +445,7 @@ mod tests {
             progress: 0.2,
             error_code: None,
             transcript: Some(""),
+            sources: None,
         };
         let running = report(&db, &progress).await.expect("progress report");
         assert_eq!(running.get_state(), PodcastJobState::Running);
@@ -450,6 +473,7 @@ mod tests {
             progress: 1.0,
             error_code: None,
             transcript: Some("bolum bir\n\nbolum iki"),
+            sources: None,
         };
         let finished = report(&db, &done).await.expect("done report");
         assert_eq!(finished.get_transcript(), Some("bolum bir\n\nbolum iki"));

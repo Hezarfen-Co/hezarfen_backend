@@ -294,7 +294,7 @@ async fn submit(app: &Router, cookie: &str, body: Value) -> common::Res {
 
 /// Submit one job for `source` with the standard format (asserting the `202`)
 /// and hand back the backend-minted id every other door names. `source` is the
-/// note id: the door resolves the note's own newest PDF before it writes
+/// note id: the door resolves the note's attachments before it writes
 /// anything, so every submitting test needs a real note behind its source.
 async fn submit_job(app: &Router, cookie: &str, source: &str) -> String {
     let res = submit(
@@ -841,6 +841,57 @@ async fn a_finished_job_serves_the_uploaded_bytes() {
         1,
         "the upload and the reports are the service's own calls, not dispatches"
     );
+}
+
+/// The per-source outcomes ride the done report and come back on the result
+/// door, verbatim — the frontend can show which documents made it into the
+/// episode without a second contract. A job whose service never reported them
+/// keeps the field absent.
+#[tokio::test]
+async fn the_result_door_exposes_the_reported_sources() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let user = common::me_id(&app, &cookie).await;
+    let (note, _key) = note_with_pdf(&app, &db).await;
+    let job_id = submit_job(&app, &cookie, &note).await;
+
+    assert_report_stored(
+        &capability_call(
+            &service.conn,
+            report_frame(&job_id, &note, &user, "running", "tts", 0.25),
+        )
+        .await,
+        &job_id,
+    );
+
+    let bytes = episode_bytes();
+    let answer = blob_upload(
+        &service.conn,
+        upload_frame(&job_id, AUDIO_NAME, AUDIO_TYPE, bytes.len()),
+        &bytes,
+    )
+    .await;
+    assert_eq!(answer["status"], "ok", "{answer}");
+
+    let mut done = report_frame(&job_id, &note, &user, "done", "", 1.0);
+    done["payload"]["transcript"] = json!("bolum bir\n\nbolum iki");
+    done["payload"]["sources"] = json!([
+        { "key": "019732e3-7b00-7000-8000-00000000beef", "name": "tanim.pdf", "status": "ok" },
+        { "key": "019732e3-7b00-7000-8000-00000000feed", "name": "ozet.txt", "status": "skipped:no_text_layer" },
+    ]);
+    assert_report_stored(&capability_call(&service.conn, done).await, &job_id);
+
+    let res = result_of(&app, &cookie, &job_id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["sources"][0]["key"], "019732e3-7b00-7000-8000-00000000beef");
+    assert_eq!(res.body["sources"][0]["name"], "tanim.pdf");
+    assert_eq!(res.body["sources"][0]["status"], "ok");
+    assert_eq!(res.body["sources"][1]["key"], "019732e3-7b00-7000-8000-00000000feed");
+    assert_eq!(res.body["sources"][1]["name"], "ozet.txt");
+    assert_eq!(res.body["sources"][1]["status"], "skipped:no_text_layer");
+
+    // The audio-missing refusal earlier in the file proves a job cannot go
+    // `done` without its upload; a report that never learns `sources` leaves
+    // the field absent rather than an empty list.
 }
 
 /// Cancelling a live job reaches the worker that owns the queue and stamps the
@@ -1593,25 +1644,20 @@ async fn the_old_path_audio_door_is_gone() {
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
 }
 
-/// The submit door resolves the source itself: a note with no PDF attachment
-/// is refused `409 source_missing` **before** anything is written. Pre-fix the
-/// door accepted the job and it died later in the service's `kaynak` stage —
-/// a queued job guaranteed to fail, which is what this refusal exists to
-/// prevent. A newer non-PDF attachment changes nothing: it is not a source.
+/// The submit door resolves the sources itself: a note with no attachments at
+/// all is refused `409 source_missing` **before** anything is written.
+/// Pre-fix the door accepted the job and it died later in the service's
+/// `kaynak` stage — a queued job guaranteed to fail, which is what this
+/// refusal exists to prevent. A single attachment — PDF or not — is a valid
+/// source now, so the refusal is exactly about emptiness.
 #[tokio::test]
-async fn a_note_with_no_pdf_is_refused_at_the_door() {
+async fn a_note_with_no_attachments_is_refused_at_the_door() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
     let course = common::create_course(&app, &teacher, "Matematik").await;
     let note = create_note(&app, &teacher, &course).await;
 
-    let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
-    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
-    assert_eq!(res.body["code"], "source_missing");
-
-    // A non-PDF attachment is newer than nothing, and is still not a source.
-    let _txt = upload_attachment(&app, &teacher, &note, "ozet.txt", "text/plain").await;
     let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     assert_eq!(res.body["code"], "source_missing");
@@ -1624,12 +1670,12 @@ async fn a_note_with_no_pdf_is_refused_at_the_door() {
     assert_eq!(rows_for(&db, &user).await, 0, "and no row is written");
 }
 
-/// A note whose PDF is on record but whose blob is gone from this host is
-/// refused the same way: the row is intact and the bytes are not, and the
-/// service could only fail on it — so the door answers now instead of queueing
-/// a job nobody can finish.
+/// A note whose attachment blobs are **all** gone from this host is refused
+/// the same way as a note with no attachments: the rows are intact and the
+/// bytes are not, and the service could only fail on them — so the door
+/// answers now instead of queueing a job nobody can finish.
 #[tokio::test]
-async fn a_pdf_whose_blob_is_gone_is_refused_at_the_door() {
+async fn a_note_whose_blobs_are_all_gone_is_refused_at_the_door() {
     let (service, app, cookie, db) = podcast_app().await;
     let user = common::me_id(&app, &cookie).await;
     let (note, key) = note_with_pdf(&app, &db).await;
@@ -1647,22 +1693,58 @@ async fn a_pdf_whose_blob_is_gone_is_refused_at_the_door() {
     assert_eq!(rows_for(&db, &user).await, 0, "and no row is written");
 }
 
-/// Which attachment narrates: the note's **newest PDF**, not its newest file —
-/// a text recap uploaded after the PDF is not a source, and a corrected PDF
-/// uploaded after that is.
+/// One blob missing among several is **not** a refusal: the door dispatches
+/// the attachments that are present (the skip is a log line) — the episode
+/// just narrates fewer documents. Only an empty result set refuses.
 #[tokio::test]
-async fn the_source_is_the_newest_pdf_attachment() {
+async fn a_missing_blob_among_several_is_skipped_not_a_refusal() {
+    let (service, app, cookie, db) = podcast_app().await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Matematik").await;
+    let note = create_note(&app, &teacher, &course).await;
+    let kept = upload_attachment(&app, &teacher, &note, "kaldi.pdf", "application/pdf").await;
+    let gone = upload_attachment(&app, &teacher, &note, "gitti.txt", "text/plain").await;
+    let path = common::blob_dir().join(&gone);
+    std::fs::remove_file(&path).expect("take the blob away");
+
+    let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "exactly one dispatch");
+    assert_eq!(seen[0].payload["source_key"], kept, "the first present blob");
+    let sources = seen[0].payload["sources"].as_array().expect("a source list");
+    assert_eq!(sources.len(), 1, "the missing blob is filtered at the door");
+    assert_eq!(sources[0]["key"], kept);
+    assert_eq!(sources[0]["name"], "kaldi.pdf");
+    assert_eq!(
+        sources[0]["content_type"], "application/pdf",
+        "the declared type rides along as a hint"
+    );
+}
+
+/// Which sources narrate: **every** attachment of the note, in upload order
+/// (id ASC) — PDF, text and docx alike; the service extracts by magic bytes,
+/// not by the declared type, so the type rides along as a hint only.
+/// `source_key`, the one-release compat field, is the first source's key.
+#[tokio::test]
+async fn the_sources_are_all_attachments_in_upload_order() {
     let (service, app, cookie, db) = podcast_app().await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
     let course = common::create_course(&app, &teacher, "Matematik").await;
     let note = create_note(&app, &teacher, &course).await;
 
-    let draft = upload_attachment(&app, &teacher, &note, "taslak.pdf", "application/pdf").await;
-    let _newer_text =
-        upload_attachment(&app, &teacher, &note, "ozet.txt", "text/plain").await;
-    let corrected =
-        upload_attachment(&app, &teacher, &note, "duzeltilmis.pdf", "application/pdf").await;
-    assert_ne!(draft, corrected, "two distinct attachment rows");
+    let first = upload_attachment(&app, &teacher, &note, "taslak.pdf", "application/pdf").await;
+    let second = upload_attachment(&app, &teacher, &note, "ozet.txt", "text/plain").await;
+    let third = upload_attachment(
+        &app,
+        &teacher,
+        &note,
+        "konusma.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    .await;
+    assert_ne!(first, second, "two distinct attachment rows");
 
     let res = submit(&app, &cookie, json!({ "source_id": &note })).await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
@@ -1671,10 +1753,25 @@ async fn the_source_is_the_newest_pdf_attachment() {
     assert_eq!(seen.len(), 1, "exactly one dispatch");
     assert_eq!(seen[0].payload["source_id"], note);
     assert_eq!(
-        seen[0].payload["source_key"], corrected,
-        "the newest PDF, not the newest file: {}",
+        seen[0].payload["source_key"], first,
+        "the compat alias is the first source's key: {}",
         seen[0].payload
     );
+    let sources = seen[0].payload["sources"].as_array().expect("a source list");
+    assert_eq!(sources.len(), 3, "{}", seen[0].payload);
+    for (source, (key, name, content_type)) in sources.iter().zip([
+        (first.as_str(), "taslak.pdf", "application/pdf"),
+        (second.as_str(), "ozet.txt", "text/plain"),
+        (
+            third.as_str(),
+            "konusma.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    ]) {
+        assert_eq!(source["key"], key);
+        assert_eq!(source["name"], name);
+        assert_eq!(source["content_type"], content_type);
+    }
 }
 
 /// Authentication is the whole gate on every door: no cookie is a `401`, not a

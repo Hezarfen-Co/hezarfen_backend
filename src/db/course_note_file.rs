@@ -101,31 +101,6 @@ pub async fn read_for(
     Ok(file)
 }
 
-/// The note's newest `application/pdf` attachment — the file the podcast
-/// submit door narrates. `None` covers both a note that never had a PDF and a
-/// note id that names no row at all: either way there is nothing to narrate.
-///
-/// The content type is matched exactly as it was declared on upload, because
-/// that is the only type the service's extractor reads.
-pub async fn newest_pdf(
-    db: &Database,
-    note: &CourseNoteId,
-) -> Result<Option<CourseNoteFile>, AppError> {
-    let file = sqlx::query_as!(
-        CourseNoteFile,
-        r#"SELECT id AS "id: CourseNoteFileId",
-               course_note AS "course_note: CourseNoteId", name AS "name: FileName",
-               content_type AS "content_type: FileContentType", size FROM course_note_file
-           WHERE course_note = $1 AND content_type = 'application/pdf'
-           ORDER BY id DESC
-           LIMIT 1"#,
-        note.uuid()
-    )
-    .fetch_optional(db)
-    .await?;
-    Ok(file)
-}
-
 /// All of `note`'s attachment rows, newest first.
 pub async fn list_for(
     db: &Database,

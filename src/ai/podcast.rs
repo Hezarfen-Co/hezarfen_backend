@@ -1,8 +1,8 @@
 //! Payload contract for the `podcast.*` capabilities and the audio ingest —
 //! both directions of the podcast seam.
 //!
-//! The podcast service turns one stored source — a course note's PDF — into an
-//! audio episode. Since 2026-09-17 the **backend owns that job's record**: the
+//! The podcast service turns a course note's stored attachments — PDF,
+//! document, text — into one audio episode, narrating them in order. Since 2026-09-17 the **backend owns that job's record**: the
 //! submit door mints the job id, writes the row, and then dispatches
 //! `podcast.submit` with that id; the service reports every transition back
 //! through the client-initiated `podcast.report` capability, and uploads the
@@ -17,9 +17,10 @@
 //! * [`submit`] — `podcast.submit`, whose payload carries the backend-minted
 //!   `job_id`, the submitting `user_id` (the service stores both; its own
 //!   record is keyed by the id the backend will keep asking about), and the
-//!   `source_key` of the note's PDF: the backend resolves which file that is
-//!   before the job exists, so the service is never asked to open a name it
-//!   cannot turn into bytes.
+//!   note's `sources` — every attachment whose blob is on this host, in
+//!   upload order: the backend resolves which files those are before the job
+//!   exists, so the service is never asked to open a name it cannot turn
+//!   into bytes.
 //! * [`cancel`] — `podcast.cancel`, unchanged: a write on the service's queue,
 //!   and the capability is what decides whether a deployment offers the door.
 //!
@@ -45,6 +46,17 @@ pub use crate::constant::{
     AI_PODCAST_CANCEL_CAPABILITY, AI_PODCAST_REPORT_CAPABILITY, AI_PODCAST_SUBMIT_CAPABILITY,
 };
 
+/// One attachment the job narrates, as the submit door resolved it: the blob
+/// key the service reads at `<PODCAST_MEDIA_ROOT>/<school>/<key>`, the file
+/// name the upload declared, and the declared content type — which the
+/// service treats as a hint only, extracting by magic bytes instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodcastSource {
+    pub key: String,
+    pub name: String,
+    pub content_type: String,
+}
+
 /// What the backend asks a podcast service to start. The `job_id` is the
 /// backend's own minted id — the service keys its record by it and echoes it
 /// in every report, so the two stores can never disagree about which job a
@@ -52,13 +64,17 @@ pub use crate::constant::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodcastSubmitPayload {
     pub job_id: String,
-    /// The course note the job narrates, for the record. `source_key` is the
-    /// handle the service actually opens.
+    /// The course note the job narrates, for the record.
     pub source_id: String,
-    /// The blob key of the note's PDF attachment — the file the service reads
-    /// at `<PODCAST_MEDIA_ROOT>/<school>/<source_key>`. The backend resolves
-    /// it (the note's newest `application/pdf` attachment) before the job
-    /// exists; `source_id` alone names nothing the service could open.
+    /// The note's attachments, in upload order (id ASC): every attachment
+    /// whose blob is on this host. The backend resolves them before the job
+    /// exists; `source_id` alone names nothing the service could open. The
+    /// service narrates all of them, one document each.
+    pub sources: Vec<PodcastSource>,
+    /// One-release compat alias for `sources[0].key`: the pre-multi-source
+    /// field, kept so a service that has not learned `sources` yet still
+    /// narrates the first document. A service reads `sources` when present
+    /// and falls back to this.
     pub source_key: String,
     /// `None` means the service applies its own default (`duz_okuma` today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +136,22 @@ pub struct PodcastReportPayload {
     /// keeps that older payload valid.
     #[serde(default)]
     pub transcript: Option<String>,
+    /// The per-source outcomes of the episode: `ok`, or `skipped:<code>` for
+    /// a source that failed extraction and was left out. Absent on a service
+    /// that has not learned the field yet — `#[serde(default)]` keeps that
+    /// older payload valid, exactly as it does for `transcript`.
+    #[serde(default)]
+    pub sources: Option<Vec<PodcastSourceStatus>>,
+}
+
+/// One source's outcome as the service reported it. The backend stores the
+/// array verbatim on the job row; the result door replays it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodcastSourceStatus {
+    pub key: String,
+    pub name: String,
+    /// `ok`, or `skipped:<code>`.
+    pub status: String,
 }
 
 /// The answer to one report. `stored` is always `true` on an `Ok` — an
@@ -154,8 +186,8 @@ pub async fn cancel(
 ///
 /// The decode is deliberately strict: a payload that does not fit
 /// [`PodcastReportPayload`] is `invalid_payload`, never coerced into a
-/// half-filled report. `transcript` is the one defaulted field, so a service
-/// that omits it still reports.
+/// half-filled report. `transcript` and `sources` are the defaulted fields,
+/// so a service that omits them still reports.
 pub async fn report(db: &Database, payload: Value) -> Result<Value, (&'static str, String)> {
     let report: PodcastReportPayload = serde_json::from_value(payload).map_err(|err| {
         (
@@ -173,6 +205,7 @@ pub async fn report(db: &Database, payload: Value) -> Result<Value, (&'static st
         progress: report.progress,
         error_code: report.error_code.as_deref(),
         transcript: report.transcript.as_deref(),
+        sources: report.sources.as_deref(),
     };
     match crate::service::podcast_job::report(db, &input).await {
         Ok(job) => Ok(serde_json::to_value(PodcastReportReply {
