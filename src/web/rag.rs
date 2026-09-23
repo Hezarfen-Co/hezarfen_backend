@@ -1146,11 +1146,14 @@ async fn summarize(
     let pair = resolve_study_pair(&pairs, &req.ders, req.sinif.as_deref())?;
     let payload = RagSummarizePayload {
         scope: req.into_scope(pair),
+        scope_pairs: pairs
+            .iter()
+            .map(|pair| (pair.sinif.clone(), pair.ders.clone()))
+            .collect(),
         // What the session already proves, never what the body claims.
         asker: user.get_id().key(),
         asker_role: user.get_role().as_str().to_string(),
     };
-
     match rag_study::summarize(&bridge, &school, payload).await {
         Ok(reply) => Ok(Json(RagSummarizeResponse::from(reply)).into_response()),
         Err(code) => Ok(failure(&code)),
@@ -1209,6 +1212,10 @@ async fn questions(
     }
     let payload = RagQuestionsPayload {
         scope: req.scope.into_scope(pair),
+        scope_pairs: pairs
+            .iter()
+            .map(|pair| (pair.sinif.clone(), pair.ders.clone()))
+            .collect(),
         asker: user.get_id().key(),
         asker_role: user.get_role().as_str().to_string(),
         n: req.n,

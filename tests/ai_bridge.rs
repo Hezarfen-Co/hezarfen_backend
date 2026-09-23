@@ -3497,6 +3497,12 @@ async fn the_summarize_request_carries_the_askers_scope_and_role() {
         }),
         "a club is school-wide, so its scope names no grade"
     );
+    assert_eq!(
+        payload["scope_pairs"],
+        json!([[null, "Satranç Kulübü"]]),
+        "the frame carries the backend-computed grant, not only the selected scope"
+    );
+
 }
 
 /// A study request launched off an answer's citation names the course by the
@@ -3606,6 +3612,12 @@ async fn the_questions_request_carries_its_knobs_and_maps_its_rows() {
             "scope_label": "",
         })
     );
+    assert_eq!(
+        payload["scope_pairs"],
+        json!([[null, "Satranç Kulübü"]]),
+        "the frame carries the backend-computed grant, not only the selected scope"
+    );
+
 
     // The knobs' defaults are the documented ones, and a body that names none
     // of them still dispatches a well-formed request.
@@ -3623,6 +3635,45 @@ async fn the_questions_request_carries_its_knobs_and_maps_its_rows() {
     assert_eq!(seen[1].payload["n"], 5, "`n` defaults to 5");
     assert_eq!(seen[1].payload["difficulty"], "orta");
     assert_eq!(seen[1].payload["seed_question"], Value::Null);
+}
+
+/// Manager and admin callers receive the whole school-derived scope, not just
+/// the one pair selected by the study request body.
+#[tokio::test]
+async fn a_manager_study_request_carries_the_school_wide_scope_pairs() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("rag", &[AI_RAG_SUMMARIZE_CAPABILITY]),
+        Behaviour::Answer(json!({ "text": "ok" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let manager = common::login_as(&app, &db, "mudur", "manager").await;
+
+    common::taught(&app, &manager, "Matematik").await;
+    common::taught(&app, &manager, "Fizik").await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/rag/summarize",
+        Some(&manager),
+        Some(json!({ "ders": "Matematik", "pages": [1] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1, "one dispatch per call, never a re-send");
+    assert_eq!(seen[0].payload["asker_role"], "manager");
+    let pairs = seen[0].payload["scope_pairs"]
+        .as_array()
+        .expect("scope_pairs is an array");
+    assert_eq!(pairs.len(), 2, "manager receives every school pair");
+    assert!(pairs.contains(&json!([null, "Matematik"])));
+    assert!(pairs.contains(&json!([null, "Fizik"])));
 }
 
 /// A connected worker that does not carry the capability is not a worker for

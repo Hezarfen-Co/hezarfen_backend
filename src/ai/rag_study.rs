@@ -64,6 +64,9 @@ pub struct RagScope {
 pub struct RagSummarizePayload {
     /// The corpus and range to summarize.
     pub scope: RagScope,
+    /// Backend-computed caller grant, in the same `(sinif, ders)` pair shape as `rag.chat`.
+    #[serde(default)]
+    pub scope_pairs: Vec<(Option<String>, String)>,
     /// The id of the person who asked. The service reads that person's own
     /// data back through the bridge's api reads (`on_behalf_of`). Read live
     /// from the authenticated session, never taken from a request body.
@@ -73,7 +76,6 @@ pub struct RagSummarizePayload {
     /// student's role may not have.
     pub asker_role: String,
 }
-
 /// What the backend asks a RAG service for (`rag.questions`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RagQuestionsPayload {
@@ -81,6 +83,9 @@ pub struct RagQuestionsPayload {
     /// on their answers: a question whose answer is not in this range must not
     /// be generated.
     pub scope: RagScope,
+    /// Backend-computed caller grant, in the same `(sinif, ders)` pair shape as `rag.chat`.
+    #[serde(default)]
+    pub scope_pairs: Vec<(Option<String>, String)>,
     /// The id of the person who asked, exactly as [`RagSummarizePayload`]'s.
     pub asker: String,
     /// The asker's live school role.
@@ -317,6 +322,7 @@ mod tests {
                 span_ids: vec![],
                 scope_label: "DNA".into(),
             },
+            scope_pairs: vec![(Some("10".into()), "Biyoloji".into())],
             asker: "01ASKER".into(),
             asker_role: "teacher".into(),
         })
@@ -331,6 +337,7 @@ mod tests {
                     "span_ids": [],
                     "scope_label": "DNA",
                 },
+                "scope_pairs": [["10", "Biyoloji"]],
                 "asker": "01ASKER",
                 "asker_role": "teacher",
             })
@@ -346,6 +353,7 @@ mod tests {
                 span_ids: vec!["s-7".into()],
                 scope_label: String::new(),
             },
+            scope_pairs: vec![(None, "Satranç Kulübü".into())],
             asker: "01ASKER".into(),
             asker_role: "student".into(),
             n: 5,
@@ -363,6 +371,7 @@ mod tests {
                     "span_ids": ["s-7"],
                     "scope_label": "",
                 },
+                "scope_pairs": [[null, "Satranç Kulübü"]],
                 "asker": "01ASKER",
                 "asker_role": "student",
                 "n": 5,
