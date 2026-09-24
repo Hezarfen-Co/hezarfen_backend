@@ -1201,6 +1201,12 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_HOLIDAY_NAME_LEN as i64,
         ),
+        (
+            "UpdateHoliday",
+            "name",
+            "maxLength",
+            MAX_HOLIDAY_NAME_LEN as i64,
+        ),
         ("CreateSlot", "topic", "maxLength", MAX_SESSION_TOPIC_LEN as i64),
         // The offering spine (course × grade_level templates) and the
         // per-class instance overrides: same bounds as the catalog course

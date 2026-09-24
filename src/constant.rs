@@ -41,10 +41,14 @@ pub const MAX_DISPLAY_NAME_LEN: usize = 50;
 pub const MAX_BIO_LEN: usize = 500;
 pub const MAX_ADDRESS_LEN: usize = 500;
 
-/// How many course and class references one profile read embeds. A cap on the
+/// How many **section** rows one profile read embeds — the block is one row
+/// per section, so this counts sections, not catalogue courses. A cap on the
 /// response, not on membership — the full lists stay at `/courses/me` and
-/// `/classes/me`.
-pub const MAX_PROFILE_COURSES: usize = 20;
+/// `/classes/me`. 100 because a teacher's sections are their courses
+/// multiplied by the classes they teach, so the course-era figure truncated a
+/// real timetable, while one course row's own cap (`MAX_COURSE_SECTIONS`)
+/// bounds only a single row.
+pub const MAX_PROFILE_COURSES: usize = 100;
 pub const MAX_PROFILE_CLASSES: usize = 5;
 
 /// RFC 5321's practical upper bound for a full address.

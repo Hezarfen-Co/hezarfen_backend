@@ -54,10 +54,9 @@ struct CreateHoliday {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateHoliday {
-    /// New name, held to the same bound as `POST` — the `HolidayName` newtype
-    /// re-checks it. No `maxLength` here: a published bound needs its own row
-    /// in the OpenAPI bounds table, and `CreateHoliday.name` already carries
-    /// this one.
+    /// New name, held to the same published bound as `POST` — and still
+    /// re-checked by the `HolidayName` newtype at runtime.
+    #[schema(max_length = 100)]
     name: Option<String>,
     #[schema(example = 1_793_318_400_000_i64)]
     starts_at: Option<i64>,
