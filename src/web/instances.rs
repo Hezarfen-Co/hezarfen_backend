@@ -270,8 +270,9 @@ pub struct InstanceResponse {
     /// The section's **resolved** weekly plan: its own `class_course_slot`
     /// rows when the flag above is `false` — including when that set is
     /// empty — the offering's `offering_slot` template week when `true`.
-    /// Weekday first, then start time. Template data a timetable renders;
-    /// nothing generates dated `course_session` rows from it.
+    /// Weekday first, then start time. Template data a timetable renders; no
+    /// dated `course_session` rows come from it until a caller asks
+    /// (`POST /instances/{id}/weekly-plan/materialize`).
     pub weekly_plan: Vec<WeeklySlotDto>,
     /// How many students are enrolled right now.
     #[schema(example = 28)]

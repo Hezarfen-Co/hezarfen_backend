@@ -30266,7 +30266,7 @@ async fn a_school_with_no_modules_can_still_use_the_core_routes() {
 
 /// Route prefixes that are deliberately ungated, each with the reason it is —
 /// a nest here is one no school can be sold or refused.
-const CORE_PREFIXES: [(&str, &str); 14] = [
+const CORE_PREFIXES: [(&str, &str); 15] = [
     ("/", "the health mirror at the root"),
     ("/health", "liveness, read before any school is resolved"),
     ("/time", "the server clock, a deploy constant"),
@@ -30288,6 +30288,10 @@ const CORE_PREFIXES: [(&str, &str); 14] = [
     (
         "/terms",
         "the academic calendar every other module hangs off",
+    ),
+    (
+        "/holidays",
+        "the school-wide non-teaching calendar the schedule bounds itself with",
     ),
     (
         "/academic-years",

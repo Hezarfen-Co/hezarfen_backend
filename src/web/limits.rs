@@ -195,9 +195,14 @@ struct CourseLimits {
     max_ders_saati: i64,
     /// An academic year's name (`POST /academic-years`).
     max_academic_year_name_len: usize,
+    /// How many sections one catalogue course row embeds in `sections`. A
+    /// course taught in more still lists them at `/instances`; the row's
+    /// `class_course_count` carries the untruncated total.
+    max_course_sections: usize,
 }
 
-/// The weekly plan: one offering's (or one section's) timetable template.
+/// The weekly plan: one offering's (or one section's) timetable template, and
+/// the one call that expands it into dated lessons.
 #[derive(Serialize, ToSchema)]
 struct WeeklyPlanLimits {
     /// Inclusive bounds for a slot's `starts_at`/`ends_at` minutes past
@@ -206,6 +211,21 @@ struct WeeklyPlanLimits {
     max_slot_minute: i64,
     /// Slots one weekly plan may hold.
     max_weekly_slots: i64,
+    /// Longest `from`–`to` span one `POST /instances/{id}/weekly-plan/
+    /// materialize` call may cover, days.
+    max_materialize_days: i64,
+    /// Most lessons one materialize call may write.
+    max_materialize_sessions: usize,
+}
+
+/// The school-wide non-teaching calendar.
+#[derive(Serialize, ToSchema)]
+struct HolidayLimits {
+    /// The holiday's display name.
+    max_name_len: usize,
+    /// The only accepted `kind` values.
+    #[schema(example = json!(["resmi", "dini", "idari", "ara"]))]
+    kinds: Vec<&'static str>,
 }
 
 /// Exams, their questions, answers, and marks.
@@ -528,6 +548,9 @@ struct LimitsResponse {
     file: FileLimits,
     message: MessageLimits,
     event: EventLimits,
+    /// The school-wide non-teaching calendar the materializer bounds its
+    /// generation with.
+    holiday: HolidayLimits,
     course: CourseLimits,
     /// The weekly plan's timetable bounds (`/offerings/{id}/weekly-plan` and
     /// the instance override doors).
@@ -610,6 +633,10 @@ impl LimitsResponse {
                 max_title_len: MAX_EVENT_TITLE_LEN,
                 max_description_len: MAX_EVENT_DESCRIPTION_LEN,
             },
+            holiday: HolidayLimits {
+                max_name_len: MAX_HOLIDAY_NAME_LEN,
+                kinds: HOLIDAY_KINDS.to_vec(),
+            },
             course: CourseLimits {
                 max_title_len: MAX_COURSE_TITLE_LEN,
                 max_description_len: MAX_COURSE_DESCRIPTION_LEN,
@@ -626,11 +653,14 @@ impl LimitsResponse {
                 min_ders_saati: MIN_DERS_SAATI,
                 max_ders_saati: MAX_DERS_SAATI,
                 max_academic_year_name_len: MAX_ACADEMIC_YEAR_NAME_LEN,
+                max_course_sections: MAX_COURSE_SECTIONS,
             },
             weekly_plan: WeeklyPlanLimits {
                 min_slot_minute: MIN_SLOT_MINUTE,
                 max_slot_minute: MAX_SLOT_MINUTE,
                 max_weekly_slots: MAX_WEEKLY_SLOTS as i64,
+                max_materialize_days: MAX_MATERIALIZE_DAYS,
+                max_materialize_sessions: MAX_MATERIALIZE_SESSIONS,
             },
             exam: ExamLimits {
                 max_title_len: MAX_EXAM_TITLE_LEN,

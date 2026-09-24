@@ -22,6 +22,7 @@ pub mod exam_weights;
 pub mod exam_ws;
 pub mod exams;
 pub mod homework;
+pub mod holidays;
 pub mod insights;
 pub mod instances;
 pub mod limits;
