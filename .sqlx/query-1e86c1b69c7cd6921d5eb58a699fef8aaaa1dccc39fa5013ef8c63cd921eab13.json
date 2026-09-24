@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM offering_exam_weight WHERE offering = $1 AND kind = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e86c1b69c7cd6921d5eb58a699fef8aaaa1dccc39fa5013ef8c63cd921eab13"
+}

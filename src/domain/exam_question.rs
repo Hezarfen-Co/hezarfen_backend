@@ -291,8 +291,10 @@ impl QuestionSpec {
 /// One question of an exam. Order within the exam is the id's creation order;
 /// the kind-dependent columns always satisfy the
 /// [`QuestionSpec`] invariants because every write goes through one. Every
-/// question links to a subject of the exam's course — the handlers verify the
-/// subject's course matches before any write.
+/// question links to a subject of the exam's course, and — since the
+/// course-template system — to one the exam's *instance* actually teaches:
+/// the service validates both halves of that rule
+/// ([`crate::service::subject::in_instance`]) before any write.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamQuestion {
     pub(crate) id: ExamQuestionId,

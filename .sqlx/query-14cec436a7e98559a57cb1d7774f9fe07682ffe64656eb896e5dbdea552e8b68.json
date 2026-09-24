@@ -1,0 +1,140 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH updated AS (\n               UPDATE course_offering SET\n                   title = CASE WHEN $2 THEN $3::text ELSE title END,\n                   description = CASE WHEN $4 THEN $5::text ELSE description END,\n                   default_ders_saati = CASE WHEN $6 THEN\n                       COALESCE($7::bigint, default_ders_saati::bigint)::smallint\n                       ELSE default_ders_saati END,\n                   default_counts_toward_karne = CASE WHEN $8 THEN $9\n                       ELSE default_counts_toward_karne END,\n                   updated_at = $10\n               WHERE id = $1\n               RETURNING id, course, grade_level, title, description,\n                         default_ders_saati, default_counts_toward_karne,\n                         created_by, created_at, updated_at)\n           SELECT u.id AS \"id: CourseOfferingId\",\n                  u.course AS \"course: CourseId\",\n                  u.grade_level AS \"grade_level: GradeLevel\",\n                  u.title AS \"title?: CourseTitle\",\n                  u.description AS \"description?: CourseDescription\",\n                  u.default_ders_saati::bigint AS \"default_ders_saati?: DersSaati\",\n                  u.default_counts_toward_karne,\n                  u.created_by AS \"created_by: UserId\",\n                  u.created_at AS \"created_at: Timestamp\",\n                  u.updated_at AS \"updated_at: Timestamp\"\n           FROM updated u",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseOfferingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "grade_level: GradeLevel",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "grade_level"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "title?: CourseTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "description?: CourseDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_ders_saati?: DersSaati",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "default_counts_toward_karne",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "default_counts_toward_karne"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Int8",
+        "Bool",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "14cec436a7e98559a57cb1d7774f9fe07682ffe64656eb896e5dbdea552e8b68"
+}

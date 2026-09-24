@@ -13,6 +13,7 @@ use common::{
 use hezarfen_backend::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_group::ClassName;
+use hezarfen_backend::domain::grade::GradeLevel;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -108,7 +109,7 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
         &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -155,7 +156,7 @@ async fn a_stale_link_detaches_and_frees_its_class() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": "9-A" })),
+            Some(json!({ "name": "9-A", "grade_level": 9 })),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED);
@@ -237,7 +238,7 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": "9-A" })),
+            Some(json!({ "name": "9-A", "grade_level": 9 })),
         )
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
@@ -365,7 +366,7 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": "9-A" })),
+            Some(json!({ "name": "9-A", "grade_level": 9 })),
         )
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
@@ -472,7 +473,7 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": "9-A" })),
+            Some(json!({ "name": "9-A", "grade_level": 9 })),
         )
         .await;
         res.body["class"]["id"].as_str().unwrap().to_string()
@@ -573,7 +574,7 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
         &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -654,7 +655,7 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
         &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -708,7 +709,7 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
         &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -778,7 +779,7 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -839,7 +840,7 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
         &db,
         &manager,
         ClassName::try_new("9-B").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -881,7 +882,10 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
 /// `{class, skipped, stocked_from}` since a create stocks from its grade's
 /// blueprint, and the tests below are about the class itself. The two outer
 /// fields have their own tests (`regress_blueprints`).
-async fn create_class(app: &axum::Router, cookie: &str, body: serde_json::Value) -> Res {
+async fn create_class(app: &axum::Router, cookie: &str, mut body: serde_json::Value) -> Res {
+    if body.get("grade_level").is_none() {
+        body["grade_level"] = serde_json::json!(9);
+    }
     let mut res = send(app, "POST", "/classes", Some(cookie), Some(body)).await;
     assert_eq!(res.status, StatusCode::CREATED, "create class");
     res.body = res.body["class"].clone();
@@ -912,7 +916,7 @@ async fn the_homeroom_teacher_round_trips_through_create_and_patch() {
     let created = create_class(
         &app,
         &manager,
-        json!({ "name": "9-A", "teacher_id": teacher_id }),
+        json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id }),
     )
     .await;
     let class = created.body["id"].as_str().unwrap().to_string();
@@ -933,7 +937,7 @@ async fn the_homeroom_teacher_round_trips_through_create_and_patch() {
         "PATCH",
         &format!("/classes/{class}"),
         Some(&manager),
-        Some(json!({ "name": "9-B" })),
+        Some(json!({ "name": "9-B", "grade_level": 9 })),
     )
     .await;
     assert_eq!(renamed.status, StatusCode::OK);
@@ -1000,7 +1004,7 @@ async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": "9-A", "teacher_id": bad })),
+            Some(json!({ "name": "9-A", "grade_level": 9, "teacher_id": bad })),
         )
         .await;
         assert_eq!(refused.status, StatusCode::BAD_REQUEST, "create with {bad}");
@@ -1011,7 +1015,7 @@ async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
         "a refused create may write no class"
     );
 
-    let class = create_class(&app, &manager, json!({ "name": "9-A" }))
+    let class = create_class(&app, &manager, json!({ "name": "9-A", "grade_level": 9 }))
         .await
         .body["id"]
         .as_str()
@@ -1023,7 +1027,7 @@ async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
             "PATCH",
             &format!("/classes/{class}"),
             Some(&manager),
-            Some(json!({ "name": "9-B", "teacher_id": bad })),
+            Some(json!({ "name": "9-B", "grade_level": 9, "teacher_id": bad })),
         )
         .await;
         assert_eq!(refused.status, StatusCode::BAD_REQUEST, "patch with {bad}");
@@ -1255,7 +1259,7 @@ async fn only_staff_and_a_linked_parent_read_another_users_classes() {
     let class = create_class(
         &app,
         &admin,
-        json!({ "name": "9-A", "teacher_id": teacher_id }),
+        json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id }),
     )
     .await
     .body["id"]
@@ -1476,7 +1480,7 @@ async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "teacher_id": teacher_id, "year": year })),
+        Some(json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id, "year": year })),
     )
     .await;
 
@@ -1539,7 +1543,7 @@ async fn a_rolled_back_create_at_a_blueprinted_grade_leaves_nothing_behind() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [course] })),
+        Some(json!({ "grade_level": 9, "course_ids": [course] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1550,7 +1554,7 @@ async fn a_rolled_back_create_at_a_blueprinted_grade_leaves_nothing_behind() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "grade": "9", "teacher_id": teacher_id })),
+        Some(json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id })),
     )
     .await;
 
@@ -1580,7 +1584,7 @@ async fn a_patch_whose_teacher_is_demoted_mid_write_undoes_the_column() {
     let manager = login_as(&app, &db, "manager", "manager").await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let teacher_id = me_id(&app, &teacher).await;
-    let class = create_class(&app, &manager, json!({ "name": "9-A" }))
+    let class = create_class(&app, &manager, json!({ "name": "9-A", "grade_level": 9 }))
         .await
         .body["id"]
         .as_str()
@@ -1701,7 +1705,7 @@ async fn a_rollback_the_guard_refuses_is_a_500_not_a_lying_409() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "teacher_id": teacher_id })),
+        Some(json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id })),
     )
     .await;
 
@@ -1737,23 +1741,25 @@ fn names(res: &Res) -> Vec<String> {
         .collect()
 }
 
-/// `?grade=` is the read a manager holding a blueprint's skip list needs: which
-/// sections carry the label the pump keyed on. It is the *query's* `WHERE`, so
-/// `total` counts the filtered set and a window walks that set alone — drop the
-/// predicate and every assertion below sees the unfiltered four instead.
+/// `?grade_level=` is the read a manager holding a blueprint's skip list
+/// needs: which sections carry the rung the pump keyed on. It is the *query's*
+/// `WHERE`, so `total` counts the filtered set and a window walks that set
+/// alone — drop the predicate and every assertion below sees the unfiltered
+/// four instead.
 #[tokio::test]
 async fn the_class_index_filters_by_grade() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
-    for (name, grade) in [
-        ("9-A", "9"),
-        ("9-B", "9"),
-        ("10-A", "10"),
-        // A club-shaped section: created with no grade at all, so its row
-        // carries no `grade` key.
-        ("satranc", ""),
+    for (name, grade_level) in [
+        ("9-A", 9),
+        ("9-B", 9),
+        ("10-A", 10),
+        // A club-shaped section: created at the ladder's floor, like every
+        // class — it just never shares a rung with an ordinary section here.
+        ("satranc", 0),
     ] {
-        create_class(&app, &manager, json!({ "name": name, "grade": grade })).await;
+        create_class(&app, &manager, json!({ "name": name, "grade_level": grade_level }))
+            .await;
     }
     let list = async |query: &str| -> Res {
         let res = send(
@@ -1778,14 +1784,16 @@ async fn the_class_index_filters_by_grade() {
     assert_eq!(total(&res.body), 4);
     assert_eq!(names(&res).len(), 4);
 
-    // One label, matched exactly: both sections at it, and a `total` that
+    // One rung, matched exactly: both sections at it, and a `total` that
     // counts only them.
-    let res = list("?grade=9").await;
+    let res = list("?grade_level=9").await;
     assert_eq!(total(&res.body), 2, "total counts the filtered set");
     assert_eq!(names(&res), ["9-B", "9-A"], "newest first, 9 only");
-    // "9" is not a prefix match, a fold, or a trim.
-    assert_eq!(names(&list("?grade=10").await), ["10-A"]);
-    for miss in ["?grade=11", "?grade=%209", "?grade=9-A"] {
+    assert_eq!(names(&list("?grade_level=10").await), ["10-A"]);
+    // Rungs nobody carries are empty pages, not errors — the integers leave
+    // no spelling games to play (an unparseable value like `anaokulu` never
+    // reaches the handler: the query decoder refuses it with a `400`).
+    for miss in ["?grade_level=11", "?grade_level=12"] {
         let res = list(miss).await;
         assert_eq!(total(&res.body), 0, "GET /classes{miss} total");
         assert!(
@@ -1794,22 +1802,22 @@ async fn the_class_index_filters_by_grade() {
         );
     }
 
-    // Empty `?grade=` is *no* grade, the same reading `grade_or_none` gives a
-    // write — the sections a blueprint can never cover.
-    let res = list("?grade=").await;
+    // The floor is a rung like any other: it filters, it does not mean
+    // "no grade" — no such class exists any more.
+    let res = list("?grade_level=0").await;
     assert_eq!((total(&res.body), names(&res)), (1, vec!["satranc".into()]));
 
     // Filter and window compose: the window is cut from the filtered set, and
     // `total` stays that set's size on every page of it.
-    let first = list("?grade=9&limit=1&offset=0").await;
+    let first = list("?grade_level=9&limit=1&offset=0").await;
     assert_eq!(total(&first.body), 2);
     assert_eq!(names(&first), ["9-B"]);
     assert_eq!(first.body["limit"], 1);
-    let second = list("?grade=9&limit=1&offset=1").await;
+    let second = list("?grade_level=9&limit=1&offset=1").await;
     assert_eq!(total(&second.body), 2);
     assert_eq!(names(&second), ["9-A"], "consecutive pages are disjoint");
     assert_eq!(second.body["offset"], 1);
-    let past = list("?grade=9&limit=1&offset=9").await;
+    let past = list("?grade_level=9&limit=1&offset=9").await;
     assert!(names(&past).is_empty(), "past the end is an empty page");
     assert_eq!(
         total(&past.body),
@@ -1817,12 +1825,12 @@ async fn the_class_index_filters_by_grade() {
         "…with the filtered total still honest"
     );
 
-    // A label the write paths would refuse is refused here too, rather than
+    // A rung the write paths would refuse is refused here too, rather than
     // reading as "no such grade".
     let res = send(
         &app,
         "GET",
-        &format!("/classes?grade={}", "9".repeat(21)),
+        "/classes?grade_level=13",
         Some(&manager),
         None,
     )
@@ -1862,7 +1870,7 @@ async fn a_member_exit_never_hands_a_row_to_a_class_that_is_gone() {
             &db,
             &manager,
             ClassName::try_new(name).unwrap(),
-            None,
+            GradeLevel::new(9).unwrap(),
             None,
             None,
         )
@@ -1947,7 +1955,7 @@ async fn an_archived_year_freezes_every_class_write_and_no_read() {
     let class = create_class(
         &app,
         &manager,
-        json!({ "name": "9-A", "grade": "9", "year": year }),
+        json!({ "name": "9-A", "grade_level": 9, "year": year }),
     )
     .await;
     let class = common::id_of(&class.body);
@@ -1978,7 +1986,7 @@ async fn an_archived_year_freezes_every_class_write_and_no_read() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [dated] })),
+        Some(json!({ "grade_level": 9, "course_ids": [dated] })),
     )
     .await;
     assert_eq!(blueprint.status, StatusCode::CREATED, "blueprint");
@@ -1998,7 +2006,7 @@ async fn an_archived_year_freezes_every_class_write_and_no_read() {
         (
             "PATCH",
             format!("/classes/{class}"),
-            Some(json!({ "name": "9-B" })),
+            Some(json!({ "name": "9-B", "grade_level": 9 })),
         ),
         (
             "POST",
@@ -2082,7 +2090,7 @@ async fn an_archived_year_freezes_every_class_write_and_no_read() {
         "PATCH",
         &format!("/classes/{class}"),
         Some(&manager),
-        Some(json!({ "name": "9-B" })),
+        Some(json!({ "name": "9-B", "grade_level": 9 })),
     )
     .await;
     assert_eq!(patched.status, StatusCode::OK, "thawed: {:?}", patched.body);
@@ -2110,14 +2118,14 @@ async fn two_subeler_teaching_one_course_are_two_instances() {
     let a = create_class(
         &app,
         &manager,
-        json!({ "name": "5-A", "grade": "5", "year": year }),
+        json!({ "name": "5-A", "grade_level": 5, "year": year }),
     )
     .await;
     let a = common::id_of(&a.body);
     let b = create_class(
         &app,
         &manager,
-        json!({ "name": "5-B", "grade": "5", "year": year }),
+        json!({ "name": "5-B", "grade_level": 5, "year": year }),
     )
     .await;
     let b = common::id_of(&b.body);

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH del AS (\n               DELETE FROM class_course_slot WHERE class_course = $1\n               RETURNING id\n           ), flip AS (\n               UPDATE class_course SET weekly_plan_inherited = TRUE\n               WHERE id = $1\n               RETURNING id\n           )\n           SELECT id AS \"id: ClassCourseId\" FROM flip",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "45c0a9450aa19fa07de87083711413eae6d9a3ab48889a56ece629279f2c156e"
+}

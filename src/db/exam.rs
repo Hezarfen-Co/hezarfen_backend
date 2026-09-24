@@ -771,7 +771,7 @@ mod tests {
                     &db,
                     &creator,
                     crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
-                    None,
+                    crate::domain::grade::GradeLevel::new(9).unwrap(),
                     None,
                     None,
                 )

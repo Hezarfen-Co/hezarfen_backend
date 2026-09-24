@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT class AS \"class: ClassGroupId\", course AS \"course: CourseId\"\n           FROM class_course\n           WHERE source = (SELECT id FROM class_blueprint WHERE grade_level = $1)\n             AND course <> ALL($2)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e8784821e75fe4ab681ff91695d953af6c4abd32821251f7804ef02c4e637cf8"
+}

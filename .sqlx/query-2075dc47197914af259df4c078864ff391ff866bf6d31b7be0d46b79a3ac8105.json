@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH updated AS (\n               UPDATE class_course\n                  SET exam_weights_inherited = FALSE\n                WHERE id = $1\n                RETURNING id\n           ), written AS (\n               INSERT INTO class_course_exam_weight (class_course, kind, weight)\n               SELECT $1, $2, $3::bigint::smallint\n                WHERE EXISTS (SELECT 1 FROM updated)\n               ON CONFLICT (class_course, kind) DO UPDATE SET weight = EXCLUDED.weight\n               RETURNING class_course\n           )\n           SELECT u.id AS \"id: ClassCourseId\" FROM updated u",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2075dc47197914af259df4c078864ff391ff866bf6d31b7be0d46b79a3ac8105"
+}

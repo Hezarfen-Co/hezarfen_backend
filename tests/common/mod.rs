@@ -517,7 +517,43 @@ pub async fn create_subject(app: &Router, cookie: &str, course: &str, name: &str
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "create subject {name}");
-    id_of(&res.body)
+    let subject = id_of(&res.body);
+
+    // The subject-tag gates (homework, exam questions) read the section's
+    // resolved syllabus, so a topic a suite creates is only usable once the
+    // offering selects it. When the course has been attached somewhere, the
+    // offering exists — select the fresh topic there (idempotent; a
+    // non-manager cookie cannot curate the offering and skips this, which
+    // the tag gates then surface as their own 400).
+    let res = send(
+        app,
+        "GET",
+        &format!("/offerings?course={course}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    if res.status == StatusCode::OK
+        && let Some(offering) = res.body["items"][0]["id"].as_str()
+    {
+        let res = send(
+            app,
+            "POST",
+            &format!("/offerings/{offering}/subjects"),
+            Some(cookie),
+            Some(json!({ "subject": subject })),
+        )
+        .await;
+        // A non-manager cookie cannot curate the offering; the tag gates
+        // then answer their own 400 and the caller selects another way
+        // (see `create_homework`'s instance-door retry).
+        assert!(
+            matches!(res.status, StatusCode::CREATED | StatusCode::OK | StatusCode::FORBIDDEN),
+            "select subject {name} on offering {offering}: {}",
+            res.body
+        );
+    }
+    subject
 }
 
 // ---- the academic fixture ---------------------------------------------------
@@ -595,10 +631,14 @@ pub async fn create_term(app: &Router, staff: &str, year: &str, name: &str) -> S
 }
 
 /// Create a class (şube) as `staff` (asserts 201); returns its id. `body`
-/// carries everything but the name: `year`, `teacher_id`, `grade`.
+/// carries everything but the name: `year`, `teacher_id`, `grade_level`
+/// (defaulting to rung 9 when the caller does not name one).
 pub async fn create_class(app: &Router, staff: &str, name: &str, body: Value) -> String {
     let mut body = body;
     body["name"] = json!(name);
+    if body.get("grade_level").is_none() {
+        body["grade_level"] = json!(9);
+    }
     let res = send(app, "POST", "/classes", Some(staff), Some(body)).await;
     assert_eq!(
         res.status,
@@ -749,6 +789,75 @@ pub async fn create_exam_with(app: &Router, cookie: &str, instance: &str, body: 
     .await
 }
 
+/// One homework-create send with the subject-gate retry: a `subject_id` the
+/// section's resolved syllabus does not carry is refused, and the writer —
+/// who holds a right over the instance (the very gate the homework write
+/// passed) — takes the topic onto the section's own set through the instance
+/// door and retries once. Every other refusal comes back untouched.
+async fn send_homework_create(
+    app: &Router,
+    cookie: &str,
+    instance: &str,
+    body: Value,
+) -> Res {
+    let res = send(
+        app,
+        "POST",
+        &format!("/instances/{instance}/homework"),
+        Some(cookie),
+        Some(body.clone()),
+    )
+    .await;
+    if res.status == StatusCode::BAD_REQUEST
+        && res.body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("subject is not in this section's subject set"))
+    {
+        let subject = body["subject_id"].as_str().expect("subject_id").to_string();
+        let res = send(
+            app,
+            "POST",
+            &format!("/instances/{instance}/subjects"),
+            Some(cookie),
+            Some(json!({ "subject": subject })),
+        )
+        .await;
+        assert!(
+            matches!(res.status, StatusCode::CREATED | StatusCode::OK),
+            "select subject {subject} on instance {instance}: {}",
+            res.body
+        );
+        return send(
+            app,
+            "POST",
+            &format!("/instances/{instance}/homework"),
+            Some(cookie),
+            Some(body),
+        )
+        .await;
+    }
+    res
+}
+
+/// Take `subject` onto the section's own syllabus through the instance door —
+/// the D10 gate, the same right the question and homework writers hold.
+/// Idempotent: a subject already in the set re-answers 200.
+pub async fn select_instance_subject(app: &Router, cookie: &str, instance: &str, subject: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/instances/{instance}/subjects"),
+        Some(cookie),
+        Some(json!({ "subject": subject })),
+    )
+    .await;
+    assert!(
+        matches!(res.status, StatusCode::CREATED | StatusCode::OK),
+        "select subject {subject} on instance {instance}: {}",
+        res.body
+    );
+}
+
 /// Create a homework inside `instance` as `cookie` (asserts 201); returns its
 /// id. Tagged with `subject` (required — every homework carries one of its
 /// course's subjects) and due at `due_at` (unix-millis; must not lie past the
@@ -762,12 +871,11 @@ pub async fn create_homework(
     title: &str,
     due_at: i64,
 ) -> String {
-    let res = send(
+    let res = send_homework_create(
         app,
-        "POST",
-        &format!("/instances/{instance}/homework"),
-        Some(cookie),
-        Some(json!({ "title": title, "subject_id": subject, "due_at": due_at })),
+        cookie,
+        instance,
+        json!({ "title": title, "subject_id": subject, "due_at": due_at }),
     )
     .await;
     assert_eq!(
@@ -780,16 +888,11 @@ pub async fn create_homework(
 }
 
 /// Create a homework inside `instance` from a full JSON body (no assertion) —
-/// for exercising the `assigned` subset and the validation rejects.
+/// for exercising the `assigned` subset and the validation rejects. The
+/// subject-gate retry applies here too; every other refusal comes back as
+/// the server answered it.
 pub async fn create_homework_with(app: &Router, cookie: &str, instance: &str, body: Value) -> Res {
-    send(
-        app,
-        "POST",
-        &format!("/instances/{instance}/homework"),
-        Some(cookie),
-        Some(body),
-    )
-    .await
+    send_homework_create(app, cookie, instance, body).await
 }
 
 /// Create a lesson session inside `instance` as `cookie` (asserts 201); returns

@@ -9,7 +9,7 @@
 //! `enrollment` rows, and an elective placed by hand next to them is still an
 //! individual enrollment nothing here can see.
 //!
-//! This module is the pure shape: the id (the grade label *is* the primary
+//! This module is the pure shape: the id (the ladder rung *is* the unique
 //! key, so "one blueprint per grade" holds by construction), the row, the
 //! pump's report types ([`Pumped`], [`Skip`], [`SectionStatus`]) and the
 //! shared skip vocabulary ([`skip_reason`]).
@@ -21,43 +21,55 @@
 use crate::constant::MAX_CLASS_COURSES;
 use crate::db::class_pump::{Attached, Axis};
 use crate::domain::class_course::ClassCourse;
-use crate::domain::class_group::{ClassGrade, ClassGroupId};
+use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
+use crate::domain::grade::GradeLevel;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// A grade label as the table's `TEXT` primary key — one blueprint per grade
-/// by construction, like the settings singleton's `'school'` row: the key is
-/// a name, not a minted entity id.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+/// A ladder rung as the table's unique key — one blueprint per grade by
+/// construction, like the settings singleton's `'school'` row: the key is a
+/// position, not a minted entity id. The stored row keeps its surrogate uuid
+/// primary key (what `class_course.source` references); this id is the
+/// identity the API speaks, and a key that parses to no rung (`from_key`'s
+/// `-1` fallback) matches no row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
-pub struct ClassBlueprintId(String);
+pub struct ClassBlueprintId(i16);
 
 impl ClassBlueprintId {
-    /// The key one grade label always maps to.
-    pub fn for_grade(grade: &ClassGrade) -> Self {
-        Self(grade.as_str().to_string())
+    /// The key one ladder rung always maps to.
+    pub fn for_grade(grade: &GradeLevel) -> Self {
+        Self(grade.get())
     }
 
+    /// Parses a wire path key. A key that is not a ladder number parses to
+    /// `-1`, which matches no row — the nil-uuid shape [`ClassGroupId`]
+    /// uses, so an unaddressable grade answers a `404`, never a decode panic.
     pub fn from_key(key: &str) -> Self {
-        Self(key.to_string())
+        Self(key.trim().parse::<i16>().unwrap_or(-1))
     }
 
-    pub fn key(&self) -> &str {
-        &self.0
+    /// The inner rung, for the queries that cannot take the newtype.
+    pub fn get(self) -> i16 {
+        self.0
+    }
+
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-/// One grade's template. The id is the grade label itself — the key one
-/// grade always maps to — stored here beside the `grade` field so a read
-/// never has to parse a record id back into a domain value. `courses` is
-/// not a column of the row: it is the `blueprint_course` junction, joined
+/// One grade's template. The id is the ladder rung itself — the key one
+/// grade always maps to — stored here beside the `grade_level` field so a
+/// read never has to parse a record id back into a domain value. `courses`
+/// is not a column of the row: it is the `blueprint_course` junction, joined
 /// on by the db layer (sorted by course, which is the order every CAS
 /// comparison relies on).
 #[derive(Debug, Clone)]
 pub struct ClassBlueprint {
     pub(crate) id: ClassBlueprintId,
-    pub(crate) grade: ClassGrade,
+    pub(crate) grade_level: GradeLevel,
     pub(crate) courses: Vec<CourseId>,
     pub(crate) creator: UserId,
 }
@@ -75,13 +87,12 @@ pub struct Skip {
 
 /// What a pump did: how many sections it reached, and the pairs it refused.
 ///
-/// `matched` exists because an empty `skipped` is not success on its own. A
-/// grade label is free text ([`ClassGrade`]) and
-/// [`crate::db::class_group::list_for_grade`]
-/// matches it exactly, so a blueprint keyed `"9 "` reaches none of the sections
-/// keyed `"9"` — and with nothing to skip it answers exactly like a pump that
-/// stocked every one of them. The count is the only thing that tells those
-/// apart.
+/// `matched` exists because an empty `skipped` is not success on its own. The
+/// sections are matched by their ladder rung
+/// ([`crate::db::class_group::list_for_grade`]), so a blueprint keyed `9`
+/// reaches none of the sections keyed `10` — and with nothing to skip it
+/// answers exactly like a pump that stocked every one of them. The count is
+/// the only thing that tells those apart.
 ///
 /// A struct rather than a pair with
 /// [`crate::service::class_blueprint::set_courses`]'s: three
@@ -129,8 +140,8 @@ impl ClassBlueprint {
         &self.id
     }
 
-    pub fn get_grade(&self) -> &ClassGrade {
-        &self.grade
+    pub fn get_grade_level(&self) -> GradeLevel {
+        self.grade_level
     }
 
     pub fn get_courses(&self) -> &[CourseId] {
@@ -139,30 +150,6 @@ impl ClassBlueprint {
 
     pub fn get_creator(&self) -> &UserId {
         &self.creator
-    }
-
-    /// The grade a blueprint may be keyed on. Non-empty, because the label is
-    /// the primary key and there is no blueprint for "no grade"; and free of
-    /// the characters that would make that key unaddressable as a URL path
-    /// segment, the second gate [`crate::domain::menu::MenuSlot`] carries for
-    /// the same reason. Grades were never validated for this, so a *class* may
-    /// already carry a label refused here — it simply cannot have a blueprint
-    /// until it is renamed, which is a 400 the caller can read rather than a
-    /// route nobody can reach.
-    pub fn grade_key(value: &str) -> Result<ClassGrade, AppError> {
-        if value.is_empty() {
-            return Err(AppError::Validation(ValidationError::Empty("grade")));
-        }
-        if value
-            .chars()
-            .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%'))
-        {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "grade",
-                reason: "must not contain / \\ ? # or %",
-            }));
-        }
-        Ok(ClassGrade::try_new(value)?)
     }
 
     /// The course list a blueprint may hold: deduplicated, and no longer than
@@ -190,19 +177,22 @@ impl ClassBlueprint {
 mod tests {
     use super::*;
 
+    /// A blueprint's key is a ladder rung: a key that names no rung (`from_key`
+    /// falls back to `-1`) matches no row, so an unaddressable grade is a
+    /// `404` at the route rather than a decode panic — and `for_grade` is the
+    /// rung the class carries, byte for byte.
     #[test]
-    fn a_grade_key_must_be_addressable() {
-        assert!(ClassBlueprint::grade_key("").is_err());
-        assert!(ClassBlueprint::grade_key("9/A").is_err());
-        assert!(ClassBlueprint::grade_key("9%A").is_err());
+    fn a_blueprint_key_is_a_ladder_rung() {
+        assert_eq!(ClassBlueprintId::from_key("9"), ClassBlueprintId(9));
+        assert_eq!(ClassBlueprintId::from_key(" 9 "), ClassBlueprintId(9));
+        assert_eq!(ClassBlueprintId::from_key("anaokulu"), ClassBlueprintId(-1));
+        assert_eq!(ClassBlueprintId::from_key(""), ClassBlueprintId(-1));
+        assert_eq!(ClassBlueprintId::from_key("9/A"), ClassBlueprintId(-1));
         assert_eq!(
-            ClassBlueprint::grade_key("9-A")
-                .unwrap()
-                .as_str()
-                .to_string(),
-            "9-A"
+            ClassBlueprintId::for_grade(&GradeLevel::new(9).unwrap()),
+            ClassBlueprintId::from_key("9")
         );
-        assert!(ClassBlueprint::grade_key(&"x".repeat(1000)).is_err());
+        assert_eq!(ClassBlueprintId::from_key("9").key(), "9");
     }
 
     /// The list is a *set*: a caller sending the same course twice must not

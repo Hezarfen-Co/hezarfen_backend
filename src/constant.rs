@@ -107,12 +107,17 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
-/// A class section is named like a course, but its optional `grade` is
-/// a free-text label the school picks ("9", "10-A", "kindergarten") — a line of
-/// display text, so it is bounded like the other short labels, not like a
-/// description.
+/// A class section is named like a course. `MAX_CLASS_GRADE_LEN` is gone with
+/// the free-text grade it bounded: a class now carries a validated ladder
+/// position (`MIN_GRADE_LEVEL`..=`MAX_GRADE_LEVEL`, `0` = anaokulu), which
+/// needs a length bound no more than a week day does.
 pub const MAX_CLASS_NAME_LEN: usize = 200;
-pub const MAX_CLASS_GRADE_LEN: usize = 20;
+
+/// The grade ladder every class section and course template sits on. `0` is
+/// anaokulu (kindergarten), `1..=12` the school years; [`MAX_GRADE_LEVEL`]
+/// graduating is expressed by the absence of a promotion, not a 13th rung.
+pub const MIN_GRADE_LEVEL: i16 = 0;
+pub const MAX_GRADE_LEVEL: i16 = 12;
 
 /// How big one class may get, on each of its two axes. These are not comfort
 /// numbers: attaching a course to a class writes one enrollment per member and
@@ -136,6 +141,21 @@ pub const MAX_CLASS_COURSES: i64 = 50;
 /// so a typo cannot make one instance dominate the year average.
 pub const MIN_DERS_SAATI: i64 = 1;
 pub const MAX_DERS_SAATI: i64 = 40;
+
+/// How many slots one owner's weekly plan may hold. A slot is where one of
+/// the week's lesson hours lands, and a course teaches at most
+/// `MAX_DERS_SAATI` (40) hours a week — so 40 bounds any honest timetable
+/// (the bounds are the same number by construction) and stops a pathological
+/// client at the bound every other weekly-hours loop already answers to.
+pub const MAX_WEEKLY_SLOTS: usize = MAX_DERS_SAATI as usize;
+
+/// The earliest minute a weekly-plan slot may start or end: midnight.
+pub const MIN_SLOT_MINUTE: i64 = 0;
+
+/// The latest minute a weekly-plan slot may start or end: 23:59. (A `TIME`
+/// column has no `24:00` to carry a midnight end, and the
+/// minutes-past-midnight wire form never lies about it.)
+pub const MAX_SLOT_MINUTE: i64 = 24 * 60 - 1;
 
 /// The default grade-display bands: the Turkish 5-point scale (85–100 = 5,
 /// … 0–44 = 1). Schools edit the list via `PATCH /settings`; the report-card

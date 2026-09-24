@@ -24,6 +24,7 @@ use utoipa_axum::routes;
 use crate::domain::academic_year::{
     AcademicYear, AcademicYearId, AcademicYearName, GradePromotion,
 };
+use crate::domain::grade::GradeLevel;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
@@ -68,18 +69,22 @@ struct UpdateYear {
     grade_promotions: Option<Vec<PromotionBody>>,
 }
 
-/// One grade-promotion pair off the wire.
+/// One grade-promotion pair off the wire: two rungs on the grade ladder
+/// (`0` = anaokulu, `1..=12` the school years).
 #[derive(Deserialize, Serialize, ToSchema)]
 struct PromotionBody {
-    #[schema(max_length = 20, example = "5")]
-    from_grade: String,
-    #[schema(max_length = 20, example = "6")]
-    to_grade: String,
+    #[schema(minimum = 0, maximum = 12, example = 5)]
+    from_grade: i16,
+    #[schema(minimum = 0, maximum = 12, example = 6)]
+    to_grade: i16,
 }
 
 impl PromotionBody {
     fn parse(&self) -> Result<GradePromotion, AppError> {
-        Ok(GradePromotion::try_new(&self.from_grade, &self.to_grade)?)
+        Ok(GradePromotion::new(
+            GradeLevel::new(self.from_grade)?,
+            GradeLevel::new(self.to_grade)?,
+        ))
     }
 }
 
@@ -119,8 +124,8 @@ impl YearResponse {
                 .get_grade_promotions()
                 .iter()
                 .map(|promo| PromotionBody {
-                    from_grade: promo.get_from_grade().to_string(),
-                    to_grade: promo.get_to_grade().to_string(),
+                    from_grade: promo.get_from_grade().get(),
+                    to_grade: promo.get_to_grade().get(),
                 })
                 .collect(),
             class_count: year.get_class_count(),
@@ -140,9 +145,9 @@ struct RolloverResponse {
     classes: usize,
     #[schema(example = 312)]
     students: usize,
-    /// The grade labels that stayed behind (graduation), in the order they
-    /// were met.
-    #[schema(example = json!(["8", "12"]))]
+    /// The labels of the rungs that stayed behind (graduation), in the order
+    /// they were met — `"Anaokulu"` at the floor, the year number elsewhere.
+    #[schema(example = json!(["11", "12"]))]
     graduated: Vec<String>,
 }
 

@@ -3672,8 +3672,10 @@ async fn a_manager_study_request_carries_the_school_wide_scope_pairs() {
         .as_array()
         .expect("scope_pairs is an array");
     assert_eq!(pairs.len(), 2, "manager receives every school pair");
-    assert!(pairs.contains(&json!([null, "Matematik"])));
-    assert!(pairs.contains(&json!([null, "Fizik"])));
+    // Every şube sits at a ladder rung now, so the pairs name the rung label,
+    // not a null grade.
+    assert!(pairs.contains(&json!(["9", "Matematik"])));
+    assert!(pairs.contains(&json!(["9", "Fizik"])));
 }
 
 /// A connected worker that does not carry the capability is not a worker for

@@ -422,15 +422,27 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ),
         (
             "CreateClass",
-            "grade",
-            "maxLength",
-            MAX_CLASS_GRADE_LEN as i64,
+            "grade_level",
+            "minimum",
+            MIN_GRADE_LEVEL as i64,
+        ),
+        (
+            "CreateClass",
+            "grade_level",
+            "maximum",
+            MAX_GRADE_LEVEL as i64,
         ),
         (
             "CreateBlueprint",
-            "grade",
-            "maxLength",
-            MAX_CLASS_GRADE_LEN as i64,
+            "grade_level",
+            "minimum",
+            MIN_GRADE_LEVEL as i64,
+        ),
+        (
+            "CreateBlueprint",
+            "grade_level",
+            "maximum",
+            MAX_GRADE_LEVEL as i64,
         ),
         (
             "UpdateClass",
@@ -440,9 +452,15 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ),
         (
             "UpdateClass",
-            "grade",
-            "maxLength",
-            MAX_CLASS_GRADE_LEN as i64,
+            "grade_level",
+            "minimum",
+            MIN_GRADE_LEVEL as i64,
+        ),
+        (
+            "UpdateClass",
+            "grade_level",
+            "maximum",
+            MAX_GRADE_LEVEL as i64,
         ),
         (
             "CreateExamInCourse",
@@ -735,6 +753,18 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ),
         ("ExamKindDto", "weight", "minimum", MIN_EXAM_KIND_WEIGHT),
         ("ExamKindDto", "weight", "maximum", MAX_EXAM_KIND_WEIGHT),
+        (
+            "PatchExamWeight",
+            "weight",
+            "minimum",
+            MIN_EXAM_KIND_WEIGHT,
+        ),
+        (
+            "PatchExamWeight",
+            "weight",
+            "maximum",
+            MAX_EXAM_KIND_WEIGHT,
+        ),
         ("GradeBandDto", "min", "minimum", MIN_MARK),
         ("GradeBandDto", "min", "maximum", MAX_MARK),
         (
@@ -1121,8 +1151,8 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ),
         // --- academic years and the class×course instance (the K12 anchor) ---
         // A year is named like a term ("2026-2027"), so it shares the term
-        // name's bound; its two grade labels are şube grades, bounded like
-        // `CreateClass.grade`.
+        // name's bound; its two grade fields are şube rungs on the grade
+        // ladder, bounded like `CreateClass.grade_level`.
         (
             "CreateYear",
             "name",
@@ -1138,19 +1168,61 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         (
             "PromotionBody",
             "from_grade",
-            "maxLength",
-            MAX_CLASS_GRADE_LEN as i64,
+            "minimum",
+            MIN_GRADE_LEVEL as i64,
+        ),
+        (
+            "PromotionBody",
+            "from_grade",
+            "maximum",
+            MAX_GRADE_LEVEL as i64,
         ),
         (
             "PromotionBody",
             "to_grade",
-            "maxLength",
-            MAX_CLASS_GRADE_LEN as i64,
+            "minimum",
+            MIN_GRADE_LEVEL as i64,
+        ),
+        (
+            "PromotionBody",
+            "to_grade",
+            "maximum",
+            MAX_GRADE_LEVEL as i64,
         ),
         // The instance's weekly hours: the karne weight, bounded so one
         // instance cannot be made to dominate the year average by a typo.
         ("UpdateInstance", "ders_saati", "minimum", MIN_DERS_SAATI),
         ("UpdateInstance", "ders_saati", "maximum", MAX_DERS_SAATI),
+        // The offering spine (course × grade_level templates) and the
+        // per-class instance overrides: same bounds as the catalog course
+        // they inherit from.
+        ("CreateOffering", "grade_level", "minimum", MIN_GRADE_LEVEL as i64),
+        ("CreateOffering", "grade_level", "maximum", MAX_GRADE_LEVEL as i64),
+        ("CreateOffering", "title", "maxLength", MAX_COURSE_TITLE_LEN as i64),
+        (
+            "CreateOffering",
+            "description",
+            "maxLength",
+            MAX_COURSE_DESCRIPTION_LEN as i64,
+        ),
+        ("CreateOffering", "default_ders_saati", "minimum", MIN_DERS_SAATI),
+        ("CreateOffering", "default_ders_saati", "maximum", MAX_DERS_SAATI),
+        ("UpdateOffering", "title", "maxLength", MAX_COURSE_TITLE_LEN as i64),
+        (
+            "UpdateOffering",
+            "description",
+            "maxLength",
+            MAX_COURSE_DESCRIPTION_LEN as i64,
+        ),
+        ("UpdateOffering", "default_ders_saati", "minimum", MIN_DERS_SAATI),
+        ("UpdateOffering", "default_ders_saati", "maximum", MAX_DERS_SAATI),
+        ("UpdateInstance", "title", "maxLength", MAX_COURSE_TITLE_LEN as i64),
+        (
+            "UpdateInstance",
+            "description",
+            "maxLength",
+            MAX_COURSE_DESCRIPTION_LEN as i64,
+        ),
     ]
 }
 

@@ -6,8 +6,10 @@
 //! average takes a label from the school's grade bands; and the term's own
 //! number is a single average over the instances, each weighted by its
 //! `ders_saati` (the report-card weight the section set on the instance). The
-//! catalog's `course` row contributes only its title — the two class sections
-//! teaching it are their own instances and their own report-card lines.
+//! title a line shows is the instance's **resolved** one (override → offering
+//! → catalog, via [`crate::service::instance_resolve`]) — two class sections
+//! teaching the same catalog course are their own instances and their own
+//! report-card lines.
 //!
 //! A line's marks are the exams *addressed to* its instance
 //! (`exam_audience`), not only the ones it owns: a shared exam announced to
@@ -36,7 +38,8 @@ use crate::error::AppError;
 
 /// One instance's line on a report card: the average of the marks the student
 /// holds in it this term, its band label, and the `ders_saati` it weighs into
-/// the year average with. `course` is the catalog course's title (what a
+/// the year average with. `course` is the instance's **resolved** title — its
+/// section's override, else its offering's, else the catalog course's (what a
 /// family reads); `class_course` is the instance itself, for anything that
 /// must act on the line.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -150,14 +153,22 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
         .map(|class| class.get_id().clone())
         .collect();
 
-    let instances: Vec<crate::domain::class_course::ClassCourse> =
-        crate::db::class_course::list_for_class_ids(db, &class_ids)
-            .await?
-            .into_iter()
-            .filter(|instance| instance.counts_toward_karne())
-            .collect();
+    // The report-card-counting instances, each with its **resolved** policy:
+    // `counts_toward_karne` is nullable now (NULL = inherit the offering's
+    // default, else counted), so the filter and the weights both go through
+    // the resolver — a raw read would treat "not decided" as a decision.
+    let mut counted: Vec<(
+        crate::domain::class_course::ClassCourse,
+        crate::service::class_course::InstancePolicy,
+    )> = Vec::new();
+    for instance in crate::db::class_course::list_for_class_ids(db, &class_ids).await? {
+        let policy = crate::service::class_course::resolve_policy(db, &instance).await?;
+        if policy.counts_toward_karne {
+            counted.push((instance, policy));
+        }
+    }
     let instance_ids: Vec<crate::domain::class_course::ClassCourseId> =
-        instances.iter().map(|i| i.get_id().clone()).collect();
+        counted.iter().map(|(i, _)| i.get_id().clone()).collect();
 
     // The term's exams inside those instances, plus this student's marks on
     // them. An exam another term owns is not this report card's to weigh.
@@ -178,24 +189,20 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
         crate::db::exam_result::list_for_user_in_term(db, user, term.get_id(), &instance_ids)
             .await?;
 
-    // Titles for the lines: one batch read for the whole report.
-    let course_ids: Vec<crate::domain::course::CourseId> =
-        instances.iter().map(|i| i.get_course().clone()).collect();
-    let courses = crate::db::course::list_by_ids(db, &course_ids).await?;
-    let titles: HashMap<String, String> = courses
-        .iter()
-        .map(|course| {
-            (
-                course.get_id().key(),
-                course.get_title().as_str().to_string(),
-            )
-        })
-        .collect();
+    // Titles for the lines: the sections' **resolved** titles (override →
+    // offering → catalog), batched — one offering read + one catalog read
+    // for the whole report.
+    let line_refs: Vec<&crate::domain::class_course::ClassCourse> =
+        counted.iter().map(|(i, _)| i).collect();
+    let titles = crate::service::instance_resolve::resolved_content(db, &line_refs).await?;
 
-    let mut lines = Vec::with_capacity(instances.len());
+    let mut lines = Vec::with_capacity(counted.len());
     let mut weighted: Vec<(f64, i64)> = Vec::new();
-    for instance in &instances {
+    for (instance, policy) in &counted {
         let mut pairs: Vec<(i64, i64)> = Vec::new();
+        // The section's weight chain answer per kind, computed once — every
+        // mark of a kind weighs the same inside one line.
+        let mut line_weights: HashMap<String, i64> = HashMap::new();
         for (line, result) in &results {
             // Every mark the read attributed to another instance stays out of
             // this line; one line's marks are exactly those addressed under it.
@@ -207,24 +214,35 @@ async fn compute(db: &Database, user: &UserId, term: &Term) -> Result<KarneRepor
                 // term's exam that is no longer there): not this line's.
                 continue;
             };
-            // The kind's current settings weight; an exam keeps a retired
-            // kind, and its marks then count once.
-            let weight = school
-                .exam_kind_weight(exam.get_kind().as_str())
-                .unwrap_or(1);
+            // The kind's weight *in this section*: the section's own
+            // override, else the offering's, else the settings weight, else 1
+            // — a retired kind keeps counting once, an own set in force is
+            // the whole answer, empty included.
+            let kind = exam.get_kind().as_str();
+            let weight = match line_weights.get(kind) {
+                Some(weight) => *weight,
+                None => {
+                    let weight =
+                        crate::service::exam_weight::resolve(db, instance, kind).await?;
+                    line_weights.insert(kind.to_string(), weight);
+                    weight
+                }
+            };
             pairs.push((result.get_mark().as_i64(), weight));
         }
         let average = weighted_average(&pairs);
         if let Some(average) = average {
-            weighted.push((average, instance.get_ders_saati().as_i64()));
+            weighted.push((average, policy.ders_saati.as_i64()));
         }
         lines.push(KarneInstance {
             class_course: instance.get_id().key(),
+            // The resolved display title: the section's override, else its
+            // offering's, else the catalog's — never the bare catalog row.
             course: titles
-                .get(instance.get_course().key().as_str())
-                .cloned()
+                .get(instance.get_id().key().as_str())
+                .map(|content| content.title.clone())
                 .unwrap_or_default(),
-            ders_saati: instance.get_ders_saati().as_i64(),
+            ders_saati: policy.ders_saati.as_i64(),
             band: average.and_then(|average| school.grade_label(average).map(str::to_string)),
             average,
         });
@@ -321,7 +339,7 @@ mod tests {
         };
 
         // The owner sits both exams; the addressed instance only the shared
-        // one. Both kinds are `yazili`, whose default weight is 1.
+        // one. Both kinds (`yazili`, `sozlu`) weigh 1 in the default settings.
         let owner = line(&fixture.owner);
         assert_eq!(
             owner.average,
@@ -348,6 +366,47 @@ mod tests {
             report.verdict.as_deref(),
             Some("gecti"),
             "75 clears the floor"
+        );
+    }
+
+    /// A class-level weight moves the average: with the owner section's own
+    /// set in force (`yazili` = 2), its ortak mark counts double —
+    /// (85×2 + 45×1) / 3 — while the sibling section, still inheriting, keeps
+    /// the plain settings weight and its plain mean. Read off the settings
+    /// singleton both lines would have stayed at 65 and 85.
+    #[tokio::test]
+    async fn a_class_level_weight_changes_the_karne_average() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let fixture = crate::db::exam_result::tests::an_ortak_exam_karne(&db).await;
+
+        let owner = crate::service::class_course::read(&db, &fixture.owner)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::service::exam_weight::set_for_class(&db, owner.get_id(), "yazili", 2)
+            .await
+            .unwrap();
+
+        let report = build(&db, &fixture.student, &fixture.term).await.unwrap();
+        let line = |instance: &crate::domain::class_course::ClassCourseId| {
+            report
+                .instances
+                .iter()
+                .find(|line| line.class_course == instance.key())
+                .unwrap_or_else(|| panic!("no line for {}", instance.key()))
+        };
+
+        assert_eq!(
+            line(&fixture.owner).average,
+            Some((2.0 * crate::db::exam_result::tests::ORTAK_MARK as f64
+                + crate::db::exam_result::tests::OWNER_MARK as f64)
+                / 3.0),
+            "the ortak mark counts double under the section's own weight"
+        );
+        assert_eq!(
+            line(&fixture.addressed).average,
+            Some(crate::db::exam_result::tests::ORTAK_MARK as f64),
+            "the sibling still inherits — a class weight never leaks across sections"
         );
     }
 }

@@ -547,7 +547,7 @@ mod tests {
             db,
             manager,
             ClassName::try_new(name).unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(9).unwrap(),
             year.cloned(),
             None,
         )

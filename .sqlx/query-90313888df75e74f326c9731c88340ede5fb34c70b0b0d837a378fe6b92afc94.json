@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT grade_level AS \"grade_level: GradeLevel\" FROM class_group\n               WHERE id = $1 FOR KEY SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "grade_level: GradeLevel",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "grade_level"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "90313888df75e74f326c9731c88340ede5fb34c70b0b0d837a378fe6b92afc94"
+}

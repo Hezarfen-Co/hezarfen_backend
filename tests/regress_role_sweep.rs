@@ -24,6 +24,7 @@ use hezarfen_backend::database::Database;
 use hezarfen_backend::db::enrollment;
 use hezarfen_backend::domain::class_course::ClassCourseId;
 use hezarfen_backend::domain::class_group::{ClassGroupId, ClassName};
+use hezarfen_backend::domain::grade::GradeLevel;
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::timestamp::Timestamp;
@@ -385,7 +386,7 @@ async fn a_class_named(name: &str, db: &Database) -> ClassGroupId {
         db,
         &manager,
         ClassName::try_new(name).unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         None,
         None,
     )

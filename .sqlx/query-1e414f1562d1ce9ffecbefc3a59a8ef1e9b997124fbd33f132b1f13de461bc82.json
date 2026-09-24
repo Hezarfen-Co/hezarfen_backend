@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH kicked AS (\n               DELETE FROM class_course_exam_weight WHERE class_course = $1\n           ), updated AS (\n               UPDATE class_course\n                  SET exam_weights_inherited = TRUE\n                WHERE id = $1\n                RETURNING id\n           )\n           SELECT u.id AS \"id: ClassCourseId\" FROM updated u",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1e414f1562d1ce9ffecbefc3a59a8ef1e9b997124fbd33f132b1f13de461bc82"
+}

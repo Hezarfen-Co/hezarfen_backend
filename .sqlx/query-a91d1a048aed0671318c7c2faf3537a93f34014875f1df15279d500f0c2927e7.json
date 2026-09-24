@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM offering_slot WHERE id = $1 AND offering = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a91d1a048aed0671318c7c2faf3537a93f34014875f1df15279d500f0c2927e7"
+}

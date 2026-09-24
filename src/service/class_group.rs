@@ -5,7 +5,8 @@
 use crate::database::Database;
 use crate::db::class_group;
 use crate::domain::academic_year::AcademicYearId;
-use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
+use crate::domain::class_group::{ClassGroup, ClassGroupId, ClassName};
+use crate::domain::grade::GradeLevel;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -25,11 +26,11 @@ pub async fn create(
     db: &Database,
     creator: &UserId,
     name: ClassName,
-    grade: Option<ClassGrade>,
+    grade_level: GradeLevel,
     year: Option<AcademicYearId>,
     teacher: Option<UserId>,
 ) -> Result<ClassGroup, AppError> {
-    class_group::create(db, creator, name, grade, year, teacher).await
+    class_group::create(db, creator, name, grade_level, year, teacher).await
 }
 
 /// The row, for callers that only inspect it — the web layer's
@@ -38,15 +39,15 @@ pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>
     class_group::read(db, id).await
 }
 
-/// Every class, newest first — or one grade's, when `grade` narrows it: the
-/// read behind the class index.
+/// Every class, newest first — or one rung's, when `grade_level` narrows it:
+/// the read behind the class index.
 pub async fn list_all(
     db: &Database,
-    grade: Option<Option<ClassGrade>>,
+    grade_level: Option<GradeLevel>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ClassGroup>, i64), AppError> {
-    class_group::list_all(db, grade, limit, offset).await
+    class_group::list_all(db, grade_level, limit, offset).await
 }
 
 /// The classes `ids` names, in no particular order — the join behind the two
@@ -68,11 +69,11 @@ pub async fn update(
     db: &Database,
     class: ClassGroup,
     name: Option<ClassName>,
-    grade: Option<Option<ClassGrade>>,
+    grade_level: Option<GradeLevel>,
     year: Option<Option<AcademicYearId>>,
     teacher: Option<Option<UserId>>,
 ) -> Result<ClassGroup, AppError> {
-    class_group::update(db, class, name, grade, year, teacher).await
+    class_group::update(db, class, name, grade_level, year, teacher).await
 }
 
 /// Delete the class and give its year reference back; `false` = refused,

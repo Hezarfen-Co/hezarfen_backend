@@ -1,0 +1,139 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO course_offering\n               (id, course, grade_level, title, description,\n                default_ders_saati, default_counts_toward_karne,\n                created_by, created_at, updated_at)\n           VALUES ($1, $2, $3, $4, $5, $6::bigint, $7, $8, $9, $9)\n           RETURNING id AS \"id: CourseOfferingId\",\n                     course AS \"course: CourseId\",\n                     grade_level AS \"grade_level: GradeLevel\",\n                     title AS \"title?: CourseTitle\",\n                     description AS \"description?: CourseDescription\",\n                     default_ders_saati::bigint AS \"default_ders_saati?: DersSaati\",\n                     default_counts_toward_karne,\n                     created_by AS \"created_by: UserId\",\n                     created_at AS \"created_at: Timestamp\",\n                     updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseOfferingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "grade_level: GradeLevel",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "grade_level"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "title?: CourseTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "description?: CourseDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_ders_saati?: DersSaati",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "default_counts_toward_karne",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "default_counts_toward_karne"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int2",
+        "Text",
+        "Text",
+        "Int8",
+        "Bool",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "56a731baf00b6a3d69e425c7ae42d449430f363319ce19ab195f2429eb9a5c55"
+}

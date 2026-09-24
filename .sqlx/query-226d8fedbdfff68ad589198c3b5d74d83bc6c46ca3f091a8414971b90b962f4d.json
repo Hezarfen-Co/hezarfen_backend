@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: CourseOfferingId\" FROM course_offering\n           WHERE course = $1 AND grade_level = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseOfferingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "226d8fedbdfff68ad589198c3b5d74d83bc6c46ca3f091a8414971b90b962f4d"
+}

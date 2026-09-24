@@ -1,10 +1,14 @@
-//! Subject workflows: the two id resolvers every question/homework tag goes
+//! Subject workflows: the id resolvers every question/homework tag goes
 //! through — the same-course rule for curriculum content, existence-only for
 //! the bank's cross-course origin metadata — over the row writes in
-//! [`crate::db::subject`].
+//! [`crate::db::subject`]. Since the course-template system, the tag gate for
+//! instance-scoped content is [`in_instance`]: the same-course rule *plus*
+//! the section's resolved subject set (override-or-inherit), because a
+//! section teaches a selection of the course, not the whole course.
 
 use crate::database::Database;
 use crate::db::subject;
+use crate::domain::class_course::ClassCourse;
 use crate::domain::course::CourseId;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::{AppError, ValidationError};
@@ -53,9 +57,12 @@ pub async fn delete(db: &Database, target: Subject) -> Result<Subject, AppError>
 }
 
 /// Turn a request-supplied subject id into a validated reference, provided the
-/// subject belongs to `course` — a question may only be tagged with a subject
-/// of its own exam's course. Unknown or foreign subjects are a `400` naming
-/// the field. Shared by the question create/update handlers.
+/// subject belongs to `course`. The *course half* of the instance tag gate —
+/// a question may only be tagged with a subject of its own exam's course.
+/// Instance-scoped writers use [`in_instance`], which adds the section's
+/// resolved subject set on top; this fn stays for the callers that have only
+/// the course at hand. Unknown or foreign subjects are a `400` naming the
+/// field. Shared by the question create/update handlers.
 pub async fn in_course(db: &Database, id: &str, course: &CourseId) -> Result<SubjectId, AppError> {
     let subject =
         subject::read(db, &SubjectId::from_key(id))
@@ -71,6 +78,25 @@ pub async fn in_course(db: &Database, id: &str, course: &CourseId) -> Result<Sub
         }));
     }
     Ok(*subject.get_id())
+}
+
+/// The instance-scoped tag gate: the same two 400s [`in_course`] answers for
+/// the instance's course — same order, so the first 4xx a client sees is
+/// unchanged — then the course-template half: the subject must sit in what
+/// this section actually *teaches*, its resolved set
+/// ([`crate::service::offering_subject::resolved_for_instance`]), not merely
+/// in the catalog course. A right-course-but-off-syllabus subject is a `400`
+/// naming the field. The resolved-set probe is one SQL statement that reads
+/// the section's flag and the matching table as of one snapshot
+/// ([`crate::db::offering_subject::resolves_for_class_course`]).
+pub async fn in_instance(
+    db: &Database,
+    id: &str,
+    instance: &ClassCourse,
+) -> Result<SubjectId, AppError> {
+    let subject_id = in_course(db, id, instance.get_course()).await?;
+    crate::service::offering_subject::ensure_resolved_member(db, instance, &subject_id).await?;
+    Ok(subject_id)
 }
 
 /// Turn a request-supplied subject id into a validated reference, checking only

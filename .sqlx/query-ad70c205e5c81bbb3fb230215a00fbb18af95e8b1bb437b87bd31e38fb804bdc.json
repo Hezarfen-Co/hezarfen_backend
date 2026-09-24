@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT s.id AS \"id: SubjectId\",\n                  s.course AS \"course: CourseId\",\n                  s.name AS \"name: SubjectName\",\n                  s.description AS \"description: SubjectDescription\"\n           FROM class_course_subject ccs\n           JOIN subject s ON s.id = ccs.subject\n           WHERE ccs.class_course = $1\n           ORDER BY s.name ASC, s.id ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: SubjectName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description: SubjectDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "subject",
+            "name": "description"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ad70c205e5c81bbb3fb230215a00fbb18af95e8b1bb437b87bd31e38fb804bdc"
+}

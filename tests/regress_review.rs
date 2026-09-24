@@ -21,7 +21,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{
     app_and_db, create_exam_with, create_subject, enroll, id_of, login, login_as, me_id, send,
-    taught_under, ABSENT_ID,
+    select_instance_subject, taught_under, ABSENT_ID,
 };
 use serde_json::json;
 
@@ -38,6 +38,10 @@ async fn review_hides_the_key_of_a_bank_question_live_under_another_sitting() {
 
     let t = taught_under(&app, &mudur, &teacher, "maths").await;
     let subject = create_subject(&app, &teacher, &t.course, "arithmetic").await;
+    // The section only tags questions with topics it actually *teaches* —
+    // the resolved set, not the bare course — so the fixture takes the topic
+    // onto this section first.
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     enroll(&app, &teacher, &t.instance, &student_id).await;
 
     // One template, instantiated into both exams below.
@@ -226,6 +230,9 @@ async fn review_hides_a_question_banked_out_of_it_and_live_elsewhere() {
 
     let t = taught_under(&app, &mudur, &teacher, "physics").await;
     let subject = create_subject(&app, &teacher, &t.course, "optics").await;
+    // Same as above: the tag check reads the resolved syllabus, so the
+    // fixture teaches the topic before tagging with it.
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     enroll(&app, &teacher, &t.instance, &student_id).await;
 
     let exam = async |title: &str, review: bool| {
@@ -397,6 +404,7 @@ async fn a_retake_in_progress_closes_the_students_own_review_reads() {
 
     let t = taught_under(&app, &mudur, &teacher, "biology").await;
     let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = create_exam_with(
         &app,
@@ -494,6 +502,7 @@ async fn review_stays_shut_while_another_sitting_is_still_available() {
 
     let t = taught_under(&app, &mudur, &teacher, "chemistry").await;
     let subject = create_subject(&app, &teacher, &t.course, "bonds").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     enroll(&app, &teacher, &t.instance, &student_id).await;
     // Unlimited sittings: no amount of finishing exhausts them.
     let res = create_exam_with(

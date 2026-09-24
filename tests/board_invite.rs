@@ -66,7 +66,7 @@ async fn a_class(app: &axum::Router, manager: &str, name: &str, members: &[&str]
         "POST",
         "/classes",
         Some(manager),
-        Some(json!({ "name": name })),
+        Some(json!({ "name": name, "grade_level": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

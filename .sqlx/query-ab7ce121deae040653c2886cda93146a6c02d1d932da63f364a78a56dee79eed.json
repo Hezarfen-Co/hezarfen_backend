@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: CourseOfferingId\" FROM course_offering WHERE id = $1\n           FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseOfferingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_offering",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ab7ce121deae040653c2886cda93146a6c02d1d932da63f364a78a56dee79eed"
+}

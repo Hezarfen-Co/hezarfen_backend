@@ -13,7 +13,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
-use crate::constant::{MAX_ACADEMIC_YEAR_NAME_LEN, MAX_CLASS_GRADE_LEN};
+use crate::constant::MAX_ACADEMIC_YEAR_NAME_LEN;
+use crate::domain::grade::GradeLevel;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -81,39 +82,28 @@ impl AcademicYearName {
 }
 
 /// One grade-promotion mapping: a student who finished `from_grade` moves to
-/// `to_grade` at rollover.
+/// `to_grade` at rollover. Both ends are ladder rungs (`GradeLevel`), stored
+/// as the integers they are — the JSON column serializes them as numbers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GradePromotion {
-    from_grade: String,
-    to_grade: String,
+    from_grade: GradeLevel,
+    to_grade: GradeLevel,
 }
 
 impl GradePromotion {
-    pub fn try_new(from_grade: &str, to_grade: &str) -> Result<Self, ValidationError> {
-        let bound = |field: &'static str, value: &str| {
-            if value.is_empty() || value.chars().count() > MAX_CLASS_GRADE_LEN {
-                Err(ValidationError::Invalid {
-                    field,
-                    reason: "grade labels must be 1 to 20 characters",
-                })
-            } else {
-                Ok(())
-            }
-        };
-        bound("from_grade", from_grade)?;
-        bound("to_grade", to_grade)?;
-        Ok(Self {
-            from_grade: from_grade.to_string(),
-            to_grade: to_grade.to_string(),
-        })
+    pub fn new(from_grade: GradeLevel, to_grade: GradeLevel) -> Self {
+        Self {
+            from_grade,
+            to_grade,
+        }
     }
 
-    pub fn get_from_grade(&self) -> &str {
-        &self.from_grade
+    pub fn get_from_grade(&self) -> GradeLevel {
+        self.from_grade
     }
 
-    pub fn get_to_grade(&self) -> &str {
-        &self.to_grade
+    pub fn get_to_grade(&self) -> GradeLevel {
+        self.to_grade
     }
 }
 
@@ -188,12 +178,12 @@ impl AcademicYear {
 
     /// The grade a section at `grade` rolls into, or `None` when the grade has no
     /// promotion entry (graduation).
-    pub fn promotion_for(&self, grade: &str) -> Option<&str> {
+    pub fn promotion_for(&self, grade: GradeLevel) -> Option<GradeLevel> {
         self.grade_promotions
             .0
             .iter()
             .find(|promo| promo.from_grade == grade)
-            .map(|promo| promo.to_grade.as_str())
+            .map(|promo| promo.to_grade)
     }
 
     pub fn get_class_count(&self) -> i64 {
@@ -226,10 +216,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promotions_validate_both_labels() {
-        assert!(GradePromotion::try_new("5", "6").is_ok());
-        assert!(GradePromotion::try_new("", "6").is_err());
-        assert!(GradePromotion::try_new("5", &"x".repeat(MAX_CLASS_GRADE_LEN + 1)).is_err());
+    async fn promotions_carry_ladder_rungs() {
+        let (five, six) = (
+            GradeLevel::new(5).unwrap(),
+            GradeLevel::new(6).unwrap(),
+        );
+        let promo = GradePromotion::new(five, six);
+        assert_eq!(promo.get_from_grade(), five);
+        assert_eq!(promo.get_to_grade(), six);
     }
 
     #[tokio::test]
@@ -247,10 +241,17 @@ mod tests {
             ts(0),
             ts(1000),
             creator,
-            vec![GradePromotion::try_new("5", "6").unwrap()],
+            vec![GradePromotion::new(
+                GradeLevel::new(5).unwrap(),
+                GradeLevel::new(6).unwrap(),
+            )],
         )
         .unwrap();
-        assert_eq!(year.promotion_for("5"), Some("6"));
-        assert_eq!(year.promotion_for("12"), None);
+        assert_eq!(
+            year.promotion_for(GradeLevel::new(5).unwrap()),
+            Some(GradeLevel::new(6).unwrap())
+        );
+        // The ladder's top rung graduates unless the school names a promotion.
+        assert_eq!(year.promotion_for(GradeLevel::new(12).unwrap()), None);
     }
 }

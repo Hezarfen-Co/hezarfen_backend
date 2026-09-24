@@ -209,7 +209,7 @@ async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "year": year })),
+        Some(json!({ "name": "9-A", "year": year, "grade_level": 9 })),
     )
     .await;
     assert_eq!(

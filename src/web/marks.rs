@@ -125,10 +125,12 @@ async fn enrolled_instances(user: &UserId, db: &Database) -> Result<Vec<ClassCou
 }
 
 /// Assemble the report: for each instance the student sits, join its exams with
-/// the student's graded results, weigh each mark by its exam kind's settings
-/// weight, then average. A `viewer` narrows the report to the instances that
-/// viewer manages (self-reports and manager+ reports pass `None` and see
-/// everything); the overall average follows the narrowed set.
+/// the student's graded results, weigh each mark by its kind's weight *in that
+/// section* ([`service::exam_weight::resolve`]: the section's override, else
+/// the offering's, else the settings weight, else 1), then average. A `viewer`
+/// narrows the report to the instances that viewer manages (self-reports and
+/// manager+ reports pass `None` and see everything); the overall average
+/// follows the narrowed set.
 async fn build_report(
     user: &UserId,
     viewer: Option<&User>,
@@ -145,8 +147,9 @@ async fn build_report(
         instances = kept;
     }
 
-    // One settings read weighs and labels the whole report, and one batch read
-    // resolves every block's catalog row (its title and kind).
+    // One settings read grades (bands/labels) the whole report — the weights
+    // ride each section's own chain now — and one batch read resolves every
+    // block's catalog row (its title and kind).
     let school = service::settings::load(db).await?;
     let course_ids: Vec<crate::domain::course::CourseId> =
         instances.iter().map(|i| i.get_course().clone()).collect();
@@ -156,10 +159,19 @@ async fn build_report(
         .map(|course| (course.get_id().key(), course))
         .collect();
     let people = person_map(courses.iter().flat_map(course_people), db).await?;
+    // The blocks display the sections' **resolved** titles/descriptions
+    // (override → offering → catalog), batched — the `/courses` catalog list
+    // is the deliberate exception that keeps the catalog row's own values,
+    // because that surface IS the catalog.
+    let instance_refs: Vec<&ClassCourse> = instances.iter().collect();
+    let content = service::instance_resolve::resolved_content(db, &instance_refs).await?;
 
     let mut blocks = Vec::with_capacity(instances.len());
     let mut seen: HashSet<String> = HashSet::new();
     for instance in &instances {
+        // The section's weight chain answer per kind, computed once — every
+        // mark of a kind weighs the same inside one block.
+        let mut line_weights: HashMap<String, i64> = HashMap::new();
         let exams = crate::service::exam::list_for_class_course(db, instance.get_id()).await?;
         let by_exam: HashMap<String, &Exam> = exams.iter().map(|e| (e.get_id().key(), e)).collect();
         let results =
@@ -174,11 +186,19 @@ async fn build_report(
             let Some(exam) = by_exam.get(result.get_exam().key().as_str()) else {
                 continue;
             };
-            // The kind's current settings weight; an exam keeps a retired
-            // kind, and its marks then count once.
-            let weight = school
-                .exam_kind_weight(exam.get_kind().as_str())
-                .unwrap_or(1);
+            // The kind's weight *in this section*: the section's own
+            // override, else the offering's, else the settings weight, else 1
+            // — a retired kind keeps counting once, an own set in force is
+            // the whole answer, empty included.
+            let kind = exam.get_kind().as_str();
+            let weight = match line_weights.get(kind) {
+                Some(weight) => *weight,
+                None => {
+                    let weight = service::exam_weight::resolve(db, instance, kind).await?;
+                    line_weights.insert(kind.to_string(), weight);
+                    weight
+                }
+            };
             entries.push(MarkEntry {
                 exam: exam.get_id().key().to_string(),
                 title: exam.get_title().as_str().to_string(),
@@ -200,9 +220,17 @@ async fn build_report(
         };
         seen.insert(instance.get_id().key());
         let average = weighted_average(&pairs);
+        // The instance-scoped display: resolved title/description over the
+        // catalog row's (which stays the id/kind/counters source).
+        let resolved = content
+            .get(instance.get_id().key().as_str())
+            .expect("resolved_content covers every instance it is given");
+        let mut course = CourseResponse::new(course, &people);
+        course.title = resolved.title.clone();
+        course.description = resolved.description.clone();
         blocks.push(CourseMarks {
             instance: instance.get_id().key(),
-            course: CourseResponse::new(course, &people),
+            course,
             average,
             average_grade: average.and_then(|a| school.grade_label(a).map(str::to_string)),
             results: entries,

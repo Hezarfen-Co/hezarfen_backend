@@ -38,6 +38,7 @@ use hezarfen_backend::db::{
 use hezarfen_backend::domain::academic_year::AcademicYearName;
 use hezarfen_backend::domain::class_course::ClassCourseId;
 use hezarfen_backend::domain::class_group::{ClassGroupId, ClassName};
+use hezarfen_backend::domain::grade::GradeLevel;
 use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
 use hezarfen_backend::domain::course_note::{CourseNoteContent, CourseNoteTitle};
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
@@ -155,7 +156,7 @@ async fn fixture(db: &Database) -> Fixture {
         db,
         &teacher,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        GradeLevel::new(9).unwrap(),
         Some(year),
         None,
     )

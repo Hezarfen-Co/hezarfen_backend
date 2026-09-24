@@ -132,17 +132,24 @@ pub async fn for_user(
     let classes = crate::db::class_group::list_by_ids(db, &class_ids).await?;
     let courses = crate::db::course::list_by_ids(db, &course_ids).await?;
 
-    // Grade labels, keyed by class section. A class with no grade at all (a
-    // club-shaped section, and the shape a fixture class carries) simply
-    // contributes no entry, so its instances scope the subject across every
-    // grade — the documented meaning of an absent `sinif`.
+    // Display labels, keyed by class section. Every section carries a ladder
+    // rung now, so every class-keyed instance pairs with one; only the
+    // school-wide club/study memberships ride in with no grade at all (the
+    // documented meaning of an absent `sinif`).
     let grades: HashMap<String, String> = classes
         .iter()
-        .filter_map(|class| {
-            class
-                .get_grade()
-                .map(|grade| (class.get_id().key(), grade.as_str().to_owned()))
-        })
+        .map(|class| (class.get_id().key(), class.get_grade_level().label().to_owned()))
+        .collect();
+    // The instances' **resolved** titles (override → offering → catalog): the
+    // section's own grade content is what a scope pair names. Batched — one
+    // offering read + one catalog read for the whole scope. The club/study
+    // memberships below keep the catalog title: a school-wide course has no
+    // offering, so the catalog row is the only label there is.
+    let instance_refs: Vec<&ClassCourse> = instances.iter().collect();
+    let resolved = crate::service::instance_resolve::resolved_content(db, &instance_refs).await?;
+    let ders_by_instance: HashMap<String, String> = resolved
+        .into_iter()
+        .map(|(key, content)| (key, content.title))
         .collect();
     let titles: HashMap<String, String> = courses
         .iter()
@@ -152,10 +159,10 @@ pub async fn for_user(
     let mut pairs: Vec<RagScopePair> = Vec::new();
     let mut seen: HashSet<(Option<String>, String)> = HashSet::new();
     for instance in &instances {
-        // A course row the batch read did not answer is unreachable — the
+        // A title the batch read did not answer is unreachable — the
         // instance's key is a foreign key — so the skip is a guard against a
         // dangling read, not a rule: a title-less pair could not be routed.
-        let Some(ders) = titles.get(&instance.get_course().key()) else {
+        let Some(ders) = ders_by_instance.get(instance.get_id().key().as_str()) else {
             continue;
         };
         push_pair(
@@ -203,7 +210,8 @@ fn push_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::class_group::{ClassGrade, ClassGroupId, ClassName};
+    use crate::domain::class_group::{ClassGroupId, ClassName};
+    use crate::domain::grade::GradeLevel;
     use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
     use crate::domain::user::Username;
 
@@ -230,15 +238,15 @@ mod tests {
         .unwrap()
     }
 
-    /// A class section carrying a grade label — the half of every instance
-    /// pair, since `a_class` deliberately has none.
+    /// A class section at a chosen rung — the half of every instance pair
+    /// that scopes by grade.
     async fn graded_class(db: &Database, name: &str, grade: &str) -> ClassGroupId {
         let office = crate::db::class_member::tests::fixture_user(db, "ragscope-office").await;
         crate::service::class_group::create(
             db,
             &office,
             ClassName::try_new(name).unwrap(),
-            Some(ClassGrade::try_new(grade).unwrap()),
+            GradeLevel::new(grade.parse().unwrap()).unwrap(),
             None,
             None,
         )

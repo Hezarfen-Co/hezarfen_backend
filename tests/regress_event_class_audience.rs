@@ -20,7 +20,7 @@ async fn create_class(app: &Router, cookie: &str, name: &str) -> String {
         "POST",
         "/classes",
         Some(cookie),
-        Some(json!({"name": name})),
+        Some(json!({"name": name, "grade_level": 9})),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);

@@ -674,7 +674,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
     // a plain teacher run the instance's roster and write its exams.
     let class: Value = manager
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "9-A", "year": year, "teacher_id": teacher_id }))
+        .json(&json!({ "name": "9-A", "grade_level": 9, "year": year, "teacher_id": teacher_id }))
         .send()
         .await
         .unwrap()
@@ -692,6 +692,26 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .await
         .unwrap();
     let instance_id = instance["id"].as_str().unwrap().to_string();
+
+    // The attach auto-minted the grade-level offering with an empty syllabus;
+    // the manager selects the fresh topic onto it, because a question may
+    // only name a subject the section teaches.
+    let offering: Value = manager
+        .get(format!("{base}/instances/{instance_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let offering_id = offering["offering"].as_str().unwrap().to_string();
+    let res = manager
+        .post(format!("{base}/offerings/{offering_id}/subjects"))
+        .json(&json!({ "subject": subject_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
 
     let res = teacher
         .post(format!("{base}/instances/{instance_id}/enrollments"))
@@ -3288,7 +3308,7 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
     );
     let res = manager
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "9-A", "grade": "9", "teacher_id": teacher_id }))
+        .json(&json!({ "name": "9-A", "grade_level": 9, "teacher_id": teacher_id }))
         .send()
         .await
         .unwrap();
@@ -3541,7 +3561,7 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
     // instance is what every one of the writes below hangs off.
     let res = mudur
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "9-A", "grade": "9", "year": year_id }))
+        .json(&json!({ "name": "9-A", "grade_level": 9, "year": year_id }))
         .send()
         .await
         .unwrap();
@@ -3559,6 +3579,28 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     let instance_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
+    // The attach auto-minted the grade-level offering with an empty syllabus;
+    // select the fresh topic onto it so the question and the homework below
+    // may tag it.
+    let offering_id = json_of(
+        mudur
+            .get(format!("{base}/instances/{instance_id}"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await["offering"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let res = mudur
+        .post(format!("{base}/offerings/{offering_id}/subjects"))
+        .json(&json!({ "subject": subject_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
 
     let exam: Value = json_of(
         mudur
@@ -4162,7 +4204,7 @@ async fn a_course_taught_by_two_subeler_is_two_instances_end_to_end() {
     // --- two şubeler, one catalog course ------------------------------------
     let res = mudur
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "5-A", "grade": "5", "year": year, "teacher_id": hoca_id }))
+        .json(&json!({ "name": "5-A", "grade_level": 5, "year": year, "teacher_id": hoca_id }))
         .send()
         .await
         .unwrap();
@@ -4170,7 +4212,7 @@ async fn a_course_taught_by_two_subeler_is_two_instances_end_to_end() {
     let five_a = id_of(&res.json::<Value>().await.unwrap()["class"]);
     let res = mudur
         .post(format!("{base}/classes"))
-        .json(&json!({ "name": "5-B", "grade": "5", "year": year }))
+        .json(&json!({ "name": "5-B", "grade_level": 5, "year": year }))
         .send()
         .await
         .unwrap();

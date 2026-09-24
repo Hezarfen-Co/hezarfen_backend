@@ -14,7 +14,6 @@ use crate::domain::academic_year::{
     AcademicYear, AcademicYearId, AcademicYearName, GradePromotion, archived_error,
     rollover_target_not_empty,
 };
-use crate::domain::class_group::ClassGrade;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -215,24 +214,21 @@ pub async fn rollover(
         graduated: Vec::new(),
     };
     for class in class_group::list_for_year(db, from).await? {
-        let Some(grade) = class.get_grade() else {
-            continue;
-        };
-        let Some(mapped) = from_year.promotion_for(grade.as_str()) else {
-            // No promotion entry: this grade graduated. Reported once per
+        let grade = class.get_grade_level();
+        let Some(next) = from_year.promotion_for(grade) else {
+            // No promotion entry: this rung graduated. Reported once per
             // label, however many class sections carry it.
-            let label = grade.as_str().to_string();
+            let label = grade.label().to_string();
             if !report.graduated.contains(&label) {
                 report.graduated.push(label);
             }
             continue;
         };
-        let next = ClassGrade::try_new(mapped)?;
         let planted = class_group::create(
             db,
             by,
             class.get_name().clone(),
-            Some(next),
+            next,
             Some(*target),
             class.get_teacher().copied(),
         )
@@ -258,11 +254,20 @@ pub async fn rollover(
                     instance.get_course().key()
                 )));
             };
+            // The section's own overrides ride along — a copy sets exactly
+            // what the source had set (its `None`s are the inherit state, and
+            // the fresh row is born NULL anyway). The *offering*, unlike these
+            // scalars, is deliberately NOT copied: `attach_sourced` resolved
+            // it against the new section's own `grade_level` (auto-creating
+            // that grade's template), so a rolled-up section teaches from its
+            // new grade's offering, never the source grade's.
             class_course::update(
                 db,
                 copied.get_id(),
-                Some(instance.get_ders_saati()),
-                Some(instance.counts_toward_karne()),
+                instance.get_title().cloned(),
+                instance.get_description().cloned(),
+                instance.get_ders_saati(),
+                instance.counts_toward_karne(),
             )
             .await?;
             for teacher in class_course_teacher::list_for_instance(db, instance.get_id()).await? {

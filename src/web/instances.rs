@@ -3,9 +3,12 @@
 //!
 //! Everything a class actually runs hangs off this row: its roster, its
 //! teachers, its exams, its lessons and its homework. Two sections teaching the
-//! same course are two instances and share none of it. The weekly hours
-//! (`ders_saati`) and the report-card policy (`counts_toward_karne`) are the
-//! instance's own, so two sections may legitimately differ.
+//! same course are two instances and share none of it. Each instance points at
+//! its grade-level **offering** template and may override the content fields
+//! (`title`, `description`, `ders_saati`, `counts_toward_karne`) — a `PATCH`
+//! sets an override, `POST /{id}/reset` clears back to inherit, and what a
+//! read presents is the resolved value (override → offering default →
+//! constant), never the raw `NULL`.
 //!
 //! The catalog CRUD stays in [`super::courses`]; the exam, session and
 //! homework sub-routers live *here* now (they used to hang off `/courses/{id}`)
@@ -25,6 +28,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati};
+use crate::domain::course::{CourseDescription, CourseTitle};
 use crate::domain::course_session::SessionTopic;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -39,16 +43,20 @@ use crate::service;
 use crate::service::instance::{can_manage_instance, visible_instances};
 use crate::state::AppState;
 
+use super::exam_weights::ExamWeightEntry;
 use super::homework::{description_or_none, resolve_assigned};
+use super::weekly_plan::WeeklySlotDto;
 use super::{
     CurrentUser, ExamResponse, HomeworkResponse, Page, PageParams, PersonRef, RequireManager,
-    RequireTeacher, SessionResponse, check_not_past, check_time_range, paginate, person_map,
+    RequireTeacher, SessionResponse, SubjectResponse, check_not_past, check_time_range, paginate,
+    person_map,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(my_instances))
         .routes(routes!(get_instance, update_instance))
+        .routes(routes!(reset_instance))
         .routes(routes!(assign_teacher))
         .routes(routes!(unassign_teacher))
         .routes(routes!(enroll, list_roster))
@@ -74,13 +82,31 @@ pub fn homework_routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateInstance {
-    /// Weekly lesson hours: the instance's weight in the year's report-card average.
-    /// Omit to keep the stored value; at least 1 and at most 40.
+    /// The section's own title override. Omit to keep the stored value; a
+    /// PATCH **sets**, it never clears — clearing back to inherit is the
+    /// reset door's (`POST /instances/{id}/reset`).
+    #[schema(max_length = 200, example = "9-A Matematik")]
+    title: Option<String>,
+    /// The section's own description override. Omit to keep; never clears.
+    #[schema(max_length = 2_000)]
+    description: Option<String>,
+    /// The section's own weekly-hours override: the weight it takes in the
+    /// year's report-card average while it is set. Omit to keep the stored
+    /// value (`null` to clear is the reset door's); at least 1 and at most 40.
     #[schema(minimum = 1, maximum = 40, example = 5)]
     ders_saati: Option<i64>,
-    /// Whether this instance's marks count into the report card. Omit to keep the
-    /// stored value.
+    /// The section's own report-card policy override. Omit to keep; never
+    /// clears.
     counts_toward_karne: Option<bool>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ResetInstanceOverrides {
+    /// The overrides to clear back to **inherit**: `title`, `description`,
+    /// `ders_saati`, `counts_toward_karne` — and, flipping the section's own
+    /// table back to non-authoritative (the offering's set applies again),
+    /// `subjects`, `exam_weights`, `weekly_plan`. Unknown names are a 400.
+    fields: Vec<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -185,8 +211,14 @@ struct CreateSessionInCourse {
     ends_at: Option<i64>,
 }
 
-/// Public shape of one instance: the course as this section teaches it, with the
-/// policy that is the instance's own.
+/// Public shape of one instance: the course as this section teaches it. Every
+/// content field is the **resolved** view the instance resolver composes —
+/// scalar chains run override → offering → catalog/constant, the set axes are
+/// flag-driven — so a client renders this verbatim and renders a per-class
+/// edit screen from this one call: `*_overridden` tells its own override from
+/// an inherited value, `*_inherited` tells whose set is authoritative. The
+/// raw template values (nullable, unset = inherit) live one level up, on
+/// `GET /offerings/{id}`.
 #[derive(Serialize, ToSchema)]
 pub struct InstanceResponse {
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
@@ -196,11 +228,51 @@ pub struct InstanceResponse {
     /// The catalog course being taught (`GET /courses/{id}`) — its title lives
     /// there, shared by every instance of it.
     pub course: String,
-    /// Weekly lesson hours; the instance's weight in the year's report-card average.
+    /// The grade-level offering template this section teaches from
+    /// (`GET /offerings/{id}`) — the thing its unset fields inherit from.
+    pub offering: String,
+    /// The section's **resolved** title: its own override, else its
+    /// offering's, else the catalog course's.
+    pub title: String,
+    /// `true` when `title` is this section's own override rather than
+    /// inherited from the offering or the catalog.
+    pub title_overridden: bool,
+    /// The section's **resolved** description, the same chain as `title`.
+    pub description: String,
+    /// `true` when `description` is this section's own override.
+    pub description_overridden: bool,
+    /// The section's **effective** weekly hours: its own override, else the
+    /// offering's default, else 1 — the weight it takes in the year's
+    /// report-card average.
     #[schema(example = 5)]
     pub ders_saati: i64,
-    /// Whether this instance's marks count toward the report card.
+    /// `true` when the hours are this section's own override.
+    pub ders_saati_overridden: bool,
+    /// The effective report-card policy: own override, else the offering's
+    /// default, else counted.
     pub counts_toward_karne: bool,
+    /// `true` when the policy is this section's own override.
+    pub counts_toward_karne_overridden: bool,
+    /// `false` = this section's own subject table is authoritative, including
+    /// when empty; `true` = the offering's subject set applies.
+    pub subjects_inherited: bool,
+    /// The section's **resolved** syllabus — the same set
+    /// `GET /{id}/subjects` serves, name-then-id order.
+    pub subjects: Vec<SubjectResponse>,
+    /// `true` = the section follows its offering's weight map; `false` = its
+    /// own table is authoritative, empty included.
+    pub exam_weights_inherited: bool,
+    /// The section's **resolved** weight map: every kind at its effective
+    /// weight (override → offering → settings → 1).
+    pub exam_weights: Vec<ExamWeightEntry>,
+    /// The same switch for the section's weekly plan.
+    pub weekly_plan_inherited: bool,
+    /// The section's **resolved** weekly plan: its own `class_course_slot`
+    /// rows when the flag above is `false` — including when that set is
+    /// empty — the offering's `offering_slot` template week when `true`.
+    /// Weekday first, then start time. Template data a timetable renders;
+    /// nothing generates dated `course_session` rows from it.
+    pub weekly_plan: Vec<WeeklySlotDto>,
     /// How many students are enrolled right now.
     #[schema(example = 28)]
     pub enrollment_count: i64,
@@ -210,23 +282,44 @@ pub struct InstanceResponse {
 }
 
 impl InstanceResponse {
-    fn new(
+    async fn new(
+        db: &Database,
         instance: &ClassCourse,
         teachers: &[UserId],
         people: &HashMap<String, PersonRef>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AppError> {
+        // One composed resolver call: title, description, the policy pair and
+        // the three set axes — never a fallback chain re-implemented here.
+        let resolved = service::instance_resolve::resolve(db, instance).await?;
+        Ok(Self {
             id: instance.get_id().key().to_string(),
             class: instance.get_class().key().to_string(),
             course: instance.get_course().key().to_string(),
-            ders_saati: instance.get_ders_saati().as_i64(),
-            counts_toward_karne: instance.counts_toward_karne(),
+            offering: instance.get_offering().key(),
+            title: resolved.title,
+            title_overridden: resolved.title_overridden,
+            description: resolved.description,
+            description_overridden: resolved.description_overridden,
+            ders_saati: resolved.ders_saati.as_i64(),
+            ders_saati_overridden: resolved.ders_saati_overridden,
+            counts_toward_karne: resolved.counts_toward_karne,
+            counts_toward_karne_overridden: resolved.counts_toward_karne_overridden,
+            subjects_inherited: resolved.subjects_inherited,
+            subjects: resolved.subjects.iter().map(SubjectResponse::new).collect(),
+            exam_weights_inherited: resolved.exam_weights_inherited,
+            exam_weights: resolved
+                .exam_weights
+                .iter()
+                .map(ExamWeightEntry::of)
+                .collect(),
+            weekly_plan_inherited: resolved.weekly_plan_inherited,
+            weekly_plan: resolved.weekly_plan.iter().map(WeeklySlotDto::new).collect(),
             enrollment_count: instance.get_enrollment_count(),
             teachers: teachers
                 .iter()
                 .map(|teacher| PersonRef::resolve(people, teacher))
                 .collect(),
-        }
+        })
     }
 }
 
@@ -344,10 +437,10 @@ async fn my_instances(
         .collect();
     let with_teachers = crate::db::class_course_teacher::into_instances(&st.db, window).await?;
     let people = instance_people(&with_teachers, &st.db).await?;
-    let items = with_teachers
-        .iter()
-        .map(|(instance, teachers)| InstanceResponse::new(instance, teachers, &people))
-        .collect();
+    let mut items = Vec::with_capacity(with_teachers.len());
+    for (instance, teachers) in &with_teachers {
+        items.push(InstanceResponse::new(&st.db, instance, teachers, &people).await?);
+    }
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -380,12 +473,13 @@ async fn get_instance(
     let teachers =
         crate::db::class_course_teacher::list_for_instance(&st.db, instance.get_id()).await?;
     let people = person_map(teachers.iter().cloned(), &st.db).await?;
-    Ok(Json(InstanceResponse::new(&instance, &teachers, &people)))
+    Ok(Json(InstanceResponse::new(&st.db, &instance, &teachers, &people).await?))
 }
 
-/// Update one instance's own policy. Requires teacher+ and a right over this
-/// instance: manager+, one of its assigned teachers, or its section's homeroom
-/// teacher. Omitted fields keep their value; both are non-clearable.
+/// Update one instance's own policy overrides. Requires teacher+ and a right
+/// over this instance: manager+, one of its assigned teachers, or its
+/// section's homeroom teacher. Omitted fields keep their value; a PATCH
+/// **sets**, it never clears — `POST /{id}/reset` is the clear door.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -395,7 +489,7 @@ async fn get_instance(
     request_body = UpdateInstance,
     responses(
         (status = 200, description = "Updated instance", body = InstanceResponse),
-        (status = 400, description = "Invalid ders_saati", body = ErrorResponse),
+        (status = 400, description = "Invalid title, description, or ders_saati", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -413,14 +507,73 @@ async fn update_instance(
     service::class_course::ensure_instance_teacher(&st.db, &user, instance.get_id()).await?;
     service::class_course::require_open(&st.db, instance.get_id()).await?;
 
+    let title = match &req.title {
+        Some(title) => Some(CourseTitle::try_new(title)?),
+        None => None,
+    };
+    let description = match &req.description {
+        Some(description) => Some(CourseDescription::try_new(description)?),
+        None => None,
+    };
     let staff = req.ders_saati.map(DersSaati::try_new).transpose()?;
-    let updated =
-        service::class_course::update(&st.db, instance.get_id(), staff, req.counts_toward_karne)
-            .await?;
+    let updated = service::class_course::update(
+        &st.db,
+        instance.get_id(),
+        title,
+        description,
+        staff,
+        req.counts_toward_karne,
+    )
+    .await?;
     let teachers =
         crate::db::class_course_teacher::list_for_instance(&st.db, updated.get_id()).await?;
     let people = person_map(teachers.iter().cloned(), &st.db).await?;
-    Ok(Json(InstanceResponse::new(&updated, &teachers, &people)))
+    Ok(Json(InstanceResponse::new(&st.db, &updated, &teachers, &people).await?))
+}
+
+/// Clear the named overrides back to inherit — the door a PATCH never is.
+/// Same gate as the PATCH: teacher+ with a right over this instance, and a
+/// live (non-archived) year. Resetting a set policy (`subjects`,
+/// `exam_weights`, `weekly_plan`) flips the section's flag back to
+/// *inherited*; deleting the section's own rows under it rides the child
+/// tables' own reset doors.
+#[utoipa::path(
+    post,
+    path = "/{id}/reset",
+    tag = "instances",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Instance id")),
+    request_body = ResetInstanceOverrides,
+    responses(
+        (status = 200, description = "The overrides cleared; the instance now inherits the named fields", body = InstanceResponse),
+        (status = 400, description = "A field name is unknown, or the list is empty", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This instance's academic year is archived — past years are read-only", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn reset_instance(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<ResetInstanceOverrides>,
+) -> Result<Json<InstanceResponse>, AppError> {
+    let instance = instance_or_404(&ClassCourseId::from_key(&id), &st.db).await?;
+    service::class_course::ensure_instance_teacher(&st.db, &user, instance.get_id()).await?;
+    service::class_course::require_open(&st.db, instance.get_id()).await?;
+
+    let mut fields = Vec::with_capacity(req.fields.len());
+    for name in &req.fields {
+        fields.push(service::class_course::parse_reset_field(name)?);
+    }
+    let updated =
+        service::class_course::reset_overrides(&st.db, instance.get_id(), &fields).await?;
+    let teachers =
+        crate::db::class_course_teacher::list_for_instance(&st.db, updated.get_id()).await?;
+    let people = person_map(teachers.iter().cloned(), &st.db).await?;
+    Ok(Json(InstanceResponse::new(&st.db, &updated, &teachers, &people).await?))
 }
 
 /// Assign a teacher to this instance (idempotent). Manager+ only — staffing is
@@ -461,7 +614,7 @@ async fn assign_teacher(
     let teachers =
         crate::db::class_course_teacher::list_for_instance(&st.db, instance.get_id()).await?;
     let people = person_map(teachers.iter().cloned(), &st.db).await?;
-    Ok(Json(InstanceResponse::new(&instance, &teachers, &people)))
+    Ok(Json(InstanceResponse::new(&st.db, &instance, &teachers, &people).await?))
 }
 
 /// Unassign a teacher from this instance. Manager+ only. The instance, its
@@ -1033,7 +1186,7 @@ mod tests {
             &db,
             &office,
             ClassName::try_new("5-A").unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(5).unwrap(),
             None,
             Some(teacher),
         )
@@ -1132,7 +1285,7 @@ mod tests {
             &db,
             &office,
             ClassName::try_new("5-A").unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(5).unwrap(),
             None,
             Some(teacher),
         )

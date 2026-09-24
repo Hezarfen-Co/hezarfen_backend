@@ -279,8 +279,10 @@ struct UpdateHomework {
 /// Edit a homework's title, description, due date, subject, or assigned subset.
 /// Requires teacher+ and management rights over its instance. Omitted fields
 /// keep their value; a newly set `due_at` is re-checked against now and a new
-/// `subject_id` re-checked against the instance's course. Narrowing `assigned`
-/// is refused (409) while it would orphan an existing submission or result.
+/// `subject_id` re-checked against the instance's resolved subject set (the
+/// offering's selection, or the section's own while it overrides). Narrowing
+/// `assigned` is refused (409) while it would orphan an existing submission or
+/// result.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -290,7 +292,7 @@ struct UpdateHomework {
     request_body = UpdateHomework,
     responses(
         (status = 200, description = "Updated homework", body = HomeworkResponse),
-        (status = 400, description = "Invalid title, description, due date, subject (unknown or from another course), or assigned list", body = ErrorResponse),
+        (status = 400, description = "Invalid title, description, due date, subject (unknown, from another course, or outside the instance's resolved subject set), or assigned list", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -336,7 +338,7 @@ async fn update_homework(
     check_not_past("due_at", due_at)?;
     let subject = match &req.subject_id {
         Some(subject_id) => Some(
-            crate::service::subject::in_course(&st.db, subject_id, instance.get_course()).await?,
+            crate::service::subject::in_instance(&st.db, subject_id, &instance).await?,
         ),
         None => None,
     };

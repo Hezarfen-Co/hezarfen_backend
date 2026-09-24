@@ -223,6 +223,12 @@ async fn build_report(
     let course_by_key: HashMap<String, &Course> =
         courses.iter().map(|c| (c.get_id().key(), c)).collect();
     let people = person_map(courses.iter().flat_map(course_people), db).await?;
+    // The per-instance blocks display the sections' **resolved**
+    // titles/descriptions (override → offering → catalog), batched — the
+    // `/courses` catalog list is the deliberate exception that keeps the
+    // catalog row's own values, because that surface IS the catalog.
+    let instance_refs: Vec<&ClassCourse> = instances.iter().collect();
+    let content = crate::service::instance_resolve::resolved_content(db, &instance_refs).await?;
 
     let mut blocks = Vec::with_capacity(instance_ids.len());
     let mut visible_rows: Vec<&SessionAttendance> = Vec::with_capacity(sessions.len());
@@ -242,9 +248,17 @@ async fn build_report(
         };
         let rows = &by_instance[instance_id.key().as_str()];
         visible_rows.extend(rows.iter().copied());
+        // The instance-scoped display: resolved title/description over the
+        // catalog row's (which stays the id/kind/counters source).
+        let resolved = content
+            .get(instance.get_id().key().as_str())
+            .expect("resolved_content covers every instance it is given");
+        let mut course = CourseResponse::new(course, &people);
+        course.title = resolved.title.clone();
+        course.description = resolved.description.clone();
         blocks.push(CourseAttendance {
             instance: instance.get_id().key(),
-            course: CourseResponse::new(course, &people),
+            course,
             counts: StatusCounts::tally(rows.iter().map(|r| r.get_status())),
         });
     }

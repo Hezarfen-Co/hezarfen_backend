@@ -19,7 +19,7 @@ use common::{
     upload_file_at,
 };
 use hezarfen_backend::database::Database;
-use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
+use hezarfen_backend::domain::grade::GradeLevel;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::monotonic_id::next_uuid;
 use hezarfen_backend::domain::timestamp::Timestamp;
@@ -76,22 +76,24 @@ async fn source_of(class: &str, course: &str, db: &Database) -> Option<uuid::Uui
     .unwrap()
 }
 
-async fn blueprint_id(grade: &str, db: &Database) -> uuid::Uuid {
-    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM class_blueprint WHERE grade = $1")
-        .bind(grade)
+async fn blueprint_id(grade_level: i16, db: &Database) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM class_blueprint WHERE grade_level = $1",
+    )
+    .bind(grade_level)
         .fetch_one(db)
         .await
         .unwrap()
 }
 
 /// Does that grade's template still name that course, in the store?
-async fn templated(grade: &str, course: &str, db: &Database) -> bool {
+async fn templated(grade_level: i16, course: &str, db: &Database) -> bool {
     sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM blueprint_course bc \
          JOIN class_blueprint b ON b.id = bc.blueprint \
-         WHERE b.grade = $1 AND bc.course = $2",
+         WHERE b.grade_level = $1 AND bc.course = $2",
     )
-    .bind(grade)
+    .bind(grade_level)
     .bind(CourseId::from_key(course))
     .fetch_one(db)
     .await
@@ -115,13 +117,18 @@ async fn held(app: &axum::Router, cookie: &str, grade: &str) -> Vec<Value> {
 }
 
 /// Create a class section as `cookie`; returns its id.
-async fn create_class(app: &axum::Router, cookie: &str, name: &str, grade: &str) -> String {
+async fn create_class(
+    app: &axum::Router,
+    cookie: &str,
+    name: &str,
+    grade_level: i16,
+) -> String {
     let res = send(
         app,
         "POST",
         "/classes",
         Some(cookie),
-        Some(json!({ "name": name, "grade": grade })),
+        Some(json!({ "name": name, "grade_level": grade_level })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "create class {name}");
@@ -210,11 +217,11 @@ async fn a_blueprint_is_created_read_updated_and_deleted() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
-    assert_eq!(made.body["blueprint"]["grade"], "9");
+    assert_eq!(made.body["blueprint"]["grade_level"], 9);
     assert_eq!(made.body["blueprint"]["courses"][0], algebra.as_str());
     assert!(skips(&made).is_empty(), "no class exists to skip");
 
@@ -225,7 +232,7 @@ async fn a_blueprint_is_created_read_updated_and_deleted() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [] })),
+        Some(json!({ "grade_level": 9, "course_ids": [] })),
     )
     .await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{:?}", again.body);
@@ -270,20 +277,20 @@ async fn a_blueprint_is_created_read_updated_and_deleted() {
     let gone = send(&app, "GET", "/classes/blueprints/9", Some(&manager), None).await;
     assert_eq!(gone.status, StatusCode::NOT_FOUND);
 
-    // An unaddressable grade is a 400, not a record nobody can ever read back.
-    for bad in ["", "9/A"] {
+    // An off-ladder rung is a 400, not a record nobody can ever read back.
+    for bad in [-1, 13, 99] {
         let refused = send(
             &app,
             "POST",
             "/classes/blueprints",
             Some(&manager),
-            Some(json!({ "grade": bad, "course_ids": [] })),
+            Some(json!({ "grade_level": bad, "course_ids": [] })),
         )
         .await;
         assert_eq!(
             refused.status,
             StatusCode::BAD_REQUEST,
-            "grade {bad:?}: {:?}",
+            "grade_level {bad}: {:?}",
             refused.body
         );
     }
@@ -302,12 +309,12 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), physics.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone(), physics.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED);
 
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
     let student = student_in(&app, &db, &class, &manager, "ali").await;
 
     let applied = send(
@@ -325,7 +332,7 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
         assert!(attached(&class, course, &db).await);
         assert_eq!(
             source_of(&class, course, &db).await,
-            Some(blueprint_id("9", &db).await),
+            Some(blueprint_id(9, &db).await),
             "the blueprint must own what it attached"
         );
         let instance = instance_of(&class, course, &db).await;
@@ -361,7 +368,7 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
     assert_eq!(rows("SELECT count(*) FROM class_course", &db).await, 2);
 
     // A class whose grade no blueprint covers is a 404, not an empty success.
-    let other = create_class(&app, &manager, "10-A", "10").await;
+    let other = create_class(&app, &manager, "10-A", 10).await;
     let none = send(
         &app,
         "POST",
@@ -388,7 +395,7 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), physics.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone(), physics.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -398,12 +405,12 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "grade": "9" })),
+        Some(json!({ "name": "9-A", "grade_level": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
     assert_eq!(
-        res.body["stocked_from"], "9",
+        res.body["stocked_from"], 9,
         "the create must name the template that stocked it: {:?}",
         res.body
     );
@@ -419,7 +426,7 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         assert!(attached(&class, course, &db).await, "{course} is attached");
         assert_eq!(
             source_of(&class, course, &db).await,
-            Some(blueprint_id("9", &db).await),
+            Some(blueprint_id(9, &db).await),
             "the blueprint must own what a create attached, exactly as a pump does"
         );
     }
@@ -451,8 +458,9 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
     // A grade no template covers, and a class with no grade at all: `null`,
     // which is the one thing an empty `skipped` could never say.
     for body in [
-        json!({ "name": "10-A", "grade": "10" }),
-        json!({ "name": "satranç", "grade": "" }),
+        json!({ "name": "10-A", "grade_level": 10 }),
+        // A club-shaped section sits at the ladder's floor, like any class.
+        json!({ "name": "satranç", "grade_level": 0 }),
     ] {
         let res = send(&app, "POST", "/classes", Some(&manager), Some(body)).await;
         assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
@@ -497,7 +505,7 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), physics.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone(), physics.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -522,7 +530,7 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         .unwrap();
     tx.commit().await.unwrap();
     assert!(
-        templated("9", &physics, &db).await,
+        templated(9, &physics, &db).await,
         "the id is still listed"
     );
 
@@ -531,7 +539,7 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "grade": "9" })),
+        Some(json!({ "name": "9-A", "grade_level": 9 })),
     )
     .await;
     assert_eq!(
@@ -540,7 +548,7 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         "a pair that will not fit may not cost the class: {:?}",
         res.body
     );
-    assert_eq!(res.body["stocked_from"], "9");
+    assert_eq!(res.body["stocked_from"], 9);
     assert_eq!(skips(&res).len(), 1, "{:?}", res.body);
     assert_eq!(skips(&res)[0]["reason"], "course_deleted");
     assert_eq!(skips(&res)[0]["course"], physics.as_str());
@@ -584,9 +592,9 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
-    let a = create_class(&app, &manager, "9-A", "9").await;
-    let b = create_class(&app, &manager, "9-B", "9").await;
-    let ten = create_class(&app, &manager, "10-A", "10").await;
+    let a = create_class(&app, &manager, "9-A", 9).await;
+    let b = create_class(&app, &manager, "9-B", 9).await;
+    let ten = create_class(&app, &manager, "10-A", 10).await;
     let ali = student_in(&app, &db, &a, &manager, "ali").await;
     student_in(&app, &db, &ten, &manager, "veli").await;
 
@@ -596,7 +604,7 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [] })),
+        Some(json!({ "grade_level": 9, "course_ids": [] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED);
@@ -658,7 +666,7 @@ async fn a_duplicate_attach_answers_its_machine_code() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let roomy = create_course(&app, &manager, "algebra").await;
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
     student_in(&app, &db, &class, &manager, "ali").await;
 
     let attached = send(
@@ -701,8 +709,8 @@ async fn a_removal_spares_a_hand_attached_course() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
-    let pumped = create_class(&app, &manager, "9-A", "9").await;
-    let byhand = create_class(&app, &manager, "9-B", "9").await;
+    let pumped = create_class(&app, &manager, "9-A", 9).await;
+    let byhand = create_class(&app, &manager, "9-B", 9).await;
     let ali = student_in(&app, &db, &pumped, &manager, "ali").await;
     student_in(&app, &db, &byhand, &manager, "veli").await;
 
@@ -727,7 +735,7 @@ async fn a_removal_spares_a_hand_attached_course() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED);
@@ -739,7 +747,7 @@ async fn a_removal_spares_a_hand_attached_course() {
     );
     assert_eq!(
         source_of(&pumped, &algebra, &db).await,
-        Some(blueprint_id("9", &db).await),
+        Some(blueprint_id(9, &db).await),
     );
 
     // Drop it from the template.
@@ -799,7 +807,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
     student_in(&app, &db, &class, &manager, "ali").await;
     let attached_by_hand = send(
         &app,
@@ -836,7 +844,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -896,7 +904,7 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -905,13 +913,13 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     // is stocked by its own create, and one that existed already was stocked by
     // the template's. Moving it there afterwards is neither — a grade change is
     // deliberately a blueprint no-op.
-    let class = create_class(&app, &manager, "9-A", "10").await;
+    let class = create_class(&app, &manager, "9-A", 10).await;
     let moved = send(
         &app,
         "PATCH",
         &format!("/classes/{class}"),
         Some(&manager),
-        Some(json!({ "grade": "9" })),
+        Some(json!({ "grade_level": 9 })),
     )
     .await;
     assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
@@ -923,19 +931,35 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     // the strand consists of. Capture the uuid before the delete: the grade
     // label is UNIQUE, not the FK.
     let manager_id = UserId::from_key(&me_id(&app, &manager).await);
-    let stranded = blueprint_id("9", &db).await;
+    let stranded = blueprint_id(9, &db).await;
     let mut tx = db.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM class_blueprint WHERE grade = '9'")
+    sqlx::query("DELETE FROM class_blueprint WHERE grade_level = 9")
         .execute(&mut *tx)
         .await
         .unwrap();
+    // The strand names an offering too (the column is NOT NULL): the pump run
+    // above already minted one for (algebra, 9) — reuse it, minting a twin
+    // only if none survived, exactly like `ensure_tx` would.
+    let offering: (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO course_offering (id, course, grade_level, created_by, created_at, updated_at) \
+         VALUES ($1, $2, 9, $3, $4, $4) \
+         ON CONFLICT (course, grade_level) DO UPDATE SET updated_at = EXCLUDED.updated_at \
+         RETURNING id",
+    )
+    .bind(next_uuid())
+    .bind(CourseId::from_key(&algebra))
+    .bind(manager_id)
+    .bind(Timestamp::now().as_millis())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     sqlx::query(
-        "INSERT INTO class_course (id, class, course, attached_by, attached_at, source) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO class_course (id, class, course, attached_by, attached_at, source, offering) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(next_uuid())
     .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
@@ -943,6 +967,7 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     .bind(manager_id)
     .bind(Timestamp::now().as_millis())
     .bind(stranded)
+    .bind(offering.0)
     .execute(&mut *tx)
     .await
     .unwrap();
@@ -990,30 +1015,30 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     );
 }
 
-/// The silent miss `matched` exists for: a grade label is free text and matched
-/// exactly, so a template keyed `"9 "` reaches none of the sections keyed `"9"`
+/// The silent miss `matched` exists for: sections are matched by their ladder
+/// rung, so a template keyed at a rung no section carries reaches none of them
 /// — and it says so with an empty `skipped`, which is the same body a template
 /// that stocked every section returns.
 ///
-/// Both halves are asserted from the same section, one label apart, because the
+/// Both halves are asserted from the same section, one rung apart, because the
 /// count only means anything against the case that *does* reach it: a `matched`
-/// wired to the course list would claim 1 on the typo, and one wired to the
-/// skip count would answer 0 on the label that works.
+/// wired to the course list would claim 1 on the empty rung, and one wired to
+/// the skip count would answer 0 on the rung that works.
 #[tokio::test]
-async fn a_grade_label_nothing_carries_reports_matched_zero() {
+async fn a_rung_nothing_carries_reports_matched_zero() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
     // The section exists first, so a template that finds it stocks it on
     // create.
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
 
     let typo = send(
         &app,
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9 ", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 11, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(typo.status, StatusCode::CREATED, "{:?}", typo.body);
@@ -1024,12 +1049,12 @@ async fn a_grade_label_nothing_carries_reports_matched_zero() {
     );
     assert_eq!(
         typo.body["matched"], 0,
-        "no section carries \"9 \", and that must not read as success: {:?}",
+        "no section sits at 11, and that must not read as success: {:?}",
         typo.body
     );
     assert!(
         !attached(&class, &algebra, &db).await,
-        "a trailing space really is a different grade"
+        "a rung above the section's really is a different grade"
     );
 
     let right = send(
@@ -1037,7 +1062,7 @@ async fn a_grade_label_nothing_carries_reports_matched_zero() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(right.status, StatusCode::CREATED, "{:?}", right.body);
@@ -1074,7 +1099,7 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     let algebra = create_course(&app, &manager, "algebra").await;
     // The section starts at grade 10, where nothing stocks it, so the template
     // below is never what attached anything to it.
-    let short = create_class(&app, &manager, "9-A", "10").await;
+    let short = create_class(&app, &manager, "9-A", 10).await;
 
     // No template covers the grade yet, and that is a 404 rather than an empty
     // report — there is nothing to be out of sync with.
@@ -1093,7 +1118,7 @@ async fn a_status_read_names_the_course_a_section_is_short() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1101,7 +1126,7 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     assert_eq!(made.body["matched"], 0, "no section carries the label yet");
 
     // A section created at the grade is stocked by its own create, in sync.
-    let full = create_class(&app, &manager, "9-B", "9").await;
+    let full = create_class(&app, &manager, "9-B", 9).await;
     assert!(attached(&full, &algebra, &db).await);
 
     // The other section reaches the grade by a rename, which is deliberately
@@ -1111,7 +1136,7 @@ async fn a_status_read_names_the_course_a_section_is_short() {
         "PATCH",
         &format!("/classes/{short}"),
         Some(&manager),
-        Some(json!({ "grade": "9" })),
+        Some(json!({ "grade_level": 9 })),
     )
     .await;
     assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
@@ -1126,7 +1151,7 @@ async fn a_status_read_names_the_course_a_section_is_short() {
     )
     .await;
     assert_eq!(drifted.status, StatusCode::OK, "{:?}", drifted.body);
-    assert_eq!(drifted.body["grade"], "9");
+    assert_eq!(drifted.body["grade_level"], 9);
     assert_eq!(drifted.body["matched"], 2, "both sections carry the label");
     assert_eq!(
         missing(&drifted, &short),
@@ -1213,14 +1238,14 @@ async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     // a section that lets its link go is what lets the course be deleted at
     // all (the guard reads the course's own instance counter, so one still
     // teaching it is a 409).
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
 
     let made = send(
         &app,
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), history.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone(), history.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1268,11 +1293,11 @@ async fn deleting_a_course_takes_it_out_of_every_blueprint() {
     assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
 
     assert!(
-        !templated("9", &history, &db).await,
+        !templated(9, &history, &db).await,
         "the deleted course is out of the template"
     );
     assert!(
-        templated("9", &algebra, &db).await,
+        templated(9, &algebra, &db).await,
         "…and nothing else is — the sweep names one course"
     );
     assert!(
@@ -1336,7 +1361,7 @@ async fn a_grade_with_no_sections_still_loses_its_deleted_course() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "11", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 11, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1353,7 +1378,7 @@ async fn a_grade_with_no_sections_still_loses_its_deleted_course() {
     assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
 
     assert!(
-        !templated("11", &algebra, &db).await,
+        !templated(11, &algebra, &db).await,
         "no section to walk, and the id is gone anyway"
     );
     assert!(
@@ -1396,7 +1421,7 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
     let history = create_course(&app, &manager, "history").await;
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
     let ali = student_in(&app, &db, &class, &manager, "ali").await;
 
     let made = send(
@@ -1404,7 +1429,7 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), history.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone(), history.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1415,7 +1440,7 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
     sqlx::query(
         "DELETE FROM blueprint_course \
          WHERE course = $1 \
-           AND blueprint = (SELECT id FROM class_blueprint WHERE grade = '9')",
+           AND blueprint = (SELECT id FROM class_blueprint WHERE grade_level = 9)",
     )
     .bind(CourseId::from_key(&history))
     .execute(&db)
@@ -1506,7 +1531,7 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let algebra = create_course(&app, &manager, "algebra").await;
     let history = create_course(&app, &manager, "history").await;
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
 
     let mut conn = db.acquire().await.expect("acquire for the trigger");
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
@@ -1527,7 +1552,7 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
@@ -1610,7 +1635,7 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
     let refused = class_blueprint::create(
         &db,
         &by,
-        ClassBlueprint::grade_key("9").unwrap(),
+        GradeLevel::new(9).unwrap(),
         vec![ghost.clone()],
     )
     .await;
@@ -1627,7 +1652,7 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
     let blueprint = class_blueprint::create(
         &db,
         &by,
-        ClassBlueprint::grade_key("9").unwrap(),
+        GradeLevel::new(9).unwrap(),
         vec![algebra.clone()],
     )
     .await
@@ -1670,15 +1695,15 @@ async fn a_blueprint_removal_unlinks_the_swept_instances_blob_bytes() {
         "POST",
         "/classes/blueprints",
         Some(&manager),
-        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+        Some(json!({ "grade_level": 9, "course_ids": [algebra.clone()] })),
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
     let class =
-        common::create_class(&app, &manager, "9-A", json!({ "grade": "9", "year": year })).await;
+        common::create_class(&app, &manager, "9-A", json!({ "grade_level": 9, "year": year })).await;
     assert_eq!(
         source_of(&class, &algebra, &db).await,
-        Some(blueprint_id("9", &db).await),
+        Some(blueprint_id(9, &db).await),
         "the create must stock the section from the template"
     );
     let instance = instance_of(&class, &algebra, &db).await;

@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH ins AS (\n               INSERT INTO class_course_slot (id, class_course, weekday, starts_at, ends_at)\n               VALUES ($1, $2, $3,\n                       ($4::bigint * interval '1 minute')::time,\n                       ($5::bigint * interval '1 minute')::time)\n               RETURNING id, weekday, starts_at, ends_at\n           ), flip AS (\n               UPDATE class_course SET weekly_plan_inherited = FALSE\n               WHERE id = $2 AND EXISTS (SELECT 1 FROM ins)\n               RETURNING id\n           )\n           SELECT ins.id AS \"id: WeeklySlotId\",\n                  ins.weekday AS \"weekday: Weekday\",\n                  (EXTRACT(EPOCH FROM ins.starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                  (EXTRACT(EPOCH FROM ins.ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\"\n           FROM ins\n           WHERE EXISTS (SELECT 1 FROM flip)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: WeeklySlotId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course_slot",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "weekday: Weekday",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "class_course_slot",
+            "name": "weekday"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at!: SlotMinute",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at!: SlotMinute",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int2",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "855316157629bcc63776b4f6d2ed8745b37d88ff00f48812498dc87c9b5fb51d"
+}

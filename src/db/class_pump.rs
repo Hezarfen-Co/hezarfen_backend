@@ -34,14 +34,16 @@ use sqlx::postgres::PgConnection;
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::{Database, foreign_key_violation, tx_with_retry, unique_violation};
 use crate::domain::class_blueprint::ClassBlueprintId;
-use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati};
+use crate::domain::class_course::{ClassCourse, ClassCourseId};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
+use crate::domain::course::CourseKind;
+use crate::domain::grade::GradeLevel;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
 /// What [`attach_course`]'s attach settled. The caller answers each verdict —
 /// a hand attach turns them into this route's errors; a blueprint pump reads
@@ -268,7 +270,7 @@ async fn early_verdicts(
     axis: Axis,
     pivot: Pivot<'_>,
     source: Option<&ClassBlueprintId>,
-) -> Result<(Option<Early>, Option<uuid::Uuid>), AppError> {
+) -> Result<(Option<Early>, Option<uuid::Uuid>, Option<CourseKind>), AppError> {
     let held = match pivot {
         Pivot::User(user) => sqlx::query_scalar!(
             r#"SELECT 1 AS "one" FROM class_member
@@ -289,7 +291,7 @@ async fn early_verdicts(
         .is_some(),
     };
     if held {
-        return Ok((Some(Early::Duplicate), None));
+        return Ok((Some(Early::Duplicate), None, None));
     }
     // The lock and the resolution are one read: the stored `source` is the
     // blueprint's surrogate uuid, and the row this read returns it from is
@@ -297,16 +299,17 @@ async fn early_verdicts(
     let mut source_id = None;
     if let Some(source) = source {
         let locked = sqlx::query_scalar!(
-            r#"SELECT id FROM class_blueprint WHERE grade = $1 FOR KEY SHARE"#,
+            r#"SELECT id FROM class_blueprint WHERE grade_level = $1 FOR KEY SHARE"#,
             source as _
         )
         .fetch_optional(&mut *tx)
         .await?;
         let Some(id) = locked else {
-            return Ok((Some(Early::SourceGone), None));
+            return Ok((Some(Early::SourceGone), None, None));
         };
         source_id = Some(id);
     }
+    let mut kind = None;
     match pivot {
         Pivot::User(user) => {
             let row = sqlx::query!(
@@ -316,20 +319,24 @@ async fn early_verdicts(
             .fetch_optional(&mut *tx)
             .await?;
             if row.map(|row| row.role) != Some(Role::Student) {
-                return Ok((Some(Early::PivotGone), None));
+                return Ok((Some(Early::PivotGone), None, None));
             }
         }
         Pivot::Course(course) => {
-            let alive = sqlx::query_scalar!(
-                r#"SELECT 1 AS "one" FROM course WHERE id = $1 FOR KEY SHARE"#,
+            // The lock and the kind in one read: the same `FOR KEY SHARE` the
+            // attach needs against a concurrent course delete answers what
+            // kind of course it is locking — and only a class-delivered ders
+            // may become an instance (the gate lives in [`attach_course`]).
+            let locked = sqlx::query!(
+                r#"SELECT kind AS "kind: CourseKind" FROM course WHERE id = $1 FOR KEY SHARE"#,
                 course as _
             )
             .fetch_optional(&mut *tx)
-            .await?
-            .is_some();
-            if !alive {
-                return Ok((Some(Early::PivotGone), None));
-            }
+            .await?;
+            let Some(locked_kind) = locked else {
+                return Ok((Some(Early::PivotGone), None, None));
+            };
+            kind = Some(locked_kind.kind);
         }
     }
     // Read off the class row inside the transaction that claims it, so the
@@ -354,7 +361,7 @@ async fn early_verdicts(
         .await?
         .is_some(),
     };
-    Ok((over.then_some(Early::Overloaded), source_id))
+    Ok((over.then_some(Early::Overloaded), source_id, kind))
 }
 
 /// Write the member stint and enroll the student into every instance the
@@ -410,7 +417,7 @@ pub(crate) async fn add_member_sourced(
     let (user, by) = (*user, *by);
     let id = ClassMemberId::generate();
     let outcome = tx_with_retry(db, false, async move |tx| {
-        let (early, _) = early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?;
+        let (early, _, _) = early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?;
         if let Some(early) = early {
             return Ok(refusal_of(early));
         }
@@ -498,7 +505,8 @@ pub(crate) async fn add_member_sourced(
 /// Students already enrolled in it keep the rows they have — no count charged,
 /// `source` untouched. There is no roster-size gate any more (D5: the
 /// counter is a count, not a capacity), so the only refusals left are the
-/// class's own ceilings and a vanished pivot.
+/// class's own ceilings, a vanished pivot, and a course kind that is not
+/// class-delivered (a 400 straight out of the transaction).
 ///
 /// `source` is the blueprint whose behalf this attach runs on, and supplying
 /// it adds one more claim: that it is still there when the transaction runs
@@ -507,9 +515,20 @@ pub(crate) async fn add_member_sourced(
 /// and passes `None`.
 ///
 /// The instance's own id is minted here (v7, so a class's instances list in
-/// creation order) and its policy columns take the schema defaults: one weekly
-/// hour, counted toward the report card, an empty roster. A PATCH on `/instances`
-/// changes them afterwards.
+/// creation order) and its content columns are born `NULL` — the *inherit*
+/// state: what the section teaches is whatever its grade-level
+/// [`crate::domain::course_offering::CourseOffering`] says, and through it
+/// the catalog course. That template is resolved (auto-created empty, with
+/// `created_by` naming the attaching actor, when the (course, grade_level)
+/// pair has none yet) in this same transaction — the class row is read under
+/// `FOR KEY SHARE`, so the offering the insert names is the one for the
+/// grade the class carries *at the attach*, not at the caller's read. A
+/// PATCH on `/instances` overrides the content afterwards.
+///
+/// Only a **class-delivered** course
+/// ([`CourseKind::is_class_delivered`], `kind = 'course'`) becomes an
+/// instance: a club or an etüt is joined individually and is refused with a
+/// 400, whatever axis asked for the attach.
 ///
 /// Two counters ride the write, both in this one transaction: the class's
 /// `class_course_count` (claimed by the conditional CTE, so a full or gone
@@ -532,7 +551,7 @@ pub(crate) async fn attach_course(
     let source = source.cloned();
     let id = ClassCourseId::generate();
     let outcome = tx_with_retry(db, false, async move |tx| {
-        let (early, source_id) = early_verdicts(
+        let (early, source_id, kind) = early_verdicts(
             tx,
             &class,
             Axis::Course,
@@ -543,13 +562,55 @@ pub(crate) async fn attach_course(
         if let Some(early) = early {
             return Ok(refusal_of(early));
         }
+        let Some(kind) = kind else {
+            // Unreachable on this axis — the course pivot always answers its
+            // kind when it is alive. A future axis change should surface as
+            // this 500, not as a wrong-looking refusal.
+            return Err(AppError::Internal(
+                "a course attach locked a course but read no kind".into(),
+            ));
+        };
+        if !kind.is_class_delivered() {
+            // The gate from the locked row itself, so a concurrent kind
+            // change cannot slip between a pre-flight check and the insert.
+            // A blueprint listing a study/club aborts that whole pump run
+            // with this 400 — fail-closed, naming the row to fix.
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "course",
+                reason: "only a ders attaches to a class — a club or etüt is joined individually, not attached",
+            }));
+        }
+        // The class's own grade, locked: the offering the insert names is the
+        // one for the grade the class carries *now* (a concurrent grade move
+        // waits behind this KEY SHARE). A gone class answers `Gone` — the
+        // same verdict the seat claim below would have produced, one read
+        // earlier.
+        let grade_level = sqlx::query_scalar!(
+            r#"SELECT grade_level AS "grade_level: GradeLevel" FROM class_group
+               WHERE id = $1 FOR KEY SHARE"#,
+            class as _
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(grade_level) = grade_level else {
+            return Ok(Attached::Gone);
+        };
+        // The template the instance teaches from: found, or minted empty
+        // (every content column NULL — inherit the catalog) with this actor
+        // as its `created_by`. Race-closed inside `ensure_tx`. Minted before
+        // the seat claim, so a refused attach (a full class) may leave an
+        // empty template behind — harmless: an empty template inherits the
+        // catalog exactly as no template would, and the next attach at that
+        // grade reuses it.
+        let offering =
+            crate::db::course_offering::ensure_tx(tx, &course, grade_level, &by).await?;
         let inserted = match sqlx::query_scalar!(
             r#"WITH seat AS (
                    UPDATE class_group SET class_course_count = class_course_count + 1
                     WHERE id = $1 AND class_course_count < $2
                     RETURNING 1)
-               INSERT INTO class_course (id, class, course, attached_by, attached_at, source)
-               SELECT $3, $1, $4, $5, $6, $7 WHERE EXISTS (SELECT 1 FROM seat)
+               INSERT INTO class_course (id, class, course, attached_by, attached_at, source, offering)
+               SELECT $3, $1, $4, $5, $6, $7, $8 WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING 1 AS "one""#,
             class as _,
             Axis::Course.cap(),
@@ -558,6 +619,7 @@ pub(crate) async fn attach_course(
             by as _,
             attached_at as _,
             source_id,
+            offering as _,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -621,11 +683,16 @@ pub(crate) async fn attach_course(
             id: id.clone(),
             class: class.clone(),
             course: course.clone(),
+            offering: offering.clone(),
             attached_by: by,
-            source: source.clone(),
-            ders_saati: DersSaati::try_new(crate::constant::MIN_DERS_SAATI)
-                .expect("the schema default is a valid weekly-hours count"),
-            counts_toward_karne: true,
+            source,
+            title: None,
+            description: None,
+            ders_saati: None,
+            counts_toward_karne: None,
+            subjects_inherited: true,
+            exam_weights_inherited: true,
+            weekly_plan_inherited: true,
             enrollment_count,
             attached_at,
         }))
@@ -933,7 +1000,7 @@ pub(crate) async fn detach_course(
                 sqlx::query_scalar!(
                     r#"SELECT id AS "id: uuid::Uuid" FROM class_course
                        WHERE class = $1 AND course = $2
-                         AND source = (SELECT id FROM class_blueprint WHERE grade = $3)
+                         AND source = (SELECT id FROM class_blueprint WHERE grade_level = $3)
                        FOR UPDATE"#,
                     class as _,
                     course as _,

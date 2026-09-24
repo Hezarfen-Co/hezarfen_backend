@@ -1,4 +1,4 @@
-//! The `class_blueprint` table: the row keyed by its grade label, the
+//! The `class_blueprint` table: the row keyed by its ladder rung, the
 //! compare-and-set writes the edit and the delete go through, and the reads
 //! the sweep and the status screen are built on. The workflows that sequence
 //! these — and the row lock that serializes a delete against the attaches
@@ -13,7 +13,8 @@ use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::class_pump;
 use crate::db::page::PagedList;
 use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId};
-use crate::domain::class_group::{ClassGrade, ClassGroupId};
+use crate::domain::class_group::ClassGroupId;
+use crate::domain::grade::GradeLevel;
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::UserId;
@@ -29,17 +30,17 @@ struct BlueprintRow {
     /// The surrogate uuid primary key — the key the junction rows reference.
     #[sqlx(rename = "id")]
     key: uuid::Uuid,
-    grade: ClassGrade,
+    grade_level: GradeLevel,
     creator: UserId,
 }
 
 impl BlueprintRow {
     fn into_blueprint(self, courses: Vec<CourseId>) -> ClassBlueprint {
         ClassBlueprint {
-            // The API identity is the grade label, which the key column also
-            // stores — the id *is* the grade.
-            id: ClassBlueprintId::for_grade(&self.grade),
-            grade: self.grade,
+            // The API identity is the ladder rung, which the key column also
+            // stores — the id *is* the grade level.
+            id: ClassBlueprintId::for_grade(&self.grade_level),
+            grade_level: self.grade_level,
             courses,
             creator: self.creator,
         }
@@ -155,16 +156,16 @@ fn no_such_course() -> AppError {
 /// carries a UNIQUE constraint, so the duplicate is seen rather than raced
 /// (`23505` on `class_blueprint_grade_key`, mapped right here: a duplicate is
 /// a decision, never a retry). The surrogate `id` is minted here and never
-/// read back: the grade label stays the only identity the API speaks.
+/// read back: the ladder rung stays the only identity the API speaks.
 pub async fn create(
     db: &Database,
     creator: &UserId,
-    grade: ClassGrade,
+    grade_level: GradeLevel,
     courses: Vec<CourseId>,
 ) -> Result<ClassBlueprint, AppError> {
     let blueprint = ClassBlueprint {
-        id: ClassBlueprintId::for_grade(&grade),
-        grade: grade.clone(),
+        id: ClassBlueprintId::for_grade(&grade_level),
+        grade_level,
         courses: courses.clone(),
         creator: *creator,
     };
@@ -173,10 +174,10 @@ pub async fn create(
     tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &courses).await?;
         let inserted = sqlx::query!(
-            r#"INSERT INTO class_blueprint (id, grade, creator)
+            r#"INSERT INTO class_blueprint (id, grade_level, creator)
                VALUES ($1, $2, $3)"#,
             id,
-            grade as _,
+            grade_level as _,
             creator as _
         )
         .execute(&mut *tx)
@@ -209,9 +210,9 @@ pub async fn read(
 ) -> Result<Option<ClassBlueprint>, AppError> {
     let row = sqlx::query_as!(
         BlueprintRow,
-        r#"SELECT id AS "key: uuid::Uuid", grade AS "grade: ClassGrade",
+        r#"SELECT id AS "key: uuid::Uuid", grade_level AS "grade_level: GradeLevel",
                   creator AS "creator: UserId"
-           FROM class_blueprint WHERE grade = $1"#,
+           FROM class_blueprint WHERE grade_level = $1"#,
         id as _
     )
     .fetch_optional(db)
@@ -225,14 +226,14 @@ pub async fn read(
     }
 }
 
-/// Every blueprint, by grade label — the id *is* the label, so this is the
+/// Every blueprint, by ladder rung — the id *is* the rung, so this is the
 /// only ordering that means anything here.
 pub async fn list_all(
     db: &Database,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ClassBlueprint>, i64), AppError> {
-    let (rows, total) = PagedList::new(CLASS_BLUEPRINT_TABLE, "ORDER BY grade ASC")
+    let (rows, total) = PagedList::new(CLASS_BLUEPRINT_TABLE, "ORDER BY grade_level ASC")
         .run::<BlueprintRow>(limit, offset, db)
         .await?;
     Ok((with_courses(db, rows).await?, total))
@@ -261,17 +262,17 @@ pub async fn set_courses_if_unchanged(
     held: Vec<CourseId>,
     wanted: Vec<CourseId>,
 ) -> Result<Option<ClassBlueprint>, AppError> {
-    let grade = id.clone();
+    let grade = id.get();
     let mut held = held;
     held.sort_by_key(|course| course.uuid());
     let keys: Vec<uuid::Uuid> = wanted.iter().map(CourseId::uuid).collect();
     tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &wanted).await?;
         let row = sqlx::query!(
-            r#"SELECT id AS "key: uuid::Uuid", grade AS "grade: ClassGrade",
+            r#"SELECT id AS "key: uuid::Uuid", grade_level AS "grade_level: GradeLevel",
                       creator AS "creator: UserId"
-               FROM class_blueprint WHERE grade = $1 FOR UPDATE"#,
-            grade.key(),
+               FROM class_blueprint WHERE grade_level = $1 FOR UPDATE"#,
+            grade,
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -303,8 +304,8 @@ pub async fn set_courses_if_unchanged(
         .execute(&mut *tx)
         .await?;
         Ok(Some(ClassBlueprint {
-            id: ClassBlueprintId::for_grade(&row.grade),
-            grade: row.grade,
+            id: ClassBlueprintId::for_grade(&row.grade_level),
+            grade_level: row.grade_level,
             courses: wanted.clone(),
             creator: row.creator,
         }))
@@ -328,9 +329,8 @@ pub async fn delete_if_unchanged(
     id: &ClassBlueprintId,
     held: Vec<CourseId>,
 ) -> Result<bool, AppError> {
-    let grade = id.clone();
     tx_with_retry(db, false, async move |tx| {
-        delete_claimed(&mut *tx, &grade, &held).await
+        delete_claimed(&mut *tx, id, &held).await
     })
     .await
 }
@@ -361,7 +361,7 @@ async fn delete_claimed(
 ) -> Result<bool, AppError> {
     let row = sqlx::query!(
         r#"SELECT id AS "key: uuid::Uuid" FROM class_blueprint
-           WHERE grade = $1 FOR UPDATE"#,
+           WHERE grade_level = $1 FOR UPDATE"#,
         id as _,
     )
     .fetch_optional(&mut *tx)
@@ -398,7 +398,7 @@ pub(crate) async fn held_courses_for_update(
 ) -> Result<Option<Vec<CourseId>>, AppError> {
     let row = sqlx::query!(
         r#"SELECT id AS "key: uuid::Uuid" FROM class_blueprint
-           WHERE grade = $1 FOR UPDATE"#,
+           WHERE grade_level = $1 FOR UPDATE"#,
         id as _,
     )
     .fetch_optional(&mut *tx)
@@ -466,7 +466,7 @@ pub async fn prune(
     sqlx::query!(
         r#"DELETE FROM blueprint_course
            WHERE course = $2
-             AND blueprint = (SELECT id FROM class_blueprint WHERE grade = $1)"#,
+             AND blueprint = (SELECT id FROM class_blueprint WHERE grade_level = $1)"#,
         id as _,
         course as _,
     )
@@ -500,7 +500,7 @@ pub async fn sourced_links(
     let rows = sqlx::query!(
         r#"SELECT class AS "class: ClassGroupId", course AS "course: CourseId"
            FROM class_course
-           WHERE source = (SELECT id FROM class_blueprint WHERE grade = $1)
+           WHERE source = (SELECT id FROM class_blueprint WHERE grade_level = $1)
              AND course <> ALL($2)"#,
         id as _,
         keep as _

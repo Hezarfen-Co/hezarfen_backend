@@ -8,8 +8,8 @@ use axum::http::{Request, StatusCode};
 use common::{
     add_member, app_and_db, app_and_tenants, attach_instance, create_class, create_course,
     create_exam, create_exam_with, create_homework, create_session, create_subject, create_term,
-    create_year, enroll, ensure_year, id_of, login, login_as, me_id, mem_app, send, set_role,
-    taught_under, unenroll, upload_course_note_file,
+    create_year, enroll, ensure_year, id_of, login, login_as, me_id, mem_app, select_instance_subject,
+    send, set_role, taught, taught_under, unenroll, upload_course_note_file,
 };
 use hezarfen_backend::build_router;
 use hezarfen_backend::constant::{
@@ -4671,6 +4671,8 @@ async fn subject_reference_counts_track_every_writer() {
     let t = taught_under(&app, &mudur, &teacher, "physics").await;
     let from = create_subject(&app, &teacher, &t.course, "optics").await;
     let to = create_subject(&app, &teacher, &t.course, "waves").await;
+    select_instance_subject(&app, &teacher, &t.instance, &from).await;
+    select_instance_subject(&app, &teacher, &t.instance, &to).await;
     let exam = create_exam(&app, &teacher, &t.instance, &t.term, "midterm", "yazili").await;
     let due = Timestamp::now().as_millis() + 86_400_000;
 
@@ -9093,6 +9095,8 @@ async fn subject_delete_blocks_while_questions_reference_it() {
     let t = taught_under(&app, &mudur, &teacher, "history").await;
     let tagged = create_subject(&app, &teacher, &t.course, "antiquity").await;
     let spare = create_subject(&app, &teacher, &t.course, "middle ages").await;
+    select_instance_subject(&app, &teacher, &t.instance, &tagged).await;
+    select_instance_subject(&app, &teacher, &t.instance, &spare).await;
     let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
     let question_body = create_question_body(
         &app,
@@ -9189,7 +9193,7 @@ async fn create_question(
     id_of(&create_question_body(app, cookie, exam, subject, body).await)
 }
 
-/// Like [`create_question`], but hands back the whole response: choice ids are
+/// Like [`create_question_body`], but hands back the whole response: choice ids are
 /// minted by the server, so a test that answers a question — or pictures one of
 /// its options — has to read them off the response rather than count positions.
 async fn create_question_body(
@@ -9205,9 +9209,33 @@ async fn create_question_body(
         "POST",
         &format!("/exams/{exam}/questions"),
         Some(cookie),
-        Some(body),
+        Some(body.clone()),
     )
     .await;
+    // The subject-tag gate reads the section's resolved syllabus: a topic the
+    // offering never selected is refused. The writer holds a right over the
+    // instance (the very gate the question write passed), so take the topic
+    // onto the section's own set through the instance door and retry once.
+    let res = if res.status == StatusCode::BAD_REQUEST
+        && res.body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("subject is not in this section's subject set"))
+    {
+        let exam_row = send(app, "GET", &format!("/exams/{exam}"), Some(cookie), None).await;
+        assert_eq!(exam_row.status, StatusCode::OK, "{}", exam_row.body);
+        let instance = exam_row.body["class_course"].as_str().expect("class_course");
+        select_instance_subject(app, cookie, instance, subject).await;
+        send(
+            app,
+            "POST",
+            &format!("/exams/{exam}/questions"),
+            Some(cookie),
+            Some(body),
+        )
+        .await
+    } else {
+        res
+    };
     assert_eq!(
         res.status,
         StatusCode::CREATED,
@@ -9266,6 +9294,7 @@ async fn question_crud_validation_and_rbac() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "logic").await;
     let subject = create_subject(&app, &teacher, &t.course, "propositions").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     let exam = create_exam(&app, &teacher, &t.instance, &t.term, "final", "final").await;
 
     // A choice question echoes its full authoring view, correct included.
@@ -9470,6 +9499,7 @@ async fn question_crud_validation_and_rbac() {
     // Re-tagging stays inside the course: another of its subjects is fine, a
     // foreign course's subject is a 400.
     let second_subject = create_subject(&app, &teacher, &t.course, "predicates").await;
+    select_instance_subject(&app, &teacher, &t.instance, &second_subject).await;
     let res = send(
         &app,
         "PATCH",
@@ -15759,6 +15789,7 @@ async fn hw_world(app: &axum::Router, db: &hezarfen_backend::database::Database)
     let veli_id = me_id(app, &veli).await;
     let t = taught_under(app, &mudur, &teacher, "math").await;
     let subject = create_subject(app, &teacher, &t.course, "algebra").await;
+    select_instance_subject(app, &teacher, &t.instance, &subject).await;
     // The students sit in the şube: the pump enrolls them into the instance.
     add_member(app, &mudur, &t.class, &ali_id).await;
     add_member(app, &mudur, &t.class, &veli_id).await;
@@ -16092,6 +16123,7 @@ async fn homework_patch_rechecks_and_blocks_orphaning() {
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     let algebra2 = create_subject(&app, &w.teacher, &w.course, "algebra II").await;
+    select_instance_subject(&app, &w.teacher, &w.instance, &algebra2).await;
     let res = send(
         &app,
         "PATCH",
@@ -17172,6 +17204,7 @@ async fn homework_blocks_subject_delete_until_retagged() {
 
     // Re-tagging frees the old subject and guards the new one.
     let second = create_subject(&app, &w.teacher, &w.course, "geometry").await;
+    select_instance_subject(&app, &w.teacher, &w.instance, &second).await;
     let res = send(
         &app,
         "PATCH",
@@ -19837,6 +19870,7 @@ async fn bank_question_create_get_list_and_instantiate() {
     let mudur = login_as(&app, &db, "algebra_m", "manager").await;
     let t = taught_under(&app, &mudur, &teacher, "algebra").await;
     let subject = create_subject(&app, &teacher, &t.course, "linear").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     // Create a template — subject is origin metadata, not held to a course.
     let res = send(
@@ -19936,6 +19970,7 @@ async fn bank_question_list_pages_filters_and_names() {
     let mudur = login_as(&app, &db, "algebra_m", "manager").await;
     let t = taught_under(&app, &mudur, &teacher, "algebra").await;
     let subject = create_subject(&app, &teacher, &t.course, "linear").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     let other_subject = create_subject(&app, &teacher, &t.course, "quadratic").await;
 
     // 120 templates — more than the clients' `limit=100`.
@@ -20413,6 +20448,7 @@ async fn bank_private_template_is_invisible_until_published() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &owner, "bio").await;
     let subject = create_subject(&app, &owner, &t.course, "cells").await;
+    select_instance_subject(&app, &owner, &t.instance, &subject).await;
 
     // Two templates; only the second is ever published.
     let res = send(
@@ -20463,6 +20499,7 @@ async fn bank_private_template_is_invisible_until_published() {
     // The other teacher's own exam, to attempt an instantiate from.
     let t2 = taught_under(&app, &mudur, &other, "bio2").await;
     let subject2 = create_subject(&app, &other, &t2.course, "cells2").await;
+    select_instance_subject(&app, &other, &t2.instance, &subject2).await;
     let exam2 = create_exam(&app, &other, &t2.instance, &t2.term, "quiz", "final").await;
     let owner_id = me_id(&app, &owner).await;
 
@@ -20740,6 +20777,7 @@ async fn bank_instantiate_copies_images() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "geo1").await;
     let subject = create_subject(&app, &teacher, &t.course, "maps1").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     // A choice template with an illustration and one option picture.
     let res = send(
@@ -21042,6 +21080,7 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "geo2").await;
     let subject = create_subject(&app, &teacher, &t.course, "maps2").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     // Two images so the copy loop has multiple steps.
     let res = send(
@@ -21411,6 +21450,7 @@ async fn bank_provenance_both_directions() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "bprov_c").await;
     let subject = create_subject(&app, &teacher, &t.course, "bprov_s").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     // Bank -> exam: from_bank is the template id, banked_as stays null.
     let res = send(
@@ -21921,6 +21961,7 @@ async fn bank_list_counts_the_copies_made_from_each_template() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "buse_c").await;
     let subject = create_subject(&app, &teacher, &t.course, "buse_s").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     let template = |text: &'static str| {
         send(
@@ -22042,6 +22083,7 @@ async fn refreshing_a_question_recopies_its_template() {
     scheduling_kinds(&app, &mudur).await;
     let t = taught_under(&app, &mudur, &teacher, "bref_c").await;
     let subject = create_subject(&app, &teacher, &t.course, "bref_s").await;
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
 
     // A template with an illustration and a picture on its first option.
     let res = send(
@@ -26993,7 +27035,7 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
         "POST",
         "/classes",
         Some(&teacher),
-        Some(json!({"name": "9-A"})),
+        Some(json!({"name": "9-A", "grade_level": 9})),
     )
     .await;
     assert_eq!(
@@ -27006,13 +27048,13 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({"name": "9-A", "grade": ""})),
+        Some(json!({"name": "9-A", "grade_level": 9})),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    assert!(
-        res.body["class"]["grade"].is_null(),
-        "an empty grade is no grade"
+    assert_eq!(
+        res.body["class"]["grade_level"], 9,
+        "the class carries the rung it was created at"
     );
     let class = id_of(&res.body["class"]);
     assert_eq!(
@@ -27206,7 +27248,7 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A" })),
+        Some(json!({ "name": "9-A", "grade_level": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -27309,7 +27351,7 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A" })),
+        Some(json!({ "name": "9-A", "grade_level": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -27467,7 +27509,7 @@ async fn a_year_a_class_points_at_refuses_to_delete() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A", "year": year })),
+        Some(json!({ "name": "9-A", "grade_level": 9, "year": year })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -27552,7 +27594,7 @@ async fn an_attach_that_cannot_seat_the_whole_class_seats_none_of_it() {
         "POST",
         "/classes",
         Some(&manager),
-        Some(json!({ "name": "9-A" })),
+        Some(json!({ "name": "9-A", "grade_level": 9 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -30269,7 +30311,7 @@ const CORE_PREFIXES: [(&str, &str); 14] = [
 /// A module may own more than one prefix: `courses` also answers under
 /// `/instances` (the instance anchor), and `chatbot` — the whole `ai` package —
 /// also answers under `/rag`, `/insights` and `/podcast`.
-const MODULE_PREFIXES: [(Module, &str); 25] = [
+const MODULE_PREFIXES: [(Module, &str); 26] = [
     (Module::Chatbot, "/chatbot"),
     (Module::Chatbot, "/rag"),
     (Module::Chatbot, "/insights"),
@@ -30280,6 +30322,7 @@ const MODULE_PREFIXES: [(Module, &str); 25] = [
     (Module::Appointments, "/appointments"),
     (Module::Courses, "/courses"),
     (Module::Courses, "/instances"),
+    (Module::Courses, "/offerings"),
     (Module::CourseNotes, "/course-notes"),
     (Module::Classes, "/classes"),
     (Module::Sessions, "/sessions"),
@@ -30894,4 +30937,434 @@ async fn the_insight_run_ledger_is_manager_only() {
 
     let res = send(&app, "GET", "/insights/runs", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+// --- course template: the six template/instance children are wired --------
+
+/// The six foreign-module route pairs wave 2 mounted — subject selection,
+/// exam weights and the weekly plan under both `/offerings` and
+/// `/instances` — all answer through the built router with one manager
+/// session. A missed merge or a double prefix would 404 here; the module
+/// gates stay out of the way because the school runs every module.
+#[tokio::test]
+async fn offering_and_instance_template_children_answer_through_the_router() {
+    let (app, db) = app_and_db().await;
+    let mudur = login_as(&app, &db, "mudur_template", "manager").await;
+
+    // One class-delivered ders attached to one şube: the attach auto-mints
+    // the grade-level offering the section inherits from, and the instance
+    // read names it.
+    let t = taught(&app, &mudur, "resim").await;
+    let read = send(
+        &app,
+        "GET",
+        &format!("/instances/{}", t.instance),
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    let offering = read.body["offering"]
+        .as_str()
+        .expect("instance carries its offering")
+        .to_string();
+
+    // The catalog POST itself: a second grade level of the same ders is a
+    // fresh template — 201, not a 404 from a double-prefixed mount.
+    let created = send(
+        &app,
+        "POST",
+        "/offerings",
+        Some(&mudur),
+        Some(json!({ "course": t.course, "grade_level": 0 })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+
+    for (path, why) in [
+        (
+            format!("/offerings/{offering}/subjects"),
+            "offering subjects",
+        ),
+        (
+            format!("/offerings/{offering}/exam-weights"),
+            "offering exam weights",
+        ),
+        (
+            format!("/offerings/{offering}/weekly-plan"),
+            "offering weekly plan",
+        ),
+        (
+            format!("/instances/{}/subjects", t.instance),
+            "instance subjects",
+        ),
+        (
+            format!("/instances/{}/exam-weights", t.instance),
+            "instance exam weights",
+        ),
+        (
+            format!("/instances/{}/weekly-plan", t.instance),
+            "instance weekly plan",
+        ),
+    ] {
+        let res = send(&app, "GET", &path, Some(&mudur), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{why}: {}", res.body);
+    }
+}
+
+// --- course template: the user's per-class scenario, end to end -------------
+
+/// The user's scenario (2026-09-23): a 9th-grade and a 12th-grade section both
+/// teach Biology — same catalog course, two instances — and each resolves to
+/// the template of its own grade, with per-class overrides deviating exactly
+/// one axis at a time (override-or-inherit, never merge). Driven over the HTTP
+/// surface only:
+///
+/// (a) both instances share the course id but resolve to different offerings;
+/// (b) the grade-9 offering's template (title suffix, description, hours, a
+///     topic, a weight, a slot) shows on the grade-9 instance and nowhere on
+///     grade 12;
+/// (c) a `ders_saati` override on one instance deviates exactly that axis;
+/// (d) an own-but-empty subject set beats the offering's set;
+/// (e) the reset doors restore inheritance (a scalar, and the set axes);
+/// (f) a topic of the grade-9 template tags a question there and is refused
+///     in the grade-12 instance;
+/// (g) the marks and karne reports show each section its own resolved title.
+#[tokio::test]
+async fn course_template_resolution_is_per_class_end_to_end() {
+    let (app, db) = app_and_db().await;
+    let staff = login_as(&app, &db, "mudur_scenario", "manager").await;
+
+    // One ders, two topics, two şubeler at different rungs of the ladder.
+    let course = create_course(&app, &staff, "Biyoloji").await;
+    let s1 = create_subject(&app, &staff, &course, "Hücre").await;
+    let s2 = create_subject(&app, &staff, &course, "Genetik").await;
+    let year = ensure_year(&app, &staff).await;
+    let term = create_term(&app, &staff, &year, "1. Dönem").await;
+    let class_a = create_class(
+        &app,
+        &staff,
+        "9-A",
+        json!({ "year": year, "grade_level": 9 }),
+    )
+    .await;
+    let class_b = create_class(
+        &app,
+        &staff,
+        "12-B",
+        json!({ "year": year, "grade_level": 12 }),
+    )
+    .await;
+    let inst_a = attach_instance(&app, &staff, &class_a, &course).await;
+    let inst_b = attach_instance(&app, &staff, &class_b, &course).await;
+    let read_instance = |uri: String| {
+        let app = app.clone();
+        let staff = staff.clone();
+        async move { send(&app, "GET", &uri, Some(&staff), None).await }
+    };
+
+    // (a) Same ders, two instances — and each teaches from its own grade's
+    // template: shared course id, distinct offering ids, both scalars still
+    // inheriting the catalog/constant floor.
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    let b = read_instance(format!("/instances/{inst_b}")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(b.status, StatusCode::OK, "{}", b.body);
+    assert_eq!(a.body["course"], course, "(a) same catalog course");
+    assert_eq!(b.body["course"], course, "(a) same catalog course");
+    let offering_a = a.body["offering"].as_str().expect("(a) offering id");
+    let offering_b = b.body["offering"].as_str().expect("(a) offering id");
+    assert_ne!(offering_a, offering_b, "(a) each grade has its own template");
+    assert_eq!(a.body["title"], "Biyoloji", "(a) pre-template title inherits");
+    assert_eq!(a.body["title_overridden"], false);
+    assert_eq!(b.body["ders_saati"], 1, "(a) the constant floor, not a value");
+    assert_eq!(b.body["ders_saati_overridden"], false);
+
+    // (b) Fill the grade-9 template; the grade-12 one stays empty.
+    let patched = send(
+        &app,
+        "PATCH",
+        &format!("/offerings/{offering_a}"),
+        Some(&staff),
+        Some(json!({
+            "title": "Biyoloji (9. sınıf)",
+            "description": "9. sınıf müfredatı",
+            "default_ders_saati": 4
+        })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
+    for (offering, subject) in [(offering_a, &s1), (offering_b, &s2)] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/offerings/{offering}/subjects"),
+            Some(&staff),
+            Some(json!({ "subject": subject })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    let weighted = send(
+        &app,
+        "PATCH",
+        &format!("/offerings/{offering_a}/exam-weights"),
+        Some(&staff),
+        Some(json!({ "kind": "yazili", "weight": 3 })),
+    )
+    .await;
+    assert_eq!(weighted.status, StatusCode::OK, "{}", weighted.body);
+    let slotted = send(
+        &app,
+        "POST",
+        &format!("/offerings/{offering_a}/weekly-plan"),
+        Some(&staff),
+        Some(json!({ "weekday": 1, "starts_at": 540, "ends_at": 570 })),
+    )
+    .await;
+    assert_eq!(slotted.status, StatusCode::CREATED, "{}", slotted.body);
+
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["title"], "Biyoloji (9. sınıf)", "(b) grade-9 title");
+    assert_eq!(a.body["title_overridden"], false, "(b) inherited, not owned");
+    assert_eq!(a.body["description"], "9. sınıf müfredatı");
+    assert_eq!(a.body["ders_saati"], 4, "(b) the grade-9 default");
+    assert_eq!(a.body["subjects_inherited"], true);
+    assert_eq!(a.body["subjects"][0]["id"], s1, "(b) the grade-9 syllabus");
+    let a_weights = a.body["exam_weights"]
+        .as_array()
+        .expect("(b) resolved weight map");
+    let a_yazili = a_weights
+        .iter()
+        .find(|w| w["kind"] == "yazili")
+        .expect("(b) settings kinds are always mapped");
+    assert_eq!(a_yazili["weight"], 3, "(b) the template's weight");
+    assert_eq!(a.body["weekly_plan"][0]["weekday"], 1, "(b) template week");
+
+    let b = read_instance(format!("/instances/{inst_b}")).await;
+    assert_eq!(b.body["title"], "Biyoloji", "(b) grade 12 stays on the catalog");
+    assert_eq!(b.body["ders_saati"], 1, "(b) the empty template inherits all");
+    assert_eq!(b.body["subjects"][0]["id"], s2, "(b) grade 12's own template");
+    assert!(
+        !b.body["subjects"]
+            .as_array()
+            .expect("(b) subjects array")
+            .iter()
+            .any(|s| s["id"] == s1),
+        "(b) no bleed of the grade-9 topic into grade 12"
+    );
+    let b_weights = b.body["exam_weights"]
+        .as_array()
+        .expect("(b) resolved weight map");
+    let b_yazili = b_weights
+        .iter()
+        .find(|w| w["kind"] == "yazili")
+        .expect("(b) settings kinds are always mapped");
+    assert_eq!(b_yazili["weight"], 1, "(b) grade 12 keeps the settings weight");
+    assert_eq!(
+        b.body["weekly_plan"]
+            .as_array()
+            .expect("(b) weekly plan array")
+            .len(),
+        0,
+        "(b) the empty grade-12 template week"
+    );
+
+    // (c) Override exactly one axis on the grade-9 section: its hours move,
+    // everything else keeps flowing from the template, and grade 12 is
+    // untouched.
+    let patched = send(
+        &app,
+        "PATCH",
+        &format!("/instances/{inst_a}"),
+        Some(&staff),
+        Some(json!({ "ders_saati": 6 })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["ders_saati"], 6, "(c) the override wins");
+    assert_eq!(a.body["ders_saati_overridden"], true, "(c) flagged as owned");
+    assert_eq!(
+        a.body["title"], "Biyoloji (9. sınıf)",
+        "(c) no merge: the title still inherits"
+    );
+    assert_eq!(a.body["title_overridden"], false, "(c) still not owned");
+    assert_eq!(
+        a.body["subjects_inherited"], true,
+        "(c) the set axis is untouched"
+    );
+    let b = read_instance(format!("/instances/{inst_b}")).await;
+    assert_eq!(b.body["ders_saati"], 1, "(c) grade 12 unaffected");
+
+    // (f) Topic tagging while grade 9 still inherits: its template's topic is
+    // accepted there, refused next door.
+    let exam_a = create_exam(&app, &staff, &inst_a, &term, "A sınavı", "yazili").await;
+    let exam_b = create_exam(&app, &staff, &inst_b, &term, "B sınavı", "yazili").await;
+    let tagged = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam_a}/questions"),
+        Some(&staff),
+        Some(json!({ "subject_id": s1, "text": "Mitokondri?", "kind": "text", "points": 10 })),
+    )
+    .await;
+    assert_eq!(tagged.status, StatusCode::CREATED, "(f) {}", tagged.body);
+    let refused = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam_b}/questions"),
+        Some(&staff),
+        Some(json!({ "subject_id": s1, "text": "Mitokondri?", "kind": "text", "points": 10 })),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "(f) {}", refused.body);
+    let own = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam_b}/questions"),
+        Some(&staff),
+        Some(json!({ "subject_id": s2, "text": "DNA?", "kind": "text", "points": 10 })),
+    )
+    .await;
+    assert_eq!(
+        own.status,
+        StatusCode::CREATED,
+        "(f) the refusal is syllabus scope, not course scope: {}",
+        own.body
+    );
+
+    // (d) An own set that is EMPTY wins: take a topic onto the section and
+    // drop it — the flag stays "own", the resolved set is empty, and the
+    // sibling still sees its own template's topic.
+    let took = send(
+        &app,
+        "POST",
+        &format!("/instances/{inst_a}/subjects"),
+        Some(&staff),
+        Some(json!({ "subject": s1 })),
+    )
+    .await;
+    assert_eq!(took.status, StatusCode::CREATED, "(d) {}", took.body);
+    let dropped = send(
+        &app,
+        "DELETE",
+        &format!("/instances/{inst_a}/subjects/{s1}"),
+        Some(&staff),
+        None,
+    )
+    .await;
+    assert_eq!(dropped.status, StatusCode::NO_CONTENT, "(d) {}", dropped.body);
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["subjects_inherited"], false, "(d) the set is its own");
+    assert_eq!(
+        a.body["subjects"]
+            .as_array()
+            .expect("(d) subjects array")
+            .len(),
+        0,
+        "(d) empty own set beats the template's"
+    );
+    let b = read_instance(format!("/instances/{inst_b}")).await;
+    assert_eq!(
+        b.body["subjects"][0]["id"], s2,
+        "(d) the sibling still inherits its template"
+    );
+
+    // (e) The reset doors restore inheritance: the scalar goes back to the
+    // offering's default, the weekly plan back to the template week, and the
+    // subjects flag back to the template's set.
+    let reset = send(
+        &app,
+        "POST",
+        &format!("/instances/{inst_a}/reset"),
+        Some(&staff),
+        Some(json!({ "fields": ["ders_saati"] })),
+    )
+    .await;
+    assert_eq!(reset.status, StatusCode::OK, "(e) {}", reset.body);
+    assert_eq!(reset.body["ders_saati"], 4, "(e) the offering default again");
+    assert_eq!(reset.body["ders_saati_overridden"], false, "(e) inheriting");
+
+    let own_slot = send(
+        &app,
+        "POST",
+        &format!("/instances/{inst_a}/weekly-plan"),
+        Some(&staff),
+        Some(json!({ "weekday": 2, "starts_at": 600, "ends_at": 630 })),
+    )
+    .await;
+    assert_eq!(own_slot.status, StatusCode::CREATED, "(e) {}", own_slot.body);
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["weekly_plan_inherited"], false, "(e) own week wins");
+    assert_eq!(a.body["weekly_plan"][0]["weekday"], 2);
+    let plan_reset = send(
+        &app,
+        "DELETE",
+        &format!("/instances/{inst_a}/weekly-plan"),
+        Some(&staff),
+        None,
+    )
+    .await;
+    assert_eq!(plan_reset.status, StatusCode::NO_CONTENT, "(e)");
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["weekly_plan_inherited"], true, "(e) inheriting again");
+    assert_eq!(
+        a.body["weekly_plan"][0]["weekday"], 1,
+        "(e) the template week again"
+    );
+
+    let subjects_reset = send(
+        &app,
+        "POST",
+        &format!("/instances/{inst_a}/reset"),
+        Some(&staff),
+        Some(json!({ "fields": ["subjects"] })),
+    )
+    .await;
+    assert_eq!(subjects_reset.status, StatusCode::OK, "(e)");
+    let a = read_instance(format!("/instances/{inst_a}")).await;
+    assert_eq!(a.body["subjects_inherited"], true, "(e) the flag is back");
+    assert_eq!(a.body["subjects"][0]["id"], s1, "(e) the template set again");
+
+    // (g) The batched report reads show each section its own resolved title.
+    let ogrenci = login(&app, "scenario_ogrenci").await;
+    let student_id = me_id(&app, &ogrenci).await;
+    add_member(&app, &staff, &class_a, &student_id).await;
+    add_member(&app, &staff, &class_b, &student_id).await;
+
+    let marks = send(&app, "GET", &format!("/marks/{student_id}"), Some(&staff), None).await;
+    assert_eq!(marks.status, StatusCode::OK, "(g) {}", marks.body);
+    let blocks = marks.body["courses"].as_array().expect("(g) marks blocks");
+    assert_eq!(blocks.len(), 2, "(g) one block per section: {}", marks.body);
+    for block in blocks {
+        let expected = if block["instance"] == inst_a {
+            "Biyoloji (9. sınıf)"
+        } else {
+            "Biyoloji"
+        };
+        assert_eq!(block["course"]["title"], expected, "(g) {}", marks.body);
+    }
+
+    let karne = send(
+        &app,
+        "GET",
+        &format!("/marks/karne/{student_id}?term={term}"),
+        Some(&staff),
+        None,
+    )
+    .await;
+    assert_eq!(karne.status, StatusCode::OK, "(g) {}", karne.body);
+    let lines = karne.body["instances"]
+        .as_array()
+        .expect("(g) karne lines");
+    assert_eq!(lines.len(), 2, "(g) one line per section: {}", karne.body);
+    for line in lines {
+        let expected = if line["class_course"] == inst_a {
+            "Biyoloji (9. sınıf)"
+        } else {
+            "Biyoloji"
+        };
+        assert_eq!(line["course"], expected, "(g) {}", karne.body);
+    }
 }

@@ -1008,8 +1008,9 @@ struct ProfileClassRef {
     id: String,
     #[schema(example = "9-A")]
     name: String,
-    #[schema(example = "9")]
-    grade: Option<String>,
+    /// The class's rung on the grade ladder (`0` = anaokulu).
+    #[schema(example = 9)]
+    grade_level: i16,
 }
 
 /// A course as a profile shows it — a label, nothing more.
@@ -1207,13 +1208,17 @@ async fn profile_of(
             .map(|class| ProfileClassRef {
                 id: class.get_id().key().to_string(),
                 name: class.get_name().as_str().to_string(),
-                grade: class.get_grade().map(|grade| grade.as_str().to_string()),
+                grade_level: class.get_grade_level().get(),
             })
             .collect(),
         courses: courses
             .iter()
             .map(|course| ProfileCourseRef {
                 id: course.get_id().key().to_string(),
+                // Catalog-tier surface, like `GET /courses`: a profile lists
+                // the person's courses by their catalog identity (a person
+                // may sit two sections of one ders), so the catalog title is
+                // the deliberate exception to the instance-resolved display.
                 title: course.get_title().as_str().to_string(),
                 kind: course.get_kind().as_str().to_string(),
             })

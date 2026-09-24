@@ -35,7 +35,8 @@ use crate::db::class_pump::Attached;
 use crate::domain::class_blueprint::{
     ClassBlueprint, ClassBlueprintId, Pumped, SectionStatus, Skip, skip_reason,
 };
-use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId};
+use crate::domain::class_group::{ClassGroup, ClassGroupId};
+use crate::domain::grade::GradeLevel;
 use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -47,11 +48,11 @@ use crate::error::AppError;
 pub async fn create(
     db: &Database,
     creator: &UserId,
-    grade: ClassGrade,
+    grade_level: GradeLevel,
     courses: Vec<CourseId>,
 ) -> Result<ClassBlueprint, AppError> {
     let courses = ClassBlueprint::course_list(courses)?;
-    class_blueprint::create(db, creator, grade, courses).await
+    class_blueprint::create(db, creator, grade_level, courses).await
 }
 
 /// The row, for callers that only inspect it — the web layer's
@@ -339,7 +340,7 @@ pub async fn pump(
         skipped: Vec::new(),
     };
     let mut dead = Vec::new();
-    for class in class_group::list_for_grade(db, &blueprint.grade).await? {
+    for class in class_group::list_for_grade(db, blueprint.grade_level).await? {
         pumped.matched += 1;
         if !apply_courses(db, blueprint, &class, by, &mut dead, &mut pumped.skipped).await? {
             break;
@@ -378,7 +379,7 @@ pub async fn status(
     db: &Database,
     blueprint: &ClassBlueprint,
 ) -> Result<Vec<SectionStatus>, AppError> {
-    let sections = class_group::list_for_grade(db, &blueprint.grade).await?;
+    let sections = class_group::list_for_grade(db, blueprint.grade_level).await?;
     if sections.is_empty() {
         return Ok(Vec::new());
     }
@@ -415,14 +416,13 @@ mod tests {
     };
     use crate::domain::class_group::{ClassGroup, ClassName};
 
-    /// A section that a pump's own grade loop can actually find — [`a_class`]
-    /// carries no grade at all, so `list_for_grade` reaches none of them.
+    /// A section at the pump's own rung (9), so `list_for_grade` reaches it.
     async fn a_section(name: &str, db: &Database) -> ClassGroup {
         class_group::create(
             db,
             &fixture_user(db, "manager").await,
             ClassName::try_new(name).unwrap(),
-            Some(ClassBlueprint::grade_key("9").unwrap()),
+            GradeLevel::new(9).unwrap(),
             None,
             None,
         )
@@ -430,17 +430,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A blueprint holding `courses`, at grade "9".
+    /// A blueprint holding `courses`, at rung 9.
     async fn a_blueprint(courses: Vec<CourseId>, db: &Database) -> ClassBlueprint {
         let manager = fixture_user(db, "manager").await;
-        create(
-            db,
-            &manager,
-            ClassBlueprint::grade_key("9").unwrap(),
-            courses,
-        )
-        .await
-        .unwrap()
+        create(db, &manager, GradeLevel::new(9).unwrap(), courses)
+            .await
+            .unwrap()
     }
 
     /// Every skip names the record that actually failed.
@@ -498,6 +493,7 @@ mod tests {
         // The class is deleted out from under the pump: the counter claim
         // matches nothing and the read that follows finds no row.
         let (db, _leases) = crate::database::init_test_db().await;
+        let manager = fixture_user(&db, "manager").await;
         let course = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
@@ -528,6 +524,7 @@ mod tests {
         // The class stands at its own ceiling: the same claim matches nothing,
         // but the row is there — and that is the one a manager can act on.
         let (db, _leases) = crate::database::init_test_db().await;
+        let manager = fixture_user(&db, "manager").await;
         let course = a_course("algebra", &db).await;
         let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await

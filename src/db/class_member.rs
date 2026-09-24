@@ -102,15 +102,16 @@ pub(crate) mod tests {
         UserId::from_key(&id.to_string())
     }
 
-    /// A class with no year and no grade: the shape most fixtures want, since
-    /// the year only matters to the academic-calendar reads.
+    /// A class with no year, at a fixed ladder rung: the shape most fixtures
+    /// want, since the year only matters to the academic-calendar reads and
+    /// the grade level only to the blueprint/rollover ones.
     pub(crate) async fn a_class(name: &str, db: &Database) -> ClassGroupId {
         let manager = fixture_user(db, "manager").await;
         crate::db::class_group::create(
             db,
             &manager,
             ClassName::try_new(name).unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(9).unwrap(),
             None,
             None,
         )

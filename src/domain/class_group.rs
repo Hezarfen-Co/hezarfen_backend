@@ -16,12 +16,13 @@
 //! the route-facing wrappers in [`crate::service::class_group`] — this file is
 //! the row shape, its newtypes and getters.
 
-use crate::constant::{MAX_CLASS_GRADE_LEN, MAX_CLASS_NAME_LEN};
+use crate::constant::MAX_CLASS_NAME_LEN;
 use crate::domain::academic_year::AcademicYearId;
+use crate::domain::grade::GradeLevel;
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
-use crate::validate::{validate_optional, validate_required};
+use crate::validate::validate_required;
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(transparent)]
@@ -64,24 +65,6 @@ impl ClassName {
     }
 }
 
-/// The school's own label for the year a class sits in ("9", "10-A",
-/// "kindergarten"). Free text on purpose — no school's grade ladder is the next
-/// one's — and optional: a club-shaped class has no grade at all.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
-#[sqlx(transparent)]
-pub struct ClassGrade(String);
-
-impl ClassGrade {
-    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
-        validate_optional("grade", value, MAX_CLASS_GRADE_LEN)?;
-        Ok(Self(value.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// One class. `creator` is who made it; the two refcounts behind the delete
 /// guard are database-side columns only, so no whole-row save can clobber one
 /// (see [`crate::db::cap`]).
@@ -90,12 +73,17 @@ impl ClassGrade {
 /// refcounted, and merely a label pointing at a teacher-or-higher account — the
 /// web layer holds that bar, and a demotion sweeps the column
 /// ([`crate::db::class_group::unassign_everywhere`]).
+///
+/// `grade_level` is the section's rung on the shared grade ladder
+/// ([`GradeLevel`]) — required, not a label the school makes up: a club-shaped
+/// *class* still sits at a grade, and it is the school-wide club/study
+/// *courses* that belong to no section at all.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassGroup {
     pub(crate) id: ClassGroupId,
     pub(crate) creator: UserId,
     pub(crate) name: ClassName,
-    pub(crate) grade: Option<ClassGrade>,
+    pub(crate) grade_level: GradeLevel,
     pub(crate) year: Option<AcademicYearId>,
     pub(crate) teacher: Option<UserId>,
 }
@@ -113,8 +101,8 @@ impl ClassGroup {
         &self.name
     }
 
-    pub fn get_grade(&self) -> Option<&ClassGrade> {
-        self.grade.as_ref()
+    pub fn get_grade_level(&self) -> GradeLevel {
+        self.grade_level
     }
 
     pub fn get_year(&self) -> Option<&AcademicYearId> {
@@ -136,13 +124,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_is_required_and_grade_is_optional() {
+    fn name_is_required_and_the_grade_is_a_ladder_rung() {
         assert!(ClassName::try_new("9-A").is_ok());
         assert!(ClassName::try_new("").is_err());
         assert!(ClassName::try_new("   ").is_err());
         assert!(ClassName::try_new(&"x".repeat(MAX_CLASS_NAME_LEN + 1)).is_err());
-        assert!(ClassGrade::try_new("").is_ok());
-        assert!(ClassGrade::try_new("anaokulu").is_ok());
-        assert!(ClassGrade::try_new(&"x".repeat(MAX_CLASS_GRADE_LEN + 1)).is_err());
+        assert!(GradeLevel::new(0).is_ok());
+        assert!(GradeLevel::new(12).is_ok());
+        assert!(GradeLevel::new(13).is_err());
+        assert!(GradeLevel::new(-1).is_err());
     }
 }

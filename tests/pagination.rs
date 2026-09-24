@@ -594,7 +594,7 @@ async fn class_lists_are_paged() {
             "POST",
             "/classes",
             Some(&manager),
-            Some(json!({ "name": format!("9-{n}") })),
+            Some(json!({ "name": format!("9-{n}"), "grade_level": 9 })),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

@@ -8,7 +8,8 @@ use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::{FieldUpdate, Refcount};
 use crate::db::page::PagedList;
 use crate::domain::academic_year::AcademicYearId;
-use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
+use crate::domain::class_group::{ClassGroup, ClassGroupId, ClassName};
+use crate::domain::grade::GradeLevel;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -48,7 +49,7 @@ pub async fn create(
     db: &Database,
     creator: &UserId,
     name: ClassName,
-    grade: Option<ClassGrade>,
+    grade_level: GradeLevel,
     year: Option<AcademicYearId>,
     teacher: Option<UserId>,
 ) -> Result<ClassGroup, AppError> {
@@ -64,16 +65,16 @@ pub async fn create(
                        UPDATE academic_year SET class_count = class_count + 1
                         WHERE id = $1
                         RETURNING 1)
-                   INSERT INTO class_group (id, creator, name, grade, year, teacher)
+                   INSERT INTO class_group (id, creator, name, grade_level, year, teacher)
                    SELECT $2, $3, $4, $5, $1, $6 WHERE EXISTS (SELECT 1 FROM seat)
                    RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
-                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                      year AS "year: AcademicYearId", teacher AS "teacher: UserId""#,
                 year.uuid(),
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
-                grade.as_ref().map(ClassGrade::as_str),
+                grade_level.get(),
                 teacher.as_ref().map(UserId::uuid)
             )
             .fetch_optional(db)
@@ -97,15 +98,15 @@ pub async fn create(
         None => {
             let created = sqlx::query_as!(
                 ClassGroup,
-                r#"INSERT INTO class_group (id, creator, name, grade, year, teacher)
+                r#"INSERT INTO class_group (id, creator, name, grade_level, year, teacher)
                    VALUES ($1, $2, $3, $4, $5, $6)
                    RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
-                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                      year AS "year: AcademicYearId", teacher AS "teacher: UserId""#,
                 id.uuid(),
                 creator.uuid(),
                 name.as_str(),
-                grade.as_ref().map(ClassGrade::as_str),
+                grade_level.get(),
                 year.as_ref().map(AcademicYearId::uuid),
                 teacher.as_ref().map(UserId::uuid)
             )
@@ -121,7 +122,7 @@ pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>
     let class = sqlx::query_as!(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
-                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                   year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = $1"#,
         id.uuid()
@@ -131,40 +132,36 @@ pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>
     Ok(class)
 }
 
-/// Every class, newest first — or one grade's, when `grade` narrows it:
-/// `Some(Some(label))` is the sections carrying that exact label (no trim,
-/// no case folding, matching [`list_for_grade`] and the
-/// blueprint keyed by that very string), `Some(None)` the sections carrying
-/// no grade at all, `None` the whole list.
+/// Every class, newest first — or one rung's, when `grade_level` narrows it:
+/// `Some(level)` is the sections carrying that exact ladder position (the
+/// same equality [`list_for_grade`] and the blueprint keyed by that rung
+/// use), `None` the whole list.
 ///
 /// The narrowing is the `WHERE`, so the `total` [`PagedList`] counts is the
 /// filtered set and a client can page through it.
 pub async fn list_all(
     db: &Database,
-    grade: Option<Option<ClassGrade>>,
+    grade_level: Option<GradeLevel>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<ClassGroup>, i64), AppError> {
-    let list = match grade {
+    let list = match grade_level {
         None => PagedList::new(CLASS_GROUP_TABLE, "ORDER BY id DESC"),
-        Some(None) => PagedList::new(
-            format!("{CLASS_GROUP_TABLE} WHERE grade IS NULL"),
-            "ORDER BY id DESC",
-        ),
-        Some(Some(grade)) => PagedList::new(
-            format!("{CLASS_GROUP_TABLE} WHERE grade = $1"),
+        Some(grade_level) => PagedList::new(
+            format!("{CLASS_GROUP_TABLE} WHERE grade_level = $1"),
             "ORDER BY id DESC",
         )
-        .bind(grade.as_str().to_string()),
+        .bind(grade_level.get() as i64),
     };
     list.run(limit, offset, db).await
 }
 
 /// Write only the fields the PATCH carried — `None` means the request
 /// omitted it, so the column is left alone rather than re-stated from the
-/// snapshot this struct was read into. `grade`, `year` and `teacher` are
-/// nullable, so they take the outer/inner `Option<Option<_>>`: `None` =
-/// omitted (keep), `Some(None)` = clear.
+/// snapshot this struct was read into. `grade_level` is a plain `Option`
+/// (the column is NOT NULL: a PATCH may set a rung, never clear it);
+/// `year` and `teacher` are nullable, so they take the outer/inner
+/// `Option<Option<_>>`: `None` = omitted (keep), `Some(None)` = clear.
 ///
 /// A year move claims the new year and releases the old one inside the very
 /// transaction that moves the link, exactly as in
@@ -174,7 +171,7 @@ pub async fn update(
     db: &Database,
     class: ClassGroup,
     name: Option<ClassName>,
-    grade: Option<Option<ClassGrade>>,
+    grade_level: Option<GradeLevel>,
     year: Option<Option<AcademicYearId>>,
     teacher: Option<Option<UserId>>,
 ) -> Result<ClassGroup, AppError> {
@@ -182,10 +179,10 @@ pub async fn update(
     let expected = class.year.as_ref().map(AcademicYearId::uuid);
     FieldUpdate::new(CLASS_GROUP_TABLE, class.id.uuid())
         .set("name", name.map(|name| name.as_str().to_string()))
-        .set(
-            "grade",
-            grade.map(|grade| grade.map(|grade| grade.as_str().to_string())),
-        )
+        // `Param` has no i16 arm (and db/page.rs is a shared seam): the rung
+        // rides as BIGINT, which Postgres assignment-casts into the SMALLINT
+        // column.
+        .set("grade_level", grade_level.map(|grade| grade.get() as i64))
         .set("year", year.map(|year| year.map(|year| year.uuid())))
         // Not refcounted: a homeroom assignment is a label, so it rides the
         // plain `set` path and never arms the year CAS.
@@ -218,7 +215,7 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
     let classes = sqlx::query_as!(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
-                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                   year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE id = ANY($1)"#,
         &ids
@@ -228,20 +225,20 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
     Ok(classes)
 }
 
-/// Every class section at one grade label, in no particular order — what a
+/// Every class section at one ladder rung, in no particular order — what a
 /// grade blueprint pumps. Unpaged on purpose: the caller is reconciling all
 /// of them, and a page would silently stock only the first window.
 pub async fn list_for_grade(
     db: &Database,
-    grade: &ClassGrade,
+    grade_level: GradeLevel,
 ) -> Result<Vec<ClassGroup>, AppError> {
     let classes = sqlx::query_as!(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
-                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                   year AS "year: AcademicYearId", teacher AS "teacher: UserId"
-           FROM class_group WHERE grade = $1"#,
-        grade.as_str()
+           FROM class_group WHERE grade_level = $1"#,
+        grade_level.get()
     )
     .fetch_all(db)
     .await?;
@@ -258,7 +255,7 @@ pub async fn list_for_year(
     let classes = sqlx::query_as!(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
-                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                   year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE year = $1 ORDER BY id"#,
         year.uuid()
@@ -287,7 +284,7 @@ pub async fn list_for_teacher(db: &Database, user: &UserId) -> Result<Vec<ClassG
     let classes = sqlx::query_as!(
         ClassGroup,
         r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
-                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  name AS "name: ClassName", grade_level AS "grade_level: GradeLevel",
                   year AS "year: AcademicYearId", teacher AS "teacher: UserId"
            FROM class_group WHERE teacher = $1 ORDER BY id DESC"#,
         user.uuid()
@@ -464,7 +461,7 @@ mod tests {
             db,
             &manager,
             ClassName::try_new("9-A").unwrap(),
-            None,
+            GradeLevel::new(9).unwrap(),
             year,
             None,
         )
@@ -479,7 +476,7 @@ mod tests {
             db,
             &manager,
             ClassName::try_new("9-A").unwrap(),
-            None,
+            GradeLevel::new(9).unwrap(),
             None,
             teacher,
         )
@@ -740,7 +737,7 @@ mod tests {
             &db,
             &a_named_user(&db, "manager").await,
             ClassName::try_new("9-A").unwrap(),
-            None,
+            GradeLevel::anaokulu(),
             Some(id),
             None,
         )

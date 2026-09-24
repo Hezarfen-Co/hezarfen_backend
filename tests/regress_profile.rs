@@ -932,7 +932,7 @@ async fn section() -> Section {
     let student = login(&app, "kid").await;
     let student_id = me_id(&app, &student).await;
 
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    let class = create_class(&app, &manager, "9-A", 9).await;
     add_member(&app, &manager, &class, &student_id).await;
     link_student(&app, &admin, &parent_id, &student_id).await;
 
@@ -947,13 +947,13 @@ async fn section() -> Section {
     }
 }
 
-async fn create_class(app: &Router, manager: &str, name: &str, grade: &str) -> String {
+async fn create_class(app: &Router, manager: &str, name: &str, grade_level: i16) -> String {
     let res = send(
         app,
         "POST",
         "/classes",
         Some(manager),
-        Some(json!({ "name": name, "grade": grade })),
+        Some(json!({ "name": name, "grade_level": grade_level })),
     )
     .await;
     assert_eq!(
@@ -1072,7 +1072,7 @@ async fn teacher_parent_manager_and_the_owner_still_read_the_class_block() {
     let mine = send(&s.app, "GET", "/users/me/profile", Some(&s.student), None).await;
     assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
     assert_eq!(mine.body["classes"][0]["name"], "9-A");
-    assert_eq!(mine.body["classes"][0]["grade"], "9");
+    assert_eq!(mine.body["classes"][0]["grade_level"], 9);
 }
 
 /// `stats.classes` is the owner's true total, deliberately *not* the length of

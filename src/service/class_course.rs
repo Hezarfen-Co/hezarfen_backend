@@ -9,9 +9,9 @@ use crate::database::Database;
 use crate::db::class_course;
 use crate::db::class_pump::{self, Axis};
 use crate::domain::academic_year::AcademicYearId;
-use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati};
+use crate::domain::class_course::{ClassCourse, ClassCourseId, DersSaati, OverrideField};
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::course::CourseId;
+use crate::domain::course::{CourseDescription, CourseId, CourseTitle};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
@@ -22,7 +22,10 @@ use crate::error::{AppError, ValidationError};
 /// Students already in the course keep the rows they have — no second
 /// enrollment written, `source` untouched — and the attach is one
 /// `class_course` row per (class, course): the instance every exam, session,
-/// homework and enrollment under this class's course now keys on.
+/// homework and enrollment under this class's course now keys on. The row
+/// teaches from its grade-level offering (auto-created empty by the pump);
+/// only a class-delivered ders attaches — a club or etüt is a 400 naming the
+/// course.
 pub async fn attach(
     db: &Database,
     class: &ClassGroupId,
@@ -120,16 +123,101 @@ pub async fn read(db: &Database, id: &ClassCourseId) -> Result<Option<ClassCours
     class_course::read(db, id).await
 }
 
-/// PATCH one instance's own policy: the weekly hours and whether it counts
-/// toward the report card. Both are non-clearable, so an omitted field keeps
-/// the stored value.
+/// PATCH one instance's own content overrides: title, description, the
+/// weekly hours and the report-card policy. Each `Some(_)` **sets** the
+/// override; `None` keeps what the column holds — a PATCH never clears
+/// (clearing back to inherit is [`reset_overrides`]' door, `POST
+/// /instances/{id}/reset`).
 pub async fn update(
     db: &Database,
     id: &ClassCourseId,
+    title: Option<CourseTitle>,
+    description: Option<CourseDescription>,
     staff: Option<DersSaati>,
     counts: Option<bool>,
 ) -> Result<ClassCourse, AppError> {
-    class_course::update(db, id, staff, counts).await
+    class_course::update(db, id, title, description, staff, counts).await
+}
+
+/// The instance's **effective** weekly hours and report-card policy: its own
+/// override, else the offering's default, else the constants (one weekly
+/// hour, counted toward the karne). Every read of the now-nullable
+/// `ders_saati`/`counts_toward_karne` goes through here — a `NULL` on the
+/// instance is *inherit*, never a value, and unwrapping it would present "not
+/// decided" as a decision.
+///
+/// One statement per call (the offering's two defaults off its row, which the
+/// instance's `RESTRICT` foreign key keeps alive); the composition with the
+/// full content chain (title, description, the set policies) is the Phase 3
+/// resolver's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstancePolicy {
+    pub ders_saati: DersSaati,
+    pub counts_toward_karne: bool,
+}
+
+pub async fn resolve_policy(
+    db: &Database,
+    instance: &ClassCourse,
+) -> Result<InstancePolicy, AppError> {
+    let (default_hours, default_counts) =
+        crate::db::course_offering::defaults(db, instance.get_offering())
+            .await?
+            .ok_or(AppError::NotFound)?;
+    Ok(InstancePolicy {
+        ders_saati: instance.get_ders_saati().or(default_hours).unwrap_or_else(
+            || {
+                DersSaati::try_new(crate::constant::MIN_DERS_SAATI)
+                    .expect("the floor is a valid weekly-hours count")
+            },
+        ),
+        counts_toward_karne: instance
+            .counts_toward_karne()
+            .or(default_counts)
+            .unwrap_or(true),
+    })
+}
+
+/// Clear the named overrides back to **inherit** — the reset behind `POST
+/// /instances/{id}/reset`. The scalars go `NULL` (the offering's default,
+/// then the catalog row or the constant, applies again); the three set flags
+/// flip back to `TRUE` (the offering's set is authoritative again — deleting
+/// the section's own set rows rides the child-table lanes' reset doors).
+///
+/// An empty list is a 400: a reset naming nothing would otherwise read as a
+/// success that did nothing.
+pub async fn reset_overrides(
+    db: &Database,
+    id: &ClassCourseId,
+    fields: &[OverrideField],
+) -> Result<ClassCourse, AppError> {
+    if fields.is_empty() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "fields",
+            reason: "name at least one override to reset",
+        }));
+    }
+    class_course::clear_overrides(db, id, fields).await
+}
+
+/// Parse the reset route's field names. The set-valued policies are named by
+/// their *set* (`subjects`, `exam_weights`, `weekly_plan`), not by the flag
+/// column — resetting one flips the flag back to inherit.
+pub fn parse_reset_field(name: &str) -> Result<OverrideField, AppError> {
+    match name {
+        "title" => Ok(OverrideField::Title),
+        "description" => Ok(OverrideField::Description),
+        "ders_saati" => Ok(OverrideField::DersSaati),
+        "counts_toward_karne" => Ok(OverrideField::CountsTowardKarne),
+        "subjects" => Ok(OverrideField::Subjects),
+        "exam_weights" => Ok(OverrideField::ExamWeights),
+        "weekly_plan" => Ok(OverrideField::WeeklyPlan),
+        other => Err(ValidationError::Unknown {
+            field: "fields",
+            value: other.to_string(),
+        }
+        .into()),
+    }
 }
 
 /// The academic year this instance sits under, if any — the seam every
@@ -261,6 +349,7 @@ pub async fn ensure_instance_teacher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::MIN_DERS_SAATI;
     use crate::db::class_group;
     use crate::db::class_member::tests::{
         a_class, a_course, counter, course_exists, link_exists, rows, source_of,
@@ -473,7 +562,9 @@ mod tests {
         );
     }
 
-    /// PATCHing the instance writes only what the request carried.
+    /// PATCHing the instance writes only what the request carried, the reset
+    /// door clears a named override back to inherit, and the resolver layers
+    /// override → offering default → constant.
     #[tokio::test]
     async fn an_update_writes_only_the_fields_it_carried() {
         let (db, _leases) = crate::database::init_test_db().await;
@@ -481,29 +572,77 @@ mod tests {
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", &db).await;
         let instance = attach(&db, &class, &algebra, &manager).await.unwrap();
+        // A fresh instance carries no overrides: the resolver falls through
+        // the (empty, auto-created) offering to the constants.
+        let fresh = read(&db, instance.get_id()).await.unwrap().unwrap();
+        assert_eq!(fresh.get_ders_saati(), None);
+        let fresh_policy = resolve_policy(&db, &fresh).await.unwrap();
+        assert_eq!(fresh_policy.ders_saati.as_i64(), MIN_DERS_SAATI);
+        assert!(fresh_policy.counts_toward_karne);
 
         let updated = update(
             &db,
             instance.get_id(),
+            Some(CourseTitle::try_new("9-A Matematik").unwrap()),
+            None,
             Some(DersSaati::try_new(5).unwrap()),
             None,
         )
         .await
         .unwrap();
-        assert_eq!(updated.get_ders_saati().as_i64(), 5);
-        assert!(
+        assert_eq!(
+            updated.get_title().map(CourseTitle::as_str),
+            Some("9-A Matematik")
+        );
+        assert_eq!(updated.get_ders_saati().map(DersSaati::as_i64), Some(5));
+        assert_eq!(
             updated.counts_toward_karne(),
+            None,
             "the omitted field keeps its stored value"
         );
+        // The effective hours follow the override, not the constant.
+        let policy = resolve_policy(&db, &updated).await.unwrap();
+        assert_eq!(policy.ders_saati.as_i64(), 5);
 
-        let again = update(&db, instance.get_id(), None, Some(false))
-            .await
-            .unwrap();
-        assert!(!again.counts_toward_karne());
+        let again = update(
+            &db,
+            instance.get_id(),
+            None,
+            None,
+            None,
+            Some(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.counts_toward_karne(), Some(false));
         assert_eq!(
-            again.get_ders_saati().as_i64(),
-            5,
+            again.get_ders_saati().map(DersSaati::as_i64),
+            Some(5),
             "…and the other direction holds too"
+        );
+
+        // Reset: the named overrides go back to inherit, the unnamed (the
+        // title) stay.
+        let cleared = reset_overrides(
+            &db,
+            instance.get_id(),
+            &[OverrideField::DersSaati, OverrideField::CountsTowardKarne],
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.get_ders_saati(), None);
+        assert_eq!(cleared.counts_toward_karne(), None);
+        assert_eq!(
+            cleared.get_title().map(CourseTitle::as_str),
+            Some("9-A Matematik"),
+            "the reset only touches the fields it names"
+        );
+        let cleared_policy = resolve_policy(&db, &cleared).await.unwrap();
+        assert_eq!(cleared_policy.ders_saati.as_i64(), MIN_DERS_SAATI);
+        assert!(cleared_policy.counts_toward_karne);
+        assert!(
+            reset_overrides(&db, instance.get_id(), &[]).await.is_err(),
+            "a reset naming nothing is a 400, not a no-op success"
         );
     }
 
@@ -524,7 +663,7 @@ mod tests {
             &db,
             &manager,
             crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(9).unwrap(),
             None,
             Some(homeroom),
         )

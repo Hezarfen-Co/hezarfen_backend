@@ -703,7 +703,7 @@ pub(crate) async fn a_test_instance(
         db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
-        None,
+        crate::domain::grade::GradeLevel::new(9).unwrap(),
         None,
         None,
     )
@@ -934,7 +934,7 @@ mod tests {
             db,
             on,
             crate::domain::class_group::ClassName::try_new(name).unwrap(),
-            None,
+            crate::domain::grade::GradeLevel::new(9).unwrap(),
             None,
             None,
         )

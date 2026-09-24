@@ -18,6 +18,7 @@ pub mod course_notes;
 pub mod courses;
 pub mod etag;
 pub mod events;
+pub mod exam_weights;
 pub mod exam_ws;
 pub mod exams;
 pub mod homework;
@@ -30,6 +31,8 @@ pub mod messages;
 pub mod module_gate;
 pub mod modules;
 pub mod notes;
+pub mod offering_subjects;
+pub mod offerings;
 pub mod payments;
 pub mod podcast;
 pub mod pomodoro;
@@ -42,6 +45,7 @@ pub mod settings;
 pub mod subjects;
 pub mod terms;
 pub mod users;
+pub mod weekly_plan;
 pub mod work;
 
 pub mod tenant_state;
@@ -526,7 +530,7 @@ mod tests {
                 db,
                 &office,
                 ClassName::try_new("9-A").unwrap(),
-                None,
+                crate::domain::grade::GradeLevel::new(9).unwrap(),
                 None,
                 Some(*teacher.get_id()),
             )

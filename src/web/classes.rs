@@ -19,7 +19,8 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Pumped, Skip};
 use crate::domain::class_course::{ClassCourse, ClassCourseId};
-use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
+use crate::domain::class_group::{ClassGroup, ClassGroupId, ClassName};
+use crate::domain::grade::GradeLevel;
 use crate::domain::class_member::ClassMember;
 use crate::domain::course::CourseId;
 use crate::domain::role::Role;
@@ -64,10 +65,11 @@ pub fn routes() -> OpenApiRouter<AppState> {
 struct CreateClass {
     #[schema(max_length = 200, example = "9-A")]
     name: String,
-    /// The school's own label for the year this class sits in ("9", "10-A",
-    /// "kindergarten"). Free text; omit (or send `""`) for a class with no grade.
-    #[schema(max_length = 20, example = "9")]
-    grade: Option<String>,
+    /// The class's rung on the shared grade ladder — an integer, `0` =
+    /// anaokulu, `1..=12` the school years. Required: every section sits at a
+    /// grade; it is school-wide club/study courses that belong to none.
+    #[schema(minimum = 0, maximum = 12, example = 9)]
+    grade_level: i16,
     /// The academic year this class sits in (`GET /academic-years`). Optional;
     /// a class with no year takes no exam and is never rolled over.
     year: Option<String>,
@@ -81,11 +83,11 @@ struct CreateClass {
 struct UpdateClass {
     #[schema(max_length = 200)]
     name: Option<String>,
-    /// Omit to keep the current grade, send `null` (or `""`) to clear it, or
-    /// send a label to (re)set it.
-    #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<String>, max_length = 20)]
-    grade: Option<Option<String>>,
+    /// Omit to keep the current grade, or send a ladder rung (an integer,
+    /// `0`..=12) to (re)set it. The grade is required on every class, so it
+    /// cannot be cleared.
+    #[schema(value_type = Option<i16>, minimum = 0, maximum = 12)]
+    grade_level: Option<i16>,
     /// Omit to keep the current academic year, send `null` to unlink, or send
     /// a year id to (re)assign.
     #[serde(default, deserialize_with = "set_or_clear")]
@@ -124,9 +126,9 @@ struct ClassResponse {
     creator: Option<PersonRef>,
     #[schema(example = "9-A")]
     name: String,
-    /// The school's own free-text grade label; `null` when the class has none.
-    #[schema(example = "9")]
-    grade: Option<String>,
+    /// The class's rung on the grade ladder (`0` = anaokulu).
+    #[schema(example = 9)]
+    grade_level: i16,
     /// The academic year this class sits in (`GET /academic-years`); `null`
     /// when unassigned.
     year: Option<String>,
@@ -150,7 +152,7 @@ impl ClassResponse {
             id: class.get_id().key().to_string(),
             creator: with_creator.then(|| PersonRef::resolve(people, class.get_creator())),
             name: class.get_name().as_str().to_string(),
-            grade: class.get_grade().map(|g| g.as_str().to_string()),
+            grade_level: class.get_grade_level().get(),
             year: class.get_year().map(|year| year.key().to_string()),
             teacher: class
                 .get_teacher()
@@ -168,7 +170,7 @@ struct CreateClassResponse {
     /// The courses the template could not put on this section, empty when it
     /// took them all (and always empty when no template covered its grade).
     skipped: Vec<SkipResponse>,
-    /// The grade label of the blueprint that stocked this section, or `null`
+    /// The ladder rung of the blueprint that stocked this section, or `null`
     /// when none did. `null` with an empty `skipped` is what tells "no template
     /// covers this grade" apart from "the template applied cleanly" — the
     /// distinction `matched` makes on the grade-wide pumps.
@@ -179,7 +181,7 @@ struct CreateClassResponse {
     /// remedy is the same either way — `POST /classes/{id}/blueprint`, which is
     /// idempotent and `404`s when there is genuinely no template.
     #[schema(example = "9")]
-    stocked_from: Option<String>,
+    stocked_from: Option<i16>,
 }
 
 /// Every person a [`ClassResponse`] names: its homeroom teacher, plus its
@@ -234,10 +236,14 @@ impl ClassMemberResponse {
 struct ClassCourseResponse {
     id: String,
     class: String,
-    /// The catalog course the class takes (`GET /courses/{id}`) — its title
-    /// lives there; what this class actually teaches is the row this response
-    /// describes.
+    /// The catalog course the class takes (`GET /courses/{id}`).
     course: String,
+    /// The **resolved** display title of this instance: its own override,
+    /// else its offering's, else the catalog course's — what every
+    /// instance-scoped surface shows.
+    title: String,
+    /// The resolved description, the same chain as `title`.
+    description: String,
     /// Who attached it.
     attached_by: PersonRef,
     /// Weekly lesson hours; the instance's weight in the year's report-card average.
@@ -254,24 +260,35 @@ struct ClassCourseResponse {
 }
 
 impl ClassCourseResponse {
-    fn new(
+    /// The weekly hours and report-card policy shown here are the *resolved*
+    /// ones (instance override, else its offering's default, else the
+    /// catalog/constants) — the instance row itself may inherit both. So are
+    /// the title and description: `content` is the
+    /// [`crate::service::instance_resolve::resolved_content`] entry for this
+    /// instance, batched by the caller so a page stays two queries.
+    async fn new(
+        db: &Database,
         link: &ClassCourse,
+        content: &crate::service::instance_resolve::ResolvedContent,
         teachers: &[UserId],
         people: &std::collections::HashMap<String, PersonRef>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AppError> {
+        let policy = crate::service::class_course::resolve_policy(db, link).await?;
+        Ok(Self {
             id: link.get_id().key().to_string(),
             class: link.get_class().key().to_string(),
             course: link.get_course().key().to_string(),
+            title: content.title.clone(),
+            description: content.description.clone(),
             attached_by: PersonRef::resolve(people, link.get_attached_by()),
-            ders_saati: link.get_ders_saati().as_i64(),
-            counts_toward_karne: link.counts_toward_karne(),
+            ders_saati: policy.ders_saati.as_i64(),
+            counts_toward_karne: policy.counts_toward_karne,
             enrollment_count: link.get_enrollment_count(),
             teachers: teachers
                 .iter()
                 .map(|teacher| PersonRef::resolve(people, teacher))
                 .collect(),
-        }
+        })
     }
 }
 
@@ -283,17 +300,8 @@ async fn class_or_404(id: &str, db: &Database) -> Result<ClassGroup, AppError> {
         .ok_or(AppError::NotFound)
 }
 
-/// An empty grade is *no* grade: the column is nullable, so a client that omits
-/// it and one that sends `""` must land on the same stored row.
-fn grade_or_none(text: Option<&str>) -> Result<Option<ClassGrade>, AppError> {
-    match text {
-        None | Some("") => Ok(None),
-        Some(text) => Ok(Some(ClassGrade::try_new(text)?)),
-    }
-}
-
 /// The homeroom teacher a request names, as the row itself — an empty string is
-/// *no* teacher, exactly like `grade`, so omitting the field and clearing it
+/// *no* teacher, exactly like `year`, so omitting the field and clearing it
 /// with `""` land on the same stored row. The named account must exist and hold
 /// teacher-or-higher: a class's homeroom teacher is staff, and the check is the
 /// same shape `add_member` uses for a non-student. The `User` comes back so the
@@ -361,12 +369,12 @@ async fn classes_page(
 }
 
 /// Create a class. Requires manager+ — a class is school structure, not a
-/// teacher's own room. `grade` is a free-text label for the year ("9", "10-A"),
-/// `year` links the academic year (which is what binds the class to a report
+/// teacher's own room. `grade_level` is the class's rung on the grade ladder
+/// (`0` = anaokulu, `1..=12`), `year` links the academic year (which is what binds the class to a report
 /// card and to the rollover), `teacher_id` names the homeroom teacher (a
 /// teacher+ account); all optional.
 ///
-/// If a blueprint covers the new class's grade, the class is **stocked from it
+/// If a blueprint covers the new class's rung, the class is **stocked from it
 /// at once** — the same best-effort pump `POST /classes/{id}/blueprint` runs, so
 /// a course that does not fit comes back in `skipped` and the class is created
 /// either way. `stocked_from` names the template that did it, and is `null` when
@@ -379,7 +387,7 @@ async fn classes_page(
     request_body = CreateClass,
     responses(
         (status = 201, description = "Class created, stocked from its grade's blueprint when one covers it", body = CreateClassResponse),
-        (status = 400, description = "Invalid name or grade, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade_level, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran (the class was rolled back, nothing was created), or the named academic year is archived — past years are read-only", body = ErrorResponse),
@@ -392,7 +400,7 @@ async fn create_class(
     Json(req): Json<CreateClass>,
 ) -> Result<(StatusCode, Json<CreateClassResponse>), AppError> {
     let name = ClassName::try_new(&req.name)?;
-    let grade = grade_or_none(req.grade.as_deref())?;
+    let grade_level = GradeLevel::new(req.grade_level)?;
     // Pre-flight only: `ClassGroup::create` claims a reference on the year
     // before it writes the link, and a year deleted in between fails that claim
     // with this very error — so an unknown id reads the same whichever side wins.
@@ -402,7 +410,7 @@ async fn create_class(
         &st.db,
         user.get_id(),
         name,
-        grade,
+        grade_level,
         year,
         teacher.as_ref().map(|t| *t.get_id()),
     )
@@ -453,10 +461,9 @@ async fn create_class(
     ))
 }
 
-/// Stock a freshly created class from its grade's blueprint, if one covers it:
-/// the template's grade label and the pairs it could not place, or `None` when
-/// the class has no grade, no blueprint holds that grade, or the stocking could
-/// not be carried out.
+/// Stock a freshly created class from its rung's blueprint, if one covers it:
+/// the template's ladder rung and the pairs it could not place, or `None` when
+/// no blueprint holds that rung or the stocking could not be carried out.
 ///
 /// Swallowing that last case is the deliberate one. Every other pump here may
 /// fail its whole request, because the caller can name what it asked for again —
@@ -470,35 +477,32 @@ async fn stock_from_blueprint(
     class: &ClassGroup,
     by: &UserId,
     db: &Database,
-) -> Option<(String, Vec<Skip>)> {
-    let grade = class.get_grade()?;
-    let blueprint = class_blueprint::read(db, &ClassBlueprintId::for_grade(grade))
-        .await
-        .ok()??;
+) -> Option<(i16, Vec<Skip>)> {
+    let blueprint = class_blueprint::read(
+        db,
+        &ClassBlueprintId::for_grade(&class.get_grade_level()),
+    )
+    .await
+    .ok()??;
     let skipped = class_blueprint::apply_to(db, &blueprint, class, by)
         .await
         .ok()?;
-    Some((blueprint.get_grade().as_str().to_string(), skipped))
+    Some((blueprint.get_grade_level().get(), skipped))
 }
 
 /// Filter for the class index.
 #[derive(Deserialize, IntoParams)]
 struct ClassFilter {
-    /// Narrow to the sections carrying this exact grade label — the same
-    /// spelling a blueprint is keyed by, matched verbatim (no trimming, no case
-    /// folding: a filter that normalized would disagree with the pump it exists
-    /// to debug). `?grade=` (empty) asks for the sections carrying *no* grade,
-    /// exactly as an empty `grade` on a write means no grade. Omit for every
-    /// class.
-    #[param(example = "9")]
-    grade: Option<String>,
+    /// Narrow to the sections carrying this exact ladder rung — the same
+    /// equality a blueprint is keyed by. Omit for every class.
+    #[param(example = 9)]
+    grade_level: Option<i16>,
 }
 
-/// List every class, newest first. Requires teacher+. `?grade=` narrows to one
-/// grade label, matched exactly as written — the label a blueprint is keyed by,
-/// so this is the read that shows which sections a `POST /classes/blueprints`
-/// pump covered (and `?grade=` on its own lists the sections with no grade at
-/// all). An unknown label is an empty page, not a `404`. Paged via
+/// List every class, newest first. Requires teacher+. `?grade_level=` narrows
+/// to one ladder rung — the same equality a blueprint is keyed by, so this is
+/// the read that shows which sections a `POST /classes/blueprints` pump
+/// covered. An unknown rung is an empty page, not a `404`. Paged via
 /// `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope whose `total` counts every class
 /// under the same filter, not just this page.
@@ -510,7 +514,7 @@ struct ClassFilter {
     params(ClassFilter, PageParams),
     responses(
         (status = 200, description = "A page of classes (the full list when unpaged)", body = Page<ClassResponse>),
-        (status = 400, description = "Invalid grade, limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid grade_level, limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -522,15 +526,13 @@ async fn list_classes(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<ClassResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    // The same newtype the write paths validate against, so an over-long label
-    // is the same `400` here as on a create. `grade_or_none` folds `""` into
-    // "no grade"; the outer `Option` is what keeps *omitted* apart from it.
-    let grade = filter
-        .grade
-        .as_deref()
-        .map(|grade| grade_or_none(Some(grade)))
+    // The same newtype the write paths validate against, so an off-ladder
+    // rung is the same `400` here as on a create or a PATCH.
+    let grade_level = filter
+        .grade_level
+        .map(GradeLevel::new)
         .transpose()?;
-    let (classes, total) = class_group::list_all(&st.db, grade, limit, offset).await?;
+    let (classes, total) = class_group::list_all(&st.db, grade_level, limit, offset).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         classes.iter().flat_map(|class| class_people(class, true)),
@@ -579,7 +581,7 @@ async fn get_class(
     request_body = UpdateClass,
     responses(
         (status = 200, description = "Updated class", body = ClassResponse),
-        (status = 400, description = "Invalid name or grade, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade_level, an unknown academic year, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -603,10 +605,7 @@ async fn update_class(
     // omitted field stays `None` so the save never re-sends this snapshot's
     // value over a concurrent PATCH of that field.
     let name = req.name.as_deref().map(ClassName::try_new).transpose()?;
-    let grade = match req.grade {
-        Some(ref update) => Some(grade_or_none(update.as_deref())?),
-        None => None,
-    };
+    let grade_level = req.grade_level.map(GradeLevel::new).transpose()?;
     let year = match req.year {
         // Explicit `null` clears the link; a value must name a real year.
         Some(update) => Some(academic_year::resolve(&st.db, update.as_deref()).await?),
@@ -625,7 +624,7 @@ async fn update_class(
         &st.db,
         class,
         name,
-        grade,
+        grade_level,
         year,
         teacher.map(|teacher| teacher.map(|teacher| *teacher.get_id())),
     )
@@ -948,9 +947,16 @@ async fn attach_course(
 
     let link = class_course::attach(&st.db, class.get_id(), course.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
+    let content = {
+        let refs = [&link];
+        crate::service::instance_resolve::resolved_content(&st.db, &refs).await?
+    };
+    let resolved = content
+        .get(link.get_id().key().as_str())
+        .expect("resolved_content covers every instance it is given");
     Ok((
         StatusCode::CREATED,
-        Json(ClassCourseResponse::new(&link, &[], &people)),
+        Json(ClassCourseResponse::new(&st.db, &link, resolved, &[], &people).await?),
     ))
 }
 
@@ -992,10 +998,17 @@ async fn list_class_courses(
         &st.db,
     )
     .await?;
-    let items = with_teachers
-        .iter()
-        .map(|(row, teachers)| ClassCourseResponse::new(row, teachers, &people))
-        .collect();
+    // The page's resolved titles/descriptions in one batch (one offering
+    // read + one catalog read), never per-row fallback reads.
+    let refs: Vec<&ClassCourse> = with_teachers.iter().map(|(row, _)| row).collect();
+    let content = crate::service::instance_resolve::resolved_content(&st.db, &refs).await?;
+    let mut items = Vec::with_capacity(with_teachers.len());
+    for (row, teachers) in &with_teachers {
+        let resolved = content
+            .get(row.get_id().key().as_str())
+            .expect("resolved_content covers every instance it is given");
+        items.push(ClassCourseResponse::new(&st.db, row, resolved, teachers, &people).await?);
+    }
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1078,11 +1091,10 @@ async fn detach_course(
 
 #[derive(Deserialize, ToSchema)]
 struct CreateBlueprint {
-    /// The grade label this template stocks — the same free text a class
-    /// carries in `grade` ("9", "10-A"). It is the blueprint's own id, so it
-    /// must be non-empty and free of `/ \ ? # %`.
-    #[schema(max_length = 20, example = "9")]
-    grade: String,
+    /// The ladder rung this template stocks — 0 = anaokulu, 1..=12 school
+    /// years. It is the blueprint's own id, so a rung off the ladder is a 400.
+    #[schema(minimum = 0, maximum = 12, example = 9)]
+    grade_level: i16,
     /// The courses every class section at that grade takes.
     course_ids: Vec<String>,
 }
@@ -1097,9 +1109,9 @@ struct UpdateBlueprint {
 
 #[derive(Serialize, ToSchema)]
 struct BlueprintResponse {
-    /// The grade label, which is also the blueprint's id in every path here.
-    #[schema(example = "9")]
-    grade: String,
+    /// The ladder rung, which is also the blueprint's id in every path here.
+    #[schema(example = 9)]
+    grade_level: i16,
     /// The course ids this grade's sections take.
     courses: Vec<String>,
     /// Who wrote the template.
@@ -1112,7 +1124,7 @@ impl BlueprintResponse {
         people: &std::collections::HashMap<String, PersonRef>,
     ) -> Self {
         Self {
-            grade: blueprint.get_grade().as_str().to_string(),
+            grade_level: blueprint.get_grade_level().get(),
             courses: blueprint
                 .get_courses()
                 .iter()
@@ -1181,11 +1193,9 @@ impl SkipResponse {
 struct BlueprintPumpResponse {
     blueprint: BlueprintResponse,
     /// How many class sections this pump reached. **`0` means no section
-    /// carries this grade label** — the template was saved and stocked
-    /// nothing. A grade is free text and matched exactly, so `"9 "`, `"9-A"`
-    /// and `"9"` are three different grades: check the label against the one
-    /// the sections actually carry, since an empty `skipped` alone reads the
-    /// same whether every section took the list or none was found.
+    /// carries this rung** — the template was saved and stocked nothing:
+    /// an empty `skipped` alone reads the same whether every section took
+    /// the list or none was found.
     ///
     /// The sections *reached*, not the ones the grade holds: a
     /// `blueprint_deleted` skip ends the run, and this then counts the ones
@@ -1213,8 +1223,8 @@ struct SectionStatusResponse {
 
 #[derive(Serialize, ToSchema)]
 struct BlueprintStatusResponse {
-    #[schema(example = "9")]
-    grade: String,
+    #[schema(example = 9)]
+    grade_level: i16,
     /// The template every section below is measured against.
     courses: Vec<String>,
     /// How many sections carry this grade label — the same count a pump
@@ -1250,11 +1260,11 @@ async fn resolve_courses(ids: &[String], db: &Database) -> Result<Vec<CourseId>,
     Ok(courses)
 }
 
-/// The blueprint a path grade names, or a 404.
-async fn blueprint_or_404(grade: &str, db: &Database) -> Result<ClassBlueprint, AppError> {
-    class_blueprint::read(db, &ClassBlueprintId::from_key(grade))
-        .await?
-        .ok_or(AppError::NotFound)
+/// The blueprint `id` names, or a 404. Path handlers parse their segment
+/// with `ClassBlueprintId::from_key`, which lands a non-numeric key on an id
+/// that matches no row — a `404`, never a decode panic.
+async fn blueprint_or_404(id: &ClassBlueprintId, db: &Database) -> Result<ClassBlueprint, AppError> {
+    class_blueprint::read(db, id).await?.ok_or(AppError::NotFound)
 }
 
 async fn blueprint_body(
@@ -1289,7 +1299,7 @@ async fn blueprint_body(
     request_body = CreateBlueprint,
     responses(
         (status = 201, description = "Blueprint created, with the number of sections it reached and the classes it could not stock", body = BlueprintPumpResponse),
-        (status = 400, description = "Invalid or unaddressable grade, too many courses, or a course that does not exist", body = ErrorResponse),
+        (status = 400, description = "A grade_level off the ladder, too many courses, or a course that does not exist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "A blueprint already exists for that grade", body = ErrorResponse),
@@ -1301,9 +1311,9 @@ async fn create_blueprint(
     RequireManager(user): RequireManager,
     Json(req): Json<CreateBlueprint>,
 ) -> Result<(StatusCode, Json<BlueprintPumpResponse>), AppError> {
-    let grade = ClassBlueprint::grade_key(&req.grade)?;
+    let grade_level = GradeLevel::new(req.grade_level)?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let mut blueprint = class_blueprint::create(&st.db, user.get_id(), grade, courses).await?;
+    let mut blueprint = class_blueprint::create(&st.db, user.get_id(), grade_level, courses).await?;
     let pumped = class_blueprint::pump(&st.db, &mut blueprint, user.get_id()).await?;
     let body = blueprint_body(&blueprint, &pumped, &st.db).await?;
     Ok((StatusCode::CREATED, Json(body)))
@@ -1349,7 +1359,7 @@ async fn list_blueprints(
     path = "/blueprints/{grade}",
     tag = "classes",
     security(("session_cookie" = [])),
-    params(("grade" = String, Path, description = "Grade label")),
+    params(("grade" = String, Path, description = "Grade level (0 = anaokulu, 1..=12 school years)")),
     responses(
         (status = 200, description = "The blueprint", body = BlueprintResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
@@ -1362,7 +1372,7 @@ async fn get_blueprint(
     RequireManager(_user): RequireManager,
     Path(grade): Path<String>,
 ) -> Result<Json<BlueprintResponse>, AppError> {
-    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let blueprint = blueprint_or_404(&ClassBlueprintId::from_key(&grade), &st.db).await?;
     let people = person_map([*blueprint.get_creator()], &st.db).await?;
     Ok(Json(BlueprintResponse::new(&blueprint, &people)))
 }
@@ -1387,7 +1397,7 @@ async fn get_blueprint(
     path = "/blueprints/{grade}",
     tag = "classes",
     security(("session_cookie" = [])),
-    params(("grade" = String, Path, description = "Grade label")),
+    params(("grade" = String, Path, description = "Grade level (0 = anaokulu, 1..=12 school years)")),
     request_body = UpdateBlueprint,
     responses(
         (status = 200, description = "Updated blueprint, with the number of sections it reached and the classes it could not stock", body = BlueprintPumpResponse),
@@ -1405,7 +1415,7 @@ async fn update_blueprint(
     Path(grade): Path<String>,
     Json(req): Json<UpdateBlueprint>,
 ) -> Result<Json<BlueprintPumpResponse>, AppError> {
-    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let blueprint = blueprint_or_404(&ClassBlueprintId::from_key(&grade), &st.db).await?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
     // The dropped templates cascade: every sourced instance they leave behind
     // is detached, and its subtree's files are gone from the database and the
@@ -1430,7 +1440,7 @@ async fn update_blueprint(
     path = "/blueprints/{grade}",
     tag = "classes",
     security(("session_cookie" = [])),
-    params(("grade" = String, Path, description = "Grade label")),
+    params(("grade" = String, Path, description = "Grade level (0 = anaokulu, 1..=12 school years)")),
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
@@ -1444,7 +1454,7 @@ async fn delete_blueprint(
     RequireManager(_user): RequireManager,
     Path(grade): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let blueprint = blueprint_or_404(&ClassBlueprintId::from_key(&grade), &st.db).await?;
     // Deleting a blueprint detaches every sourced instance it started, subtree
     // and all — the returned keys are the only record of the files those rows
     // named, so they are unlinked here (the same contract the instance-detach
@@ -1477,7 +1487,7 @@ async fn delete_blueprint(
     path = "/blueprints/{grade}/status",
     tag = "classes",
     security(("session_cookie" = [])),
-    params(("grade" = String, Path, description = "Grade label")),
+    params(("grade" = String, Path, description = "Grade level (0 = anaokulu, 1..=12 school years)")),
     responses(
         (status = 200, description = "Every section at the grade, with the template courses it is missing", body = BlueprintStatusResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
@@ -1490,10 +1500,10 @@ async fn blueprint_status(
     RequireManager(_user): RequireManager,
     Path(grade): Path<String>,
 ) -> Result<Json<BlueprintStatusResponse>, AppError> {
-    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let blueprint = blueprint_or_404(&ClassBlueprintId::from_key(&grade), &st.db).await?;
     let sections = class_blueprint::status(&st.db, &blueprint).await?;
     Ok(Json(BlueprintStatusResponse {
-        grade: blueprint.get_grade().as_str().to_string(),
+        grade_level: blueprint.get_grade_level().get(),
         courses: blueprint
             .get_courses()
             .iter()
@@ -1543,8 +1553,8 @@ async fn apply_blueprint(
     Path(id): Path<String>,
 ) -> Result<Json<ApplyResponse>, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let grade = class.get_grade().ok_or(AppError::NotFound)?;
-    let blueprint = blueprint_or_404(grade.as_str(), &st.db).await?;
+    let blueprint =
+        blueprint_or_404(&ClassBlueprintId::for_grade(&class.get_grade_level()), &st.db).await?;
     // The pump writes both ends, so both are guarded — the class, whose year
     // every instance it mints will belong to, and every course the template
     // names. A course the template names that is already gone is the pump's own
@@ -1561,20 +1571,15 @@ async fn apply_blueprint(
 mod tests {
     use super::*;
 
-    /// The nullable-grade rule both write paths share: absent and `""` are the
-    /// same *no grade*, so a PATCH clearing with `""` cannot store a blank
-    /// label a create could never make.
+    /// The one validation both write paths share: the rung must sit on the
+    /// ladder, and the wire type is the integer itself — no `"9"`/`"10-A"`
+    /// string ever crosses the boundary.
     #[test]
-    fn an_empty_grade_is_no_grade() {
-        assert!(grade_or_none(None).unwrap().is_none());
-        assert!(grade_or_none(Some("")).unwrap().is_none());
-        assert_eq!(
-            grade_or_none(Some("9"))
-                .unwrap()
-                .map(|g| g.as_str().to_string()),
-            Some("9".to_string())
-        );
-        assert!(grade_or_none(Some(&"x".repeat(1000))).is_err());
+    fn a_grade_level_is_a_ladder_rung() {
+        assert!(GradeLevel::new(0).is_ok());
+        assert!(GradeLevel::new(12).is_ok());
+        assert!(GradeLevel::new(-1).is_err());
+        assert!(GradeLevel::new(13).is_err());
     }
 
     /// The same nullable rule on the homeroom teacher, plus the bar it holds:

@@ -35,6 +35,15 @@ pub async fn create(
     assigned: Option<Vec<UserId>>,
     created_by: &UserId,
 ) -> Result<Homework, AppError> {
+    // The subject tag is checked against the instance's *resolved* subject
+    // set — override-or-inherit — not merely against the catalog course.
+    // Service-side, so every caller (the route under `/instances` included)
+    // enforces the syllabus rule even though its own pre-flight only sees
+    // the course.
+    let instance = crate::service::class_course::read(db, class_course)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    crate::service::offering_subject::ensure_resolved_member(db, &instance, subject).await?;
     homework::create(
         db,
         class_course,

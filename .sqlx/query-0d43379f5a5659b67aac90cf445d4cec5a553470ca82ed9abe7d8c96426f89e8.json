@@ -1,0 +1,195 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH updated AS (\n               UPDATE class_course\n                  SET title = COALESCE($2, title),\n                      description = COALESCE($3, description),\n                      ders_saati = COALESCE($4::bigint, ders_saati::bigint)::smallint,\n                      counts_toward_karne = COALESCE($5, counts_toward_karne)\n                WHERE id = $1\n                RETURNING *)\n           SELECT u.id AS \"id: ClassCourseId\", u.class AS \"class: ClassGroupId\",\n                  u.course AS \"course: CourseId\", u.offering AS \"offering: CourseOfferingId\",\n                  u.attached_by AS \"attached_by: UserId\",\n                  b.grade_level AS \"source?: ClassBlueprintId\",\n                  u.title AS \"title?: CourseTitle\",\n                  u.description AS \"description?: CourseDescription\",\n                  u.ders_saati::bigint AS \"ders_saati?: DersSaati\",\n                  u.counts_toward_karne,\n                  u.subjects_inherited, u.exam_weights_inherited, u.weekly_plan_inherited,\n                  u.enrollment_count,\n                  u.attached_at AS \"attached_at: Timestamp\"\n           FROM updated u\n           LEFT JOIN class_blueprint b ON b.id = u.source",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "offering: CourseOfferingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "offering"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "attached_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "attached_by"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "source?: ClassBlueprintId",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "class_blueprint",
+            "name": "grade_level"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "title?: CourseTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "description?: CourseDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "ders_saati?: DersSaati",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "counts_toward_karne",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "counts_toward_karne"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "subjects_inherited",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "subjects_inherited"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "exam_weights_inherited",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "exam_weights_inherited"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "weekly_plan_inherited",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "weekly_plan_inherited"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "enrollment_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "enrollment_count"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "attached_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "attached_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0d43379f5a5659b67aac90cf445d4cec5a553470ca82ed9abe7d8c96426f89e8"
+}

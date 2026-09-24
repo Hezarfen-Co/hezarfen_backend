@@ -220,6 +220,11 @@ async fn list_courses(
     let window = paginate(&courses, limit, offset);
     // Join creators onto the page alone — the lookup shrinks with the window.
     let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
+    // Deliberate exception to the instance-resolved display rule: this
+    // surface IS the ders catalog, so it shows each row's own catalog
+    // title/description. The grade templates (`/offerings`) and the
+    // per-class instances (`/instances`) resolve from it — they never edit
+    // it.
     let items = window
         .iter()
         .map(|course| CourseResponse::new(course, &people))

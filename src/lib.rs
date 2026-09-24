@@ -67,6 +67,7 @@ use crate::web::module_gate::gate;
         (name = "events", description = "Calendar events and attendance. An event's `audience` is its expected-attendee roster, not a visibility wall: everyone sees every event. Aim it at the whole school, one role, a course's enrollment, a class section's (şube) roster, or a hand-built registration list. Rosters resolve live, so role changes, (un)enrollments and class-roster changes move people in and out by themselves. Attendance: teacher+ marks people in the audience (students never mark, not even themselves), and the roster report joins the expected list with the marks to show who missed. Registration lists are filled seat by seat (teachers place students, staff place only themselves), optionally capped by `capacity`, and close once the event starts. `GET /events` takes an optional `?starts_after=&ends_after=` schedule window (unix-millis) that keeps only upcoming/unfinished events and lists them soonest-first; without it the list stays newest-first"),
         (name = "courses", description = "The course **catalog**: the school's reusable rows — kind `course` (a regular ders), `study` (etüt, a supervised study session) or `club` (kulüp) — with their curriculum subjects (`/courses/{id}/subjects`). A catalog row teaches nobody by itself: a ders is taught by attaching it to a şube, which mints an instance (`POST /classes/{id}/instances`), and everything a class actually runs — roster, teachers, exams, lessons, homework — belongs to that instance (`GET /instances/{id}`). An etüt or kulüp has no şube at all: it is joined school-wide (`POST /courses/{id}/members`, students only), and a `course`-kind ders refuses that door with a `400` — its students come through its instances. Catalog rights are the office's and the row's creator: edit, delete, its subjects and its member list all need the creator or manager+, and a row still taught anywhere (any instance, any member) cannot be deleted (`409`). `GET /courses/me` is what a caller is reached by, both tiers together; the instances themselves are `GET /instances/me`."),
         (name = "instances", description = "One catalog course **as one şube teaches it** — the instance, and the anchor everything academic hangs off. Attaching a course to a class (`POST /classes/{id}/instances`) mints one; two şubeler teaching the same course are two instances with their own roster, teachers, exams, lessons and homework. The row carries the instance's own policy: `ders_saati` (weekly lesson hours — the weight the instance takes in the year's karne average) and `counts_toward_karne`. Acting on an instance (`PATCH`, its rosters, its exams/sessions/homework, its roll-call) is open to manager+, to a teacher assigned to that instance (`POST /instances/{id}/teachers`, manager+) and to the şube's homeroom teacher — one rule, applied by every route here. `GET /instances/me` is a student's own list: the instances of the şubeler they are a live member of."),
+        (name = "offerings", description = "The grade-level course **templates** (`course_offering`): one offering per (course × grade level, `0` = anaokulu through `12`) carrying the title, description, default weekly hours (`default_ders_saati`, else 1) and default report-card policy (`default_counts_toward_karne`, else counted) that every şube at that grade teaches from. A şube's instance teaches **from** its offering and may override any content field — an unset field inherits down the chain offering → catalog course → constant, override-or-inherit, never merge. Attaching a course to a class at a grade with no offering yet mints an empty one automatically (so an untouched grade teaches exactly what the catalog row says); only a class-delivered ders (`kind = 'course'`) has offerings — a club or etüt is joined individually and has no grade. Reads are open to any signed-in session; writing (create, `PATCH`, delete) is manager+, and a template any instance still teaches from cannot be deleted (`409 offering_in_use`). The per-class overrides ride the instance (`PATCH /instances/{id}`, `POST /instances/{id}/reset`), not this group."),
         (name = "course-notes", description = "Notes a teacher attaches to a **catalog course** — announcements, recaps, anything worth pinning to the course rather than to one student — with file attachments, mirroring the personal `notes` stack. Writing (create, edit, delete, upload, delete a file) requires teacher+ and catalog rights over the course (its creator, or a manager/admin); reading (`GET /course-notes/{id}`, listing, downloading) is open to anyone the course reaches — a student enrolled in one of its instances, a member of it, its creator, or a manager/admin. `GET /course-notes` requires `?course=` and lists that course's notes only, newest first. At most 10 files per note, each at most the school's `max_file_bytes`. `GET /course-notes/{id}/rag` serves what the backend indexed for the AI features, and is derived data: deleting it suppresses nothing, and the next edit to the note or its files may regenerate it."),
         (name = "classes", description = "Class sections (şube): a named set of students the school moves as one, sitting in an academic year (`year`; a şube with no year takes no exam and is never rolled over). A class is bulk enrollment, not a second kind of membership — adding a student enrolls them into every instance the class carries, and attaching a course (`POST /classes/{id}/instances`) mints the class×course **instance** and enrolls the whole roster into it, the rows written being ordinary enrollments tagged with the şube that pumped them (a row with no such tag was placed by hand, and no sweep takes it back). A student already enrolled by hand keeps their own row. Removing a member is a **soft** leave: the stint is stamped `left_at` and the live-member counter comes down, but the row stays as the section's history — re-adding the same student is a fresh stint, so a pair may hold two rows, one live. `DELETE /classes/{id}/instances/{instance}` takes the whole instance with it — exams, homework, sessions, the roster it pumped, its teacher links — and unlinks the uploaded files those rows named. A homeroom teacher (`teacher_id`, sınıf öğretmeni) may act on every instance of their section; the class itself is the office's (manager+). Refusals carry a machine `code` beside the prose where two routes share one vocabulary: a member add is refused by a full roster (`class_at_roster_ceiling`) or by an instance list longer than one add may enroll at once (`class_course_list_too_large`), a course attach by the mirror of both (`class_at_course_ceiling`, `class_roster_too_large`); `duplicate` is a refusal on either manual route; `linked_course_missing` (another course on that section no longer exists — detach it first) only the member add can meet. Grade blueprints (`/classes/blueprints`) are the template side: a manager+ writes the courses every section of a grade takes, and the pump that stocks a section from it is idempotent and best-effort — the courses that did not fit come back in `skipped` with those codes, and `blueprint_deleted`/`class_deleted`/`course_deleted` report a row that vanished mid-pump."),
         (name = "sessions", description = "Lesson sessions and their roll call (session teacher or course manager marks enrolled students; manager+ marks the teacher). Roll call is also what feeds two badge counters (see `users`): the first mark taken for a lesson **at or after its own `starts_at`** credits its teacher's `lessons_held_total` once — a sheet opened early is never refused, it simply holds nothing until the bell — and a student marked `present` or `late` gains a `lessons_attended_total` a later correction gives back"),
@@ -120,11 +121,41 @@ fn courses_router(state: &AppState) -> OpenApiRouter<AppState> {
     )
 }
 
-/// `/instances` and the three foreign-module route pairs mounted inside it —
+/// `/offerings` and the three foreign-module route pairs mounted inside it —
+/// the same split as `/courses`: the grade-level template carries its own
+/// subject selection (`Subjects`), exam weights (`Exams`) and weekly plan
+/// (`Sessions`) beside the offering CRUD. Each child carries its own module's
+/// gate *and*, through the outer one applied here, the course gate — so either
+/// module being off refuses it.
+fn offerings_router(state: &AppState) -> OpenApiRouter<AppState> {
+    let children = gate(
+        web::offering_subjects::offering_routes(),
+        state,
+        Module::Subjects,
+    )
+    .merge(gate(
+        web::exam_weights::offering_routes(),
+        state,
+        Module::Exams,
+    ))
+    .merge(gate(
+        web::weekly_plan::offering_routes(),
+        state,
+        Module::Sessions,
+    ));
+    gate(
+        web::offerings::routes().merge(children),
+        state,
+        Module::Courses,
+    )
+}
+
+/// `/instances` and the six foreign-module route pairs mounted inside it —
 /// the same split as `/courses`, one anchor down: the instance is what a class
-/// section teaches, and what exams, sessions and homework hang off. Each child carries
-/// its own module's gate *and*, through the outer one applied here, the course
-/// gate (an instance is a course taught somewhere), so either module being off
+/// section teaches, and what exams, sessions, homework, subject selection,
+/// exam weights and the weekly plan hang off. Each child carries its own
+/// module's gate *and*, through the outer one applied here, the course gate
+/// (an instance is a course taught somewhere), so either module being off
 /// refuses it.
 fn instances_router(state: &AppState) -> OpenApiRouter<AppState> {
     let children = gate(web::instances::exam_routes(), state, Module::Exams)
@@ -137,6 +168,21 @@ fn instances_router(state: &AppState) -> OpenApiRouter<AppState> {
             web::instances::homework_routes(),
             state,
             Module::Homework,
+        ))
+        .merge(gate(
+            web::offering_subjects::instance_routes(),
+            state,
+            Module::Subjects,
+        ))
+        .merge(gate(
+            web::exam_weights::instance_routes(),
+            state,
+            Module::Exams,
+        ))
+        .merge(gate(
+            web::weekly_plan::instance_routes(),
+            state,
+            Module::Sessions,
         ));
     gate(
         web::instances::routes().merge(children),
@@ -193,6 +239,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .nest("/courses", courses_router(&state))
         .nest("/instances", instances_router(&state))
+        .nest("/offerings", offerings_router(&state))
         .nest("/academic-years", web::academic_years::routes())
         .nest(
             "/course-notes",

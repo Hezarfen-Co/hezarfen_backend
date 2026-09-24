@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: ClassGroupId\", creator AS \"creator: UserId\",\n                  name AS \"name: ClassName\", grade_level AS \"grade_level: GradeLevel\",\n                  year AS \"year: AcademicYearId\", teacher AS \"teacher: UserId\"\n           FROM class_group WHERE year = $1 ORDER BY id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: ClassName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "grade_level: GradeLevel",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "grade_level"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "year: AcademicYearId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "year"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "teacher: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_group",
+            "name": "teacher"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "493f0cef9fc99fe448ea60cff7490d06dce0779211543a72b1f6f769d9f00ed8"
+}

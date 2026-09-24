@@ -87,6 +87,14 @@ impl HomeworkDescription {
 /// homework carries no roster, a student who enrolls later is covered
 /// automatically; a subset is a fixed snapshot of the students named at
 /// assign (or last PATCH) time.
+///
+/// The `subject` tag names a topic of the homework's course — and, since the
+/// course-template system, one the instance actually *teaches*: its resolved
+/// subject set (override-or-inherit), validated service-side
+/// ([`crate::service::subject::in_instance`] at tag time,
+/// [`crate::service::offering_subject::ensure_resolved_member`] on create),
+/// because the check needs the instance's override state and so cannot live
+/// as a pure rule on this row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Homework {
     pub(crate) id: HomeworkId,

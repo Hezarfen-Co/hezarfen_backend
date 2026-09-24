@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO offering_slot (id, offering, weekday, starts_at, ends_at)\n           VALUES ($1, $2, $3,\n                   ($4::bigint * interval '1 minute')::time,\n                   ($5::bigint * interval '1 minute')::time)\n           RETURNING id AS \"id: WeeklySlotId\",\n                     weekday AS \"weekday: Weekday\",\n                     (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                     (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: WeeklySlotId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "offering_slot",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "weekday: Weekday",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "offering_slot",
+            "name": "weekday"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at!: SlotMinute",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at!: SlotMinute",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int2",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "d930c577b90a403e259f6c1e8c4d4be6648243c4627e8719fff5cc4d38efb738"
+}

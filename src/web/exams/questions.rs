@@ -12,8 +12,10 @@ use crate::service::exam_question;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateQuestion {
-    /// The subject this question belongs to — one of the subjects of the exam
-    /// instance's catalog course (`GET /courses/{id}/subjects`). Required.
+    /// The subject this question belongs to — one of the subjects the exam
+    /// instance actually teaches: its resolved subject set
+    /// (`GET /instances/{id}/subjects`), always a subject of the instance's
+    /// catalog course. Required.
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
     /// The question itself.
@@ -139,9 +141,11 @@ impl QuestionResponse {
 }
 
 /// Add a question to an exam. Requires teacher+ and management rights over the
-/// exam's instance. `subject_id` must name one of the subjects of that
-/// instance's catalog course (`GET /courses/{id}/subjects`) — every question
-/// belongs to a subject.
+/// exam's instance. `subject_id` must name one of the subjects the instance
+/// actually *teaches* — its resolved subject set (the offering's selection,
+/// or the section's own while it overrides; `GET /instances/{id}/subjects`) —
+/// and in every case a subject of the instance's catalog course. Every
+/// question belongs to a subject.
 /// `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text`
 /// questions carry neither. Locked once attempts exist.
 #[utoipa::path(
@@ -153,7 +157,7 @@ impl QuestionResponse {
     request_body = CreateQuestion,
     responses(
         (status = 201, description = "Question created", body = QuestionResponse),
-        (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
+        (status = 400, description = "Invalid text, kind, points, choices, or correct — or a subject that is unknown, from another course, or outside the instance's resolved subject set", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
@@ -184,7 +188,7 @@ pub(crate) async fn create_question(
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
 
     let subject =
-        service::subject::in_course(&st.db, &req.subject_id, instance.get_course()).await?;
+        service::subject::in_instance(&st.db, &req.subject_id, &instance).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
     // No stored choices to match against on create, so every option is new and
@@ -294,7 +298,7 @@ pub(crate) async fn question_page(
     request_body = UpdateQuestion,
     responses(
         (status = 200, description = "Updated question", body = QuestionResponse),
-        (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
+        (status = 400, description = "Invalid text, kind, points, choices, or correct — or a subject that is unknown, from another course, or outside the instance's resolved subject set", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
@@ -323,10 +327,8 @@ pub(crate) async fn update_question(
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
-    let subject = match req.subject_id {
-        Some(ref subject_id) => {
-            service::subject::in_course(&st.db, subject_id, instance.get_course()).await?
-        }
+    let subject = match &req.subject_id {
+        Some(subject_id) => service::subject::in_instance(&st.db, subject_id, &instance).await?,
         None => *question.get_subject(),
     };
     let text = match req.text {
@@ -462,7 +464,7 @@ pub(crate) struct InstantiateFromBank {
     request_body = InstantiateFromBank,
     responses(
         (status = 201, description = "Question created from the template", body = QuestionResponse),
-        (status = 400, description = "Unknown subject, or one from another course", body = ErrorResponse),
+        (status = 400, description = "A subject that is unknown, from another course, or outside the instance's resolved subject set", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not this instance's teacher, its şube's homeroom teacher, or a manager/admin", body = ErrorResponse),
         (status = 404, description = "No such exam, or no bank template the caller may see", body = ErrorResponse),
@@ -489,18 +491,20 @@ pub(crate) async fn question_from_bank(
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let subject =
-        service::subject::in_course(&st.db, &req.subject_id, instance.get_course()).await?;
-
     let template = bank_question::read(&st.db, &BankQuestionId::from_key(&bid))
         .await?
         .ok_or(AppError::NotFound)?;
     // A template the caller may not see is a 404, exactly as it is on the bank's
     // own routes — instantiating is a read of `correct`, and a 403 here would
-    // confirm that someone else's private template exists under that id.
+    // confirm that someone else's private template exists under that id. The
+    // read precedes the subject gate, so an invisible template never leaks
+    // existence through a body-validation 400.
     if !crate::web::bank_questions::can_see(&template, &user) {
         return Err(AppError::NotFound);
     }
+    let subject =
+        service::subject::in_instance(&st.db, &req.subject_id, &instance).await?;
+
     let question = exam_question::create_from_bank(
         &st.db,
         exam.get_id(),

@@ -181,8 +181,11 @@ struct CourseLimits {
     max_session_topic_len: usize,
     max_term_name_len: usize,
     max_class_name_len: usize,
-    /// A class's optional free-text grade label ("9", "10-A").
-    max_class_grade_len: usize,
+    /// The valid `grade_level` range on a class and a blueprint: `0` is
+    /// anaokulu, `1..=12` the school years. Every class carries one — there
+    /// is no "no grade" any more.
+    min_grade_level: i16,
+    max_grade_level: i16,
     /// Students one class may hold. Removing one frees a place.
     max_class_members: i64,
     /// Instances one class may carry. Detaching one frees a place.
@@ -192,6 +195,17 @@ struct CourseLimits {
     max_ders_saati: i64,
     /// An academic year's name (`POST /academic-years`).
     max_academic_year_name_len: usize,
+}
+
+/// The weekly plan: one offering's (or one section's) timetable template.
+#[derive(Serialize, ToSchema)]
+struct WeeklyPlanLimits {
+    /// Inclusive bounds for a slot's `starts_at`/`ends_at` minutes past
+    /// midnight (`540` = 09:00).
+    min_slot_minute: i64,
+    max_slot_minute: i64,
+    /// Slots one weekly plan may hold.
+    max_weekly_slots: i64,
 }
 
 /// Exams, their questions, answers, and marks.
@@ -515,6 +529,9 @@ struct LimitsResponse {
     message: MessageLimits,
     event: EventLimits,
     course: CourseLimits,
+    /// The weekly plan's timetable bounds (`/offerings/{id}/weekly-plan` and
+    /// the instance override doors).
+    weekly_plan: WeeklyPlanLimits,
     exam: ExamLimits,
     homework: HomeworkLimits,
     question_pool: QuestionPoolLimits,
@@ -602,12 +619,18 @@ impl LimitsResponse {
                 max_session_topic_len: MAX_SESSION_TOPIC_LEN,
                 max_term_name_len: MAX_TERM_NAME_LEN,
                 max_class_name_len: MAX_CLASS_NAME_LEN,
-                max_class_grade_len: MAX_CLASS_GRADE_LEN,
+                min_grade_level: MIN_GRADE_LEVEL,
+                max_grade_level: MAX_GRADE_LEVEL,
                 max_class_members: MAX_CLASS_MEMBERS,
                 max_class_courses: MAX_CLASS_COURSES,
                 min_ders_saati: MIN_DERS_SAATI,
                 max_ders_saati: MAX_DERS_SAATI,
                 max_academic_year_name_len: MAX_ACADEMIC_YEAR_NAME_LEN,
+            },
+            weekly_plan: WeeklyPlanLimits {
+                min_slot_minute: MIN_SLOT_MINUTE,
+                max_slot_minute: MAX_SLOT_MINUTE,
+                max_weekly_slots: MAX_WEEKLY_SLOTS as i64,
             },
             exam: ExamLimits {
                 max_title_len: MAX_EXAM_TITLE_LEN,

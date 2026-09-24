@@ -9,7 +9,9 @@ mod common;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::{create_subject, enroll, login_as, me_id, send, set_role, taught_under};
+use common::{
+    create_subject, enroll, login_as, me_id, select_instance_subject, send, set_role, taught_under,
+};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
@@ -314,6 +316,9 @@ async fn attempt_history_survives_remigration() {
     let mudur = login_as(&app, &db, "mudur", "manager").await;
     let t = taught_under(&app, &mudur, &teacher, "biology").await;
     let subject = create_subject(&app, &teacher, &t.course, "cells").await;
+    // The tag check reads the resolved syllabus — the topic rides the
+    // section's own set before any question may carry it.
+    select_instance_subject(&app, &teacher, &t.instance, &subject).await;
     enroll(&app, &teacher, &t.instance, &student_id).await;
     let res = send(
         &app,

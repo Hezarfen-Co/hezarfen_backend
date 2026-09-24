@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM course_offering\n           WHERE id = $1\n             AND NOT EXISTS (SELECT 1 FROM class_course cc WHERE cc.offering = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3a49e0572c8418cd692b7bda75b8ea1bfd4efce1a726282cfb739be6451a0714"
+}

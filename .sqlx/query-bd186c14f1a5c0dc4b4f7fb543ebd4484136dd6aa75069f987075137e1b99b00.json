@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO offering_exam_weight (offering, kind, weight)\n           VALUES ($1, $2, $3::bigint::smallint)\n           ON CONFLICT (offering, kind) DO UPDATE SET weight = EXCLUDED.weight",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bd186c14f1a5c0dc4b4f7fb543ebd4484136dd6aa75069f987075137e1b99b00"
+}

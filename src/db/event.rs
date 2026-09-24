@@ -331,7 +331,7 @@ mod tests {
         let creator = a_person(&db, "event-guard").await;
         // `audience_class` is a foreign key too: the class case needs a real group.
         let class = ClassGroupId::generate();
-        sqlx::query("INSERT INTO class_group (id, name, creator) VALUES ($1, 'g1', $2)")
+        sqlx::query("INSERT INTO class_group (id, name, creator, grade_level) VALUES ($1, 'g1', $2, 9)")
             .bind(class.uuid())
             .bind(creator.uuid())
             .execute(&db)

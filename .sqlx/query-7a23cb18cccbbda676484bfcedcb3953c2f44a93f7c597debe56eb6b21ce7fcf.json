@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM blueprint_course\n           WHERE course = $2\n             AND blueprint = (SELECT id FROM class_blueprint WHERE grade_level = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int2",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a23cb18cccbbda676484bfcedcb3953c2f44a93f7c597debe56eb6b21ce7fcf"
+}

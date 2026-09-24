@@ -551,7 +551,7 @@ pub(crate) mod tests {
                 db,
                 &office,
                 ClassName::try_new(name).unwrap(),
-                None,
+                crate::domain::grade::GradeLevel::new(5).unwrap(),
                 Some(*year.get_id()),
                 None,
             )
@@ -570,9 +570,10 @@ pub(crate) mod tests {
         let addressed = instances[1].clone();
 
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
-        for (title, addressed_to_both, mark) in
-            [("ortak", true, ORTAK_MARK), ("tek", false, OWNER_MARK)]
-        {
+        for (title, addressed_to_both, kind, mark) in [
+            ("ortak", true, "yazili", ORTAK_MARK),
+            ("tek", false, "sozlu", OWNER_MARK),
+        ] {
             let exam = crate::db::exam::create(
                 db,
                 &office,
@@ -580,7 +581,7 @@ pub(crate) mod tests {
                 term.get_id(),
                 ExamTitle::try_new(title).unwrap(),
                 ExamDescription::try_new("").unwrap(),
-                ExamKind::try_new("yazili", &kinds).unwrap(),
+                ExamKind::try_new(kind, &kinds).unwrap(),
                 ExamSchedule::try_new(None, None, None, None).unwrap(),
                 ExamAttemptLimit::try_new(1).unwrap(),
                 true,
@@ -606,7 +607,7 @@ pub(crate) mod tests {
                 1,
                 Mark::try_new(mark).unwrap(),
                 &office,
-                "yazili",
+                kind,
             )
             .await
             .unwrap();
