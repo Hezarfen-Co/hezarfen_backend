@@ -239,6 +239,32 @@ pub const MAX_APPOINTMENT_REASON_LEN: usize = 1_000;
 /// (a decade out) is refused instead of writing thousands of rows.
 pub const MAX_SLOT_OCCURRENCES: usize = 52;
 
+/// A holiday is named for a human reader ("29 Ekim Cumhuriyet Bayramı").
+pub const MAX_HOLIDAY_NAME_LEN: usize = 100;
+
+/// The only accepted holiday kinds. `resmi`: an official public holiday.
+/// `dini`: a religious observance. `idari`: an administrative closure the
+/// school itself declares. `ara`: a break inside the year (yarım yıl arası).
+pub const HOLIDAY_KINDS: [&str; 4] = ["resmi", "dini", "idari", "ara"];
+
+/// The holiday table's name, for the same builder-shaped writes every other
+/// table names through its constant.
+pub const HOLIDAY_TABLE: &str = "holiday";
+
+/// The longest `from`/`to` span one materialize call may cover, in days. A
+/// school year fits; a decade is a typo and is refused.
+pub const MAX_MATERIALIZE_DAYS: i64 = 366;
+
+/// The most lessons one materialize call may write. Forty slots a week is the
+/// plan cap, so a full year is far under this; the ceiling is what stops a
+/// runaway range from writing thousands of rows in one request.
+pub const MAX_MATERIALIZE_SESSIONS: usize = 500;
+
+/// How many sections one catalogue course row may embed. A course taught in
+/// more sections than this still lists them at `/instances`; the catalogue
+/// row carries the untruncated total beside the array.
+pub const MAX_COURSE_SECTIONS: usize = 50;
+
 /// The default meal slots; schools replace the list via `PATCH /settings`, and
 /// a published menu snapshots the slot it was written for, so retiring a slot
 /// never rewrites history.

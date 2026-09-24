@@ -146,6 +146,41 @@ pub async fn list_for_class_ids(
     Ok(rows)
 }
 
+/// Every instance of any of `courses` (one query, unpaged) — the batched twin
+/// of [`list_for_course`]: the catalogue page reads one query per page, not
+/// one per course. Ids that name no course are simply absent from the result.
+pub async fn list_for_course_ids(
+    db: &Database,
+    courses: &[CourseId],
+) -> Result<Vec<ClassCourse>, AppError> {
+    if courses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<uuid::Uuid> = courses.iter().map(CourseId::uuid).collect();
+    let rows = sqlx::query_as!(
+        ClassCourse,
+        r#"SELECT cc.id AS "id: ClassCourseId", cc.class AS "class: ClassGroupId",
+                  cc.course AS "course: CourseId", cc.offering AS "offering: CourseOfferingId",
+                  cc.attached_by AS "attached_by: UserId",
+                  b.grade_level AS "source?: ClassBlueprintId",
+                  cc.title AS "title?: CourseTitle",
+                  cc.description AS "description?: CourseDescription",
+                  cc.ders_saati::bigint AS "ders_saati?: DersSaati",
+                  cc.counts_toward_karne,
+                  cc.subjects_inherited, cc.exam_weights_inherited, cc.weekly_plan_inherited,
+                  cc.enrollment_count,
+                  cc.attached_at AS "attached_at: Timestamp"
+           FROM class_course cc
+           LEFT JOIN class_blueprint b ON b.id = cc.source
+           WHERE cc.course = ANY($1)
+           ORDER BY cc.attached_at DESC, cc.id DESC"#,
+        &ids,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 /// Load every instance behind `ids` (one query) — the join half of the reads
 /// that already hold instance ids (a marks report's per-instance blocks).
 pub async fn list_by_ids(

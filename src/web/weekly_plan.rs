@@ -190,6 +190,7 @@ async fn add_offering_slot(
         weekday,
         starts_at,
         ends_at,
+        None,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(WeeklySlotDto::new(&slot))))
@@ -295,8 +296,15 @@ async fn add_instance_slot(
     service::class_course::require_open(&st.db, instance.get_id()).await?;
     let (weekday, starts_at, ends_at) = parse_slot(&req)?;
     let slot =
-        service::weekly_slot::add_for_class(&st.db, instance.get_id(), weekday, starts_at, ends_at)
-            .await?;
+        service::weekly_slot::add_for_class(
+            &st.db,
+            instance.get_id(),
+            weekday,
+            starts_at,
+            ends_at,
+            None,
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(WeeklySlotDto::new(&slot))))
 }
 

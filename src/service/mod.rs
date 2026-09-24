@@ -37,6 +37,7 @@ pub mod homework;
 pub mod homework_file;
 pub mod homework_result;
 pub mod homework_submission;
+pub mod holiday;
 pub mod instance;
 pub mod instance_resolve;
 pub mod karne;

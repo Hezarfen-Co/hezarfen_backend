@@ -21,6 +21,7 @@ use sqlx::postgres::PgConnection;
 use crate::database::{Database, unique_violation};
 use crate::domain::class_course::ClassCourseId;
 use crate::domain::course_offering::CourseOfferingId;
+use crate::domain::course_session::SessionTopic;
 use crate::domain::weekly_slot::{SlotMinute, Weekday, WeeklySlot, WeeklySlotId};
 use crate::error::AppError;
 
@@ -52,7 +53,8 @@ pub(crate) async fn list_for_offering_on(
         r#"SELECT id AS "id: WeeklySlotId",
                   weekday AS "weekday: Weekday",
                   (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS "starts_at!: SlotMinute",
-                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute"
+                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute",
+                  topic AS "topic?: SessionTopic"
            FROM offering_slot
            WHERE offering = $1
            ORDER BY weekday, starts_at"#,
@@ -72,7 +74,8 @@ pub(crate) async fn list_for_class_on(
         r#"SELECT id AS "id: WeeklySlotId",
                   weekday AS "weekday: Weekday",
                   (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS "starts_at!: SlotMinute",
-                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute"
+                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute",
+                  topic AS "topic?: SessionTopic"
            FROM class_course_slot
            WHERE class_course = $1
            ORDER BY weekday, starts_at"#,
@@ -132,19 +135,22 @@ pub(crate) async fn add_for_offering_tx(
 ) -> Result<WeeklySlot, AppError> {
     sqlx::query_as!(
         WeeklySlot,
-        r#"INSERT INTO offering_slot (id, offering, weekday, starts_at, ends_at)
+        r#"INSERT INTO offering_slot (id, offering, weekday, starts_at, ends_at, topic)
            VALUES ($1, $2, $3,
                    ($4::bigint * interval '1 minute')::time,
-                   ($5::bigint * interval '1 minute')::time)
+                   ($5::bigint * interval '1 minute')::time,
+                   $6)
            RETURNING id AS "id: WeeklySlotId",
                      weekday AS "weekday: Weekday",
                      (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS "starts_at!: SlotMinute",
-                     (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute""#,
+                     (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute",
+                     topic AS "topic?: SessionTopic""#,
         slot.get_id().uuid(),
         offering.uuid(),
         slot.get_weekday().get(),
         slot.get_starts_at().get(),
         slot.get_ends_at().get(),
+        slot.get_topic().map(|topic| topic.as_str()),
     )
     .fetch_one(&mut *tx)
     .await
@@ -173,11 +179,12 @@ pub(crate) async fn add_for_class_tx(
     sqlx::query_as!(
         WeeklySlot,
         r#"WITH ins AS (
-               INSERT INTO class_course_slot (id, class_course, weekday, starts_at, ends_at)
+               INSERT INTO class_course_slot (id, class_course, weekday, starts_at, ends_at, topic)
                VALUES ($1, $2, $3,
                        ($4::bigint * interval '1 minute')::time,
-                       ($5::bigint * interval '1 minute')::time)
-               RETURNING id, weekday, starts_at, ends_at
+                       ($5::bigint * interval '1 minute')::time,
+                       $6)
+               RETURNING id, weekday, starts_at, ends_at, topic
            ), flip AS (
                UPDATE class_course SET weekly_plan_inherited = FALSE
                WHERE id = $2 AND EXISTS (SELECT 1 FROM ins)
@@ -186,7 +193,8 @@ pub(crate) async fn add_for_class_tx(
            SELECT ins.id AS "id: WeeklySlotId",
                   ins.weekday AS "weekday: Weekday",
                   (EXTRACT(EPOCH FROM ins.starts_at - TIME '00:00:00') / 60)::bigint AS "starts_at!: SlotMinute",
-                  (EXTRACT(EPOCH FROM ins.ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute"
+                  (EXTRACT(EPOCH FROM ins.ends_at - TIME '00:00:00') / 60)::bigint AS "ends_at!: SlotMinute",
+                  ins.topic AS "topic?: SessionTopic"
            FROM ins
            WHERE EXISTS (SELECT 1 FROM flip)"#,
         slot.get_id().uuid(),
@@ -194,6 +202,7 @@ pub(crate) async fn add_for_class_tx(
         slot.get_weekday().get(),
         slot.get_starts_at().get(),
         slot.get_ends_at().get(),
+        slot.get_topic().map(|topic| topic.as_str()),
     )
     .fetch_optional(&mut *tx)
     .await?

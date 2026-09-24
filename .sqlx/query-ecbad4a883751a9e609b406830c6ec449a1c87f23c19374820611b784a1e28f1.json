@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT starts_at FROM course_session WHERE class_course = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "starts_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "starts_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ecbad4a883751a9e609b406830c6ec449a1c87f23c19374820611b784a1e28f1"
+}

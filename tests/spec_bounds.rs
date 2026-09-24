@@ -1193,6 +1193,15 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         // instance cannot be made to dominate the year average by a typo.
         ("UpdateInstance", "ders_saati", "minimum", MIN_DERS_SAATI),
         ("UpdateInstance", "ders_saati", "maximum", MAX_DERS_SAATI),
+        // The holiday calendar's one free-text field, and the optional topic
+        // a weekly-plan slot may stamp onto every lesson it generates.
+        (
+            "CreateHoliday",
+            "name",
+            "maxLength",
+            MAX_HOLIDAY_NAME_LEN as i64,
+        ),
+        ("CreateSlot", "topic", "maxLength", MAX_SESSION_TOPIC_LEN as i64),
         // The offering spine (course × grade_level templates) and the
         // per-class instance overrides: same bounds as the catalog course
         // they inherit from.

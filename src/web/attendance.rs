@@ -21,6 +21,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
+use crate::domain::calendar::{zone_offset_minutes, zoned_day};
 use crate::domain::class_course::{ClassCourse, ClassCourseId};
 use crate::domain::course::{Course, CourseId};
 use crate::domain::role::Role;
@@ -148,30 +149,6 @@ struct AttendanceReport {
     /// in no term's range is not counted here (it still counts in the
     /// tallies).
     devamsizlik: Vec<TermAbsence>,
-}
-
-/// The school's day boundary as a fixed offset in minutes.
-///
-/// The allow-list in [`crate::constant::TIMEZONES`] names zones whose offset
-/// is constant (Turkey has run on UTC+3 with no DST since 2016), so the
-/// backend buckets days without carrying a timezone database — the same
-/// arithmetic the settings module's own list is built on. An unrecognised name
-/// falls back to [`crate::constant::DEFAULT_TIMEZONE`]'s offset, which is what
-/// an unset setting
-/// gets anyway.
-fn zone_offset_minutes(timezone: &str) -> i32 {
-    match timezone {
-        "UTC" => 0,
-        _ => 3 * 60,
-    }
-}
-
-/// The calendar day an instant falls on, in the school's zone.
-fn zoned_day(millis: i64, offset_minutes: i32) -> chrono::NaiveDate {
-    let shifted = millis + i64::from(offset_minutes) * 60_000;
-    chrono::DateTime::from_timestamp_millis(shifted)
-        .expect("timestamps are within chrono's representable range")
-        .date_naive()
 }
 
 /// The term an instant falls in: the containing term with the latest start,
@@ -436,23 +413,5 @@ async fn user_report(
     Ok(Json(build_report(&target, viewer, &st.db).await?))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The day bucket is the school's day, not UTC's: 22:30 UTC in summer
-    /// Istanbul is already tomorrow. This is the whole reason the timezone is
-    /// read off the settings.
-    #[test]
-    fn the_day_bucket_follows_the_school_zone() {
-        let at = crate::domain::timestamp::Timestamp::from_millis(1_767_216_600_000); // 2025-12-31T21:30Z
-        assert_eq!(
-            zoned_day(at.as_millis(), zone_offset_minutes("UTC")).to_string(),
-            "2025-12-31"
-        );
-        assert_eq!(
-            zoned_day(at.as_millis(), zone_offset_minutes("Europe/Istanbul")).to_string(),
-            "2026-01-01"
-        );
-    }
-}
+// The day-bucketing unit test moved with its arithmetic to
+// `src/domain/calendar.rs` (`the_day_bucket_follows_the_school_zone`).

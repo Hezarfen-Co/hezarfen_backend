@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO offering_slot (id, offering, weekday, starts_at, ends_at)\n           VALUES ($1, $2, $3,\n                   ($4::bigint * interval '1 minute')::time,\n                   ($5::bigint * interval '1 minute')::time)\n           RETURNING id AS \"id: WeeklySlotId\",\n                     weekday AS \"weekday: Weekday\",\n                     (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                     (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\"",
+  "query": "SELECT id AS \"id: WeeklySlotId\",\n                  weekday AS \"weekday: Weekday\",\n                  (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\",\n                  topic AS \"topic?: SessionTopic\"\n           FROM offering_slot\n           WHERE offering = $1\n           ORDER BY weekday, starts_at",
   "describe": {
     "columns": [
       {
@@ -36,23 +36,31 @@
         "name": "ends_at!: SlotMinute",
         "type_info": "Int8",
         "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "topic?: SessionTopic",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "offering_slot",
+            "name": "topic"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid",
-        "Int2",
-        "Int8",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
       null,
-      null
+      null,
+      true
     ]
   },
-  "hash": "d930c577b90a403e259f6c1e8c4d4be6648243c4627e8719fff5cc4d38efb738"
+  "hash": "34e21f7794cb59e3565397da7620b1ea60bd13fbe21a3432d1f6952742af99a4"
 }

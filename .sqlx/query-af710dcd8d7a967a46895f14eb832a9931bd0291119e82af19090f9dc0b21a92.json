@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: WeeklySlotId\",\n                  weekday AS \"weekday: Weekday\",\n                  (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\"\n           FROM class_course_slot\n           WHERE class_course = $1\n           ORDER BY weekday, starts_at",
+  "query": "SELECT id AS \"id: WeeklySlotId\",\n                  weekday AS \"weekday: Weekday\",\n                  (EXTRACT(EPOCH FROM starts_at - TIME '00:00:00') / 60)::bigint AS \"starts_at!: SlotMinute\",\n                  (EXTRACT(EPOCH FROM ends_at - TIME '00:00:00') / 60)::bigint AS \"ends_at!: SlotMinute\",\n                  topic AS \"topic?: SessionTopic\"\n           FROM class_course_slot\n           WHERE class_course = $1\n           ORDER BY weekday, starts_at",
   "describe": {
     "columns": [
       {
@@ -36,6 +36,17 @@
         "name": "ends_at!: SlotMinute",
         "type_info": "Int8",
         "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "topic?: SessionTopic",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "class_course_slot",
+            "name": "topic"
+          }
+        }
       }
     ],
     "parameters": {
@@ -47,8 +58,9 @@
       false,
       false,
       null,
-      null
+      null,
+      true
     ]
   },
-  "hash": "e5505bb02b156cc94939881d352b2ff94efb5d2bef4ec746afdd68d65746d351"
+  "hash": "af710dcd8d7a967a46895f14eb832a9931bd0291119e82af19090f9dc0b21a92"
 }

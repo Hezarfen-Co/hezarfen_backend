@@ -38,6 +38,7 @@ pub mod exam_weight;
 pub mod fee_plan;
 pub mod fee_plan_assignment;
 pub mod field_update;
+pub mod holiday;
 pub mod homework;
 pub mod homework_file;
 pub mod homework_result;

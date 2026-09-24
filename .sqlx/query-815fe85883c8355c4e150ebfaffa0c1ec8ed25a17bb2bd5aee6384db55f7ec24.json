@@ -1,0 +1,93 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO course_session (id, class_course, teacher, topic, starts_at, ends_at)\n           SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::bigint[], $6::bigint[])\n           ON CONFLICT (class_course, starts_at) DO NOTHING\n           RETURNING id AS \"id: CourseSessionId\",\n                     class_course AS \"class_course: ClassCourseId\",\n                     teacher AS \"teacher: UserId\", topic AS \"topic: SessionTopic\",\n                     starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at?: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseSessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "class_course: ClassCourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "class_course"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "teacher: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "teacher"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "topic: SessionTopic",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "topic"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "ends_at?: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "course_session",
+            "name": "ends_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "815fe85883c8355c4e150ebfaffa0c1ec8ed25a17bb2bd5aee6384db55f7ec24"
+}

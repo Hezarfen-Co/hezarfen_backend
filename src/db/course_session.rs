@@ -6,7 +6,9 @@
 //! [`crate::service::course_session`].
 
 use crate::constant::COURSE_SESSION_TABLE;
-use crate::database::{Database, foreign_key_violation, tx_with_retry};
+use crate::database::{
+    Database, foreign_key_violation, tx_with_retry, unique_violation,
+};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::class_course::ClassCourseId;
@@ -58,8 +60,99 @@ pub async fn create(
     match created {
         Ok(created) => Ok(created),
         Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
+        // `23505` — the section's own `UNIQUE (class_course, starts_at)`: a
+        // lesson already starts at that instant (a hand-created one, or one a
+        // concurrent materialize just minted). The same refusal the
+        // weekly-plan duplicate answers with.
+        Err(err) if unique_violation(&err).is_some() => Err(AppError::ConflictCoded {
+            code: "session_time_taken",
+            message: "this section already has a lesson starting then".into(),
+        }),
         Err(err) => Err(err.into()),
     }
+}
+
+/// One session to batch-insert: everything the materializer already decided.
+/// The wire shape of [`insert_many`], not a door of its own.
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    pub id: CourseSessionId,
+    pub class_course: ClassCourseId,
+    pub teacher: UserId,
+    pub topic: SessionTopic,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
+}
+
+/// Insert a batch of generated sessions in one statement, skipping the starts
+/// this section already holds (`ON CONFLICT DO NOTHING` against
+/// `UNIQUE (class_course, starts_at)`). The returned rows are exactly the rows
+/// that landed, so the caller's `created` count is truthful. No transaction of
+/// its own: the caller's (or none — the conflict skip makes a partial batch a
+/// safe outcome either way). Empty input never touches the database.
+pub async fn insert_many(
+    db: &Database,
+    rows: &[NewSession],
+) -> Result<Vec<CourseSession>, AppError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut conn = db.acquire().await?;
+    insert_many_tx(&mut conn, rows).await
+}
+
+/// The transaction-scoped twin of [`insert_many`]: the very same statement,
+/// bound to the caller's own connection, so a batch its transaction rolls back
+/// never lands. The materializer is the caller — its row lock and its insert
+/// must be the one transaction, and a pooled insert inside that window would
+/// commit on its own.
+pub(crate) async fn insert_many_tx(
+    tx: &mut sqlx::PgConnection,
+    rows: &[NewSession],
+) -> Result<Vec<CourseSession>, AppError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.id.uuid()).collect();
+    let class_courses: Vec<uuid::Uuid> = rows.iter().map(|row| row.class_course.uuid()).collect();
+    let teachers: Vec<uuid::Uuid> = rows.iter().map(|row| row.teacher.uuid()).collect();
+    let topics: Vec<String> = rows.iter().map(|row| row.topic.as_str().to_owned()).collect();
+    let starts: Vec<i64> = rows.iter().map(|row| row.starts_at.as_millis()).collect();
+    let ends: Vec<i64> = rows.iter().map(|row| row.ends_at.as_millis()).collect();
+    let inserted = sqlx::query_as!(
+        CourseSession,
+        r#"INSERT INTO course_session (id, class_course, teacher, topic, starts_at, ends_at)
+           SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::bigint[], $6::bigint[])
+           ON CONFLICT (class_course, starts_at) DO NOTHING
+           RETURNING id AS "id: CourseSessionId",
+                     class_course AS "class_course: ClassCourseId",
+                     teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at?: Timestamp""#,
+        &ids,
+        &class_courses,
+        &teachers,
+        &topics,
+        &starts,
+        &ends,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(inserted)
+}
+
+/// The instants this section already holds a lesson at — the materializer's
+/// skip set, one read for the whole range.
+pub async fn existing_starts(
+    db: &Database,
+    instance: &ClassCourseId,
+) -> Result<std::collections::HashSet<i64>, AppError> {
+    let rows = sqlx::query_scalar!(
+        r#"SELECT starts_at FROM course_session WHERE class_course = $1"#,
+        instance.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSession>, AppError> {

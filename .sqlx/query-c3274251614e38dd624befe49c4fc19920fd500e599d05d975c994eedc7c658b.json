@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: HolidayId\", name AS \"name: HolidayName\",\n                  starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at: Timestamp\",\n                  kind AS \"kind: HolidayKind\", creator AS \"creator: UserId\",\n                  created_at AS \"created_at: Timestamp\"\n           FROM holiday WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HolidayId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name: HolidayName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: HolidayKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "holiday",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c3274251614e38dd624befe49c4fc19920fd500e599d05d975c994eedc7c658b"
+}

@@ -5,15 +5,16 @@
 //! `weekly_plan_inherited` in the same statement — see
 //! [`crate::db::weekly_slot`]).
 //!
-//! **No scheduler.** Nothing here generates dated `course_session` rows from
-//! a weekly plan — `course_session` stays the per-lesson occurrence, written
-//! by its own routes. This module is template + override + resolution only; a
-//! scheduler needs its own spec.
+//! **Not a scheduler.** Nothing runs on its own: this module is template +
+//! override + resolution only, and the explicit materialize door
+//! ([`crate::service::course_session::materialize`]) is the one caller that
+//! turns a resolution into dated lessons.
 
 use crate::database::{Database, tx_with_retry};
 use crate::db::weekly_slot as slot_db;
 use crate::domain::class_course::{ClassCourse, ClassCourseId};
 use crate::domain::course_offering::CourseOfferingId;
+use crate::domain::course_session::SessionTopic;
 use crate::domain::weekly_slot::{
     SlotAddError, SlotMinute, Weekday, WeeklySlot, WeeklySlotId, check_add,
 };
@@ -58,15 +59,18 @@ async fn resolved_own(
 /// refused with 409 `slot_overlap` when a template slot already occupies an
 /// intersecting window on that weekday (the exact duplicate overlaps too),
 /// 409 `slot_cap` when the week already holds [`MAX_WEEKLY_SLOTS`] slots,
-/// and 400 for a malformed weekday, minute, or empty window.
+/// and 400 for a malformed weekday, minute, or empty window. `topic` is the
+/// optional lesson topic the materializer copies onto generated sessions —
+/// content, never an overlap input.
 pub async fn add_for_offering(
     db: &Database,
     offering: &CourseOfferingId,
     weekday: Weekday,
     starts_at: SlotMinute,
     ends_at: SlotMinute,
+    topic: Option<SessionTopic>,
 ) -> Result<WeeklySlot, AppError> {
-    let slot = WeeklySlot::new(WeeklySlotId::generate(), weekday, starts_at, ends_at)?;
+    let slot = WeeklySlot::new(WeeklySlotId::generate(), weekday, starts_at, ends_at, topic)?;
     let owner = offering.clone();
     tx_with_retry(db, false, async move |tx| {
         // The row lock serializes the pre-check and the insert: under READ
@@ -89,8 +93,9 @@ pub async fn add_for_class(
     weekday: Weekday,
     starts_at: SlotMinute,
     ends_at: SlotMinute,
+    topic: Option<SessionTopic>,
 ) -> Result<WeeklySlot, AppError> {
-    let slot = WeeklySlot::new(WeeklySlotId::generate(), weekday, starts_at, ends_at)?;
+    let slot = WeeklySlot::new(WeeklySlotId::generate(), weekday, starts_at, ends_at, topic)?;
     let owner = instance.clone();
     tx_with_retry(db, false, async move |tx| {
         slot_db::lock_class_tx(tx, &owner).await?;
@@ -198,13 +203,13 @@ mod tests {
         let instance = an_instance(&db, "5-A").await;
         let offering = instance.get_offering().clone();
 
-        add_for_offering(&db, &offering, day(2), mins(600), mins(660))
+        add_for_offering(&db, &offering, day(2), mins(600), mins(660), None)
             .await
             .unwrap();
-        add_for_offering(&db, &offering, day(1), mins(600), mins(660))
+        add_for_offering(&db, &offering, day(1), mins(600), mins(660), None)
             .await
             .unwrap();
-        add_for_offering(&db, &offering, day(1), mins(480), mins(540))
+        add_for_offering(&db, &offering, day(1), mins(480), mins(540), None)
             .await
             .unwrap();
 
@@ -229,11 +234,11 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let instance = an_instance(&db, "5-B").await;
         let offering = instance.get_offering().clone();
-        add_for_offering(&db, &offering, day(1), mins(480), mins(540))
+        add_for_offering(&db, &offering, day(1), mins(480), mins(540), None)
             .await
             .unwrap();
 
-        add_for_class(&db, instance.get_id(), day(3), mins(540), mins(600))
+        add_for_class(&db, instance.get_id(), day(3), mins(540), mins(600), None)
             .await
             .unwrap();
         // The write flipped the flag: re-read so the resolver follows the
@@ -269,7 +274,7 @@ mod tests {
     async fn an_overlapping_slot_is_refused() {
         let (db, _leases) = crate::database::init_test_db().await;
         let instance = an_instance(&db, "5-C").await;
-        add_for_class(&db, instance.get_id(), day(1), mins(540), mins(600))
+        add_for_class(&db, instance.get_id(), day(1), mins(540), mins(600), None)
             .await
             .unwrap();
 
@@ -280,7 +285,7 @@ mod tests {
             (530, 630, "the wider window"),
         ] {
             let attempt =
-                add_for_class(&db, instance.get_id(), day(1), mins(starts), mins(ends)).await;
+                add_for_class(&db, instance.get_id(), day(1), mins(starts), mins(ends), None).await;
             assert_eq!(
                 coded(&attempt),
                 "slot_overlap",
@@ -289,10 +294,10 @@ mod tests {
         }
 
         // Touching endpoints and a different weekday are not overlaps.
-        add_for_class(&db, instance.get_id(), day(1), mins(600), mins(660))
+        add_for_class(&db, instance.get_id(), day(1), mins(600), mins(660), None)
             .await
             .unwrap();
-        add_for_class(&db, instance.get_id(), day(2), mins(540), mins(600))
+        add_for_class(&db, instance.get_id(), day(2), mins(540), mins(600), None)
             .await
             .unwrap();
         assert_eq!(
@@ -307,12 +312,12 @@ mod tests {
         assert!(Weekday::new(0).is_err());
         assert!(SlotMinute::new(-1).is_err());
         let empty_window =
-            add_for_class(&db, instance.get_id(), day(1), mins(600), mins(600)).await;
+            add_for_class(&db, instance.get_id(), day(1), mins(600), mins(600), None).await;
         assert!(
             matches!(empty_window, Err(AppError::Validation(_))),
             "{empty_window:?}"
         );
-        let inverted = add_for_class(&db, instance.get_id(), day(1), mins(1439), mins(600)).await;
+        let inverted = add_for_class(&db, instance.get_id(), day(1), mins(1439), mins(600), None).await;
         assert!(
             matches!(inverted, Err(AppError::Validation(_))),
             "{inverted:?}"
@@ -330,13 +335,7 @@ mod tests {
         // 480+(i/7) — five or six per weekday, all touching, none crossing.
         for i in 0..crate::constant::MAX_WEEKLY_SLOTS {
             let i = i as i64;
-            add_for_class(
-                &db,
-                instance.get_id(),
-                day(((i % 7) + 1) as i16),
-                mins(480 + i / 7),
-                mins(481 + i / 7),
-            )
+            add_for_class(&db, instance.get_id(), day(((i % 7) + 1) as i16), mins(480 + i / 7), mins(481 + i / 7), None)
             .await
             .unwrap();
         }
@@ -349,7 +348,7 @@ mod tests {
         );
 
         // Room on Sunday's timeline, but the plan is full.
-        let one_more = add_for_class(&db, instance.get_id(), day(7), mins(700), mins(760)).await;
+        let one_more = add_for_class(&db, instance.get_id(), day(7), mins(700), mins(760), None).await;
         assert_eq!(coded(&one_more), "slot_cap");
         assert_eq!(
             slot_db::list_for_class(&db, instance.get_id())
@@ -367,10 +366,10 @@ mod tests {
         let (db, _leases) = crate::database::init_test_db().await;
         let instance = an_instance(&db, "5-E").await;
         let offering = instance.get_offering().clone();
-        add_for_offering(&db, &offering, day(1), mins(480), mins(540))
+        add_for_offering(&db, &offering, day(1), mins(480), mins(540), None)
             .await
             .unwrap();
-        add_for_class(&db, instance.get_id(), day(2), mins(480), mins(540))
+        add_for_class(&db, instance.get_id(), day(2), mins(480), mins(540), None)
             .await
             .unwrap();
         assert!(
@@ -403,10 +402,10 @@ mod tests {
         let instance = an_instance(&db, "5-F").await;
         let other = an_instance(&db, "5-G").await;
 
-        add_for_class(&db, instance.get_id(), day(1), mins(480), mins(540))
+        add_for_class(&db, instance.get_id(), day(1), mins(480), mins(540), None)
             .await
             .unwrap();
-        add_for_class(&db, instance.get_id(), day(2), mins(480), mins(540))
+        add_for_class(&db, instance.get_id(), day(2), mins(480), mins(540), None)
             .await
             .unwrap();
         let own = slot_db::list_for_class(&db, instance.get_id())
@@ -450,10 +449,10 @@ mod tests {
         let instance = an_instance(&db, "5-H").await;
         let offering = instance.get_offering().clone();
 
-        add_for_offering(&db, &offering, day(1), mins(540), mins(600))
+        add_for_offering(&db, &offering, day(1), mins(540), mins(600), None)
             .await
             .unwrap();
-        let clash = add_for_offering(&db, &offering, day(1), mins(570), mins(630)).await;
+        let clash = add_for_offering(&db, &offering, day(1), mins(570), mins(630), None).await;
         assert_eq!(coded(&clash), "slot_overlap");
 
         let slots = slot_db::list_for_offering(&db, &offering).await.unwrap();

@@ -16,14 +16,16 @@
 //! list comes back in is `weekday` first, then `starts_at` — Monday through
 //! Sunday, each day dawn to dusk.
 //!
-//! **No scheduler.** Nothing generates dated `course_session` rows from a
-//! weekly plan — `course_session` stays the per-lesson occurrence, written by
-//! its own routes. This module is template + override + resolution only.
+//! **Not a store for lessons.** This module is template + override +
+//! resolution only: the dated `course_session` rows are minted on demand by
+//! [`crate::service::course_session::materialize`], which reads this
+//! resolution and the school's holiday calendar.
 //!
 //! The slot bounds live in [`crate::constant`] beside every other published
 //! bound, so `GET /limits` and the completeness guard see them.
 
 use crate::constant::{MAX_SLOT_MINUTE, MAX_WEEKLY_SLOTS, MIN_SLOT_MINUTE};
+use crate::domain::course_session::SessionTopic;
 use crate::domain::monotonic_id::next_uuid;
 use crate::error::ValidationError;
 
@@ -107,7 +109,8 @@ impl SlotMinute {
     }
 }
 
-/// One weekly plan line: on `weekday`, from `starts_at` to `ends_at`.
+/// One weekly plan line: on `weekday`, from `starts_at` to `ends_at`, with an
+/// optional lesson topic the materializer copies onto the generated sessions.
 ///
 /// The list a resolver returns is ordered `weekday` first, then `starts_at`.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -116,18 +119,21 @@ pub struct WeeklySlot {
     pub(crate) weekday: Weekday,
     pub(crate) starts_at: SlotMinute,
     pub(crate) ends_at: SlotMinute,
+    pub(crate) topic: Option<SessionTopic>,
 }
 
 impl WeeklySlot {
     /// The slot `id` names, or a validation error when the window is not one
     /// (`ends_at` must land strictly after `starts_at` — equal times are an
     /// empty window, inverted ones a typo). The store's
-    /// `CHECK (ends_at > starts_at)` is the same rule at rest.
+    /// `CHECK (ends_at > starts_at)` is the same rule at rest. `topic` rides
+    /// along unjudged for overlap: it is content, not a timetable line.
     pub fn new(
         id: WeeklySlotId,
         weekday: Weekday,
         starts_at: SlotMinute,
         ends_at: SlotMinute,
+        topic: Option<SessionTopic>,
     ) -> Result<Self, ValidationError> {
         if starts_at.get() >= ends_at.get() {
             return Err(ValidationError::Invalid {
@@ -140,6 +146,7 @@ impl WeeklySlot {
             weekday,
             starts_at,
             ends_at,
+            topic,
         })
     }
 
@@ -157,6 +164,13 @@ impl WeeklySlot {
 
     pub fn get_ends_at(&self) -> SlotMinute {
         self.ends_at
+    }
+
+    /// The lesson topic the slot carries, `None` = the generated session
+    /// falls back to the instance's resolved title (then the literal
+    /// `"Ders"`).
+    pub fn get_topic(&self) -> Option<&SessionTopic> {
+        self.topic.as_ref()
     }
 
     /// Whether this and `other` cannot both stand in one owner's plan: the
@@ -210,8 +224,44 @@ mod tests {
             day(weekday),
             mins(starts),
             mins(ends),
+            None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn topic_is_optional_and_survives_construction() {
+        // A slot without a topic reads back `None`.
+        let bare = slot(1, 540, 600);
+        assert!(bare.get_topic().is_none());
+        // A topic rides along verbatim.
+        let topic = SessionTopic::try_new("Photosynthesis").unwrap();
+        let themed = WeeklySlot::new(
+            WeeklySlotId::generate(),
+            day(2),
+            mins(540),
+            mins(600),
+            Some(topic.clone()),
+        )
+        .unwrap();
+        assert_eq!(themed.get_topic(), Some(&topic));
+    }
+
+    #[test]
+    fn overlap_is_independent_of_the_topic() {
+        let bare = slot(1, 540, 600);
+        let themed = WeeklySlot::new(
+            WeeklySlotId::generate(),
+            day(1),
+            mins(540),
+            mins(600),
+            Some(SessionTopic::try_new("Cells").unwrap()),
+        )
+        .unwrap();
+        // The same window with a different (or absent) topic still collides —
+        // the topic is content, not a timetable line.
+        assert!(bare.overlaps(&themed));
+        assert!(themed.overlaps(&bare));
     }
 
     #[test]
@@ -233,10 +283,16 @@ mod tests {
     #[test]
     fn a_slot_window_must_be_non_empty_and_forward() {
         // Zero-length and inverted windows are refused.
-        assert!(WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(600)).is_err());
-        assert!(WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(540)).is_err());
+        assert!(
+            WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(600), None).is_err()
+        );
+        assert!(
+            WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(540), None).is_err()
+        );
         // A one-minute window stands.
-        assert!(WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(601)).is_ok());
+        assert!(
+            WeeklySlot::new(WeeklySlotId::generate(), day(1), mins(600), mins(601), None).is_ok()
+        );
     }
 
     #[test]
