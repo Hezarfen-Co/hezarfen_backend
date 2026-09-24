@@ -360,8 +360,13 @@ fn soon() -> i64 {
 /// `POST /instances/{id}/sessions` and the session PATCH refuse a start time in
 /// the past — which is what makes the counter's own gate worth having, since a
 /// client can only ever schedule *forward* into an unheld lesson.
+///
+/// The shift is *relative* to the row's own start, not a shared constant:
+/// `UNIQUE (class_course, starts_at)` makes two lessons of one section unable
+/// to share an instant, so pinning every row to `1` would itself be a
+/// violation once a test rings more than one bell on one section.
 async fn ring_the_bell(db: &Database, session: &str) {
-    sqlx::query("UPDATE course_session SET starts_at = 1 WHERE id = $1")
+    sqlx::query("UPDATE course_session SET starts_at = starts_at - 360_000_000 WHERE id = $1")
         .bind(hezarfen_backend::domain::course_session::CourseSessionId::from_key(session))
         .execute(db)
         .await
