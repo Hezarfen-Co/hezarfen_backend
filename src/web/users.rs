@@ -1020,6 +1020,16 @@ struct ProfileClassRef {
 /// carry their own resolved titles and hours, and the profile lists both. `id`
 /// is the instance id (`GET /instances/{id}`); `kind` is the catalog row's,
 /// which is the same for every section of one course.
+///
+/// The class identity rides the profile's **class gate**, not the course one:
+/// `class`, `class_name` and `grade_level` name the section's şube, and a
+/// class name and grade are exactly what `GET /classes/user/{id}` withholds
+/// from a viewer below the [`crate::service::parent_link::ensure_can_observe`]
+/// bar — so this block withholds them from exactly the same viewers (they
+/// read `null`), the same all-or-nothing rule the `classes` block answers to.
+/// A viewer who passes — self, teacher+, a linked parent — reads all three.
+/// `id`, `course`, `title` and `kind` stay populated for everyone the course
+/// gate lets through: the block's purpose is the section, not the class.
 #[derive(Serialize, ToSchema)]
 struct ProfileCourseRef {
     /// The instance id (`GET /instances/{id}`).
@@ -1028,19 +1038,22 @@ struct ProfileCourseRef {
     /// The catalog course this section teaches (`GET /courses/{id}`).
     #[schema(example = "019732e3-7b00-7000-8000-00000000beef")]
     course: String,
-    /// The class this section belongs to (`GET /classes/{id}`).
+    /// The class this section belongs to (`GET /classes/{id}`) — `null` for a
+    /// viewer below the class-observation bar.
     #[schema(example = "019732e3-7b00-7000-8000-00000000cafe")]
-    class: String,
-    /// The class's own name, e.g. `9-A`.
+    class: Option<String>,
+    /// The class's own name, e.g. `9-A` — `null` for a viewer below the
+    /// class-observation bar.
     #[schema(example = "9-A")]
-    class_name: String,
+    class_name: Option<String>,
     /// The **resolved** display title of this section: its own override, else
     /// its offering's, else the catalog course's.
     #[schema(example = "Matematik")]
     title: String,
-    /// The class's rung on the grade ladder (`0` = anaokulu).
+    /// The class's rung on the grade ladder (`0` = anaokulu) — `null` for a
+    /// viewer below the class-observation bar.
     #[schema(example = 9)]
-    grade_level: i16,
+    grade_level: Option<i16>,
     /// `course`, `study` (supervised study), or `club`.
     #[schema(example = "course")]
     kind: String,
@@ -1215,6 +1228,12 @@ async fn profile_of(
     if viewer.get_id() != id && ensure_can_observe(viewer, id, &st.db).await.is_err() {
         members.clear();
     }
+    // The section rows name their class (`class`/`class_name`/`grade_level`),
+    // so the same all-or-nothing gate rules what that triple may say here:
+    // one predicate, computed once, feeding both blocks — never a second
+    // rule the two blocks could disagree about.
+    let may_see_class = viewer.get_id() == id
+        || ensure_can_observe(viewer, id, &st.db).await.is_ok();
     let class_ids: Vec<ClassGroupId> = members.iter().map(|row| row.get_class().clone()).collect();
     let classes = crate::service::class_group::list_by_ids(&st.db, &class_ids).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
@@ -1249,10 +1268,10 @@ async fn profile_of(
             .map(|section| ProfileCourseRef {
                 id: section.id.clone(),
                 course: section.course.clone(),
-                class: section.class.clone(),
-                class_name: section.class_name.clone(),
+                class: may_see_class.then(|| section.class.clone()),
+                class_name: may_see_class.then(|| section.class_name.clone()),
                 title: section.title.clone(),
-                grade_level: section.grade_level,
+                grade_level: may_see_class.then_some(section.grade_level),
                 kind: kinds.get(&section.course).cloned().unwrap_or_default(),
             })
             .collect(),

@@ -91,24 +91,23 @@ pub async fn visible_instances(
         let manages = homeroom_keys.contains(&instance.get_class().key());
         rows.push((instance, manages));
     }
-    // The instances the caller teaches: read through the catalog courses they
-    // are assigned in (the junction has no teacher-keyed read of its own) and
-    // kept only where the assignment actually names them.
+    // The instances the caller teaches: one statement over the assignment
+    // junction (`class_course` join `class_course_teacher` filtered by the
+    // teacher), not a catalog read plus one query per taught course plus one
+    // gate call per instance. `manages` keeps today's meaning — an assigned
+    // teacher may run the section (D10's teacher arm; the manager+ arm is
+    // unreachable here, a manager's `visible` is served by the class arm
+    // above or read manager-side) — and a row the class arm already carried
+    // (homeroom ∩ assigned) is dropped, the union is a set.
     if user.get_role().at_least(Role::Teacher) {
-        for course in super::course::list_for_teacher(db, user.get_id()).await? {
-            let (taught, _) =
-                crate::db::class_course::list_for_course(db, course.get_id(), None, 0).await?;
-            for instance in taught {
-                if rows
-                    .iter()
-                    .any(|(row, _)| row.get_id() == instance.get_id())
-                {
-                    continue;
-                }
-                if can_manage_instance(db, instance.get_id(), user).await? {
-                    rows.push((instance, true));
-                }
+        for instance in crate::db::class_course::list_for_teacher_ids(db, user.get_id()).await? {
+            if rows
+                .iter()
+                .any(|(row, _)| row.get_id() == instance.get_id())
+            {
+                continue;
             }
+            rows.push((instance, true));
         }
     }
     Ok(rows)

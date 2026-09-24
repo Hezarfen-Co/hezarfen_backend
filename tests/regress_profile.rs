@@ -13,8 +13,9 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_exam_with, create_homework, create_subject, enroll, id_of, items, login,
-    login_as, me_id, send, set_role, taught_under, ABSENT_ID,
+    app_and_db, attach_instance, create_course, create_exam_with, create_homework, create_subject,
+    create_year, enroll, id_of, items, login, login_as, me_id, send, set_role, taught_under,
+    ABSENT_ID,
 };
 use hezarfen_backend::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN};
 use hezarfen_backend::database::Database;
@@ -919,6 +920,10 @@ struct Section {
     peer: String,
     student: String,
     student_id: String,
+    /// The şube the student sits in (`9-A`).
+    class: String,
+    /// The academic year that şube sits in.
+    year: String,
 }
 
 async fn section() -> Section {
@@ -932,7 +937,8 @@ async fn section() -> Section {
     let student = login(&app, "kid").await;
     let student_id = me_id(&app, &student).await;
 
-    let class = create_class(&app, &manager, "9-A", 9).await;
+    let year = create_year(&app, &manager, "2026-2027").await;
+    let class = create_class(&app, &manager, "9-A", 9, &year).await;
     add_member(&app, &manager, &class, &student_id).await;
     link_student(&app, &admin, &parent_id, &student_id).await;
 
@@ -944,16 +950,18 @@ async fn section() -> Section {
         peer,
         student,
         student_id,
+        class,
+        year,
     }
 }
 
-async fn create_class(app: &Router, manager: &str, name: &str, grade_level: i16) -> String {
+async fn create_class(app: &Router, manager: &str, name: &str, grade_level: i16, year: &str) -> String {
     let res = send(
         app,
         "POST",
         "/classes",
         Some(manager),
-        Some(json!({ "name": name, "grade_level": grade_level })),
+        Some(json!({ "name": name, "grade_level": grade_level, "year": year })),
     )
     .await;
     assert_eq!(
@@ -1073,6 +1081,59 @@ async fn teacher_parent_manager_and_the_owner_still_read_the_class_block() {
     assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
     assert_eq!(mine.body["classes"][0]["name"], "9-A");
     assert_eq!(mine.body["classes"][0]["grade_level"], 9);
+}
+
+/// The section rows' class triple answers the same bar the `classes` block
+/// does. The leak this closes: the section split gave `ProfileCourseRef` a
+/// `class`/`class_name`/`grade_level` of its own, filtered only by catalog
+/// readability — so a fellow student reading a classmate's profile was served
+/// the classmate's şube, name and grade and all, while the `classes` block in
+/// the very same response stayed empty for exactly that viewer. Both sides in
+/// one test, so the two blocks cannot drift apart unnoticed.
+#[tokio::test]
+async fn a_section_rows_class_fields_obey_the_class_block_gate() {
+    let s = section().await;
+    // Attach a course to the student's own class so the profile's course
+    // block carries the section row the gate is about. The fixture's şube
+    // already sits in `s.year`, so the attach lands.
+    let course = create_course(&s.app, &s.manager, "Tarih").await;
+    let _instance = attach_instance(&s.app, &s.manager, &s.class, &course).await;
+    // The peer shares the *catalog course* — their own şube teaches it too —
+    // which is the only way a fellow student passes the course gate and
+    // reaches the section row at all. The class gate then withholds the şube
+    // identity the row names: same course, different class.
+    let class_b = create_class(&s.app, &s.manager, "9-B", 9, &s.year).await;
+    let peer_id = me_id(&s.app, &s.peer).await;
+    add_member(&s.app, &s.manager, &class_b, &peer_id).await;
+    attach_instance(&s.app, &s.manager, &class_b, &course).await;
+
+    let peer_seen = profile(&s.app, &s.peer, &s.student_id).await;
+    assert_eq!(peer_seen.status, StatusCode::OK, "{}", peer_seen.body);
+    let rows = peer_seen.body["courses"].as_array().expect("courses");
+    assert_eq!(rows.len(), 1, "the section row itself is served: {}", peer_seen.body);
+    let row = &rows[0];
+    // The block's purpose stays: the section, resolved title, kind.
+    assert_eq!(row["course"], json!(course), "{}", row);
+    assert_eq!(row["title"], json!("Tarih"), "{}", row);
+    assert_eq!(row["kind"], json!("course"), "{}", row);
+    // The class identity is withheld — null, not dropped.
+    assert_eq!(row["class"], json!(null), "{}", row);
+    assert_eq!(row["class_name"], json!(null), "{}", row);
+    assert_eq!(row["grade_level"], json!(null), "{}", row);
+
+    // A manager passes the bar and reads the triple.
+    let boss_seen = profile(&s.app, &s.manager, &s.student_id).await;
+    assert_eq!(boss_seen.status, StatusCode::OK, "{}", boss_seen.body);
+    let boss_row = &boss_seen.body["courses"][0];
+    assert_eq!(boss_row["class_name"], json!("9-A"), "{}", boss_row);
+    assert_eq!(boss_row["grade_level"], json!(9), "{}", boss_row);
+    assert!(boss_row["class"].as_str().is_some(), "{}", boss_row);
+
+    // The owner passes it too, reading their own profile.
+    let mine = send(&s.app, "GET", "/users/me/profile", Some(&s.student), None).await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+    assert_eq!(mine.body["courses"][0]["class_name"], json!("9-A"), "{}", mine.body);
+    assert_eq!(mine.body["courses"][0]["grade_level"], json!(9), "{}", mine.body);
 }
 
 /// `stats.classes` is the owner's true total, deliberately *not* the length of

@@ -509,6 +509,25 @@ async fn materialize_weekly_plan(
 ) -> Result<Json<MaterializeReport>, AppError> {
     let instance = instance_or_404(&id, &st.db).await?;
     service::class_course::ensure_instance_teacher(&st.db, &user, instance.get_id()).await?;
+    // The day math shifts each instant by the zone offset before it reads the
+    // date off it, and `zoned_day` panics when that shifted value leaves
+    // chrono's representable range — so an absurd magnitude must be refused
+    // *here*, with checked arithmetic, naming the field. Checked before the
+    // offset is even loaded: the refusal cannot depend on the school's zone.
+    for (field, millis) in [("from", req.from), ("to", req.to)] {
+        if millis
+            .checked_add(i64::from(
+                crate::domain::calendar::MAX_ZONE_OFFSET_MINUTES,
+            ) * 60_000)
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .is_none()
+        {
+            return Err(AppError::Validation(crate::error::ValidationError::Invalid {
+                field,
+                reason: "is outside the representable calendar range",
+            }));
+        }
+    }
     let from = Timestamp::from_millis(req.from);
     let to = Timestamp::from_millis(req.to);
     check_time_range(Some(from), Some(to))?;
@@ -517,9 +536,6 @@ async fn materialize_weekly_plan(
     // range may legitimately end in the past when `from` does not, which is
     // how a school backfills a plan it only now entered.)
     check_not_past("from", Some(from))?;
-    // The day-bucketing read `attendance` makes: a range's instants name
-    // *school* days, and each lesson lands at its slot's minute of that local
-    // day.
     let school = service::settings::load(&st.db).await?;
     let offset = zone_offset_minutes(school.get_timezone());
 

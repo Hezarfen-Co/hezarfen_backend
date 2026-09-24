@@ -15,8 +15,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Datelike, NaiveDate, Weekday};
 use common::{
-    app_and_db, attach_instance, create_class, create_course, ensure_year, enroll, id_of, items,
-    login, login_as, me_id, send, taught,
+    app_and_db, attach_instance, create_class, create_course, create_session, ensure_year, enroll,
+    id_of, items, login, login_as, me_id, send, taught,
 };
 use serde_json::{json, Value};
 
@@ -674,6 +674,30 @@ async fn materialize_rejects_a_bad_range_before_anything_runs() {
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 
+    // An instant the day math cannot represent: shifting by the zone offset
+    // overflows chrono's range and `zoned_day` panics there. The route must
+    // refuse with a 400 that names the field — for `i64::MAX` and `i64::MIN`
+    // alike — before anything runs.
+    for (field, at) in [("from", i64::MAX), ("to", i64::MAX), ("from", i64::MIN), ("to", i64::MIN)] {
+        let (from, to) = match field {
+            "from" => (at, day_start(later_monday())),
+            _ => (day_start(lesson_monday()), at),
+        };
+        let res = materialize(&app, &manager, &t.instance, from, to, None).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{field}={at}: {}", res.body);
+        let body = res.body.to_string();
+        assert!(
+            body.contains(field),
+            "the 400 must name `{field}`: {body}"
+        );
+    }
+
+    // A sane range through the same gate still works — the guard refuses
+    // magnitudes, not the ordinary calendar.
+    let (from, to) = day_range(lesson_monday());
+    let res = materialize(&app, &manager, &t.instance, from, to, None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
     let page = sessions_page(&app, &manager, &t.instance).await;
     assert_eq!(page["total"], json!(0), "nothing was written: {}", page);
 }
@@ -742,6 +766,55 @@ async fn a_hand_created_session_on_a_generated_slot_is_a_coded_conflict() {
     assert_eq!(ok.status, StatusCode::CREATED, "{}", ok.body);
     let page = sessions_page(&app, &manager, &t.instance).await;
     assert_eq!(page["total"], json!(2), "{}", page);
+}
+
+/// The PATCH door answers the same coded 409, not a 500: moving one lesson's
+/// `starts_at` onto an instant the section already holds trips the same
+/// `UNIQUE (class_course, starts_at)` the create door maps. A PATCH to a free
+/// instant still succeeds.
+#[tokio::test]
+async fn a_session_moved_onto_an_occupied_instant_is_a_coded_conflict() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let (t, _) = planned_monday(&app, &db, &manager, true).await;
+
+    // Two lessons one minute apart.
+    create_session(&app, &manager, &t.instance, day_start(lesson_monday()) + 540 * 60_000).await;
+    let second = create_session(&app, &manager, &t.instance, day_start(lesson_monday()) + 601 * 60_000).await;
+
+    // PATCH the second onto the first's instant: the unique wall, through the
+    // update path, must be the coded 409 — never a raw 500.
+    let moved = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{second}"),
+        Some(&manager),
+        Some(json!({ "starts_at": day_start(lesson_monday()) + 540 * 60_000 })),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::CONFLICT, "{}", moved.body);
+    assert_eq!(moved.body["code"], "session_time_taken", "{}", moved.body);
+
+    // The refused PATCH wrote nothing: both lessons still sit where they did.
+    let page = sessions_page(&app, &manager, &t.instance).await;
+    assert_eq!(page["total"], json!(2), "{}", page);
+
+    // A PATCH onto a free instant is not caught by the same wall.
+    let ok = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{second}"),
+        Some(&manager),
+        Some(json!({ "starts_at": day_start(lesson_monday()) + 661 * 60_000 })),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    assert_eq!(
+        ok.body["starts_at"],
+        json!(day_start(lesson_monday()) + 661 * 60_000),
+        "{}",
+        ok.body
+    );
 }
 
 // ---- the materializer: shape of the generated set --------------------------------

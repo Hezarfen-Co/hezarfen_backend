@@ -565,6 +565,12 @@ const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[
      the result door returns the stored text; a browser never sizes a \
      transcript against this",
     ),
+    (
+        "MAX_ZONE_OFFSET_MINUTES",
+        "the largest shift `calendar::zoned_day` applies — internal arithmetic \
+     for a checked pre-flight in the materialize route, not a value a client \
+     sizes a request against",
+    ),
 ];
 
 #[test]

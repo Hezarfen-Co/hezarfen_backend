@@ -181,6 +181,41 @@ pub async fn list_for_course_ids(
     Ok(rows)
 }
 
+/// Every instance `teacher` is assigned to (one query, unpaged) — the batched
+/// replacement for [`list_for_teacher`]-then-[`list_for_course`]-per-course:
+/// a reach read walks the assignment junction directly, so a teacher's
+/// catalogue page costs one query, not one per taught course. A teacher
+/// assigned to two sections of one course gets both rows; an id that names no
+/// assignment is simply absent.
+pub async fn list_for_teacher_ids(
+    db: &Database,
+    teacher: &UserId,
+) -> Result<Vec<ClassCourse>, AppError> {
+    let rows = sqlx::query_as!(
+        ClassCourse,
+        r#"SELECT cc.id AS "id: ClassCourseId", cc.class AS "class: ClassGroupId",
+                  cc.course AS "course: CourseId", cc.offering AS "offering: CourseOfferingId",
+                  cc.attached_by AS "attached_by: UserId",
+                  b.grade_level AS "source?: ClassBlueprintId",
+                  cc.title AS "title?: CourseTitle",
+                  cc.description AS "description?: CourseDescription",
+                  cc.ders_saati::bigint AS "ders_saati?: DersSaati",
+                  cc.counts_toward_karne,
+                  cc.subjects_inherited, cc.exam_weights_inherited, cc.weekly_plan_inherited,
+                  cc.enrollment_count,
+                  cc.attached_at AS "attached_at: Timestamp"
+           FROM class_course cc
+           JOIN class_course_teacher t ON t.class_course = cc.id
+           LEFT JOIN class_blueprint b ON b.id = cc.source
+           WHERE t.teacher = $1
+           ORDER BY cc.attached_at DESC, cc.id DESC"#,
+        teacher.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 /// Load every instance behind `ids` (one query) — the join half of the reads
 /// that already hold instance ids (a marks report's per-instance blocks).
 pub async fn list_by_ids(

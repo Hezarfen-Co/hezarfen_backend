@@ -203,7 +203,7 @@ pub async fn update(
     starts_at: Option<Timestamp>,
     ends_at: Option<Option<Timestamp>>,
 ) -> Result<CourseSession, AppError> {
-    FieldUpdate::new(COURSE_SESSION_TABLE, session.id.uuid())
+    let updated = FieldUpdate::new(COURSE_SESSION_TABLE, session.id.uuid())
         .set(
             "teacher",
             teacher.map(|teacher| crate::db::page::Param::Uuid(teacher.uuid())),
@@ -216,7 +216,19 @@ pub async fn update(
         )
         .ordered("starts_at", "ends_at", range_error())
         .run::<CourseSession>(db)
-        .await
+        .await;
+    match updated {
+        Ok(updated) => Ok(updated),
+        // `23505` — the section's own `UNIQUE (class_course, starts_at)`: the
+        // PATCH moved this lesson onto an instant the section already holds
+        // (a hand-created one, or one a concurrent materialize just minted).
+        // The same coded refusal `create` answers with, never a raw 500.
+        Err(AppError::Db(err)) if unique_violation(&err).is_some() => Err(AppError::ConflictCoded {
+            code: "session_time_taken",
+            message: "this section already has a lesson starting then".into(),
+        }),
+        Err(err) => Err(err),
+    }
 }
 
 /// Delete the session and cascade-remove its roll-call rows, in one

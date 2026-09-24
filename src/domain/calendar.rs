@@ -24,6 +24,12 @@ pub fn zone_offset_minutes(timezone: &str) -> i32 {
     }
 }
 
+/// The largest shift [`zoned_day`] can ever apply: the biggest offset any
+/// entry of [`crate::constant::TIMEZONES`] produces. A caller that must not
+/// panic (the materialize route's raw `i64` instants) uses it for a checked
+/// pre-flight that mirrors the unchecked arithmetic below.
+pub const MAX_ZONE_OFFSET_MINUTES: i32 = 3 * 60;
+
 /// The calendar day an instant falls on, in the school's zone.
 pub fn zoned_day(millis: i64, offset_minutes: i32) -> chrono::NaiveDate {
     let shifted = millis + i64::from(offset_minutes) * 60_000;
