@@ -25,7 +25,12 @@ async fn concurrent_partial_patches_keep_both_fields() {
             "POST",
             &format!("/instances/{}/sessions", t.instance),
             Some(&who),
-            Some(json!({ "topic": "old topic", "starts_at": FUTURE })),
+            // `UNIQUE (class_course, starts_at)`: each round takes its own
+            // instant — descending, all still future, all before the fixed
+            // ends patch below.
+            Some(
+                json!({ "topic": "old topic", "starts_at": FUTURE - round as i64 * 3_600_000 }),
+            ),
         )
         .await;
         assert_eq!(created.status, StatusCode::CREATED, "round {round} create");
@@ -71,15 +76,19 @@ async fn concurrent_range_patches_never_invert_the_stored_row() {
     let who = login_as(&app, &db, "range", "teacher").await;
     let mudur = login_as(&app, &db, "mudur", "manager").await;
     let t = taught_under(&app, &mudur, &who, "math").await;
-    let ends = FUTURE + 3_600_000;
 
     for round in 0..20 {
+        // `UNIQUE (class_course, starts_at)`: each round takes its own
+        // instant — descending, all still future, ends = starts + 1h kept.
+        let starts = FUTURE - round as i64 * 3_600_000;
+        let ends = starts + 3_600_000;
+
         let created = send(
             &app,
             "POST",
             &format!("/instances/{}/sessions", t.instance),
             Some(&who),
-            Some(json!({ "starts_at": FUTURE, "ends_at": ends })),
+            Some(json!({ "starts_at": starts, "ends_at": ends })),
         )
         .await;
         assert_eq!(created.status, StatusCode::CREATED, "round {round} create");
