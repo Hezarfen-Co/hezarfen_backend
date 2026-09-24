@@ -10820,12 +10820,15 @@ async fn session_crud_follows_course_management() {
     assert_eq!(res.body["topic"], "limits");
     assert_eq!(res.body["starts_at"], start);
     assert!(res.body["ends_at"].is_null());
+    // A distinct instant on purpose: `UNIQUE (class_course, starts_at)` makes
+    // two lessons of one section unable to start together, so re-using
+    // `start` here would measure that wall, not the manager's rights.
     let res = send(
         &app,
         "POST",
         &format!("/instances/{}/sessions", t.instance),
         Some(&boss),
-        Some(body.clone()),
+        Some(json!({ "topic": "limits", "starts_at": start + 60_000 })),
     )
     .await;
     assert_eq!(
@@ -10934,7 +10937,7 @@ async fn session_crud_follows_course_management() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
     // owner's, the manager's, and the one taught by `rival` — newest starts_at
-    // first, so the two `start` lessons precede the earlier `rival` one.
+    // first, so the two later lessons precede the earlier `rival` one.
     assert_eq!(common::items(&res.body).len(), 3);
     assert_eq!(common::items(&res.body)[2]["starts_at"], now + 120_000);
     let res = send(&app, "GET", "/courses/nope/sessions", Some(&student), None).await;

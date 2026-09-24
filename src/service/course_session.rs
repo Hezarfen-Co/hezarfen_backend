@@ -277,7 +277,7 @@ pub async fn materialize(
         if candidates > MAX_MATERIALIZE_SESSIONS {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "to",
-                reason: "this range would create more than 500 lessons — narrow it".into(),
+                reason: "this range would create more than 500 lessons — narrow it",
             }));
         }
         let created = if apply {
