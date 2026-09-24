@@ -276,6 +276,51 @@ pub struct CourseResponse {
     /// How many individual club/study memberships the course carries.
     #[schema(example = 12)]
     pub course_membership_count: i64,
+    /// The class sections teaching this course right now — one entry per
+    /// instance, each with its own resolved title and hours. Populated by the
+    /// catalogue reads (`GET /courses`, `GET /courses/{id}`); `[]` everywhere
+    /// else, including the CRUD responses and every report that embeds a
+    /// course row. Truncated to `MAX_COURSE_SECTIONS`; `class_course_count` is
+    /// the untruncated total.
+    pub sections: Vec<CourseSectionRef>,
+}
+
+/// One class section teaching a catalog course. Shared by the catalogue rows
+/// and the profile course block; `id` is the **instance** id
+/// (`GET /instances/{id}`), never the catalog row's — the 9-A and 12-A
+/// sections of one ders are two entries here, with their own resolved titles
+/// and weekly hours.
+#[derive(Serialize, Clone, ToSchema)]
+pub struct CourseSectionRef {
+    /// The instance id (`GET /instances/{id}`).
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
+    pub id: String,
+    /// The catalog course this section teaches (`GET /courses/{id}`).
+    #[schema(example = "019732e3-7b00-7000-8000-00000000beef")]
+    pub course: String,
+    /// The class this section belongs to (`GET /classes/{id}`).
+    #[schema(example = "019732e3-7b00-7000-8000-00000000cafe")]
+    pub class: String,
+    /// The class's own name, e.g. `9-A`.
+    #[schema(example = "9-A")]
+    pub class_name: String,
+    /// The **resolved** display title of this section: its own override, else
+    /// its offering's, else the catalog course's — the same chain every
+    /// instance-scoped surface shows.
+    #[schema(example = "Matematik")]
+    pub title: String,
+    /// The class's rung on the grade ladder (`0` = anaokulu).
+    #[schema(example = 9)]
+    pub grade_level: i16,
+    /// The **resolved** weekly lesson hours of this section: its own override,
+    /// else its offering's default, else the floor.
+    #[schema(example = 5)]
+    pub ders_saati: i64,
+    /// The staff assigned to run this section.
+    pub teachers: Vec<PersonRef>,
+    /// How many students are enrolled in this section right now.
+    #[schema(example = 28)]
+    pub enrollment_count: i64,
 }
 
 /// Every person a [`CourseResponse`] names: its creator. Feed this into
@@ -295,6 +340,21 @@ impl CourseResponse {
             kind: course.get_kind().as_str().to_string(),
             class_course_count: course.get_class_course_count(),
             course_membership_count: course.get_course_membership_count(),
+            sections: Vec::new(),
+        }
+    }
+
+    /// The same row plus its sections — the catalogue reads' constructor
+    /// (`GET /courses`, `GET /courses/{id}`), where every row carries the
+    /// class sections teaching it.
+    pub fn with_sections(
+        course: &Course,
+        people: &HashMap<String, PersonRef>,
+        sections: Vec<CourseSectionRef>,
+    ) -> Self {
+        Self {
+            sections,
+            ..Self::new(course, people)
         }
     }
 }

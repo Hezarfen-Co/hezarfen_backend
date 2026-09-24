@@ -178,16 +178,18 @@ pub async fn materialize(
     // the generated rows are written on that same connection: a rival
     // materialize run waits here instead of racing the existence read, and a
     // refusal rolls back whatever it had collected.
+    let pool = db.clone();
+    let instance = instance.clone();
     tx_with_retry(db, false, async move |tx| {
         // The archived-year wall every instance write passes: a past year is
         // read-only, and this run mints lesson rows.
-        crate::service::class_course::require_open(db, &instance_id).await?;
+        crate::service::class_course::require_open(&pool, &instance_id).await?;
         // The serialization point. `FOR NO KEY UPDATE` rather than
         // `FOR UPDATE`: the batch insert below takes this same row's
         // foreign-key `FOR KEY SHARE`, which `FOR UPDATE` would block on.
         crate::db::weekly_slot::lock_class_tx(tx, &instance_id).await?;
 
-        let slots = crate::service::weekly_slot::resolved_for_instance(db, instance).await?;
+        let slots = crate::service::weekly_slot::resolved_for_instance(&pool, &instance).await?;
         if slots.is_empty() {
             return Err(AppError::ConflictCoded {
                 code: "instance_has_no_weekly_plan",
@@ -195,7 +197,7 @@ pub async fn materialize(
             });
         }
         let teachers =
-            crate::db::class_course_teacher::list_for_instance(db, &instance_id).await?;
+            crate::db::class_course_teacher::list_for_instance(&pool, &instance_id).await?;
         let Some(teacher) = teachers.first().copied() else {
             return Err(AppError::ConflictCoded {
                 code: "instance_has_no_teacher",
@@ -207,7 +209,8 @@ pub async fn materialize(
         // title second (the one display chain every surface rides), the
         // literal `"Ders"` last. The resolved title is bounded by
         // `MAX_COURSE_TITLE_LEN`, so it always fits a `SessionTopic`.
-        let resolved = crate::service::instance_resolve::resolved_content(db, &[instance]).await?;
+        let resolved =
+            crate::service::instance_resolve::resolved_content(&pool, &[&instance]).await?;
         let fallback_topic = resolved
             .get(&instance_id.key())
             .map(|content| content.title.as_str())
@@ -215,8 +218,8 @@ pub async fn materialize(
             .and_then(|title| SessionTopic::try_new(title).ok())
             .unwrap_or(SessionTopic::try_new("Ders")?);
 
-        let holidays = crate::service::holiday::blocked_days(db, from, to).await?;
-        let existing = course_session::existing_starts(db, &instance_id).await?;
+        let holidays = crate::service::holiday::blocked_days(&pool, from, to).await?;
+        let existing = course_session::existing_starts(&pool, &instance_id).await?;
 
         let mut rows: Vec<NewSession> = Vec::new();
         let mut blocked: Vec<BlockedDay> = Vec::new();

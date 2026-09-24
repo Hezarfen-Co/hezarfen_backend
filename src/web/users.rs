@@ -964,10 +964,12 @@ struct ProfileResponse {
     /// At most `max_profile_classes` sections — the full list is at
     /// `GET /classes/me`.
     classes: Vec<ProfileClassRef>,
-    /// At most `max_profile_courses` courses, and only the ones the *reader*
-    /// may already read at `GET /courses/{id}` — a stranger sees an empty
-    /// block, the owner and manager+ see it whole. The full list is at
-    /// `GET /courses/me`.
+    /// At most `max_profile_courses` **sections** the person is reached by —
+    /// `GET /instances/me`'s set unioned with their own enrollment rows — each
+    /// with its own resolved title, and only the ones the *reader* may already
+    /// read the catalog course of at `GET /courses/{id}`, so a stranger sees an
+    /// empty block while the owner and manager+ see it whole. The full list is
+    /// at `GET /courses/me`.
     courses: Vec<ProfileCourseRef>,
     /// Every badge this account has earned, oldest first. Ids and stamps only —
     /// the label and the icon are the client's, keyed by id off the `badges`
@@ -1013,13 +1015,32 @@ struct ProfileClassRef {
     grade_level: i16,
 }
 
-/// A course as a profile shows it — a label, nothing more.
+/// A course as a profile shows it — one row per **class section** the person
+/// is reached by, never the catalog row: the 9-A and 12-A sections of one ders
+/// carry their own resolved titles and hours, and the profile lists both. `id`
+/// is the instance id (`GET /instances/{id}`); `kind` is the catalog row's,
+/// which is the same for every section of one course.
 #[derive(Serialize, ToSchema)]
 struct ProfileCourseRef {
+    /// The instance id (`GET /instances/{id}`).
     #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
+    /// The catalog course this section teaches (`GET /courses/{id}`).
+    #[schema(example = "019732e3-7b00-7000-8000-00000000beef")]
+    course: String,
+    /// The class this section belongs to (`GET /classes/{id}`).
+    #[schema(example = "019732e3-7b00-7000-8000-00000000cafe")]
+    class: String,
+    /// The class's own name, e.g. `9-A`.
+    #[schema(example = "9-A")]
+    class_name: String,
+    /// The **resolved** display title of this section: its own override, else
+    /// its offering's, else the catalog course's.
     #[schema(example = "Matematik")]
     title: String,
+    /// The class's rung on the grade ladder (`0` = anaokulu).
+    #[schema(example = 9)]
+    grade_level: i16,
     /// `course`, `study` (supervised study), or `club`.
     #[schema(example = "course")]
     kind: String,
@@ -1054,7 +1075,7 @@ struct ProfileStatsResponse {
     pomodoro_sessions: i64,
     /// Total focused milliseconds across those stints.
     pomodoro_focus_ms: i64,
-    /// Every course behind the `courses` block, not just the embedded window.
+    /// Every section behind the `courses` block, not just the embedded window.
     courses: i64,
     /// Every class behind the `classes` block, not just the embedded window.
     classes: i64,
@@ -1100,11 +1121,15 @@ struct ProfileStatsResponse {
 
 /// Build one profile as `viewer` may see it. The course block is chosen off the
 /// owner's **live** role, not off the `creator`/`teachers` columns: those are
-/// historical and no demotion sweeps them, so a demoted ex-teacher lists what
-/// they are enrolled in, like any other student.
+/// historical and no demotion sweeps them, so a demoted ex-teacher lists the
+/// sections they are reached by, like any other student. It lists one row per
+/// *section* and rides [`crate::web::courses::reached_instances`] — the class
+/// roster / homeroom / taught set `GET /instances/me` serves, unioned with the
+/// owner's own enrollment rows — so a section that is theirs to sit or run is
+/// the only thing that appears.
 ///
-/// A course carries a title, and `GET /courses/{id}` hands that title only to
-/// the enrolled, the staff who run it, and manager+ — so the block is
+/// A section carries a resolved title, and `GET /courses/{id}` hands that title
+/// only to the enrolled, the staff who run it, and manager+ — so the block is
 /// intersected with [`visible_courses`], the same catalog `GET /courses`
 /// serves. Reading your own profile, or reading as manager+, needs no
 /// intersection: both already see the whole list.
@@ -1150,25 +1175,33 @@ async fn profile_of(
                 .collect::<Vec<_>>(),
         ),
     };
+    // The class sections the person is reached by — the same set
+    // `GET /instances/me` serves, each with its own resolved title and hours.
+    // The block is one row per section, and `stats.courses` counts sections.
+    let mut sections = super::courses::reached_sections(&st.db, user).await?;
+    let course_total = sections.len() as i64;
     // The window is cut after the intersection, so a filtered viewer still gets
-    // up to `MAX_PROFILE_COURSES` courses they can actually see.
-    let (mut courses, course_total) = match user.get_role().at_least(Role::Teacher) {
-        // The teacher read is unpaged, so the total is what came back.
-        true => {
-            let courses = crate::service::course::list_for_teacher(&st.db, id).await?;
-            let total = courses.len() as i64;
-            (courses, total)
-        }
-        // Unfiltered readers can take the window from the database.
-        false => {
-            let window = readable.is_none().then_some(MAX_PROFILE_COURSES as i64);
-            crate::service::course::list_enrolled(&st.db, id, window, 0).await?
-        }
-    };
+    // up to `MAX_PROFILE_COURSES` sections they can actually see.
     if let Some(readable) = &readable {
-        courses.retain(|course| readable.contains(course.get_id()));
+        sections.retain(|section| readable.iter().any(|id| id.key() == section.course));
     }
-    courses.truncate(MAX_PROFILE_COURSES);
+    sections.truncate(MAX_PROFILE_COURSES);
+    // The catalog row's `kind` — one read for the window, not one per row.
+    let course_ids: Vec<crate::domain::course::CourseId> = sections
+        .iter()
+        .map(|section| crate::domain::course::CourseId::from_key(&section.course))
+        .collect();
+    let kinds: std::collections::HashMap<String, String> =
+        crate::service::course::list_by_ids(&st.db, &course_ids)
+            .await?
+            .iter()
+            .map(|course| {
+                (
+                    course.get_id().key(),
+                    course.get_kind().as_str().to_string(),
+                )
+            })
+            .collect();
     let (mut members, class_total) = crate::service::class_member::list_for_user(
         &st.db,
         id,
@@ -1211,16 +1244,16 @@ async fn profile_of(
                 grade_level: class.get_grade_level().get(),
             })
             .collect(),
-        courses: courses
+        courses: sections
             .iter()
-            .map(|course| ProfileCourseRef {
-                id: course.get_id().key().to_string(),
-                // Catalog-tier surface, like `GET /courses`: a profile lists
-                // the person's courses by their catalog identity (a person
-                // may sit two sections of one ders), so the catalog title is
-                // the deliberate exception to the instance-resolved display.
-                title: course.get_title().as_str().to_string(),
-                kind: course.get_kind().as_str().to_string(),
+            .map(|section| ProfileCourseRef {
+                id: section.id.clone(),
+                course: section.course.clone(),
+                class: section.class.clone(),
+                class_name: section.class_name.clone(),
+                title: section.title.clone(),
+                grade_level: section.grade_level,
+                kind: kinds.get(&section.course).cloned().unwrap_or_default(),
             })
             .collect(),
         badges: badges
