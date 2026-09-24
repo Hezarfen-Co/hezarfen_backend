@@ -214,7 +214,8 @@ pub async fn materialize(
         // title second (the one display chain every surface rides), the
         // literal `"Ders"` last. The resolved title is bounded by
         // `MAX_COURSE_TITLE_LEN`, so it always fits a `SessionTopic`.
-        let resolved = crate::service::instance_resolve::resolved_content(&pool, &[&instance]).await?;
+        let resolved =
+            crate::service::instance_resolve::resolved_content(&pool, &[&instance]).await?;
         let fallback_topic = resolved
             .get(&instance_id.key())
             .map(|content| content.title.as_str())

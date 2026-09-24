@@ -224,6 +224,29 @@ pub async fn read_for_user(
     Ok(row)
 }
 
+/// Every instance `user` holds an enrollment row on, in one statement for the
+/// whole set — the read behind the surfaces that must list a section a **hand**
+/// enrollment reaches. A hand-placed row (and a class row an operator later
+/// disowned, `source` NULL) is on no class roster, so
+/// [`crate::service::instance::visible_instances`] — keyed on the class — never
+/// sees it; `/courses/me` and the profile course block listed it before the
+/// section split, so they union this in. Ordered by instance id for a stable
+/// answer; a user with no enrollment reads an empty list, and the caller
+/// resolves the ids through [`crate::db::class_course`] (one batch read).
+pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<Enrollment>, AppError> {
+    let rows = sqlx::query_as!(
+        Enrollment,
+        r#"SELECT class_course AS "class_course: ClassCourseId", app_user AS "user: UserId",
+               enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId",
+               created_at AS "created_at: Timestamp"
+           FROM enrollment WHERE app_user = $1 ORDER BY class_course"#,
+        user.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 /// The roster an exam is sat by: every enrollment of every instance the exam
 /// is addressed to (`exam_audience`, D2), deduped by student — the live
 /// monitor's roster read, and the one that makes an announced-to section's

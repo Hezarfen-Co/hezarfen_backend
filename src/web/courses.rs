@@ -7,8 +7,14 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use std::collections::{HashMap, HashSet};
+
+use crate::constant::MAX_COURSE_SECTIONS;
 use crate::database::Database;
+use crate::domain::class_course::{ClassCourse, DersSaati};
+use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
+use crate::domain::course_offering::CourseOfferingId;
 use crate::domain::role::Role;
 use crate::domain::subject::{SubjectDescription, SubjectName};
 use crate::domain::user::{User, UserId};
@@ -17,6 +23,7 @@ use crate::service;
 use crate::service::course::{can_manage_course, can_view_course};
 use crate::state::AppState;
 
+use super::dto::CourseSectionRef;
 use super::{
     CourseResponse, CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SubjectResponse,
     course_people, paginate, person_map, remove_blob,
@@ -150,6 +157,198 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     Ok(courses)
 }
 
+/// The class sections teaching each of `courses`, keyed by course id — the
+/// builder every catalogue row and every `/courses/me` row rides.
+///
+/// Batched end to end: one query per resource for the *whole* page, never one
+/// per row and never one per section — the instance read
+/// ([`crate::db::class_course::list_for_course_ids`]), the teacher links
+/// ([`crate::db::class_course_teacher::into_instances`]), the classes
+/// ([`crate::db::class_group::list_by_ids`]), the offerings behind the resolved
+/// hours ([`crate::db::course_offering::list_by_ids`]), the resolved titles
+/// ([`crate::service::instance_resolve::resolved_content`], itself two queries)
+/// and the teachers' `PersonRef`s ([`person_map`], one query).
+///
+/// `viewer` is the narrowing rule: `Some(user)` for a non-manager keeps only
+/// the sections that caller already reaches — [`reached_instances`], the same
+/// set `GET /instances/me` serves plus their own enrollments — so a section
+/// they cannot reach, and its roster size, teacher and class, never leak here.
+/// `None` (manager+) sees every section. Sections per course are truncated to
+/// [`MAX_COURSE_SECTIONS`]; the course row's own `class_course_count` carries
+/// the untruncated total.
+pub(crate) async fn sections_of(
+    db: &Database,
+    courses: &[Course],
+    viewer: Option<&User>,
+) -> Result<HashMap<String, Vec<CourseSectionRef>>, AppError> {
+    let mut by_course: HashMap<String, Vec<CourseSectionRef>> = HashMap::new();
+    if courses.is_empty() {
+        return Ok(by_course);
+    }
+    let ids: Vec<CourseId> = courses.iter().map(|course| course.get_id().clone()).collect();
+    let mut instances = crate::db::class_course::list_for_course_ids(db, &ids).await?;
+    if let Some(viewer) = viewer {
+        let reachable: HashSet<String> = reached_instances(db, viewer)
+            .await?
+            .into_iter()
+            .map(|instance| instance.get_id().key())
+            .collect();
+        instances.retain(|instance| reachable.contains(&instance.get_id().key()));
+    }
+    let with_teachers = crate::db::class_course_teacher::into_instances(db, instances).await?;
+    for section in section_refs(db, with_teachers).await? {
+        by_course
+            .entry(section.course.clone())
+            .or_default()
+            .push(section);
+    }
+    for sections in by_course.values_mut() {
+        sections.truncate(MAX_COURSE_SECTIONS);
+    }
+    Ok(by_course)
+}
+
+/// The class sections the caller is reached by, one flat list — the shape
+/// `/courses/me` serves (it lists sections, not catalog rows, so there is no
+/// grouping to do). Rides [`reached_instances`] (class roster, homeroom,
+/// taught, or their own enrollment) and [`section_refs`] like [`sections_of`]
+/// does, so the surfaces cannot disagree about a section's resolved title or
+/// hours.
+pub(crate) async fn reached_sections(
+    db: &Database,
+    user: &User,
+) -> Result<Vec<CourseSectionRef>, AppError> {
+    let instances = reached_instances(db, user).await?;
+    let with_teachers = crate::db::class_course_teacher::into_instances(db, instances).await?;
+    section_refs(db, with_teachers).await
+}
+
+/// The instances `user` reaches, as rows: the class-roster / homeroom / taught
+/// set ([`crate::service::instance::visible_instances`]) unioned with the
+/// instances their own **enrollment** rows place them on, de-duplicated by
+/// instance id and kept newest-first.
+///
+/// The second half is not redundant. An enrollment row is the *instance*
+/// roster, and a hand-placed one carries no class membership at all (a class
+/// row an operator later disowned is the same shape), so the class-keyed
+/// visibility set never sees it — yet that section is theirs, and both
+/// `/courses/me` and the profile course block listed it before the section
+/// split. Two reads for the union (the enrollment list plus one batched
+/// instance read of whatever it added), never one per row.
+pub(crate) async fn reached_instances(
+    db: &Database,
+    user: &User,
+) -> Result<Vec<ClassCourse>, AppError> {
+    let mut instances: Vec<ClassCourse> = crate::service::instance::visible_instances(user, db)
+        .await?
+        .into_iter()
+        .map(|(instance, _)| instance)
+        .collect();
+    let known: HashSet<String> = instances
+        .iter()
+        .map(|instance| instance.get_id().key())
+        .collect();
+    let missing: Vec<crate::domain::class_course::ClassCourseId> =
+        crate::db::enrollment::list_for_user(db, user.get_id())
+            .await?
+            .iter()
+            .map(|enrollment| enrollment.get_class_course().clone())
+            .filter(|id| !known.contains(&id.key()))
+            .collect();
+    // `list_by_ids` orders `attached_at DESC, id DESC` — the same order the
+    // class arm of `visible_instances` produces, so the union reads newest-first
+    // end to end.
+    instances.extend(crate::db::class_course::list_by_ids(db, &missing).await?);
+    Ok(instances)
+}
+
+/// Build one [`CourseSectionRef`] per `(instance, teachers)` pair — the shared
+/// tail of [`sections_of`] and [`reached_sections`]: the classes, offerings,
+/// resolved titles and people are read once for the whole batch, then each
+/// section is assembled in memory.
+pub(crate) async fn section_refs(
+    db: &Database,
+    rows: Vec<(ClassCourse, Vec<UserId>)>,
+) -> Result<Vec<CourseSectionRef>, AppError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut class_ids: Vec<ClassGroupId> = Vec::new();
+    let mut offering_ids: Vec<CourseOfferingId> = Vec::new();
+    for (instance, _) in &rows {
+        if !class_ids.contains(instance.get_class()) {
+            class_ids.push(instance.get_class().clone());
+        }
+        if !offering_ids.contains(instance.get_offering()) {
+            offering_ids.push(instance.get_offering().clone());
+        }
+    }
+    let classes = crate::db::class_group::list_by_ids(db, &class_ids).await?;
+    let class_by_key: HashMap<String, &ClassGroup> = classes
+        .iter()
+        .map(|class| (class.get_id().key(), class))
+        .collect();
+    // The resolved weekly hours chain is `resolve_policy`'s — instance
+    // override, else the offering's default, else the floor — but its offering
+    // half is read once for the batch instead of once per section.
+    let offerings = crate::db::course_offering::list_by_ids(db, &offering_ids).await?;
+    let hours_by_offering: HashMap<String, Option<DersSaati>> = offerings
+        .iter()
+        .map(|offering| {
+            (
+                offering.get_id().key(),
+                offering.get_default_ders_saati(),
+            )
+        })
+        .collect();
+    let refs: Vec<&ClassCourse> =
+        rows.iter().map(|(instance, _)| instance).collect();
+    let content = crate::service::instance_resolve::resolved_content(db, &refs).await?;
+    let people = person_map(
+        rows.iter()
+            .flat_map(|(_, teachers)| teachers.iter().cloned()),
+        db,
+    )
+    .await?;
+    let mut sections = Vec::with_capacity(rows.len());
+    for (instance, teachers) in &rows {
+        let key = instance.get_id().key();
+        let resolved = content
+            .get(&key)
+            .expect("resolved_content covers every instance it is given");
+        let class = class_by_key
+            .get(&instance.get_class().key())
+            .expect("every section's class is in the batch read");
+        let ders_saati = instance
+            .get_ders_saati()
+            .or_else(|| {
+                hours_by_offering
+                    .get(&instance.get_offering().key())
+                    .copied()
+                    .flatten()
+            })
+            .unwrap_or_else(|| {
+                DersSaati::try_new(crate::constant::MIN_DERS_SAATI)
+                    .expect("the floor is a valid weekly-hours count")
+            });
+        sections.push(CourseSectionRef {
+            id: key,
+            course: instance.get_course().key(),
+            class: instance.get_class().key(),
+            class_name: class.get_name().as_str().to_string(),
+            title: resolved.title.clone(),
+            grade_level: class.get_grade_level().get(),
+            ders_saati: ders_saati.as_i64(),
+            teachers: teachers
+                .iter()
+                .map(|teacher| PersonRef::resolve(&people, teacher))
+                .collect(),
+            enrollment_count: instance.get_enrollment_count(),
+        });
+    }
+    Ok(sections)
+}
+
 // ---- courses ------------------------------------------------------------
 
 /// Create a catalog course owned by the current user. Requires the `teacher`
@@ -220,14 +419,23 @@ async fn list_courses(
     let window = paginate(&courses, limit, offset);
     // Join creators onto the page alone — the lookup shrinks with the window.
     let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
+    // The sections of every row on the page, batched: one round of queries for
+    // the whole page, never one per row. A non-manager sees only the sections
+    // they already reach (their şubeler, what they teach, their enrollments).
+    let viewer = (!user.get_role().at_least(Role::Manager)).then_some(&user);
+    let mut sections = sections_of(&st.db, window, viewer).await?;
     // Deliberate exception to the instance-resolved display rule: this
-    // surface IS the ders catalog, so it shows each row's own catalog
-    // title/description. The grade templates (`/offerings`) and the
-    // per-class instances (`/instances`) resolve from it — they never edit
-    // it.
+    // surface IS the ders catalog, so each *row* shows its own catalog
+    // title/description — but every row now carries the class sections
+    // teaching it, each with the section's own resolved title and hours (the
+    // grade templates (`/offerings`) and the per-class instances
+    // (`/instances`) resolve from it; they never edit it).
     let items = window
         .iter()
-        .map(|course| CourseResponse::new(course, &people))
+        .map(|course| {
+            let own = sections.remove(&course.get_id().key()).unwrap_or_default();
+            CourseResponse::with_sections(course, &people, own)
+        })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -236,9 +444,12 @@ async fn list_courses(
 /// `?limit=&offset=` (omit `limit` for all of them); returns a
 /// `{items, total, limit, offset}` envelope.
 ///
-/// Both membership tiers are here: a student's enrollments in the instances
-/// their class sections teach, and an individual club/study membership. The
-/// *instances* themselves are `GET /instances/me`.
+/// One row per **class section** the caller is reached by — the resolved
+/// title, hours, class and teachers of that section, with the *instance* id.
+/// The set is `GET /instances/me`'s (class roster, homeroom, taught) unioned
+/// with the caller's own enrollment rows, so a section is listed exactly when
+/// they reach it at all: by their şube, by running it, or by being placed on
+/// its roster by hand.
 #[utoipa::path(
     get,
     path = "/me",
@@ -246,7 +457,7 @@ async fn list_courses(
     security(("session_cookie" = [])),
     params(PageParams),
     responses(
-        (status = 200, description = "A page of the caller's courses (all of them when unpaged)", body = Page<CourseResponse>),
+        (status = 200, description = "A page of the caller's sections (all of them when unpaged)", body = Page<CourseSectionRef>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
@@ -255,38 +466,14 @@ async fn my_courses(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
-) -> Result<Json<Page<CourseResponse>>, AppError> {
+) -> Result<Json<Page<CourseSectionRef>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    // Two sources, one list: the courses reached through the instances the
-    // caller is enrolled in, and the ones they joined individually. Either
-    // read is unpaged — the union is a Rust list, so it is paged here (the
-    // `visible_courses` shape).
-    let mut courses = service::course::list_enrolled(&st.db, user.get_id(), None, 0)
-        .await?
-        .0;
-    let (joined, _) =
-        crate::db::course_membership::list_for_user(&st.db, user.get_id(), None, 0).await?;
-    let known: Vec<CourseId> = courses
-        .iter()
-        .map(|course| course.get_id().clone())
-        .collect();
-    let mut missing: Vec<CourseId> = joined
-        .iter()
-        .map(|membership| membership.get_course().clone())
-        .filter(|id| !known.contains(id))
-        .collect();
-    missing.sort_by_key(|id| std::cmp::Reverse(id.key()));
-    missing.dedup();
-    courses.extend(service::course::list_by_ids(&st.db, &missing).await?);
-    courses.sort_by_key(|course| std::cmp::Reverse(course.get_id().key()));
-    let total = courses.len() as i64;
-    let window = paginate(&courses, limit, offset);
-    let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
-    let items = window
-        .iter()
-        .map(|course| CourseResponse::new(course, &people))
-        .collect();
-    Ok(Json(Page::new(items, total, limit, offset)))
+    // The section set is a live Rust list (the visibility union), so it is
+    // paged here — the `visible_courses` shape.
+    let sections = reached_sections(&st.db, &user).await?;
+    let total = sections.len() as i64;
+    let window = paginate(&sections, limit, offset);
+    Ok(Json(Page::new(window.to_vec(), total, limit, offset)))
 }
 
 /// Fetch a single catalog course by id. Visible to the people it reaches —
@@ -320,7 +507,12 @@ async fn get_course(
         ));
     }
     let people = person_map(course_people(&course), &st.db).await?;
-    Ok(Json(CourseResponse::new(&course, &people)))
+    let viewer = (!user.get_role().at_least(Role::Manager)).then_some(&user);
+    let mut sections = sections_of(&st.db, std::slice::from_ref(&course), viewer).await?;
+    let own = sections
+        .remove(&course.get_id().key())
+        .unwrap_or_default();
+    Ok(Json(CourseResponse::with_sections(&course, &people, own)))
 }
 
 /// Update a catalog course. Requires teacher+ and catalog rights — its
