@@ -22,7 +22,7 @@ use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -1080,19 +1080,59 @@ async fn create_session_in_instance(
     ))
 }
 
+/// The optional `?starts_after=&starts_before=` window on the session list:
+/// half-open on `starts_at`, both bounds unix milliseconds. A negative value
+/// is a `400` naming the field.
+#[derive(Debug, Deserialize, IntoParams)]
+struct SessionWindow {
+    /// Keep sessions starting at or after this unix-millisecond instant
+    /// (inclusive).
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    #[serde(default)]
+    starts_after: Option<i64>,
+    /// Keep sessions starting strictly before this unix-millisecond instant,
+    /// so `[month_start, next_month_start)` names a month exactly.
+    #[param(minimum = 0, example = 1_760_259_599_999_i64)]
+    #[serde(default)]
+    starts_before: Option<i64>,
+}
+
+impl SessionWindow {
+    fn validate(&self) -> Result<(), AppError> {
+        for (field, value) in [
+            ("starts_after", self.starts_after),
+            ("starts_before", self.starts_before),
+        ] {
+            if value.is_some_and(|value| value < 0) {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field,
+                    reason: "must not be negative",
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// List one instance's lesson sessions, most recent first, paged via
 /// `?limit=&offset=` (omit `limit` for all of them). Visible to the instance's
 /// enrolled students, its teachers, and managers/admins. Returns a
 /// `{items, total, limit, offset}` envelope.
+///
+/// The optional `?starts_after=&starts_before=` window (unix milliseconds)
+/// narrows the list to the half-open `[starts_after, starts_before)` on
+/// `starts_at` — a calendar month is `[month_start, next_month_start)`. The
+/// window rides the same SQL `WHERE` as the page and the count; the order is
+/// unchanged. Absent, the response is the unfiltered list.
 #[utoipa::path(
     get,
     path = "/{id}/sessions",
     tag = "instances",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Instance id"), PageParams),
+    params(("id" = String, Path, description = "Instance id"), SessionWindow, PageParams),
     responses(
         (status = 200, description = "A page of the instance's sessions (all of them when unpaged)", body = Page<SessionResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid window, limit, or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not enrolled, not this instance's teacher, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Instance not found", body = ErrorResponse),
@@ -1102,9 +1142,11 @@ async fn list_instance_sessions(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
+    Query(window): Query<SessionWindow>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<SessionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
+    window.validate()?;
     // The instance must exist — a missing one is a 404, not an empty list.
     let instance = instance_or_404(&ClassCourseId::from_key(&id), &st.db).await?;
     if !can_view_instance(&st.db, instance.get_id(), &user).await? {
@@ -1112,9 +1154,15 @@ async fn list_instance_sessions(
             "only this instance's enrolled students, its teachers, its class's homeroom teacher, or a manager/admin can view its sessions",
         ));
     }
-    let (rows, total) =
-        service::course_session::list_for_class_course(&st.db, instance.get_id(), limit, offset)
-            .await?;
+    let (rows, total) = service::course_session::list_windowed(
+        &st.db,
+        instance.get_id(),
+        window.starts_after,
+        window.starts_before,
+        limit,
+        offset,
+    )
+    .await?;
     // Join teachers onto the page alone — the lookup shrinks with the window.
     let people = person_map(rows.iter().map(|s| *s.get_teacher()), &st.db).await?;
     let items = rows
@@ -1128,6 +1176,44 @@ async fn list_instance_sessions(
 mod tests {
     use super::*;
     use crate::domain::class_group::ClassGroupId;
+
+    /// A negative window bound is a `400` naming the field, whichever bound
+    /// it is; both absent validates clean.
+    #[test]
+    fn a_negative_session_window_bound_is_refused_naming_the_field() {
+        let clean = SessionWindow {
+            starts_after: None,
+            starts_before: None,
+        };
+        assert!(clean.validate().is_ok());
+
+        for (field, window) in [
+            (
+                "starts_after",
+                SessionWindow {
+                    starts_after: Some(-1),
+                    starts_before: None,
+                },
+            ),
+            (
+                "starts_before",
+                SessionWindow {
+                    starts_after: None,
+                    starts_before: Some(-1),
+                },
+            ),
+        ] {
+            let AppError::Validation(ValidationError::Invalid {
+                field: named,
+                reason,
+            }) = window.validate().unwrap_err()
+            else {
+                panic!("expected a validation error for {field}");
+            };
+            assert_eq!(named, field);
+            assert_eq!(reason, "must not be negative");
+        }
+    }
 
     /// The read path behind `GET /instances/me` is `class_member` → the sections
     /// → their instances. A student enrolled by a section sees exactly that

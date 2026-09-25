@@ -6,6 +6,7 @@
 
 use crate::constant::{STATUS_APPROVED, STATUS_PENDING};
 use crate::database::{Database, tx_with_retry};
+use crate::db::page::{PagedList, Param};
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::{
     PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
@@ -51,40 +52,50 @@ pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuest
     Ok(row)
 }
 
-/// Every question, newest first — the teacher+ view (approval queue and
-/// pool in one list).
-pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
-    let rows = sqlx::query_as!(
-        PoolQuestion,
-        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
-               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
-               status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId"
-           FROM pool_question ORDER BY asked_at DESC, id DESC"#,
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(rows)
-}
-
-/// The pool as a non-staff user sees it, newest first: every approved
-/// question, plus the caller's own pending ones.
-pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQuestion>, AppError> {
-    let rows = sqlx::query_as!(
-        PoolQuestion,
-        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
-               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
-               status, asked_at AS "asked_at: Timestamp",
-               approved_by AS "approved_by: UserId"
-           FROM pool_question
-           WHERE status = $1 OR asker = $2
-           ORDER BY asked_at DESC, id DESC"#,
-        STATUS_APPROVED,
-        user.uuid()
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(rows)
+/// One page of the question list, newest first — plus the `total` count of
+/// every row under the *same* filters, so a client can page past the window.
+///
+/// `viewer` is the security gate, and it is a WHERE clause, never a
+/// post-filter: `None` (teacher+ only) sees every row — the approval queue
+/// and the pool together; `Some(me)` sees every `approved` question plus
+/// their own pending ones. `status` is the caller's filter, ANDed on top of
+/// that gate so it can only ever narrow: `pending` for a student is exactly
+/// their own unapproved questions, `approved` the pool, and for teacher+
+/// `pending` is the approval queue. Gate and filter share one statement pair
+/// ([`PagedList`]: the shape is runtime-conditional, that builder's named
+/// exemption from the compile-time macros), so a `pending` request never
+/// loads the approved pool into a `Vec` first and `total` can never disagree
+/// with what paging through the list actually yields.
+pub async fn list(
+    db: &Database,
+    viewer: Option<&UserId>,
+    status: Option<&str>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<PoolQuestion>, i64), AppError> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Param> = Vec::new();
+    if let Some(viewer) = viewer {
+        binds.push(Param::Text(STATUS_APPROVED.to_string()));
+        let pool_arm = format!("status = ${}", binds.len());
+        binds.push(Param::Uuid(viewer.uuid()));
+        let own_arm = format!("asker = ${}", binds.len());
+        clauses.push(format!("({pool_arm} OR {own_arm})"));
+    }
+    if let Some(status) = status {
+        binds.push(Param::Text(status.to_string()));
+        clauses.push(format!("status = ${}", binds.len()));
+    }
+    let from_where = if clauses.is_empty() {
+        "pool_question WHERE true".to_string()
+    } else {
+        format!("pool_question WHERE {}", clauses.join(" AND "))
+    };
+    let mut page = PagedList::new(from_where, "ORDER BY asked_at DESC, id DESC");
+    for bind in binds {
+        page = page.bind(bind);
+    }
+    page.run(limit, offset, db).await
 }
 
 /// Publish a pending question into the pool, stamping who approved it.
@@ -483,13 +494,63 @@ mod tests {
             .unwrap();
 
         // The asker sees their own pending question plus the pool; a stranger
-        // sees only the pool; the teacher view (list_all) sees everything.
-        assert_eq!(list_visible_to(&db, &asker).await.unwrap().len(), 2);
-        let stranger_view = list_visible_to(&db, &other).await.unwrap();
+        // sees only the pool; the teacher view (viewer = None) sees everything.
+        let (asker_view, total) = list(&db, Some(&asker), None, None, 0).await.unwrap();
+        assert_eq!(asker_view.len(), 2);
+        assert_eq!(total, 2);
+        let (stranger_view, total) = list(&db, Some(&other), None, None, 0).await.unwrap();
         assert_eq!(stranger_view.len(), 1);
+        assert_eq!(total, 1);
         assert_eq!(stranger_view[0].get_id(), published.get_id());
-        assert_eq!(list_all(&db).await.unwrap().len(), 2);
+        let (everything, total) = list(&db, None, None, None, 0).await.unwrap();
+        assert_eq!(everything.len(), 2);
+        assert_eq!(total, 2);
         assert!(read(&db, pending.get_id()).await.unwrap().is_some());
+    }
+
+    /// The status filter rides the same WHERE as the visibility gate: a
+    /// student's `pending` page is exactly their own unapproved questions —
+    /// another student's pending one exists but is not in it — and `total`
+    /// is the filtered count. Teacher+ `pending` is the whole approval
+    /// queue, and the window applies after the filter.
+    #[tokio::test]
+    async fn status_filter_narrows_within_the_visibility_gate() {
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let other = a_user(&db).await;
+        let teacher = a_user(&db).await;
+
+        let mine_pending = insert(&db, question(&asker)).await.unwrap();
+        let theirs_pending = insert(&db, question(&other)).await.unwrap();
+        let mine_pool = insert(&db, question(&asker)).await.unwrap();
+        approve(&db, mine_pool.get_id(), &teacher).await.unwrap().unwrap();
+        let theirs_pool = insert(&db, question(&other)).await.unwrap();
+        approve(&db, theirs_pool.get_id(), &teacher).await.unwrap().unwrap();
+
+        // Student, pending: their own queue only.
+        let (items, total) =
+            list(&db, Some(&asker), Some(STATUS_PENDING), None, 0).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 1);
+        assert_eq!(items[0].get_id(), mine_pending.get_id());
+        assert_ne!(items[0].get_id(), theirs_pending.get_id());
+
+        // Student, approved: the pool (their gate already was pool + own).
+        let (items, total) =
+            list(&db, Some(&asker), Some(STATUS_APPROVED), None, 0).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(total, 2);
+
+        // Teacher+, pending: the full approval queue, whoever asked.
+        let (items, total) = list(&db, None, Some(STATUS_PENDING), None, 0).await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(total, 2);
+
+        // A paged pending request counts the filtered set, not the page.
+        let (items, total) =
+            list(&db, None, Some(STATUS_PENDING), Some(1), 0).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 2);
     }
 
     #[tokio::test]

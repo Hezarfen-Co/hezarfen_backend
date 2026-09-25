@@ -172,14 +172,29 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
     Ok(user)
 }
 
+/// Every account, newest first — the web layer's paging read — or, when
+/// `roles` is `Some`, only the rows whose role is in the set (the admin
+/// directory's tabs; `manager,admin` is one OR, not an AND). The narrowing
+/// is the `WHERE` itself, so [`PagedList`] counts the filtered set and a
+/// later page stays inside it: page and `total` share this one predicate.
 pub async fn list_all(
     db: &Database,
+    roles: Option<&[Role]>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<User>, i64), AppError> {
-    PagedList::new("app_user", "ORDER BY id DESC")
-        .run(limit, offset, db)
-        .await
+    let list = match roles {
+        None => PagedList::new("app_user", "ORDER BY id DESC"),
+        Some(roles) => PagedList::new("app_user WHERE role = ANY($1)", "ORDER BY id DESC").bind(
+            Param::Texts(
+                roles
+                    .iter()
+                    .map(|role| role.as_str().to_string())
+                    .collect(),
+            ),
+        ),
+    };
+    list.run(limit, offset, db).await
 }
 
 /// Fetch the users behind `ids` in one query. Ids with no row are simply
@@ -1247,5 +1262,72 @@ mod tests {
                 .is_none(),
             "a missing row is None, not an error"
         );
+    }
+
+    /// The admin directory's role tabs: `roles` is the query's `WHERE`, so
+    /// the page and the `total` share one filtered predicate — a window
+    /// never leaks another role, and `total` counts the filtered set, not
+    /// the roster.
+    #[tokio::test]
+    async fn the_roles_filter_is_one_where_across_page_and_total() {
+        let (db, _leases) = init_test_db().await;
+        let admin = a_user("tabor-admin", &db).await;
+        crate::service::user::set_role(&db, admin.get_id(), Role::Admin)
+            .await
+            .unwrap();
+        let manager = a_user("tabor-mgr", &db).await;
+        crate::service::user::set_role(&db, manager.get_id(), Role::Manager)
+            .await
+            .unwrap();
+        let _student1 = a_user("tabor-s1", &db).await;
+        let _student2 = a_user("tabor-s2", &db).await;
+
+        // Matched: only the staff pair, `total` = the filtered count.
+        let (staff, total) =
+            list_all(&db, Some(&[Role::Manager, Role::Admin]), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 2, "total counts the filtered set, not the roster");
+        assert!(
+            staff
+                .iter()
+                .all(|user| matches!(user.get_role(), Role::Manager | Role::Admin)),
+            "no student may ride a staff tab"
+        );
+
+        // Unmatched: a well-formed set naming nobody is an empty page, not
+        // an error.
+        let (none, total) = list_all(&db, Some(&[Role::Parent]), None, 0)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        assert_eq!(total, 0);
+
+        // Absent: the whole roster, exactly the unfiltered read.
+        let (all, total) = list_all(&db, None, None, 0).await.unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(all.len(), 4);
+
+        // The window applies AFTER the filter: a page of 1 inside the staff
+        // set still counts 2, and walking the windows collects exactly the
+        // staff pair — never a student.
+        let (page1, total) =
+            list_all(&db, Some(&[Role::Manager, Role::Admin]), Some(1), 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page1.len(), 1);
+        let (page2, _) =
+            list_all(&db, Some(&[Role::Manager, Role::Admin]), Some(1), 1)
+                .await
+                .unwrap();
+        assert_eq!(page2.len(), 1);
+        let mut both: Vec<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|user| user.get_role())
+            .collect();
+        both.sort();
+        assert_eq!(both, vec![Role::Manager, Role::Admin]);
     }
 }

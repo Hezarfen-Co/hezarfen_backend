@@ -23,12 +23,17 @@ use serde_json::json;
 
 /// Publish a menu for `date`, uncapped unless told otherwise.
 async fn publish(app: &axum::Router, mgr: &str, date: &str) -> String {
+    publish_slot(app, mgr, date, "lunch").await
+}
+
+/// Publish a menu for `date` under an explicit slot name.
+async fn publish_slot(app: &axum::Router, mgr: &str, date: &str, slot: &str) -> String {
     let res = send(
         app,
         "POST",
         "/meals/menus",
         Some(mgr),
-        Some(json!({ "date": date, "slot": "lunch" })),
+        Some(json!({ "date": date, "slot": slot })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -1411,4 +1416,155 @@ async fn an_over_ceiling_seat_from_an_older_build_is_still_cancellable() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// `?slot=` on `GET /meals/menus` filters in SQL — the page *and* the count
+/// off one WHERE — so `total` is the filtered count and `limit`/`offset`
+/// window inside the filtered set, not the unfiltered one. The match is the
+/// slot text each menu snapshotted at publish: no menu carries it, the page
+/// is empty at `200`; an empty value is a `400` naming the field.
+#[tokio::test]
+async fn the_menu_list_slot_filter_narrows_rows_and_total_together() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "mslot_admin", "admin").await;
+    let mgr = login_as(&app, &db, "mslot_mgr", "manager").await;
+    // Two slots, so a filter has something to exclude.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "meal_slots": [{ "name": "lunch" }, { "name": "dinner" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    for (date, slot) in [
+        ("2099-03-01", "lunch"),
+        ("2099-03-02", "dinner"),
+        ("2099-03-03", "lunch"),
+        ("2099-03-04", "dinner"),
+    ] {
+        publish_slot(&app, &mgr, date, slot).await;
+    }
+
+    // Absent: every menu, exactly as before the filter existed.
+    let res = send(&app, "GET", "/meals/menus", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(4), "{}", res.body);
+
+    // Matched: only that slot's menus, and `total` is the filtered count —
+    // neither the page size nor the unfiltered total.
+    let res = send(&app, "GET", "/meals/menus?slot=dinner", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let items = res.body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{}", res.body);
+    assert!(items.iter().all(|m| m["slot"] == "dinner"), "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(2), "{}", res.body);
+
+    // The window applies *after* the filter: one dinner per page, two pages,
+    // and `total` stays the filtered count on both.
+    let res = send(
+        &app,
+        "GET",
+        "/meals/menus?slot=dinner&limit=1&offset=1",
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let items = res.body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{}", res.body);
+    // Newest day first within the filtered set.
+    assert_eq!(items[0]["date"], "2099-03-02", "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(2), "{}", res.body);
+
+    // Composes with the date range: the lunch menus inside it only.
+    let res = send(
+        &app,
+        "GET",
+        "/meals/menus?slot=lunch&from=2099-03-02&to=2099-03-04",
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(1), "{}", res.body);
+    assert_eq!(res.body["items"][0]["date"], "2099-03-03", "{}", res.body);
+
+    // The value is trimmed before matching.
+    let res = send(&app, "GET", "/meals/menus?slot=%20dinner%20", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(2), "{}", res.body);
+
+    // A well-formed name no menu carries: an empty page at `200`, not a 404.
+    let res = send(&app, "GET", "/meals/menus?slot=brunch", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body["items"].as_array().unwrap().len(),
+        0,
+        "{}",
+        res.body
+    );
+    assert_eq!(res.body["total"].as_i64(), Some(0), "{}", res.body);
+
+    // Empty: refused, naming the field.
+    let res = send(&app, "GET", "/meals/menus?slot=", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(
+        res.body["error"].as_str().unwrap().contains("slot"),
+        "the refusal must name the field: {}",
+        res.body
+    );
+}
+
+/// The slot filter must *not* validate against the school's current
+/// `meal_slots`: a menu snapshots its slot's name at publish, so a slot
+/// retired since still has to find the menus published under it. The write
+/// path itself refuses to drop a slot that has menus (`409`), so a retired
+/// slot with menus exists only where a settings row written before that rule
+/// left one behind — the state this test writes by hand, like its
+/// `a_slot_whose_name_would_break_the_menu_url` sibling does.
+#[tokio::test]
+async fn a_retired_slot_still_finds_the_menus_published_under_it() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "ret_adm", "admin").await;
+    let mgr = login_as(&app, &db, "ret_mgr", "manager").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "meal_slots": [{ "name": "brunch" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    publish_slot(&app, &mgr, "2099-04-01", "brunch").await;
+
+    // The live route refuses the retirement — that guard is what makes the
+    // retired-but-published state reachable only through older rows.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "meal_slots": [{ "name": "lunch" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // …so the retirement lands the way history actually left one: a settings
+    // row written before the guard existed.
+    sqlx::query("UPDATE settings SET meal_slots = $1 WHERE id = 'school'")
+        .bind(sqlx::types::Json(json!([
+            { "name": "lunch", "serving_minute": null }
+        ])))
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let res = send(&app, "GET", "/meals/menus?slot=brunch", Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"].as_i64(), Some(1), "{}", res.body);
+    assert_eq!(res.body["items"][0]["slot"], "brunch", "{}", res.body);
 }

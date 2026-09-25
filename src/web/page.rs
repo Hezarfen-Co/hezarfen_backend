@@ -64,33 +64,47 @@ pub trait Scheduled {
     fn order_key(&self) -> String;
 }
 
-/// The optional `?starts_after=&ends_after=` schedule window on a list of
-/// scheduled rows. Both are unix milliseconds and independent (AND-ed when
-/// both are given). Omit both and the list is untouched — same order, same
-/// total as an unfiltered call.
+/// The optional `?starts_after=&ends_after=&starts_before=&ends_before=`
+/// schedule window on a list of scheduled rows. All four are unix milliseconds
+/// and independent (AND-ed when several are given). Omit all four and the list
+/// is untouched — same order, same total as an unfiltered call.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct WindowParams {
     /// Keep only rows starting strictly after this unix-millisecond instant.
     /// Rows without a `starts_at` are dropped.
     #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    #[serde(default)]
     pub starts_after: Option<i64>,
     /// Keep only rows whose window has not finished by this unix-millisecond
     /// instant: `ends_at > value`, falling back to `starts_at > value` when
     /// `ends_at` is null. Rows with no schedule at all are dropped.
     #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    #[serde(default)]
     pub ends_after: Option<i64>,
+    /// Keep only rows starting strictly before this unix-millisecond instant.
+    /// Rows without a `starts_at` are dropped.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    #[serde(default)]
+    pub starts_before: Option<i64>,
+    /// Keep only rows whose window has already finished by this
+    /// unix-millisecond instant: `ends_at < value`, falling back to
+    /// `starts_at < value` when `ends_at` is null. Rows with no schedule at
+    /// all are dropped.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    #[serde(default)]
+    pub ends_before: Option<i64>,
 }
 
 impl WindowParams {
-    /// Apply the window to an already-visibility-filtered list. With neither
-    /// parameter the list is returned untouched; with either, schedule-less
-    /// rows are dropped and the survivors are sorted ascending by `starts_at`
-    /// (falling back to `ends_at`), ties broken by id. A negative value is a
-    /// `400` naming the field.
-    pub fn apply<T: Scheduled>(&self, mut items: Vec<T>) -> Result<Vec<T>, AppError> {
+    /// The `400` half of the window: a negative bound is refused naming its
+    /// field. Endpoints that push the window into SQL call this before the
+    /// read; [`Self::apply`] calls it before filtering.
+    pub fn validate(&self) -> Result<(), AppError> {
         for (field, value) in [
             ("starts_after", self.starts_after),
             ("ends_after", self.ends_after),
+            ("starts_before", self.starts_before),
+            ("ends_before", self.ends_before),
         ] {
             if value.is_some_and(|value| value < 0) {
                 return Err(AppError::Validation(ValidationError::Invalid {
@@ -99,16 +113,40 @@ impl WindowParams {
                 }));
             }
         }
-        if self.starts_after.is_none() && self.ends_after.is_none() {
+        Ok(())
+    }
+
+    /// Apply the window to an already-visibility-filtered list. With no
+    /// parameter the list is returned untouched; with any, schedule-less
+    /// rows are dropped and the survivors are sorted ascending by `starts_at`
+    /// (falling back to `ends_at`), ties broken by id. A negative value is a
+    /// `400` naming the field.
+    pub fn apply<T: Scheduled>(&self, mut items: Vec<T>) -> Result<Vec<T>, AppError> {
+        self.validate()?;
+        if self.starts_after.is_none()
+            && self.ends_after.is_none()
+            && self.starts_before.is_none()
+            && self.ends_before.is_none()
+        {
             return Ok(items);
         }
         items.retain(|item| {
             let starts = item.starts_at_ms();
             let ends = item.ends_at_ms();
+            // The `*_after` bounds drop a `None` on their own (`None > Some`
+            // is false), but `None < Some(_)` is *true* — `Option` orders
+            // `None` first — so the `*_before` bounds must refuse a missing
+            // end explicitly, the way SQL's `NULL < x` does.
             self.starts_after.is_none_or(|after| starts > Some(after))
+                && self
+                    .starts_before
+                    .is_none_or(|before| starts.is_some_and(|start| start < before))
                 && self
                     .ends_after
                     .is_none_or(|after| ends.or(starts) > Some(after))
+                && self
+                    .ends_before
+                    .is_none_or(|before| ends.or(starts).is_some_and(|end| end < before))
         });
         // Every survivor has at least one end, so the fallback never yields
         // `None` — but sort defensively rather than unwrapping.
@@ -222,17 +260,24 @@ mod tests {
             .collect()
     }
 
-    fn window(starts_after: Option<i64>, ends_after: Option<i64>) -> WindowParams {
+    fn window(
+        starts_after: Option<i64>,
+        ends_after: Option<i64>,
+        starts_before: Option<i64>,
+        ends_before: Option<i64>,
+    ) -> WindowParams {
         WindowParams {
             starts_after,
             ends_after,
+            starts_before,
+            ends_before,
         }
     }
 
     #[test]
     fn window_absent_leaves_the_list_untouched() {
         assert_eq!(
-            keys(window(None, None)),
+            keys(window(None, None, None, None)),
             ["none", "running", "later", "ending", "tie"]
         );
     }
@@ -243,26 +288,60 @@ mod tests {
         // starts_at fallback), `none` has neither and always drops. Ascending
         // by starts_at ?? ends_at, ties broken by key.
         assert_eq!(
-            keys(window(None, Some(15))),
+            keys(window(None, Some(15), None, None)),
             ["running", "ending", "later", "tie"]
         );
         // At 25, `ending` (ends 20) is over; `running` (ends 40) is not.
-        assert_eq!(keys(window(None, Some(25))), ["running", "later", "tie"]);
+        assert_eq!(
+            keys(window(None, Some(25), None, None)),
+            ["running", "later", "tie"]
+        );
     }
 
     #[test]
     fn starts_after_excludes_started_and_start_less_rows() {
-        assert_eq!(keys(window(Some(25), None)), ["later", "tie"]);
+        assert_eq!(keys(window(Some(25), None, None, None)), ["later", "tie"]);
         // AND-ed with ends_after: `tie` ends at 50, while `later` has no end
         // and its starts_at fallback (30) is already behind 45.
-        assert_eq!(keys(window(Some(25), Some(45))), ["tie"]);
-        assert!(keys(window(Some(60), None)).is_empty());
+        assert_eq!(
+            keys(window(Some(25), Some(45), None, None)),
+            ["tie"]
+        );
+        assert!(keys(window(Some(60), None, None, None)).is_empty());
+    }
+
+    #[test]
+    fn starts_before_excludes_not_yet_started_and_start_less_rows() {
+        // Strictly before: a row starting exactly at the instant is out.
+        assert_eq!(keys(window(None, None, Some(30), None)), ["running"]);
+        // AND-ed with ends_after: `running` (ends 40) survives 35; `tie`
+        // starts exactly at 30 and a `starts_before` is strict.
+        assert_eq!(keys(window(None, Some(35), Some(30), None)), ["running"]);
+    }
+
+    #[test]
+    fn ends_before_keeps_only_finished_rows_dropping_the_unscheduled() {
+        // At 45: `ending` (ends 20) is over, `later` on its starts_at
+        // fallback (30) is over, `running` (ends 40) is over; `tie` (ends 50)
+        // is not; `none` has no schedule and always drops.
+        assert_eq!(keys(window(None, None, None, Some(45))), ["running", "ending", "later"]);
+        // Exactly at the end is not before it.
+        assert_eq!(keys(window(None, None, None, Some(40))), ["ending", "later"]);
     }
 
     #[test]
     fn window_rejects_negative_values() {
-        assert!(window(Some(-1), None).apply(rows()).is_err());
-        assert!(window(None, Some(-1)).apply(rows()).is_err());
+        assert!(window(Some(-1), None, None, None).apply(rows()).is_err());
+        assert!(window(None, Some(-1), None, None).apply(rows()).is_err());
+        assert!(window(None, None, Some(-1), None).apply(rows()).is_err());
+        assert!(window(None, None, None, Some(-1)).apply(rows()).is_err());
+        // The shared validate reports the field it refuses.
+        let Err(AppError::Validation(ValidationError::Invalid { field, .. })) =
+            window(None, None, Some(-1), None).apply(rows())
+        else {
+            panic!("expected a validation error");
+        };
+        assert_eq!(field, "starts_before");
     }
 
     #[test]

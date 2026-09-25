@@ -28,7 +28,7 @@ pub struct ExamId(uuid::Uuid);
 impl ExamId {
     /// Minted from the process-wide monotonic generator, not a plain random
     /// UUID: exams list `id DESC` (newest first,
-    /// [`crate::db::exam::list_all`]),
+    /// [`crate::db::exam::list_windowed`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
         Self(next_uuid())

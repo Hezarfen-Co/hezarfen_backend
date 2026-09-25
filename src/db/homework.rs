@@ -13,6 +13,8 @@ use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use sqlx::PgConnection;
 
+use crate::db::page::{PagedList, Param};
+
 /// The answer a link to a subject that is not there gets, on create and on
 /// re-tag alike — the conditional claim on the subject row matches nothing,
 /// and the caller says exactly what the web layer's pre-flight lookup would
@@ -199,56 +201,113 @@ pub async fn list_for_class_course(
     .await?)
 }
 
+/// The homework table as `SELECT *` cannot read it: the assigned-student
+/// roster is not a column but the `homework_assignment` junction, aggregated
+/// per row. Every runtime ([`PagedList`]) read of homework selects through
+/// this derived table, so its rows decode exactly like the `query_as!` reads
+/// beside them; the alias names the row set the outer WHERE filters.
+const HOMEWORK_WITH_ASSIGNED: &str = "(SELECT h.*, \
+       (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a \
+        WHERE a.homework = h.id) AS assigned \
+       FROM homework h) AS homework";
+
 /// Every homework in the system, newest first — the manager+ view of the
-/// cross-course "my homework" list.
-pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
-    Ok(sqlx::query_as!(
-        Homework,
-        r#"SELECT id AS "id: HomeworkId",
-                  class_course AS "class_course: ClassCourseId",
-                  subject AS "subject: SubjectId",
-                  title AS "title: HomeworkTitle",
-                  description AS "description: HomeworkDescription",
-                  due_at AS "due_at: Timestamp",
-                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
-                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
-                  created_by AS "created_by: UserId",
-                  created_at AS "created_at: Timestamp"
-           FROM homework ORDER BY id DESC"#,
-    )
-    .fetch_all(db)
-    .await?)
+/// cross-course "my homework" list, narrowed by the optional due window and
+/// instance scope before anything leaves the database, so a manager asking
+/// for open homework never loads the school's whole history. Paged in SQL:
+/// a manager retains nothing in Rust, so the window and the count are the
+/// database's to do.
+pub async fn list_all(
+    db: &Database,
+    due_after: Option<i64>,
+    due_before: Option<i64>,
+    class_course: Option<&ClassCourseId>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Homework>, i64), AppError> {
+    let mut from_where = HOMEWORK_WITH_ASSIGNED.to_string();
+    let mut next = 1;
+    let mut conds: Vec<String> = Vec::new();
+    if due_after.is_some() {
+        conds.push(format!("due_at >= ${next}"));
+        next += 1;
+    }
+    if due_before.is_some() {
+        conds.push(format!("due_at < ${next}"));
+        next += 1;
+    }
+    if class_course.is_some() {
+        conds.push(format!("class_course = ${next}"));
+    }
+    if !conds.is_empty() {
+        from_where.push_str(" WHERE ");
+        from_where.push_str(&conds.join(" AND "));
+    }
+    let mut list = PagedList::new(from_where, "ORDER BY id DESC");
+    if let Some(after) = due_after {
+        list = list.bind(after);
+    }
+    if let Some(before) = due_before {
+        list = list.bind(before);
+    }
+    if let Some(course) = class_course {
+        list = list.bind(course.uuid());
+    }
+    list.run::<Homework>(limit, offset, db).await
 }
 
 /// Every homework of every instance in `instances`, newest first (one
-/// query) — the cross-instance list over a caller's visible courses. The web
-/// layer still trims each instance's rows to what the caller may see (a
-/// student to the ones they `student_sees`).
+/// query) — the cross-instance list over a caller's visible courses, with
+/// the same optional due-window and instance narrowing as the manager view.
+/// Unbounded by design: the web layer still trims each instance's rows to
+/// what the caller may see (a student to the ones they `student_sees`), and
+/// a window here could only hide rows that trim was about to keep.
 pub async fn list_for_class_courses(
     db: &Database,
     instances: &[ClassCourseId],
+    due_after: Option<i64>,
+    due_before: Option<i64>,
+    class_course: Option<&ClassCourseId>,
 ) -> Result<Vec<Homework>, AppError> {
     if instances.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<uuid::Uuid> = instances.iter().map(ClassCourseId::uuid).collect();
-    Ok(sqlx::query_as!(
-        Homework,
-        r#"SELECT id AS "id: HomeworkId",
-                  class_course AS "class_course: ClassCourseId",
-                  subject AS "subject: SubjectId",
-                  title AS "title: HomeworkTitle",
-                  description AS "description: HomeworkDescription",
-                  due_at AS "due_at: Timestamp",
-                  (SELECT array_agg(a.student ORDER BY a.student) FROM homework_assignment a
-                    WHERE a.homework = homework.id) AS "assigned: Vec<UserId>",
-                  created_by AS "created_by: UserId",
-                  created_at AS "created_at: Timestamp"
-           FROM homework WHERE class_course = ANY($1) ORDER BY id DESC"#,
-        &ids
-    )
-    .fetch_all(db)
-    .await?)
+    // The instance set rides as TEXT: `Param` (the closed bind enum of
+    // db::page) has no uuid-array arm, and `uuid::text` is the canonical
+    // lowercase spelling both sides of the comparison agree on.
+    let scope: Vec<String> = instances.iter().map(|id| id.uuid().to_string()).collect();
+    let mut conds: Vec<String> = vec![String::from("class_course::text = ANY($1)")];
+    let mut next = 2;
+    if due_after.is_some() {
+        conds.push(format!("due_at >= ${next}"));
+        next += 1;
+    }
+    if due_before.is_some() {
+        conds.push(format!("due_at < ${next}"));
+        next += 1;
+    }
+    if class_course.is_some() {
+        conds.push(format!("class_course = ${next}"));
+    }
+    let from_where = format!(
+        "{} WHERE {}",
+        HOMEWORK_WITH_ASSIGNED,
+        conds.join(" AND ")
+    );
+    let mut list = PagedList::new(from_where, "ORDER BY id DESC").bind(Param::Texts(scope));
+    if let Some(after) = due_after {
+        list = list.bind(after);
+    }
+    if let Some(before) = due_before {
+        list = list.bind(before);
+    }
+    if let Some(course) = class_course {
+        list = list.bind(course.uuid());
+    }
+    // No window: the rows in hand are the whole filtered read, which the
+    // caller retains and pages in the web layer.
+    let (rows, _) = list.run::<Homework>(None, 0, db).await?;
+    Ok(rows)
 }
 
 /// The homework of one instance that `user` is meant to see — whole-class
@@ -931,5 +990,161 @@ mod tests {
             1,
             "whole-instance reaches the never-named student"
         );
+    }
+
+    /// A real teacher row — `created_by` is a foreign key.
+    async fn a_teacher(db: &Database) -> UserId {
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("homework-filter-{}", &teacher.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        teacher
+    }
+
+    /// One homework with a chosen due instant on `instance`.
+    async fn homework_due(
+        db: &Database,
+        instance: &ClassCourseId,
+        subject: &SubjectId,
+        due_at: i64,
+        title: &str,
+    ) -> Homework {
+        create(
+            db,
+            instance,
+            subject,
+            HomeworkTitle::try_new(title).unwrap(),
+            None,
+            Timestamp::from_millis(due_at),
+            None,
+            &a_teacher(db).await,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The SQL predicates the cross-instance lists gained: the due window and
+    /// the instance scope both run in the WHERE, and (for the manager path)
+    /// the page window sits after them, with the count over the same clause.
+    #[tokio::test]
+    async fn list_all_filters_by_due_window_and_instance_in_sql() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (here, _) = crate::db::course::a_test_instance(&db).await;
+        let (there, course2) = crate::db::course::a_test_instance(&db).await;
+        let subject = a_subject("matematik", &db).await;
+        let subject2 = crate::db::subject::create(
+            &db,
+            &course2,
+            SubjectName::try_new("fizik").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        let now = Timestamp::now().as_millis();
+        let day = 86_400_000_i64;
+        let past = homework_due(&db, &here, subject.get_id(), now - day, "past-here").await;
+        let open = homework_due(&db, &here, subject.get_id(), now + day, "open-here").await;
+        let other = homework_due(&db, &there, subject2.get_id(), now + 2 * day, "open-there").await;
+
+        // The open tab: due at or after the bound.
+        let (rows, total) = list_all(&db, Some(now), None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            rows.iter().map(Homework::get_id).collect::<Vec<_>>(),
+            vec![other.get_id(), open.get_id()],
+            "newest first, past rows left out"
+        );
+        // The past tab: due strictly before the bound — the bounds share no
+        // instant and leave no gap.
+        let (rows, total) = list_all(&db, None, Some(now), None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].get_id(), past.get_id());
+        // The instance scope: the other instance's rows stay behind.
+        let (rows, total) = list_all(&db, None, None, Some(&there), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].get_id(), other.get_id());
+        // A well-formed id that names no row is an empty page, not an error.
+        let (rows, total) = list_all(&db, None, None, Some(&ClassCourseId::generate()), None, 0)
+            .await
+            .unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
+        // The page window applies after the filter, and the count stays the
+        // filtered length, not the page size.
+        let (rows, total) = list_all(&db, Some(now), None, None, Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 2));
+        let (rows, total) = list_all(&db, Some(now), None, None, Some(1), 1)
+            .await
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 2));
+        assert_eq!(rows[0].get_id(), open.get_id());
+        // Absent params: every row, unchanged.
+        let (_, total) = list_all(&db, None, None, None, None, 0).await.unwrap();
+        assert_eq!(total, 3);
+    }
+
+    /// The per-instance path: the caller's instances scope the read in SQL,
+    /// and the due window and single-instance filter apply on top of it.
+    #[tokio::test]
+    async fn list_for_class_courses_applies_the_same_predicates() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (here, _) = crate::db::course::a_test_instance(&db).await;
+        let (there, course2) = crate::db::course::a_test_instance(&db).await;
+        let subject = a_subject("matematik", &db).await;
+        let subject2 = crate::db::subject::create(
+            &db,
+            &course2,
+            SubjectName::try_new("fizik").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        let now = Timestamp::now().as_millis();
+        let day = 86_400_000_i64;
+        let _past = homework_due(&db, &here, subject.get_id(), now - day, "past-here").await;
+        let open = homework_due(&db, &here, subject.get_id(), now + day, "open-here").await;
+        let other = homework_due(&db, &there, subject2.get_id(), now + 2 * day, "open-there").await;
+        let both = vec![here.clone(), there.clone()];
+
+        let rows = list_for_class_courses(&db, &both, Some(now), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(Homework::get_id).collect::<Vec<_>>(),
+            vec![other.get_id(), open.get_id()]
+        );
+        let rows = list_for_class_courses(&db, &both, None, Some(now), None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the past tab keeps only the past row");
+        // A filter naming an instance outside the caller's visible set matches
+        // nothing — the scopes intersect, they do not override each other.
+        let rows = list_for_class_courses(&db, &both, None, None, Some(&here))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both here rows, past and open");
+        let stranger = ClassCourseId::generate();
+        let rows = list_for_class_courses(&db, &both, None, None, Some(&stranger))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "an unknown instance names no row");
+        // Absent filters: the whole visible read, unchanged.
+        let rows = list_for_class_courses(&db, &both, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
     }
 }

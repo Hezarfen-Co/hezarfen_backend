@@ -29,10 +29,11 @@ pub async fn list_folder(
     user: &UserId,
     folder: Folder,
     read: Option<bool>,
+    q: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Message>, i64), AppError> {
-    message::list_folder(db, user, folder, read, limit, offset).await
+    message::list_folder(db, user, folder, read, q, limit, offset).await
 }
 
 pub async fn read_for(

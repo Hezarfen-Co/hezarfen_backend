@@ -7,6 +7,7 @@ use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::page::PagedList;
 use crate::domain::board::{Board, BoardId, BoardTitle, checked_participants};
 use crate::domain::timestamp::Timestamp;
+use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -130,24 +131,38 @@ pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError
 /// that is locked, or full at its lifetime cap but never drawn on again, is
 /// never stamped and so reads as **open** — because it is. Only a creator's
 /// `/close` and the lifetime cap's own refusal ever stamp one.
+///
+/// `q` is an optional free-text needle over the title, folded case- and
+/// diacritic-insensitively on both sides ([`search_fold`] /
+/// [`search_fold_sql`]); a blank needle searches nothing.
 pub async fn list_for_user(
     db: &Database,
     user: &UserId,
     open: Option<bool>,
+    q: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Board>, i64), AppError> {
+    // A blank needle searches nothing, exactly like an absent one.
+    let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
     let open_clause = match open {
         Some(true) => " AND b.closed_at IS NULL",
         Some(false) => " AND b.closed_at IS NOT NULL",
         None => "",
+    };
+    // The needle rides the same fold on both sides (`position`, not `LIKE`,
+    // keeps `%` and `_` literal); `$1` and `$2` are always spent on the
+    // membership predicate, so the needle is `$3`.
+    let q_clause = match needle {
+        Some(_) => format!(" AND position($3 in {}) > 0", search_fold_sql("b.title")),
+        None => String::new(),
     };
     // `PagedList` wraps `from_where` in `SELECT * FROM (…)`, so the window
     // is a whole derived table: the row columns plus the roster
     // re-assembled from `board_participant`, and the membership half of the
     // predicate as an `EXISTS` over it (the participant-side index covers
     // it, as the GIN index once did).
-    PagedList::new(
+    let mut builder = PagedList::new(
         format!(
             "(SELECT b.id, b.creator, b.title,
                     ARRAY(SELECT p.participant FROM board_participant p
@@ -156,14 +171,16 @@ pub async fn list_for_user(
              FROM board b
              WHERE (b.creator = $1
                     OR EXISTS (SELECT 1 FROM board_participant bp
-                               WHERE bp.board = b.id AND bp.participant = $2)){open_clause})"
+                               WHERE bp.board = b.id AND bp.participant = $2)){open_clause}{q_clause})"
         ),
         "ORDER BY id DESC",
     )
     .bind(user.uuid())
-    .bind(user.uuid())
-    .run::<Board>(limit, offset, db)
-    .await
+    .bind(user.uuid());
+    if let Some(needle) = needle {
+        builder = builder.bind(needle);
+    }
+    builder.run::<Board>(limit, offset, db).await
 }
 
 /// Re-invite: the creator-driven roster replace. The write is the
@@ -461,7 +478,7 @@ mod tests {
         .await;
         assert!(matches!(over, Err(AppError::Conflict(_))));
 
-        let last = list_for_user(&db, &creator, None, None, 0)
+        let last = list_for_user(&db, &creator, None, None, None, 0)
             .await
             .unwrap()
             .0
@@ -478,5 +495,103 @@ mod tests {
         )
         .await;
         assert!(again.is_ok());
+    }
+
+    /// `q` narrows by title through the search fold (`geometri` finds
+    /// `Geometri`), composes with `open`, and pages after the filter
+    /// (`total` counts matches, not rows) — while the membership predicate
+    /// still scopes every row: a non-participant searching a real title
+    /// sees nothing.
+    #[tokio::test]
+    async fn q_searches_titles_and_composes_with_open() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let creator = crate::db::class_member::tests::fixture_user(&db, "q-board-kurucu").await;
+        let outsider = crate::db::class_member::tests::fixture_user(&db, "q-board-disari").await;
+
+        let open_hit = create(
+            &db,
+            &creator,
+            BoardTitle::try_new("Geometri Kampı").unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        create(
+            &db,
+            &creator,
+            BoardTitle::try_new("Cebir").unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let closed_hit = create(
+            &db,
+            &creator,
+            BoardTitle::try_new("Geometri Kapanış").unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        close(&db, &closed_hit).await.unwrap();
+
+        // Absent and blank needles both see every board.
+        let (_, total) = list_for_user(&db, &creator, None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        let (_, total) = list_for_user(&db, &creator, None, Some("   "), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+
+        // Title hits through the fold, in both directions.
+        for needle in ["geometri", "GEOMETRİ"] {
+            let (hits, total) =
+                list_for_user(&db, &creator, None, Some(needle), None, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(total, 2);
+            let keys: Vec<String> = hits
+                .iter()
+                .map(|board| board.get_id().key().to_string())
+                .collect();
+            assert!(keys.contains(&open_hit.get_id().key().to_string()));
+            assert!(keys.contains(&closed_hit.get_id().key().to_string()));
+        }
+
+        // Composes with `open`.
+        let (hits, total) =
+            list_for_user(&db, &creator, Some(true), Some("geometri"), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].get_id().key().to_string(), open_hit.get_id().key().to_string());
+        let (_, total) = list_for_user(&db, &creator, Some(false), Some("geometri"), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+
+        // The window runs after the filter: `total` counts matches.
+        let (hits, total) = list_for_user(&db, &creator, None, Some("geometri"), Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 1);
+
+        // A needle matching nothing: an empty page, not an error.
+        let (hits, total) = list_for_user(&db, &creator, None, Some("yok boyle bir tahta"), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(hits.is_empty());
+
+        // The membership predicate still scopes the search: a non-participant
+        // searching a title that exists finds nothing.
+        let (hits, total) =
+            list_for_user(&db, &outsider, None, Some("geometri"), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 0);
+        assert!(hits.is_empty());
     }
 }

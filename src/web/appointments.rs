@@ -5,12 +5,14 @@ use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::appointment::{Appointment, AppointmentId, AppointmentReason};
+use crate::domain::appointment::{
+    Appointment, AppointmentId, AppointmentReason, AppointmentStatus,
+};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotNote, SlotSeries};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -379,6 +381,72 @@ async fn publish_slots(
     Ok((StatusCode::CREATED, Json(items)))
 }
 
+/// One teacher's window filter, shared by both doors: `me` is the caller,
+/// blank is refused, and a well-formed-but-unknown id stands — it names no
+/// row, so the filtered page is simply empty — while a malformed one is a
+/// 400. Never [`UserId::from_key`] into a nil id: that would read as an
+/// empty 200 instead of the caller's error.
+fn teacher_filter(raw: Option<&str>, caller: &UserId) -> Result<Option<UserId>, AppError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "teacher",
+            reason: "must not be empty",
+        }));
+    }
+    Ok(Some(match key {
+        "me" => *caller,
+        other => {
+            let id = UserId::from_key(other);
+            if id.uuid().is_nil() {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field: "teacher",
+                    reason: "must be a hyphenated uuid",
+                }));
+            }
+            id
+        }
+    }))
+}
+
+/// A `?starts_after=`/`?starts_before=` instant: unix milliseconds, negative
+/// refused, absent left absent.
+fn starts_bound_filter(field: &'static str, raw: Option<i64>) -> Result<Option<Timestamp>, AppError> {
+    match raw {
+        None => Ok(None),
+        Some(value) if value < 0 => Err(AppError::Validation(ValidationError::Invalid {
+            field,
+            reason: "must not be negative",
+        })),
+        Some(value) => Ok(Some(Timestamp::from_millis(value))),
+    }
+}
+
+/// Optional list filters on the slots door. Absent, the response is the
+/// unfiltered calendar exactly as it has always been.
+#[derive(Debug, Deserialize, IntoParams)]
+struct SlotFilter {
+    /// Narrow to one teacher's slots: `me` for the caller, else a user id.
+    #[param(example = "me")]
+    teacher: Option<String>,
+    /// Keep only slots starting at or after this unix-millisecond instant.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    starts_after: Option<i64>,
+}
+
+impl SlotFilter {
+    fn resolve_teacher(&self, caller: &UserId) -> Result<Option<UserId>, AppError> {
+        teacher_filter(self.teacher.as_deref(), caller)
+    }
+
+    fn resolve_starts_after(&self) -> Result<Option<Timestamp>, AppError> {
+        starts_bound_filter("starts_after", self.starts_after)
+    }
+}
+
 /// List slots, earliest first. Teacher+ see their own calendar, past occurrences
 /// included; everyone else sees every slot that has not started yet — the
 /// bookable calendar, bounded exactly as booking is, so a slot already underway
@@ -389,6 +457,17 @@ async fn publish_slots(
 /// already taken is not carried
 /// here: booking a taken one answers `409`. Paged via `?limit=&offset=` (omit
 /// `limit` for every slot); returns a `{items, total, limit, offset}` envelope.
+///
+/// Optional filters narrow the answer without ever widening it. `?teacher=`
+/// names one teacher — `me` for the caller, else a user id — and
+/// `?starts_after=` (unix milliseconds, inclusive) keeps the windows that
+/// start at or after the instant, in the SQL so the past is never loaded to
+/// be thrown away. A teacher+ caller's universe is their own calendar, so
+/// `teacher=me` reads the same as absent and naming another teacher is the
+/// empty intersection: a colleague's slots, past ones included, stay
+/// private. For everyone else the universe is the bookable calendar, so a
+/// named teacher's upcoming slots are exactly what the absent call already
+/// offered.
 ///
 /// Each slot carries its teacher's `PersonRef` (id, username, name) to *every*
 /// authenticated caller, parents included — deliberate, and not to be
@@ -406,10 +485,10 @@ async fn publish_slots(
     path = "/slots",
     tag = "appointments",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, SlotFilter),
     responses(
         (status = 200, description = "A page of slots (all of them when unpaged)", body = Page<SlotResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, or filter", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -417,15 +496,39 @@ async fn list_slots(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
+    Query(filter): Query<SlotFilter>,
 ) -> Result<Json<Page<SlotResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
+    let narrow_to = filter.resolve_teacher(user.get_id())?;
+    let starts_after = filter.resolve_starts_after()?;
     let (slots, people) = if user.get_role().at_least(Role::Teacher) {
-        (
-            service::appointment_slot::list_for_teacher(&st.db, user.get_id()).await?,
-            PersonRef::map_of(&[&user]),
-        )
+        // The calendar arm's universe is the caller's own published rows,
+        // past occurrences included. The `teacher` filter narrows inside it:
+        // `me` is the caller's own calendar (the same rows as absent), and
+        // naming anyone else is the empty intersection — which it must be,
+        // or the param would hand over a colleague's calendar.
+        match narrow_to {
+            Some(other) if other != *user.get_id() => {
+                (Vec::new(), PersonRef::map_of(&[&user]))
+            }
+            _ => (
+                service::appointment_slot::list_calendar(
+                    &st.db,
+                    user.get_id(),
+                    starts_after,
+                )
+                .await?,
+                PersonRef::map_of(&[&user]),
+            ),
+        }
     } else {
-        let mut slots = service::appointment_slot::list_upcoming(&st.db, Timestamp::now()).await?;
+        let mut slots = service::appointment_slot::list_upcoming(
+            &st.db,
+            Timestamp::now(),
+            narrow_to.as_ref(),
+            starts_after,
+        )
+        .await?;
         // The teachers' live rows, not the slots' word for it: a demotion
         // leaves the calendar behind, and an inert slot must not be offered.
         // Keying the person map off that same read makes the filter free.
@@ -587,20 +690,98 @@ async fn book(
     ))
 }
 
+/// Optional list filters on the bookings door. Absent, the response is the
+/// caller's listing exactly as it has always been.
+#[derive(Debug, Deserialize, IntoParams)]
+struct AppointmentFilter {
+    /// Narrow to one booking state: `pending`, `approved`, `rejected` or
+    /// `cancelled`.
+    #[param(example = "pending")]
+    status: Option<String>,
+    /// Keep only meetings starting at or after this unix-millisecond instant.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    starts_after: Option<i64>,
+    /// Keep only meetings starting before this unix-millisecond instant —
+    /// exclusive, so `[starts_after, starts_before)` is a closed-open month.
+    #[param(minimum = 0, example = 1_760_259_199_999_i64)]
+    starts_before: Option<i64>,
+    /// Narrow to bookings on one teacher's slots: `me` for the caller, else
+    /// a user id.
+    #[param(example = "me")]
+    teacher: Option<String>,
+}
+
+impl AppointmentFilter {
+    /// The wire word against the closed vocabulary the rows store
+    /// ([`AppointmentStatus::as_str`]): an unknown or blank word is a 400
+    /// naming the field, never a silent whole-list read.
+    fn resolve_status(&self) -> Result<Option<AppointmentStatus>, AppError> {
+        const STATUSES: [AppointmentStatus; 4] = [
+            AppointmentStatus::Pending,
+            AppointmentStatus::Approved,
+            AppointmentStatus::Rejected,
+            AppointmentStatus::Cancelled,
+        ];
+        let Some(raw) = self.status.as_deref() else {
+            return Ok(None);
+        };
+        let word = raw.trim();
+        if word.is_empty() {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "status",
+                reason: "must not be empty",
+            }));
+        }
+        STATUSES
+            .into_iter()
+            .find(|status| status.as_str() == word)
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::Validation(ValidationError::Invalid {
+                    field: "status",
+                    reason: "must be one of: pending, approved, rejected, cancelled",
+                })
+            })
+    }
+
+    fn resolve_starts_after(&self) -> Result<Option<Timestamp>, AppError> {
+        starts_bound_filter("starts_after", self.starts_after)
+    }
+
+    fn resolve_starts_before(&self) -> Result<Option<Timestamp>, AppError> {
+        starts_bound_filter("starts_before", self.starts_before)
+    }
+
+    fn resolve_teacher(&self, caller: &UserId) -> Result<Option<UserId>, AppError> {
+        teacher_filter(self.teacher.as_deref(), caller)
+    }
+}
+
 /// List bookings, newest first. Students and parents see the ones they
 /// requested; teacher+ see the ones aimed at their own slots — their request
 /// inbox. Managers and admins read their own inbox too (they may still decide
 /// any booking by id). Paged via `?limit=&offset=` (omit `limit` for every
 /// booking); returns a `{items, total, limit, offset}` envelope.
+///
+/// Optional filters narrow the answer without ever widening it. `?status=`
+/// is one of `pending`, `approved`, `rejected`, `cancelled`; `?starts_after=`
+/// and `?starts_before=` (unix milliseconds) keep the meetings whose start
+/// sits in `[after, before)` — a standing proposal's time when one stands,
+/// the slot's window otherwise, so a booking whose slot is gone (no window
+/// at all) is left out; `?teacher=` names the booked slot's teacher, `me` or
+/// a user id, joined through the slot. A teacher+ caller's universe is their
+/// own inbox, so `teacher=me` reads the same as absent and naming another
+/// teacher is the empty intersection rather than a read of that teacher's
+/// inbox.
 #[utoipa::path(
     get,
     path = "/",
     tag = "appointments",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, AppointmentFilter),
     responses(
         (status = 200, description = "A page of bookings (all of them when unpaged)", body = Page<AppointmentResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, or filter", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -608,12 +789,44 @@ async fn list_appointments(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
+    Query(filter): Query<AppointmentFilter>,
 ) -> Result<Json<Page<AppointmentResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
+    let status = filter.resolve_status()?;
+    let starts_after = filter.resolve_starts_after()?;
+    let starts_before = filter.resolve_starts_before()?;
+    let narrow_to = filter.resolve_teacher(user.get_id())?;
     let (rows, total) = if user.get_role().at_least(Role::Teacher) {
-        service::appointment::list_for_teacher(&st.db, user.get_id(), limit, offset).await?
+        // The inbox arm's universe is the caller's own bookings; the
+        // `teacher` filter narrows inside it, so naming another teacher is
+        // the empty intersection — see the slots door, same rule.
+        match narrow_to {
+            Some(other) if other != *user.get_id() => (Vec::new(), 0),
+            _ => {
+                service::appointment::list_for_teacher(
+                    &st.db,
+                    user.get_id(),
+                    status,
+                    starts_after,
+                    starts_before,
+                    limit,
+                    offset,
+                )
+                .await?
+            }
+        }
     } else {
-        service::appointment::list_for_requester(&st.db, user.get_id(), limit, offset).await?
+        service::appointment::list_for_requester(
+            &st.db,
+            user.get_id(),
+            status,
+            starts_after,
+            starts_before,
+            narrow_to.as_ref(),
+            limit,
+            offset,
+        )
+        .await?
     };
     // Join slots and people onto the page alone — the lookup shrinks with it.
     let items = appointment_responses(&rows, &st.db).await?;
@@ -950,5 +1163,406 @@ mod tests {
         // Never orphaned: manager+ still decides everything on the slot.
         let boss = user("mudur", Role::Manager, &db).await;
         assert!(can_manage(&slot, &boss));
+    }
+
+    // ---- the list filters ---------------------------------------------------
+
+    /// The handlers under test touch `db` alone, but [`AppState`] wants all
+    /// of its pieces — built here off the sandboxed per-test database.
+    async fn a_state(db: &Database) -> AppState {
+        AppState {
+            db: db.clone(),
+            tenants: crate::database::init_test_tenants().await,
+            files_path: std::env::temp_dir(),
+            cookie_secure: false,
+            rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
+            chatbot_limit: Default::default(),
+            rag_limit: Default::default(),
+            exam_presence: Default::default(),
+            board_hub: Default::default(),
+            ai: None,
+            metrics: crate::telemetry::Metrics::noop(),
+        }
+    }
+
+    /// One published slot at an absolute instant.
+    async fn a_slot(db: &Database, teacher: &UserId, starts_at: i64, ends_at: i64) {
+        service::appointment_slot::create(
+            db,
+            teacher,
+            Timestamp::from_millis(starts_at),
+            Timestamp::from_millis(ends_at),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The slots door, unpaged.
+    async fn slots(st: &AppState, who: &User, filter: SlotFilter) -> Page<SlotResponse> {
+        list_slots(
+            State(st.clone()),
+            CurrentUser(who.clone()),
+            Query(PageParams {
+                limit: None,
+                offset: None,
+            }),
+            Query(filter),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// The bookings door, unpaged.
+    async fn bookings(
+        st: &AppState,
+        who: &User,
+        filter: AppointmentFilter,
+    ) -> Page<AppointmentResponse> {
+        list_appointments(
+            State(st.clone()),
+            CurrentUser(who.clone()),
+            Query(PageParams {
+                limit: None,
+                offset: None,
+            }),
+            Query(filter),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    /// Blank, malformed, and negative filter words are 400s naming the
+    /// field; `me` is the caller; a well-formed stranger stands (and names
+    /// an empty page — pinned by the handler-level tests).
+    #[test]
+    fn filter_words_refuse_blank_malformed_and_negative() {
+        let caller = UserId::generate();
+
+        for word in ["", "  ", "not-a-uuid"] {
+            let filter = SlotFilter {
+                teacher: Some(word.into()),
+                starts_after: None,
+            };
+            assert!(
+                matches!(
+                    filter.resolve_teacher(&caller),
+                    Err(AppError::Validation(ValidationError::Invalid { field, .. })) if field == "teacher"
+                ),
+                "`{word}` must refuse as `teacher`"
+            );
+        }
+        assert_eq!(
+            SlotFilter {
+                teacher: Some("me".into()),
+                starts_after: None,
+            }
+            .resolve_teacher(&caller)
+            .unwrap(),
+            Some(caller)
+        );
+        let stranger = UserId::generate();
+        assert_eq!(
+            SlotFilter {
+                teacher: Some(stranger.key()),
+                starts_after: None,
+            }
+            .resolve_teacher(&caller)
+            .unwrap(),
+            Some(stranger)
+        );
+
+        let filter = SlotFilter {
+            teacher: None,
+            starts_after: Some(-1),
+        };
+        assert!(matches!(
+            filter.resolve_starts_after(),
+            Err(AppError::Validation(ValidationError::Invalid { field, .. })) if field == "starts_after"
+        ));
+        assert_eq!(
+            SlotFilter {
+                teacher: None,
+                starts_after: Some(0),
+            }
+            .resolve_starts_after()
+            .unwrap()
+            .map(|instant| instant.as_millis()),
+            Some(0)
+        );
+
+        let filter = AppointmentFilter {
+            status: None,
+            starts_after: None,
+            starts_before: Some(-5),
+            teacher: None,
+        };
+        assert!(matches!(
+            filter.resolve_starts_before(),
+            Err(AppError::Validation(ValidationError::Invalid { field, .. })) if field == "starts_before"
+        ));
+
+        // The closed status vocabulary: exact wire words only — no case
+        // play, no blank, no synonym — mirroring what the rows store.
+        let status = |word: Option<&str>| AppointmentFilter {
+            status: word.map(str::to_string),
+            starts_after: None,
+            starts_before: None,
+            teacher: None,
+        };
+        assert_eq!(status(None).resolve_status().unwrap(), None);
+        assert_eq!(
+            status(Some(" pending ")).resolve_status().unwrap(),
+            Some(AppointmentStatus::Pending)
+        );
+        assert_eq!(
+            status(Some("cancelled")).resolve_status().unwrap(),
+            Some(AppointmentStatus::Cancelled)
+        );
+        for word in ["", "  ", "APPROVED", "live", "confirmed"] {
+            assert!(
+                matches!(
+                    status(Some(word)).resolve_status(),
+                    Err(AppError::Validation(ValidationError::Invalid { field, .. })) if field == "status"
+                ),
+                "`{word}` must refuse as `status`"
+            );
+        }
+    }
+
+    /// The slots door: absent filters are today's response per role —
+    /// teacher+ read their own calendar with the past included, everyone
+    /// else reads the bookable calendar — `teacher=me` is the caller's own
+    /// set, a named other teacher narrows the bookable calendar but never
+    /// opens a colleague's calendar, and `starts_after` cuts with `total`
+    /// reporting the filtered count.
+    #[tokio::test]
+    async fn slot_filters_narrow_without_widening() {
+        let (db, _leases) = init_test_db().await;
+        let st = a_state(&db).await;
+        let now = Timestamp::now().as_millis();
+        let ali = user("ali-ogretmen", Role::Teacher, &db).await;
+        let ayse = user("ayse-ogretmen", Role::Teacher, &db).await;
+        let veli = user("veli-veli", Role::Student, &db).await;
+
+        a_slot(&db, ali.get_id(), now - 10_000, now - 5_000).await; // ali's past
+        a_slot(&db, ali.get_id(), now + 5_000, now + 10_000).await;
+        a_slot(&db, ali.get_id(), now + 60_000, now + 90_000).await;
+        a_slot(&db, ayse.get_id(), now + 30_000, now + 40_000).await;
+
+        let none = || SlotFilter {
+            teacher: None,
+            starts_after: None,
+        };
+        let me = || SlotFilter {
+            teacher: Some("me".into()),
+            starts_after: None,
+        };
+        let of = |who: &UserId| SlotFilter {
+            teacher: Some(who.key()),
+            starts_after: None,
+        };
+
+        // Student, no filters: the bookable calendar — ali's past stays out,
+        // earliest first, exactly as the absent call has always answered.
+        let page = slots(&st, &veli, none()).await;
+        assert_eq!(page.total, 3);
+        let starts: Vec<i64> = page.items.iter().map(|slot| slot.starts_at).collect();
+        let mut sorted = starts.clone();
+        sorted.sort_unstable();
+        assert_eq!(starts, sorted);
+
+        // Student, teacher=me: they publish nothing — an empty page, not an
+        // error.
+        let page = slots(&st, &veli, me()).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+
+        // Student, teacher=ali: exactly ali's upcoming pair — a narrowing of
+        // the calendar they may already see, his past slot still private.
+        let page = slots(&st, &veli, of(ali.get_id())).await;
+        assert_eq!(page.total, 2);
+        assert!(
+            page.items
+                .iter()
+                .all(|slot| slot.teacher.id == ali.get_id().key() && slot.starts_at > now)
+        );
+
+        // Student, teacher=<well-formed nobody>: an empty page, not a 404.
+        let page = slots(&st, &veli, of(&UserId::generate())).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+
+        // Teacher, no filters: their own calendar, past occurrences
+        // included — today's arm.
+        let page = slots(&st, &ali, none()).await;
+        assert_eq!(page.total, 3);
+
+        // Teacher, teacher=me: the same calendar as absent.
+        let page = slots(&st, &ali, me()).await;
+        assert_eq!(page.total, 3);
+
+        // Teacher, teacher=ayse: the empty intersection. Naming a colleague
+        // must not hand over their calendar, past rows included.
+        let page = slots(&st, &ali, of(ayse.get_id())).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+
+        // Teacher, starts_after=now: the past occurrence is cut in the SQL,
+        // and total is the filtered count.
+        let page = slots(
+            &st,
+            &ali,
+            SlotFilter {
+                teacher: None,
+                starts_after: Some(now),
+            },
+        )
+        .await;
+        assert_eq!(page.total, 2);
+        assert!(page.items.iter().all(|slot| slot.starts_at >= now));
+
+        // Both filters together, on the student arm.
+        let page = slots(
+            &st,
+            &veli,
+            SlotFilter {
+                teacher: Some(ayse.get_id().key()),
+                starts_after: Some(now),
+            },
+        )
+        .await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].starts_at, now + 30_000);
+    }
+
+    /// The bookings door: `status` and `starts_after` (the meeting's
+    /// effective start) narrow each side's own listing, `teacher` joins
+    /// through the slot, and a teacher+ caller naming another teacher gets
+    /// the empty intersection — never that teacher's inbox.
+    #[tokio::test]
+    async fn booking_filters_narrow_without_widening() {
+        let (db, _leases) = init_test_db().await;
+        let st = a_state(&db).await;
+        let now = Timestamp::now().as_millis();
+        let ali = user("ali-ogretmen", Role::Teacher, &db).await;
+        let ayse = user("ayse-ogretmen", Role::Teacher, &db).await;
+        let veli = user("veli-veli", Role::Student, &db).await;
+        let reason = AppointmentReason::try_new("görüşme").unwrap();
+
+        let ali_slot = service::appointment_slot::create(
+            &db,
+            ali.get_id(),
+            Timestamp::from_millis(now + 60_000),
+            Timestamp::from_millis(now + 120_000),
+            None,
+        )
+        .await
+        .unwrap();
+        let ayse_slot = service::appointment_slot::create(
+            &db,
+            ayse.get_id(),
+            Timestamp::from_millis(now + 200_000),
+            Timestamp::from_millis(now + 260_000),
+            None,
+        )
+        .await
+        .unwrap();
+        let pending =
+            service::appointment::book(&db, ali_slot.get_id(), veli.get_id(), reason.clone())
+                .await
+                .unwrap();
+        let approved =
+            service::appointment::book(&db, ayse_slot.get_id(), veli.get_id(), reason.clone())
+                .await
+                .unwrap();
+        service::appointment::approve(&db, approved.get_id(), ayse.get_id())
+            .await
+            .unwrap();
+
+        let none = || AppointmentFilter {
+            status: None,
+            starts_after: None,
+            starts_before: None,
+            teacher: None,
+        };
+        let status = |word: &str| AppointmentFilter {
+            status: Some(word.into()),
+            starts_after: None,
+            starts_before: None,
+            teacher: None,
+        };
+        let after = |millis: i64| AppointmentFilter {
+            status: None,
+            starts_after: Some(millis),
+            starts_before: None,
+            teacher: None,
+        };
+        let with_teacher = |who: &User| AppointmentFilter {
+            status: None,
+            starts_after: None,
+            starts_before: None,
+            teacher: Some(who.get_id().key()),
+        };
+
+        // Student, no filters: both bookings — today's response.
+        let page = bookings(&st, &veli, none()).await;
+        assert_eq!(page.total, 2);
+
+        // status: only the approved one; total is the filtered count.
+        let page = bookings(&st, &veli, status("approved")).await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, approved.get_id().key());
+        assert_eq!(page.items[0].status, "approved");
+
+        // A state nothing carries: an empty page, not an error.
+        let page = bookings(&st, &veli, status("rejected")).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+
+        // teacher: joined through the slot — only the bookings on ali's.
+        let page = bookings(&st, &veli, with_teacher(&ali)).await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, pending.get_id().key());
+
+        // starts_after judges the meeting's effective start: the slot's
+        // window while no proposal stands.
+        let page = bookings(&st, &veli, after(now + 150_000)).await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, approved.get_id().key());
+
+        // starts_before through the door: the late meeting sits outside a
+        // window ending at now + 150_000, the early one inside it.
+        let page = bookings(
+            &st,
+            &veli,
+            AppointmentFilter {
+                status: None,
+                starts_after: None,
+                starts_before: Some(now + 150_000),
+                teacher: None,
+            },
+        )
+        .await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, pending.get_id().key());
+
+        // Teacher+ inbox: only the bookings aimed at their own slots.
+        let page = bookings(&st, &ali, none()).await;
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, pending.get_id().key());
+
+        // Inbox, teacher=me: the same rows.
+        let page = bookings(&st, &ali, with_teacher(&ali)).await;
+        assert_eq!(page.total, 1);
+
+        // Inbox, teacher=ayse: the empty intersection — never her inbox.
+        let page = bookings(&st, &ali, with_teacher(&ayse)).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+
+        // Inbox, starts_after: ali's meeting is the earlier one, so a cut
+        // past it empties his inbox while ayse keeps hers.
+        let page = bookings(&st, &ali, after(now + 150_000)).await;
+        assert_eq!((page.items.len(), page.total), (0, 0));
+        let page = bookings(&st, &ayse, after(now + 150_000)).await;
+        assert_eq!(page.total, 1);
     }
 }

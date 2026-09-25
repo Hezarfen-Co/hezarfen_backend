@@ -119,24 +119,48 @@ pub async fn read(db: &Database, id: &AppointmentId) -> Result<Option<Appointmen
     appointment::read(db, id).await
 }
 
-/// The requester's bookings, newest first — the web layer's paging read.
+/// The requester's bookings, newest first — the web layer's paging read,
+/// narrowed by the door's optional `status`, `starts_after`/`starts_before`
+/// (the meeting's effective start, `[after, before)`) and `teacher` (the
+/// booked slot's teacher) filters.
 pub async fn list_for_requester(
     db: &Database,
     requester: &UserId,
+    status: Option<AppointmentStatus>,
+    starts_after: Option<Timestamp>,
+    starts_before: Option<Timestamp>,
+    teacher: Option<&UserId>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
-    appointment::list_for_requester(db, requester, limit, offset).await
+    appointment::list_for_requester(
+        db,
+        requester,
+        status,
+        starts_after,
+        starts_before,
+        teacher,
+        limit,
+        offset,
+    )
+    .await
 }
 
-/// Every booking aimed at `teacher`, newest first — the request inbox.
+/// Every booking aimed at `teacher`, newest first — the request inbox,
+/// narrowed by the door's optional `status` and `starts_after`/`starts_before`
+/// filters. The inbox is the teacher's own universe already, so it takes no
+/// teacher filter: narrowing is the web layer's call.
 pub async fn list_for_teacher(
     db: &Database,
     teacher: &UserId,
+    status: Option<AppointmentStatus>,
+    starts_after: Option<Timestamp>,
+    starts_before: Option<Timestamp>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
-    appointment::list_for_teacher(db, teacher, limit, offset).await
+    appointment::list_for_teacher(db, teacher, status, starts_after, starts_before, limit, offset)
+        .await
 }
 
 /// Confirm the meeting at the slot's own window. Re-runs the double-booking
@@ -840,5 +864,252 @@ mod tests {
         .unwrap();
         assert_eq!(second.get_status(), AppointmentStatus::Pending);
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
+    }
+
+    /// The listing filters narrow each side's own universe: `status` to one
+    /// state, `starts_after` to meetings whose effective start (a standing
+    /// proposal, the slot's window otherwise) is at or after the instant,
+    /// `teacher` to the booked slot's teacher — and the paging window applies
+    /// after all of it, with `total` counting the filtered set, not the page.
+    /// Absent filters, the listings answer exactly as before, dangling rows
+    /// included.
+    #[tokio::test]
+    async fn listings_filter_by_status_start_and_teacher() {
+        let (db, _leases) = init_test_db().await;
+        let ali = a_person(&db, "ali", "teacher").await;
+        let ayse = a_person(&db, "ayse", "teacher").await;
+        let veli = a_person(&db, "veli", "student").await;
+        let reason = AppointmentReason::try_new("görüşme").unwrap();
+        let now = Timestamp::now().as_millis();
+        let at = |millis: i64| Timestamp::from_millis(millis);
+
+        let ali_slot =
+            appointment_slot::create(&db, &ali, at(now + 60_000), at(now + 120_000), None)
+                .await
+                .unwrap();
+        let ayse_slot =
+            appointment_slot::create(&db, &ayse, at(now + 200_000), at(now + 260_000), None)
+                .await
+                .unwrap();
+        let pending = book(&db, ali_slot.get_id(), &veli, reason.clone())
+            .await
+            .unwrap();
+        let approved = book(&db, ayse_slot.get_id(), &veli, reason.clone())
+            .await
+            .unwrap();
+        approve(&db, approved.get_id(), &ayse).await.unwrap();
+        let settled_slot =
+            appointment_slot::create(&db, &ali, at(now + 300_000), at(now + 360_000), None)
+                .await
+                .unwrap();
+        let cancelled = book(&db, settled_slot.get_id(), &veli, reason.clone())
+            .await
+            .unwrap();
+        cancel(&db, cancelled.get_id(), &veli, None).await.unwrap();
+
+        // Absent: all three, newest first — the shape today's callers see.
+        let (rows, total) =
+            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (3, 3));
+
+        // status: only the approved one, and total is the filtered count.
+        let (rows, total) = list_for_requester(&db, &veli, Some(AppointmentStatus::Approved), None, None, None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), approved.get_id());
+
+        // No state matches: an empty page, not an error.
+        let (rows, total) = list_for_requester(&db, &veli, Some(AppointmentStatus::Rejected), None, None, None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (0, 0));
+
+        // teacher joins through the slot: only the bookings on ali's slots.
+        let (rows, total) =
+            list_for_requester(&db, &veli, None, None, None, Some(&ali), None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (2, 2));
+        assert!(rows.iter().all(|row| row.get_id() != approved.get_id()));
+
+        // starts_after judges the effective start: the pending meeting (at
+        // now + 60_000) is out; the approved and cancelled ones stay.
+        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now + 150_000)), None, None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (2, 2));
+        assert!(rows.iter().all(|row| row.get_id() != pending.get_id()));
+
+        // The window applies after the filter; total stays the filtered count.
+        let (page1, total) =
+            list_for_requester(&db, &veli, None, None, None, None, Some(1), 0).await.unwrap();
+        assert_eq!((page1.len(), total), (1, 3));
+        let (page2, total) =
+            list_for_requester(&db, &veli, None, None, None, None, Some(1), 1).await.unwrap();
+        assert_eq!((page2.len(), total), (1, 3));
+        assert_ne!(page1[0].get_id(), page2[0].get_id());
+
+        // A standing proposal moves the meeting's start for the cut: the
+        // pending booking proposes itself to now + 500_000, so it alone
+        // clears a cut at now + 400_000.
+        propose(&db, pending.get_id(), at(now + 500_000), at(now + 560_000), &ali)
+            .await
+            .unwrap();
+        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now + 400_000)), None, None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), pending.get_id());
+
+        // The inbox: ali's two bookings and never ayse's — the join's
+        // teacher predicate is the whole visibility universe here.
+        let (rows, total) =
+            list_for_teacher(&db, &ali, None, None, None, None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (2, 2));
+        let (rows, total) = list_for_teacher(&db, &ali, Some(AppointmentStatus::Cancelled), None, None, None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), cancelled.get_id());
+        let (_, total) =
+            list_for_teacher(&db, &ali, None, Some(at(now + 400_000)), None, None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 1);
+        let (rows, total) =
+            list_for_teacher(&db, &ali, None, None, None, Some(1), 0).await.unwrap();
+        assert_eq!((rows.len(), total), (1, 2));
+
+        // A settled booking whose slot is withdrawn still lists unfiltered —
+        // today's shape — and the time and teacher filters drop it: it has
+        // neither a meeting window nor a teacher any more. The guarded
+        // delete sweeps its settled bookings along, so the dangling shape is
+        // forced here the way a demotion sweep leaves it: the slot row goes,
+        // and the slot's `ON DELETE SET NULL` strands the booking.
+        sqlx::query("DELETE FROM appointment_slot WHERE id = $1")
+            .bind(settled_slot.get_id().uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        let (rows, total) =
+            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (3, 3), "the windowless row still lists");
+        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now)), None, None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (2, 2), "the windowless row has no start to match");
+        assert!(rows.iter().all(|row| row.get_id() != cancelled.get_id()));
+        let (rows, total) =
+            list_for_requester(&db, &veli, None, None, None, Some(&ali), None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (1, 1), "a windowless row names no teacher");
+        assert_eq!(rows[0].get_id(), pending.get_id());
+    }
+
+    /// `starts_before` is the upper edge of a half-open month window: a row
+    /// starting before the bound is out, a row inside it stays, the bound
+    /// instant itself is excluded, and absent the set is unchanged.
+    #[tokio::test]
+    async fn starts_before_bounds_the_meeting_exclusively() {
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let veli = a_person(&db, "veli", "student").await;
+        let reason = AppointmentReason::try_new("görüşme").unwrap();
+        let now = Timestamp::now().as_millis();
+        let at = |millis: i64| Timestamp::from_millis(millis);
+
+        // Two bookings: one before the bound, one after it.
+        let early_slot =
+            appointment_slot::create(&db, &teacher, at(now + 60_000), at(now + 120_000), None)
+                .await
+                .unwrap();
+        let late_slot =
+            appointment_slot::create(&db, &teacher, at(now + 200_000), at(now + 260_000), None)
+                .await
+                .unwrap();
+        let early = book(&db, early_slot.get_id(), &veli, reason.clone())
+            .await
+            .unwrap();
+        let late = book(&db, late_slot.get_id(), &veli, reason.clone())
+            .await
+            .unwrap();
+
+        // Absent: both — the set is unchanged without the bound.
+        let (rows, total) =
+            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+        assert_eq!((rows.len(), total), (2, 2));
+
+        // before: only the early booking survives.
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            None,
+            None,
+            Some(at(now + 150_000)),
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), early.get_id());
+
+        // Half-open: the bound instant itself is outside the window, so a
+        // cut exactly at the late meeting's start keeps only the early one —
+        // and the inbox answers the same way.
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            None,
+            None,
+            Some(at(now + 200_000)),
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), early.get_id());
+
+        let (rows, total) =
+            list_for_teacher(&db, &teacher, None, None, Some(at(now + 150_000)), None, 0)
+                .await
+                .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), early.get_id());
+
+        // Composed with starts_after, the pair is the month window: only the
+        // late meeting sits in [now + 150_000, now + 260_000).
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            None,
+            Some(at(now + 150_000)),
+            Some(at(now + 260_000)),
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_id(), late.get_id());
     }
 }

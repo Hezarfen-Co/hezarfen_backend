@@ -3,7 +3,7 @@ use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -11,13 +11,13 @@ use crate::constant::MAX_POMODORO_LABEL_LEN;
 use crate::domain::pomodoro::PomodoroSession;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
-use crate::error::{AppError, ErrorResponse};
+use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::parent_link::ensure_can_observe;
 use crate::service::pomodoro;
 use crate::state::AppState;
 use crate::validate::validate_optional;
 
-use super::{CurrentUser, PageParams, paginate};
+use super::{CurrentUser, PageParams};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -84,7 +84,8 @@ impl PomodoroResponse {
 #[derive(Serialize, ToSchema)]
 struct PomodoroLog {
     items: Vec<PomodoroResponse>,
-    /// Total sessions in the full log, before `limit`/`offset` are applied.
+    /// Total sessions in the log the filter selects, before `limit`/`offset`
+    /// are applied.
     #[schema(example = 256)]
     total: i64,
     /// Echo of the applied `limit`; `null` when the response is unbounded.
@@ -93,33 +94,20 @@ struct PomodoroLog {
     /// Echo of the applied `offset`.
     #[schema(example = 0)]
     offset: i64,
-    /// Sum of `duration_ms` over every *finished* session — the whole log,
-    /// not just this page. A running session counts nothing until finished.
+    /// Sum of `duration_ms` over every *finished* session the filter selects —
+    /// the whole log, not just this page. A running session counts nothing
+    /// until finished.
     total_focus_ms: i64,
 }
 
 impl PomodoroLog {
-    fn new(sessions: &[PomodoroSession], limit: Option<i64>, offset: i64) -> Self {
-        let total_focus_ms = sessions
-            .iter()
-            .filter_map(|session| {
-                session.get_finished_at().map(|done| {
-                    done.as_millis()
-                        .saturating_sub(session.get_started_at().as_millis())
-                })
-            })
-            .sum();
+    fn new(page: pomodoro::PomodoroLogPage, limit: Option<i64>, offset: i64) -> Self {
         Self {
-            // Paged in the web layer: `total_focus_ms` folds the whole log, so the
-            // rows the page comes from are already all in hand.
-            items: paginate(sessions, limit, offset)
-                .iter()
-                .map(PomodoroResponse::new)
-                .collect(),
-            total: sessions.len() as i64,
+            items: page.items.iter().map(PomodoroResponse::new).collect(),
+            total: page.total,
             limit,
             offset,
-            total_focus_ms,
+            total_focus_ms: page.total_focus_ms,
         }
     }
 }
@@ -209,19 +197,57 @@ async fn finish(
     Ok(Json(PomodoroResponse::new(&session)))
 }
 
+/// The optional `?from=&to=` window over the log. Both bounds are UTC unix
+/// milliseconds and half-open — `from` inclusive, `to` exclusive, so
+/// adjacent windows tile without overlap — and independent: each present
+/// bound narrows from its own end. Absent, the log is untouched.
+#[derive(Debug, Deserialize, IntoParams)]
+struct HistoryFilter {
+    /// Keep sessions that started at or after this instant.
+    #[param(example = 1_760_000_000_000i64)]
+    from: Option<i64>,
+    /// Keep sessions that started before this instant.
+    #[param(example = 1_760_008_640_000i64)]
+    to: Option<i64>,
+}
+
+impl HistoryFilter {
+    /// The validated bounds, or `(None, None)` for the whole log. A negative
+    /// bound is a `400` naming the field: the server stamps every instant
+    /// itself, so nothing predates the epoch and a negative value is a
+    /// malformed request, not an era to page through.
+    fn resolve(&self) -> Result<(Option<i64>, Option<i64>), AppError> {
+        let bound = |value: Option<i64>, field: &'static str| match value {
+            Some(ms) if ms < 0 => Err(AppError::Validation(ValidationError::Invalid {
+                field,
+                reason: "must not be negative",
+            })),
+            other => Ok(other),
+        };
+        Ok((bound(self.from, "from")?, bound(self.to, "to")?))
+    }
+}
+
 /// The caller's own pomodoro log, newest first — the running session (if any)
 /// included (`finished_at: null`) — plus `total_focus_ms`, the unpaged sum of
 /// finished-session durations. Paged via `?limit=&offset=` (omit `limit` for
 /// the whole log).
+///
+/// `from`/`to` (unix milliseconds) narrow the log to sessions that started in
+/// the half-open window `[from, to)` — both optional, AND-ed when both are
+/// given, negative values a `400`. The window bounds the page, `total` and
+/// `total_focus_ms` alike: the focus total is the sum over the same filtered
+/// set the page reads, and with neither bound the response is the
+/// whole-history log, unchanged.
 #[utoipa::path(
     get,
     path = "/me",
     tag = "pomodoro",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, HistoryFilter),
     responses(
         (status = 200, description = "A page of the caller's pomodoro log with the unpaged focus total", body = PomodoroLog),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, from, or to", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -229,24 +255,31 @@ async fn my_pomodoro(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
+    Query(filter): Query<HistoryFilter>,
 ) -> Result<Json<PomodoroLog>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let sessions = pomodoro::list_for_user(&st.db, user.get_id()).await?;
-    Ok(Json(PomodoroLog::new(&sessions, limit, offset)))
+    let (from, to) = filter.resolve()?;
+    let log = pomodoro::page_for_user(&st.db, user.get_id(), from, to, limit, offset).await?;
+    Ok(Json(PomodoroLog::new(log, limit, offset)))
 }
 
 /// A student's pomodoro log, newest first, with `total_focus_ms` — the same
 /// shape as `/me`. Requires teacher+ (study oversight), or a parent tied to
 /// the target student. Paged via `?limit=&offset=`.
+///
+/// Like `/me`, the optional `from`/`to` window (unix milliseconds, the
+/// half-open `[from, to)`) narrows the log — page, `total` and
+/// `total_focus_ms` together — and leaves the observation rules untouched: a
+/// caller who may not read the log cannot read a window of it either.
 #[utoipa::path(
     get,
     path = "/{user}",
     tag = "pomodoro",
     security(("session_cookie" = [])),
-    params(("user" = String, Path, description = "User id"), PageParams),
+    params(("user" = String, Path, description = "User id"), PageParams, HistoryFilter),
     responses(
         (status = 200, description = "A page of the user's pomodoro log with the unpaged focus total", body = PomodoroLog),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, from, or to", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher, or a parent link to this student", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
@@ -257,14 +290,75 @@ async fn user_pomodoro(
     CurrentUser(caller): CurrentUser,
     Path(user): Path<String>,
     Query(page): Query<PageParams>,
+    Query(filter): Query<HistoryFilter>,
 ) -> Result<Json<PomodoroLog>, AppError> {
     let (limit, offset) = page.resolve()?;
+    let (from, to) = filter.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty log.
     crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
-    let sessions = pomodoro::list_for_user(&st.db, &target).await?;
-    Ok(Json(PomodoroLog::new(&sessions, limit, offset)))
+    let log = pomodoro::page_for_user(&st.db, &target, from, to, limit, offset).await?;
+    Ok(Json(PomodoroLog::new(log, limit, offset)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Uri;
+
+    #[test]
+    fn an_absent_window_leaves_the_log_untouched() {
+        let filter = HistoryFilter {
+            from: None,
+            to: None,
+        };
+        assert_eq!(filter.resolve().unwrap(), (None, None));
+    }
+
+    #[test]
+    fn a_negative_bound_is_a_400_naming_the_field() {
+        let filter = HistoryFilter {
+            from: Some(-1),
+            to: None,
+        };
+        let AppError::Validation(ValidationError::Invalid { field, .. }) =
+            filter.resolve().unwrap_err()
+        else {
+            panic!("a negative `from` must be a validation error");
+        };
+        assert_eq!(field, "from");
+
+        let filter = HistoryFilter {
+            from: None,
+            to: Some(-1),
+        };
+        let AppError::Validation(ValidationError::Invalid { field, .. }) =
+            filter.resolve().unwrap_err()
+        else {
+            panic!("a negative `to` must be a validation error");
+        };
+        assert_eq!(field, "to");
+    }
+
+    #[test]
+    fn zero_is_a_legal_bound() {
+        let filter = HistoryFilter {
+            from: Some(0),
+            to: Some(0),
+        };
+        assert_eq!(filter.resolve().unwrap(), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn a_present_but_empty_bound_is_a_400_naming_the_field() {
+        // `?from=` carries no i64: the query extractor itself refuses, the
+        // same 400 `?limit=` has always given for an empty value.
+        let err = Query::<HistoryFilter>::try_from_uri(&Uri::from_static("/?from=&to=5"))
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.body_text().contains("from"), "{}", err.body_text());
+    }
 }

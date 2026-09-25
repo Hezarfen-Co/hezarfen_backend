@@ -73,14 +73,38 @@ pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSe
     course_session::read(db, id).await
 }
 
-/// An instance's sessions, most recent lesson first — the timetable read.
+/// An instance's sessions, most recent lesson first — the timetable read,
+/// unbounded by any schedule window.
 pub async fn list_for_class_course(
     db: &Database,
     class_course: &ClassCourseId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<CourseSession>, i64), AppError> {
-    course_session::list_for_class_course(db, class_course, limit, offset).await
+    list_windowed(db, class_course, None, None, limit, offset).await
+}
+
+/// The same timetable read narrowed to a half-open `[starts_after,
+/// starts_before)` on `starts_at` — a calendar month is
+/// `[month_start, next_month_start)`. The page and the count share the one
+/// SQL `WHERE`; the order does not flip.
+pub async fn list_windowed(
+    db: &Database,
+    class_course: &ClassCourseId,
+    starts_after: Option<i64>,
+    starts_before: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<CourseSession>, i64), AppError> {
+    course_session::list_for_class_course(
+        db,
+        class_course,
+        starts_after,
+        starts_before,
+        limit,
+        offset,
+    )
+    .await
 }
 
 /// Only what the request carried is written: an omitted field (`None`) is

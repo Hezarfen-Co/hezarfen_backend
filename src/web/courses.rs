@@ -3,7 +3,7 @@ use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -17,6 +17,7 @@ use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, Cou
 use crate::domain::course_offering::CourseOfferingId;
 use crate::domain::role::Role;
 use crate::domain::subject::{SubjectDescription, SubjectName};
+use crate::domain::text_fold::search_fold;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::service;
@@ -133,8 +134,24 @@ fn owns_course(course: &Course, user: &User) -> bool {
 /// homework. Below `teacher` a course is visible only the way it is to any
 /// other student: by enrollment.
 pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Course>, AppError> {
+    visible_courses_filtered(user, db, None, None, None).await
+}
+
+/// [`visible_courses`] narrowed by the `GET /courses` filters. The filters
+/// ride *after* the visibility union and *before* any paging, so a filter can
+/// only ever narrow what the caller already reaches and `total` is the
+/// filtered length. For a manager the filters go into the catalog query
+/// itself ([`crate::service::course::list_filtered`]); below manager the
+/// union is Rust, so the same text fold filters the merged list in memory.
+pub(crate) async fn visible_courses_filtered(
+    user: &User,
+    db: &Database,
+    kind: Option<CourseKind>,
+    q: Option<&str>,
+    taught: Option<bool>,
+) -> Result<Vec<Course>, AppError> {
     if user.get_role().at_least(Role::Manager) {
-        return service::course::list_all(db).await;
+        return service::course::list_filtered(db, kind, q, taught).await;
     }
     let mut courses = if user.get_role().at_least(Role::Teacher) {
         service::course::list_for_teacher(db, user.get_id()).await?
@@ -154,6 +171,17 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     }
     // Both sources come newest-first; re-sort so the merged list is too.
     courses.sort_by_key(|course| std::cmp::Reverse(course.get_id().key()));
+    // The same fold both sides of the manager arm's SQL uses, so a `q`
+    // matches identically above and below manager; blank means no filter.
+    let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
+    courses.retain(|course| {
+        kind.as_ref().is_none_or(|want| course.get_kind() == want)
+            && taught.is_none_or(|taught| (course.get_class_course_count() > 0) == taught)
+            && needle.as_deref().is_none_or(|needle| {
+                search_fold(course.get_title().as_str()).contains(needle)
+                    || search_fold(course.get_description().as_str()).contains(needle)
+            })
+    });
     Ok(courses)
 }
 
@@ -391,29 +419,75 @@ async fn create_course(
     ))
 }
 
+/// The `GET /courses` filters, both optional and combinable. They narrow the
+/// caller's visible set — they never widen it: a student filtering by `kind`
+/// still sees only the courses they reach.
+#[derive(Debug, Deserialize, IntoParams)]
+struct CourseListFilter {
+    /// Narrow to one kind: `course` (a regular class), `study` (a supervised
+    /// study session), or `club`. Omit for every kind.
+    #[param(example = "course")]
+    kind: Option<String>,
+    /// Case- and diacritic-insensitive fragment of the title or description.
+    /// Omit — or leave blank — to filter nothing; `%` and `_` are literal.
+    #[param(example = "matematik")]
+    q: Option<String>,
+    /// Keep only courses taught somewhere (`true`, `class_course_count > 0`)
+    /// or nowhere yet (`false`, `= 0`). Omit for both.
+    #[param(example = true)]
+    taught: Option<bool>,
+}
+
+impl CourseListFilter {
+    /// `kind` parses through the write-path validator, so an unknown or empty
+    /// spelling is the same 400 a create/PATCH gets; `taught` needs no parse —
+    /// the query extractor itself 400s a `?taught=` that is not `true`/`false`,
+    /// naming the field; `q` passes through raw — each arm trims, folds and
+    /// blanks it identically.
+    fn resolve(self) -> Result<(Option<CourseKind>, Option<String>, Option<bool>), AppError> {
+        let kind = match self.kind {
+            Some(kind) => Some(CourseKind::try_new(&kind)?),
+            None => None,
+        };
+        Ok((kind, self.q, self.taught))
+    }
+}
+
 /// List the catalog courses visible to the caller: every course for manager+,
 /// otherwise the courses they teach somewhere plus the ones they're enrolled
 /// in. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope.
+///
+/// `kind` narrows to one flavor, `q` filters by a case- and
+/// diacritic-insensitive fragment of the title or description (blank =
+/// unfiltered), and `taught` keeps only the courses a class section teaches
+/// (`true`) or none yet (`false`). All apply to the caller's visible set
+/// only — after the visibility gate and before the window is cut — so
+/// `total` is the filtered length.
 #[utoipa::path(
     get,
     path = "/",
     tag = "courses",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(CourseListFilter, PageParams),
     responses(
         (status = 200, description = "A page of the caller's visible courses (all of them when unpaged)", body = Page<CourseResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Unknown or empty kind, a `taught` that is not true/false, or invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_courses(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
+    Query(filter): Query<CourseListFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let courses = visible_courses(&user, &st.db).await?;
+    let (kind, q, taught) = filter.resolve()?;
+    // The filters ride inside the visible set — SQL for a manager, the
+    // union's tail in Rust below one — so total is the filtered length
+    // before the window is cut.
+    let courses = visible_courses_filtered(&user, &st.db, kind, q.as_deref(), taught).await?;
     let total = courses.len() as i64;
     // Paged in the web layer: the visible set is a Rust union of two lists.
     let window = paginate(&courses, limit, offset);
@@ -881,6 +955,254 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A catalog course with caller-chosen fields, minted through the real
+    /// create path.
+    async fn shaped_course(
+        creator: &User,
+        db: &Database,
+        title: &str,
+        description: &str,
+        kind: &str,
+    ) -> Course {
+        service::course::create(
+            db,
+            creator.get_id(),
+            CourseTitle::try_new(title).unwrap(),
+            CourseDescription::try_new(description).unwrap(),
+            CourseKind::try_new(kind).unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn titles(courses: &[Course]) -> Vec<&str> {
+        courses
+            .iter()
+            .map(|course| course.get_title().as_str())
+            .collect()
+    }
+
+    fn a_kind(kind: &str) -> CourseKind {
+        CourseKind::try_new(kind).unwrap()
+    }
+
+    /// An unknown or empty `kind` is the write path's own 400, naming the
+    /// field; `q` passes through verbatim (each arm folds it).
+    #[tokio::test]
+    async fn the_kind_filter_parses_through_the_write_path() {
+        for kind in ["nope", ""] {
+            let err = CourseListFilter {
+                kind: Some(kind.to_string()),
+                q: None,
+                taught: None,
+            }
+            .resolve()
+            .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    AppError::Validation(crate::error::ValidationError::Invalid { field, .. })
+                        if *field == "kind"
+                ),
+                "{kind:?}: {err:?}"
+            );
+        }
+        let (kind, q, taught) = CourseListFilter {
+            kind: Some("club".to_string()),
+            q: Some("  ".to_string()),
+            taught: None,
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(kind.as_ref().map(CourseKind::as_str), Some("club"));
+        assert_eq!(q.as_deref(), Some("  "));
+        assert_eq!(taught, None);
+    }
+
+    /// Manager arm: kind and q narrow the catalog, total is the filtered
+    /// length, a miss is an empty list, and `%`/`_` are literal.
+    #[tokio::test]
+    async fn kind_and_q_narrow_the_manager_catalog() {
+        let (db, _leases) = init_test_db().await;
+        let boss = user("boss", Role::Manager, &db).await;
+        shaped_course(&boss, &db, "Matematik", "Cebir ve Geometri", "course").await;
+        shaped_course(&boss, &db, "Satranç Kulübü", "", "club").await;
+        shaped_course(&boss, &db, "Biyoloji Etüdü", "canlı yayın", "study").await;
+        // "Matematik" is taught by a real class section; the other two are
+        // attached nowhere, so the taught axis has both values in play.
+        let class = crate::db::class_group::create(
+            &db,
+            boss.get_id(),
+            crate::domain::class_group::ClassName::try_new("9-A").unwrap(),
+            crate::domain::grade::GradeLevel::new(9).unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let matematik = visible_courses_filtered(&boss, &db, None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|course| course.get_title().as_str() == "Matematik")
+            .unwrap();
+        service::class_course::attach(&db, class.get_id(), matematik.get_id(), boss.get_id())
+            .await
+            .unwrap();
+
+        // No filters: the whole catalog, newest first — today's response,
+        // taught and untaught alike.
+        let all = visible_courses_filtered(&boss, &db, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(&all),
+            vec!["Biyoloji Etüdü", "Satranç Kulübü", "Matematik"]
+        );
+
+        // kind: exact flavor only.
+        let clubs = visible_courses_filtered(&boss, &db, Some(a_kind("club")), None, None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&clubs), vec!["Satranç Kulübü"]);
+
+        // q: title fragment, case- and diacritic-insensitive.
+        let q = visible_courses_filtered(&boss, &db, None, Some("SATRANÇ"), None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&q), vec!["Satranç Kulübü"]);
+        // q: description fragment too.
+        let q = visible_courses_filtered(&boss, &db, None, Some("canlı"), None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&q), vec!["Biyoloji Etüdü"]);
+        // q: `position`, not `LIKE` — no wildcard surprises.
+        for wildcard in ["%", "_"] {
+            let q = visible_courses_filtered(&boss, &db, None, Some(wildcard), None)
+                .await
+                .unwrap();
+            assert!(q.is_empty(), "{wildcard:?} acted as a wildcard");
+        }
+
+        // Combined filters AND; a miss is 200 empty, not an error.
+        let miss =
+            visible_courses_filtered(&boss, &db, Some(a_kind("course")), Some("satranç"), None)
+                .await
+                .unwrap();
+        assert!(miss.is_empty());
+        let hit = visible_courses_filtered(&boss, &db, Some(a_kind("study")), Some("CANLI"), None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&hit), vec!["Biyoloji Etüdü"]);
+
+        // Blank q is no filter — the unfiltered catalog again.
+        let blank = visible_courses_filtered(&boss, &db, None, Some("   "), None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&blank), titles(&all));
+
+        // taught: true keeps the attached one, false the unattached two, and
+        // it composes with kind.
+        let taught = visible_courses_filtered(&boss, &db, None, None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(titles(&taught), vec!["Matematik"]);
+        let untaught = visible_courses_filtered(&boss, &db, None, None, Some(false))
+            .await
+            .unwrap();
+        assert_eq!(titles(&untaught), vec!["Biyoloji Etüdü", "Satranç Kulübü"]);
+        let clubs = visible_courses_filtered(&boss, &db, Some(a_kind("club")), None, Some(false))
+            .await
+            .unwrap();
+        assert_eq!(titles(&clubs), vec!["Satranç Kulübü"]);
+        let miss = visible_courses_filtered(&boss, &db, Some(a_kind("club")), None, Some(true))
+            .await
+            .unwrap();
+        assert!(miss.is_empty());
+
+        // The window is cut after the filter: one course per page while the
+        // total stays the filtered length (the handler's `total` is
+        // `courses.len()` taken *before* `paginate`).
+        let dersler = visible_courses_filtered(&boss, &db, Some(a_kind("course")), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dersler.len(), 1);
+        assert_eq!(paginate(&dersler, Some(1), 0).len(), 1);
+    }
+
+    /// Below manager the filters ride the Rust union: they can narrow what a
+    /// student reaches but never widen it.
+    #[tokio::test]
+    async fn filters_narrow_but_never_widen_a_students_visible_set() {
+        let (db, _leases) = init_test_db().await;
+        let boss = user("boss2", Role::Manager, &db).await;
+        let student = user("ogrenci", Role::Student, &db).await;
+        let (instance, _ders) = crate::db::course::a_test_instance(&db).await;
+        shaped_course(&boss, &db, "Satranç Kulübü", "zeka oyunu", "club").await;
+        service::enrollment::enroll(&db, &instance, student.get_id(), boss.get_id())
+            .await
+            .unwrap();
+
+        // Unfiltered: only the enrolled ders — the club is real but not theirs.
+        let mine = visible_courses_filtered(&student, &db, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&mine), vec!["test course"]);
+
+        // kind=club: the club exists in the catalog, the student still sees none.
+        let clubs = visible_courses_filtered(&student, &db, Some(a_kind("club")), None, None)
+            .await
+            .unwrap();
+        assert!(clubs.is_empty());
+        // q over the club's own title finds nothing they cannot reach either.
+        let q = visible_courses_filtered(&student, &db, None, Some("satranç"), None)
+            .await
+            .unwrap();
+        assert!(q.is_empty());
+
+        // taught: their ders is taught (the attached instance), the club is
+        // not — the axis narrows both ways without widening anything.
+        let taught = visible_courses_filtered(&student, &db, None, None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(titles(&taught), vec!["test course"]);
+        let untaught = visible_courses_filtered(&student, &db, None, None, Some(false))
+            .await
+            .unwrap();
+        assert!(untaught.is_empty());
+
+        // Their own ders survives both filters.
+        let dersler = visible_courses_filtered(&student, &db, Some(a_kind("course")), None, None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&dersler), vec!["test course"]);
+        let q = visible_courses_filtered(&student, &db, None, Some("TEST"), None)
+            .await
+            .unwrap();
+        assert_eq!(titles(&q), vec!["test course"]);
+    }
+
+    /// `?taught=` present but empty is refused by the query extractor itself —
+    /// a 400 naming the field; only `true`/`false` parse.
+    #[test]
+    fn an_empty_taught_is_rejected_naming_the_field() {
+        let uri = axum::http::Uri::from_static("/courses?taught=");
+        let err = Query::<CourseListFilter>::try_from_uri(&uri).unwrap_err();
+        assert!(err.to_string().contains("taught"), "{err}");
+        for ok in [
+            "/courses?taught=true",
+            "/courses?taught=false",
+            "/courses?q=x",
+            "/courses",
+        ] {
+            let uri = axum::http::Uri::from_static(ok);
+            assert!(
+                Query::<CourseListFilter>::try_from_uri(&uri).is_ok(),
+                "{ok:?} refused"
+            );
+        }
     }
 
     /// The leak: `creator` is a historical column that demotion never sweeps,

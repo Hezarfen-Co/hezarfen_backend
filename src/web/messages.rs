@@ -62,6 +62,11 @@ struct ListFilter {
     /// `?folder=inbox&read=false&limit=1` makes `total` the unread badge),
     /// `true` = read only. Omit for both.
     read: Option<bool>,
+    /// Free-text search over each message's subject and body: a case- and
+    /// diacritic-insensitive substring (`etut` finds `Etüt`). Literal text —
+    /// `%` and `_` carry no special meaning. Blank means no search.
+    #[param(example = "etüt")]
+    q: Option<String>,
 }
 
 /// A message as one party sees it. `folder` is the *caller's* copy's folder;
@@ -222,6 +227,10 @@ async fn send_message(
 /// flag; `total` counts the filtered folder, so
 /// `?folder=inbox&read=false&limit=1` is a cheap unread badge. Paged via
 /// `?limit=&offset=`.
+///
+/// `?q=` narrows further by free text: a case- and diacritic-insensitive
+/// substring of each message's subject or body, composed with `folder` and
+/// `read`; `total` counts the matches. Blank means no search.
 #[utoipa::path(
     get,
     path = "/",
@@ -246,8 +255,16 @@ async fn list(
         None => Folder::Inbox,
     };
 
-    let (messages, total) =
-        message::list_folder(&st.db, user.get_id(), folder, filter.read, limit, offset).await?;
+    let (messages, total) = message::list_folder(
+        &st.db,
+        user.get_id(),
+        folder,
+        filter.read,
+        filter.q.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     let people = load_people(&messages, &st.db).await?;
     let items = messages
         .iter()

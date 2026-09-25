@@ -15,7 +15,7 @@ pub struct EventId(uuid::Uuid);
 impl EventId {
     /// Minted from the process-wide monotonic generator, not a plain random
     /// UUID: events list `id DESC` (newest first,
-    /// [`crate::db::event::list_all`]),
+    /// [`crate::db::event::list_windowed`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
         Self(next_uuid())

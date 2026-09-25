@@ -4,7 +4,7 @@
 
 use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
-use crate::db::page::Param;
+use crate::db::page::{PagedList, Param};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::event::{
@@ -68,7 +68,7 @@ pub async fn includes(db: &Database, event: &Event, user: &User) -> Result<bool,
 pub async fn members(db: &Database, event: &Event) -> Result<Vec<UserId>, AppError> {
     match event.get_audience_kind() {
         crate::domain::event::EventAudienceKind::School => {
-            Ok(crate::db::user::list_all(db, None, 0)
+            Ok(crate::db::user::list_all(db, None, None, 0)
                 .await?
                 .0
                 .iter()
@@ -164,21 +164,55 @@ pub async fn read(db: &Database, id: &EventId) -> Result<Option<Event>, AppError
     Ok(event)
 }
 
-pub async fn list_all(db: &Database) -> Result<Vec<Event>, AppError> {
-    let events = query_as!(
-        Event,
-        "SELECT id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", \
-                audience_kind AS \"audience_kind: EventAudienceKind\", \
-                audience_role AS \"audience_role: Role\", \
-                audience_course AS \"audience_course: CourseId\", \
-                audience_class AS \"audience_class: ClassGroupId\", \
-                audience_capacity, starts_at AS \"starts_at: Timestamp\", \
-                ends_at AS \"ends_at: Timestamp\" \
-         FROM event ORDER BY id DESC",
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(events)
+/// The event list behind `GET /events`, paged by the database — the window is
+/// `LIMIT/OFFSET` in SQL, and `total` a `count(*)` over the same `WHERE`, so
+/// a schedule query never decodes the whole table to slice ten rows off it.
+///
+/// The four optional bounds are [`crate::web::page::WindowParams`]'s schedule
+/// window, validated upstream. All four absent is the unfiltered read,
+/// `ORDER BY id DESC` (newest first). Any bound set drops schedule-less rows
+/// (every predicate is `NULL`-rejecting) and flips the order to ascending by
+/// schedule — `starts_at`, falling back to `ends_at`, ties by id — the same
+/// order `WindowParams::apply` used to produce in Rust.
+pub async fn list_windowed(
+    db: &Database,
+    starts_after: Option<i64>,
+    ends_after: Option<i64>,
+    starts_before: Option<i64>,
+    ends_before: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Event>, i64), AppError> {
+    // Conditions and binds move together: each bound appends its predicate
+    // with the placeholder number its bind position lands on.
+    let mut conds: Vec<String> = Vec::new();
+    let mut bounds: Vec<i64> = Vec::new();
+    let mut bound = |column: &str, op: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            conds.push(format!("{column} {op} ${}", bounds.len() + 1));
+            bounds.push(value);
+        }
+    };
+    bound("starts_at", ">", starts_after);
+    bound("starts_at", "<", starts_before);
+    bound("COALESCE(ends_at, starts_at)", ">", ends_after);
+    bound("COALESCE(ends_at, starts_at)", "<", ends_before);
+    let windowed = !conds.is_empty();
+    let from_where = if windowed {
+        format!("event WHERE {}", conds.join(" AND "))
+    } else {
+        "event".to_owned()
+    };
+    let order = if windowed {
+        "ORDER BY COALESCE(starts_at, ends_at) ASC, id ASC"
+    } else {
+        "ORDER BY id DESC"
+    };
+    let mut list = PagedList::new(from_where, order);
+    for value in bounds {
+        list = list.bind(value);
+    }
+    list.run::<Event>(limit, offset, db).await
 }
 
 /// Request-scoped: the handler reads the event, then awaits the clock and a
@@ -417,5 +451,121 @@ mod tests {
                  list, or strand a seat on an open one"
             );
         }
+    }
+
+    /// Four schedule shapes; creation order is id order (uuidv7), so the
+    /// unfiltered read is exactly the reverse of the creation order.
+    async fn four_events(db: &Database) -> (UserId, [EventId; 4]) {
+        let creator = a_person(db, "event-window").await;
+        let school = EventAudience {
+            kind: EventAudienceKind::School,
+            role: None,
+            course: None,
+            class: None,
+            capacity: None,
+        };
+        let now = Timestamp::now().as_millis();
+        let past = Timestamp::from_millis(now - 60_000);
+        let soon = Timestamp::from_millis(now + 30 * 60_000);
+        let future = Timestamp::from_millis(now + 3_600_000);
+        let later = Timestamp::from_millis(now + 2 * 3_600_000);
+        let mut ids = Vec::new();
+        for (starts_at, ends_at) in [
+            (None, None),                 // timeless — never survives a window
+            (Some(past), None),           // already started
+            (Some(soon), None),           // ends-only deadline... starts soon
+            (Some(future), Some(later)),  // fully scheduled ahead
+        ] {
+            ids.push(
+                create(
+                    db,
+                    &creator,
+                    EventTitle::try_new("window").unwrap(),
+                    EventDescription::try_new("").unwrap(),
+                    school.clone(),
+                    starts_at,
+                    ends_at,
+                )
+                .await
+                .unwrap()
+                .get_id()
+                .clone(),
+            );
+        }
+        (creator, ids.try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn absent_window_is_the_unfiltered_newest_first_read() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (_, ids) = four_events(&db).await;
+        let (events, total) = list_windowed(&db, None, None, None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 4);
+        let listed: Vec<_> = events.iter().map(|event| event.get_id()).cloned().collect();
+        let expected: Vec<_> = ids.iter().rev().cloned().collect();
+        assert_eq!(listed, expected);
+    }
+
+    #[tokio::test]
+    async fn the_window_filters_and_orders_in_sql_with_a_filtered_total() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (_, ids) = four_events(&db).await;
+        let [_, started, soon, ahead] = &ids;
+        let now = Timestamp::now().as_millis();
+
+        // ends_after: the timeless and the already-started drop; the ends-only
+        // event survives on its `ends_at` COALESCE fallback.
+        let (events, total) = list_windowed(&db, None, Some(now), None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        let keys: Vec<_> = events.iter().map(|event| event.get_id()).cloned().collect();
+        assert_eq!(keys, vec![soon.clone(), ahead.clone()]);
+
+        // A limit applies after the filter: one row out, total still two.
+        let (events, total) = list_windowed(&db, None, Some(now), None, None, Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!((events.len(), total), (1, 2));
+        assert_eq!(events[0].get_id(), soon);
+        // Offset runs inside the filtered set, not past it.
+        let (events, total) = list_windowed(&db, None, Some(now), None, None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!((events.len(), total), (1, 2));
+        assert_eq!(events[0].get_id(), ahead);
+
+        // starts_before drops the start-less rows and everything starting at
+        // or after the cut (strict): the cut sits between `soon` (+30 min)
+        // and `ahead` (+1 h), so `started` and `soon` survive, schedule
+        // ascending.
+        let (events, total) = list_windowed(
+            &db,
+            None,
+            None,
+            Some(now + 45 * 60_000),
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+        let keys: Vec<_> = events.iter().map(|event| event.get_id()).cloned().collect();
+        assert_eq!(keys, vec![started.clone(), soon.clone()]);
+
+        // ends_before: only the already-started, on its starts_at fallback.
+        let (_, total) = list_windowed(&db, None, None, None, Some(now - 30_000), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+
+        // A well-formed instant naming no row is an empty page, not an error.
+        let (events, total) = list_windowed(&db, Some(now + 30 * 86_400_000), None, None, None, None, 0)
+            .await
+            .unwrap();
+        assert!((events.is_empty()) && total == 0);
     }
 }

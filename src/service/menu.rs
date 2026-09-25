@@ -42,15 +42,18 @@ pub async fn read(db: &Database, id: &MenuId) -> Result<Option<Menu>, AppError> 
     menu::read(db, id).await
 }
 
-/// Menus, newest day first, within inclusive `YYYY-MM-DD` bounds.
+/// Menus, newest day first, within inclusive `YYYY-MM-DD` bounds. `slot`,
+/// when given, narrows to menus published under that exact snapshotted
+/// slot text.
 pub async fn list(
     db: &Database,
     from: Option<&MenuDate>,
     to: Option<&MenuDate>,
+    slot: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Menu>, i64), AppError> {
-    menu::list(db, from, to, limit, offset).await
+    menu::list(db, from, to, slot, limit, offset).await
 }
 
 /// Change a menu's seat cap; `None` keeps it, `Some(None)` clears it.

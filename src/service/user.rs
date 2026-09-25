@@ -131,13 +131,16 @@ pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> 
     user::read(db, id).await
 }
 
-/// Every account, newest first — the web layer's paging read.
+/// Every account, newest first — or only the roles `roles` names, when the
+/// set is `Some` (the admin directory's tabs). The narrowing is the query's
+/// `WHERE`, so `total` counts the filtered set and paging stays inside it.
 pub async fn list_all(
     db: &Database,
+    roles: Option<&[Role]>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<User>, i64), AppError> {
-    user::list_all(db, limit, offset).await
+    user::list_all(db, roles, limit, offset).await
 }
 
 /// The users behind `ids` in one query; missing ids simply absent.

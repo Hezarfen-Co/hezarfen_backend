@@ -33,7 +33,7 @@ pub struct PoolQuestionId(Uuid);
 impl PoolQuestionId {
     /// Minted from the process-wide monotonic generator, not a random v4:
     /// the pool sorts `asked_at DESC, id DESC` and the id *is* the tie-break
-    /// ([`crate::db::pool_question::list_all`]),
+    /// ([`crate::db::pool_question::list`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
         Self(next_uuid())

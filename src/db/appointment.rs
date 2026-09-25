@@ -132,86 +132,142 @@ where
     Ok(appointment)
 }
 
+/// The caller's own bookings, newest first. The optional filters narrow the
+/// read: `status` matches the stored state, `starts_after`/`starts_before`
+/// bound the meeting's effective start — a standing proposal, the slot's
+/// window otherwise — from below (inclusive) and above (exclusive, so a
+/// month is `[start, next_start)`), and `teacher` is the booked slot's
+/// teacher — which needs the slot row, so the read runs over a derived table
+/// the window and its count share. A booking whose slot is gone has no
+/// meeting time and no teacher, so any of those three filters drops it; with
+/// no filter the read stays the plain single-table one, so today's rows
+/// (dangling bookings included) are untouched.
 pub async fn list_for_requester(
     db: &Database,
     requester: &UserId,
+    status: Option<AppointmentStatus>,
+    starts_after: Option<Timestamp>,
+    starts_before: Option<Timestamp>,
+    teacher: Option<&UserId>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
-    PagedList::new("appointment WHERE requester = $1", "ORDER BY id DESC")
-        .bind(requester.uuid())
-        .run(limit, offset, db)
-        .await
+    // Spell the appointment columns against the join alias, so the derived
+    // table's row keeps the exact names [`Appointment`] decodes and the
+    // slot's duplicate column names never leak in. The plain shape aliases
+    // the table too, so the one clause builder speaks both shapes.
+    const JOINED: &str = "(SELECT a.id, a.slot, a.requester, a.status, a.reason, \
+         a.proposed_starts_at, a.proposed_ends_at, a.proposed_by, a.decided_by, \
+         a.cancelled_by, a.cancel_reason, a.reject_reason, a.created_at \
+         FROM appointment a LEFT JOIN appointment_slot s ON a.slot = s.id \
+         WHERE a.requester = $1";
+    let joined = teacher.is_some() || starts_after.is_some() || starts_before.is_some();
+    let mut from_where = if joined {
+        JOINED.to_string()
+    } else {
+        "appointment a WHERE a.requester = $1".to_string()
+    };
+    // The meeting's start: a standing proposal overrides the slot's window
+    // (the same rule [`Appointment::window`] applies), so the predicate
+    // coalesces them — and these clauses only ever ride the joined shape,
+    // where the slot row is in hand.
+    let mut next = 2;
+    if status.is_some() {
+        from_where.push_str(&format!(" AND a.status = ${next}"));
+        next += 1;
+    }
+    if starts_after.is_some() {
+        from_where.push_str(&format!(
+            " AND COALESCE(a.proposed_starts_at, s.starts_at) >= ${next}"
+        ));
+        next += 1;
+    }
+    if starts_before.is_some() {
+        from_where.push_str(&format!(
+            " AND COALESCE(a.proposed_starts_at, s.starts_at) < ${next}"
+        ));
+        next += 1;
+    }
+    if teacher.is_some() {
+        from_where.push_str(&format!(" AND s.teacher = ${next}"));
+    }
+    // Close the derived table when the read is the joined shape; the plain
+    // single-table shape opened none.
+    if joined {
+        from_where.push(')');
+    }
+    let mut list = PagedList::new(from_where, "ORDER BY id DESC").bind(requester.uuid());
+    if let Some(status) = status {
+        list = list.bind(status.as_str().to_string());
+    }
+    if let Some(after) = starts_after {
+        list = list.bind(after.as_millis());
+    }
+    if let Some(before) = starts_before {
+        list = list.bind(before.as_millis());
+    }
+    if let Some(teacher) = teacher {
+        list = list.bind(teacher.uuid());
+    }
+    list.run(limit, offset, db).await
 }
 
 /// Every booking aimed at `teacher`, across all their slots — the
 /// teacher's request inbox. The teacher lives on the slot row now, so
 /// this is a join; the page and its count share the one predicate, and
 /// the columns are spelled out so the join's duplicate slot-column names
-/// can never leak into the row decode.
+/// can never leak into the row decode. `status` narrows to one booking
+/// state and `starts_after`/`starts_before` to meetings whose effective
+/// start (a standing proposal, the slot's window otherwise) sits in
+/// `[after, before)` — both bounds optional, both in the SQL, so the
+/// count always describes exactly the rows the window pages over.
 pub async fn list_for_teacher(
     db: &Database,
     teacher: &UserId,
+    status: Option<AppointmentStatus>,
+    starts_after: Option<Timestamp>,
+    starts_before: Option<Timestamp>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
-    match limit {
-        None => {
-            let rows = query_as!(
-                Appointment,
-                "SELECT a.id AS \"id: AppointmentId\", a.slot AS \"slot: AppointmentSlotId\", a.requester AS \"requester: UserId\", \
-                        a.status AS \"status: AppointmentStatus\", a.reason AS \"reason: AppointmentReason\", \
-                        a.proposed_starts_at AS \"proposed_starts_at: Timestamp\", \
-                        a.proposed_ends_at AS \"proposed_ends_at: Timestamp\", \
-                        a.proposed_by AS \"proposed_by: UserId\", a.decided_by AS \"decided_by: UserId\", \
-                        a.cancelled_by AS \"cancelled_by: UserId\", \
-                        a.cancel_reason AS \"cancel_reason: AppointmentReason\", \
-                        a.reject_reason AS \"reject_reason: AppointmentReason\", \
-                        a.created_at AS \"created_at: Timestamp\" \
-                 FROM appointment a JOIN appointment_slot s ON a.slot = s.id \
-                 WHERE s.teacher = $1 \
-                 ORDER BY a.id DESC",
-                teacher.uuid()
-            )
-            .fetch_all(db)
-            .await?;
-            let total = rows.len() as i64;
-            Ok((rows, total))
-        }
-        Some(limit) => {
-            let rows = query_as!(
-                Appointment,
-                "SELECT a.id AS \"id: AppointmentId\", a.slot AS \"slot: AppointmentSlotId\", a.requester AS \"requester: UserId\", \
-                        a.status AS \"status: AppointmentStatus\", a.reason AS \"reason: AppointmentReason\", \
-                        a.proposed_starts_at AS \"proposed_starts_at: Timestamp\", \
-                        a.proposed_ends_at AS \"proposed_ends_at: Timestamp\", \
-                        a.proposed_by AS \"proposed_by: UserId\", a.decided_by AS \"decided_by: UserId\", \
-                        a.cancelled_by AS \"cancelled_by: UserId\", \
-                        a.cancel_reason AS \"cancel_reason: AppointmentReason\", \
-                        a.reject_reason AS \"reject_reason: AppointmentReason\", \
-                        a.created_at AS \"created_at: Timestamp\" \
-                 FROM appointment a JOIN appointment_slot s ON a.slot = s.id \
-                 WHERE s.teacher = $1 \
-                 ORDER BY a.id DESC LIMIT $2 OFFSET $3",
-                teacher.uuid(),
-                limit,
-                offset
-            )
-            .fetch_all(db)
-            .await?;
-            let total = query!(
-                "SELECT count(*) AS total \
-                 FROM appointment a JOIN appointment_slot s ON a.slot = s.id \
-                 WHERE s.teacher = $1",
-                teacher.uuid()
-            )
-            .fetch_one(db)
-            .await?
-            .total
-            .unwrap_or(0);
-            Ok((rows, total))
-        }
+    // The join wrapped as one derived table, so [`PagedList`]'s `SELECT *`
+    // still sees exactly the appointment columns.
+    let mut from_where = String::from(
+        "(SELECT a.id, a.slot, a.requester, a.status, a.reason, \
+         a.proposed_starts_at, a.proposed_ends_at, a.proposed_by, a.decided_by, \
+         a.cancelled_by, a.cancel_reason, a.reject_reason, a.created_at \
+         FROM appointment a JOIN appointment_slot s ON a.slot = s.id \
+         WHERE s.teacher = $1",
+    );
+    let mut next = 2;
+    if status.is_some() {
+        from_where.push_str(&format!(" AND a.status = ${next}"));
+        next += 1;
     }
+    if starts_after.is_some() {
+        from_where.push_str(&format!(
+            " AND COALESCE(a.proposed_starts_at, s.starts_at) >= ${next}"
+        ));
+        next += 1;
+    }
+    if starts_before.is_some() {
+        from_where.push_str(&format!(
+            " AND COALESCE(a.proposed_starts_at, s.starts_at) < ${next}"
+        ));
+    }
+    // Close the derived table the clauses were appended into.
+    from_where.push(')');
+    let mut list = PagedList::new(from_where, "ORDER BY id DESC").bind(teacher.uuid());
+    if let Some(status) = status {
+        list = list.bind(status.as_str().to_string());
+    }
+    if let Some(after) = starts_after {
+        list = list.bind(after.as_millis());
+    }
+    if let Some(before) = starts_before {
+        list = list.bind(before.as_millis());
+    }
+    list.run(limit, offset, db).await
 }
 
 pub async fn list_for_slot(

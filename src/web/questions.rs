@@ -38,7 +38,7 @@ use crate::web::tenant_state::State;
 
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireStudent, RequireTeacher, UploadFileForm,
-    paginate, person_map, read_image_upload, remove_blob, serve_inline_blob, store_blob,
+    person_map, read_image_upload, remove_blob, serve_inline_blob, store_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -296,6 +296,11 @@ async fn ask_question(
 /// `approved` question; `pending` ones appear only to their asker and to
 /// teacher+ — so for a teacher, `?status=pending` is the approval queue.
 /// Paged via `?limit=&offset=`.
+///
+/// The visibility gate and the `status` filter share one SQL `WHERE`, so
+/// `total` counts the filtered set — `?status=pending` never loads the whole
+/// pool into a `Vec` first. A `status` other than `pending` or `approved`
+/// is a 400.
 #[utoipa::path(
     get,
     path = "/",
@@ -316,8 +321,9 @@ async fn list_questions(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<PoolQuestionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    if let Some(ref status) = filter.status
-        && !POOL_QUESTION_STATUSES.contains(&status.as_str())
+    let status = filter.status.as_deref().map(str::trim);
+    if let Some(status) = status
+        && !POOL_QUESTION_STATUSES.contains(&status)
     {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "status",
@@ -325,18 +331,15 @@ async fn list_questions(
         }));
     }
 
-    let mut questions = if user.get_role().at_least(Role::Teacher) {
-        pool_question::list_all(&st.db).await?
-    } else {
-        pool_question::list_visible_to(&st.db, user.get_id()).await?
-    };
-    if let Some(ref status) = filter.status {
-        questions.retain(|question| question.get_status() == status);
-    }
+    // Visibility stays exactly what the two reads encoded: teacher+ see the
+    // approval queue and the pool, everyone else the pool plus their own
+    // pending questions. Gate and status filter ride one SQL WHERE — `total`
+    // is the filtered count, and the window is the database's.
+    let viewer = (!user.get_role().at_least(Role::Teacher)).then_some(user.get_id());
+    let (questions, total) =
+        pool_question::list(&st.db, viewer, status, limit, offset).await?;
 
-    let total = questions.len() as i64;
-    // Paged in the web layer: the status filter above is per-row Rust.
-    let items = question_responses(paginate(&questions, limit, offset), &st).await?;
+    let items = question_responses(&questions, &st).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

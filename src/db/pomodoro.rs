@@ -5,11 +5,14 @@
 
 use crate::constant::{MAX_COUNTED_POMODORO_PER_DAY, MIN_COUNTED_POMODORO_MS};
 use crate::database::{Database, tx_with_retry};
+use crate::db::page::{Param, PagedList};
 use crate::domain::pomodoro::{PomodoroSession, PomodoroSessionId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::postgres::PgArguments;
 use sqlx::query_as;
+use sqlx::AssertSqlSafe;
 
 /// Start a session for `user`, stamped with the server clock. The open slot
 /// is the partial unique index (`pomodoro_session_open_stint`): one row per
@@ -215,24 +218,94 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
     Ok(saved)
 }
 
-/// Every session of `user`, newest first — the running one (if any)
-/// included. Ordered by `started_at`, never by id alone: the log is a
-/// chronology, and the id tie-break only ever separates two *finished*
-/// stints sharing a `started_at` — there is one running row per user, so it
-/// can never tie with itself.
-pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<PomodoroSession>, AppError> {
-    let sessions = query_as!(
-        PomodoroSession,
-        "SELECT id AS \"id: PomodoroSessionId\", app_user AS \"user: UserId\", \
-                started_at AS \"started_at: Timestamp\", \
-                finished_at AS \"finished_at: Timestamp\", counted, label \
-         FROM pomodoro_session WHERE app_user = $1 \
-         ORDER BY started_at DESC, id DESC",
-        user.uuid()
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(sessions)
+/// One read of the log: the page's rows, the filtered session count, and the
+/// filtered focus total — three answers over one `WHERE`, so they can never
+/// disagree.
+pub(crate) struct PomodoroLogPage {
+    pub(crate) items: Vec<PomodoroSession>,
+    /// Sessions in the filtered set, before the page window is applied.
+    pub(crate) total: i64,
+    /// `SUM(finished_at - started_at)` over the filtered set, unpaged.
+    pub(crate) total_focus_ms: i64,
+}
+
+/// The `FROM … WHERE` the page, the count, and the focus sum share, assembled
+/// once per read. Placeholders are positional: `$1` is the user, and the
+/// bounds follow in `from`, `to` order, present exactly when the arm names
+/// them.
+fn log_from_where(from: bool, to: bool) -> &'static str {
+    match (from, to) {
+        (true, true) => {
+            "pomodoro_session WHERE app_user = $1 AND started_at >= $2 AND started_at < $3"
+        }
+        (true, false) => "pomodoro_session WHERE app_user = $1 AND started_at >= $2",
+        (false, true) => "pomodoro_session WHERE app_user = $1 AND started_at < $2",
+        (false, false) => "pomodoro_session WHERE app_user = $1",
+    }
+}
+
+/// A page of `user`'s log, newest first — the running session (if any)
+/// included — with the half-open window `[from, to)` applied *before* both
+/// the page window and the sums. Ordered by `started_at`, never by id alone:
+/// the log is a chronology, and the id tie-break only ever separates two
+/// *finished* stints sharing a `started_at` — there is one running row per
+/// user, so it can never tie with itself.
+///
+/// With no bounds this is the whole-history read the unpaged `list` used to give.
+/// With bounds, answering the page never materializes the log beyond
+/// the page itself — the count and the focus total are database scalars over
+/// the same `WHERE`.
+pub(crate) async fn page_for_user(
+    db: &Database,
+    user: &UserId,
+    from: Option<i64>,
+    to: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<PomodoroLogPage, AppError> {
+    let from_where = log_from_where(from.is_some(), to.is_some());
+    let mut list = PagedList::new(from_where, "ORDER BY started_at DESC, id DESC").bind(user.uuid());
+    if let Some(ms) = from {
+        list = list.bind(ms);
+    }
+    if let Some(ms) = to {
+        list = list.bind(ms);
+    }
+    let (items, total) = list.run(limit, offset, db).await?;
+    let total_focus_ms = focus_total_ms(db, from_where, user, from, to).await?;
+    Ok(PomodoroLogPage {
+        items,
+        total,
+        total_focus_ms,
+    })
+}
+
+/// `SUM(finished_at - started_at)` over the same filtered set the page reads —
+/// one SQL scalar, so the focus total never folds the log in Rust. A running
+/// stint contributes nothing (its `finished_at` is `NULL` and `SUM` skips
+/// `NULL`), and an empty set `COALESCE`s to zero. `SUM(bigint)` answers
+/// `numeric`, hence the `::BIGINT` cast.
+async fn focus_total_ms(
+    db: &Database,
+    from_where: &str,
+    user: &UserId,
+    from: Option<i64>,
+    to: Option<i64>,
+) -> Result<i64, AppError> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(finished_at - started_at), 0)::BIGINT FROM {from_where}"
+    );
+    let mut args = PgArguments::default();
+    Param::Uuid(user.uuid()).add_to(&mut args);
+    if let Some(ms) = from {
+        Param::I64(ms).add_to(&mut args);
+    }
+    if let Some(ms) = to {
+        Param::I64(ms).add_to(&mut args);
+    }
+    Ok(sqlx::query_scalar_with(AssertSqlSafe(sql), args)
+        .fetch_one(db)
+        .await?)
 }
 #[cfg(test)]
 mod tests {
@@ -345,6 +418,33 @@ mod tests {
     async fn one_stint(user: &UserId, db: &Database) {
         start_aged(user, db, MIN_COUNTED_POMODORO_MS).await.unwrap();
         finish(db, user).await.unwrap();
+    }
+
+    /// Insert one closed stint at explicit unix-ms stamps — a row the
+    /// windowed-log tests below can aim bounds at, no clock involved.
+    /// `counted = NULL` (a pre-rule row) is the honest verdict for a stint no
+    /// transaction judged.
+    async fn seeded_stint(user: &UserId, db: &Database, started_at: i64, finished_at: i64) {
+        sqlx::query(
+            "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
+             VALUES ($1, $2, $3, $4, NULL, NULL)",
+        )
+        .bind(PomodoroSessionId::generate().uuid())
+        .bind(user.uuid())
+        .bind(started_at)
+        .bind(finished_at)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// The whole unwindowed log — the read the old `list_for_user` gave —
+    /// for tests that just want the sessions.
+    async fn whole_log<'a>(user: &UserId, db: &Database) -> Vec<PomodoroSession> {
+        page_for_user(db, user, None, None, None, 0)
+            .await
+            .unwrap()
+            .items
     }
 
     #[tokio::test]
@@ -569,7 +669,7 @@ mod tests {
         // Not a study day either — and no streak column was even opened.
         assert_eq!(streak(&user, &db).await, (0, 0, -1));
         // But it happened, and the log says so.
-        let log = list_for_user(&db, &user).await.unwrap();
+        let log = whole_log(&user, &db).await;
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].get_finished_at(), short.get_finished_at());
 
@@ -590,7 +690,7 @@ mod tests {
             )
         );
         assert_eq!(streak(&user, &db).await.0, 1);
-        assert_eq!(list_for_user(&db, &user).await.unwrap().len(), 2);
+        assert_eq!(whole_log(&user, &db).await.len(), 2);
     }
 
     /// The day quota: it stops the counter, it never stops the log, and it
@@ -617,7 +717,7 @@ mod tests {
         }
         assert_eq!(counters(&user, &db).await, (finished, focus_ms));
         assert_eq!(
-            list_for_user(&db, &user).await.unwrap().len() as i64,
+            whole_log(&user, &db).await.len() as i64,
             MAX_COUNTED_POMODORO_PER_DAY + 3
         );
         // The quota is a day's, not a lifetime's.
@@ -645,7 +745,7 @@ mod tests {
         assert_eq!(counters(&user, &db).await, (0, 0));
         assert_eq!(streak(&user, &db).await, (0, 0, -1));
         // Every one of them is still the student's own history.
-        assert_eq!(list_for_user(&db, &user).await.unwrap().len(), 200);
+        assert_eq!(whole_log(&user, &db).await.len(), 200);
         assert!(
             crate::db::badge::list_for(&db, &user)
                 .await
@@ -679,7 +779,7 @@ mod tests {
         // A restart replaces the dangling session: still one row, fresh clock.
         let second = start(&db, &user, None).await.unwrap();
         assert!(second.get_started_at() >= first.get_started_at());
-        let sessions = list_for_user(&db, &user).await.unwrap();
+        let sessions = whole_log(&user, &db).await;
         assert_eq!(sessions.len(), 1);
 
         let closed = finish(&db, &user).await.unwrap();
@@ -691,7 +791,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         start(&db, &user, None).await.unwrap();
-        let sessions = list_for_user(&db, &user).await.unwrap();
+        let sessions = whole_log(&user, &db).await;
         assert_eq!(sessions.len(), 2);
     }
 
@@ -721,5 +821,100 @@ mod tests {
         let stats = crate::db::profile::load(&db, &user, 0, 0).await.unwrap();
         assert_eq!(stats.get_pomodoro_sessions(), 1);
         assert_eq!(stats.get_pomodoro_focus_ms(), 0);
+    }
+
+    /// A timeline the windowed reads aim at: three finished stints
+    /// (5000 + 500 + 6000 ms of focus) and one still running, which the sums
+    /// must never mistake for focus.
+    async fn a_seeded_timeline(db: &Database) -> UserId {
+        let user = a_user(db).await;
+        seeded_stint(&user, db, 1000, 6000).await;
+        seeded_stint(&user, db, 2000, 2500).await;
+        seeded_stint(&user, db, 3000, 9000).await;
+        sqlx::query(
+            "INSERT INTO pomodoro_session (id, app_user, started_at, finished_at, counted, label)
+             VALUES ($1, $2, 4000, NULL, NULL, NULL)",
+        )
+        .bind(PomodoroSessionId::generate().uuid())
+        .bind(user.uuid())
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
+    fn starts(page: &PomodoroLogPage) -> Vec<i64> {
+        page.items
+            .iter()
+            .map(|session| session.get_started_at().as_millis())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_window_bounds_the_page_the_count_and_the_focus_total_alike() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let user = a_seeded_timeline(&db).await;
+
+        // No bounds: today's whole-history read — every session, newest
+        // first, and the focus total over all of it (running adds nothing).
+        let page = page_for_user(&db, &user, None, None, None, 0).await.unwrap();
+        assert_eq!(page.total, 4);
+        assert_eq!(starts(&page), [4000, 3000, 2000, 1000]);
+        assert_eq!(page.total_focus_ms, 11_500);
+
+        // `from` only: half-open at the start, so the stint opening at 2500
+        // itself is out and the ones from 3000 on are in.
+        let page = page_for_user(&db, &user, Some(2500), None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(starts(&page), [4000, 3000]);
+        assert_eq!(page.total_focus_ms, 6_000);
+
+        // `to` only: exclusive, so the stint starting exactly at 2000 is out.
+        let page = page_for_user(&db, &user, None, Some(2000), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(starts(&page), [1000]);
+        assert_eq!(page.total_focus_ms, 5_000);
+
+        // Both bounds AND together.
+        let page = page_for_user(&db, &user, Some(1000), Some(3000), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(starts(&page), [2000, 1000]);
+        assert_eq!(page.total_focus_ms, 5_500);
+
+        // A window over empty ground answers an empty page, not an error.
+        let page = page_for_user(&db, &user, Some(10_000), None, None, 0)
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, 0);
+        assert_eq!(page.total_focus_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn the_page_window_slices_after_the_time_window() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let user = a_seeded_timeline(&db).await;
+
+        // limit slices the filtered set; `total` stays the filtered count and
+        // the focus total the filtered sum — not the one listed row's.
+        let page = page_for_user(&db, &user, Some(2500), None, Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!(starts(&page), [4000]);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.total_focus_ms, 6_000);
+
+        // offset paging lands inside the filtered order, and the unpaged sums
+        // span the whole filtered log — 11_500, not the two listed rows' 11_000.
+        let page = page_for_user(&db, &user, None, None, Some(2), 1).await.unwrap();
+        assert_eq!(starts(&page), [3000, 2000]);
+        assert_eq!(page.total, 4);
+        assert_eq!(page.total_focus_ms, 11_500);
     }
 }

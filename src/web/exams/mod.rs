@@ -36,7 +36,7 @@ use super::bank_questions::BankQuestionResponse;
 use super::instances::can_view_instance;
 use super::{
     ChoiceBody, CurrentUser, ExamResponse, ImageUpload, Page, PageParams, PersonRef,
-    RequireTeacher, Scheduled, UploadFileForm, WindowParams, blob_path, check_not_past, paginate,
+    RequireTeacher, UploadFileForm, WindowParams, blob_path, check_not_past, paginate,
     person_map, read_image_upload, remove_blob, set_or_clear, store_blob,
 };
 
@@ -51,20 +51,6 @@ pub(crate) use audience::*;
 pub(crate) use images::*;
 pub(crate) use questions::*;
 pub(crate) use review::*;
-
-impl Scheduled for Exam {
-    fn starts_at_ms(&self) -> Option<i64> {
-        self.get_starts_at().map(|at| at.as_millis())
-    }
-
-    fn ends_at_ms(&self) -> Option<i64> {
-        self.get_ends_at().map(|at| at.as_millis())
-    }
-
-    fn order_key(&self) -> String {
-        self.get_id().key()
-    }
-}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -245,6 +231,10 @@ struct ExamStatisticsResponse {
 /// schedule — so `?ends_after=<now>&limit=20` returns the twenty *soonest*
 /// exams rather than the twenty newest-created. Exams without a window
 /// (no `mode`, or `open`) are excluded by either parameter.
+/// `?starts_before=` / `?ends_before=` are the mirror bounds (strictly
+/// before). Visibility, the draft rule, the window, the page, and the count
+/// share one SQL `WHERE`, so a filtered page never decodes the exams it
+/// skips.
 #[utoipa::path(
     get,
     path = "/",
@@ -264,29 +254,47 @@ async fn list_exams(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<ExamResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let exams = if user.get_role().at_least(Role::Manager) {
-        service::exam::list_all(&st.db).await?
+    window.validate()?;
+    // Visibility and the draft rule ride the same WHERE as the page and the
+    // count: a manager+ reads the whole table, everyone else the exams of
+    // their visible instances — a draft only where they manage the instance.
+    let (exams, total) = if user.get_role().at_least(Role::Manager) {
+        service::exam::list_windowed(
+            &st.db,
+            None,
+            None,
+            window.starts_after,
+            window.ends_after,
+            window.starts_before,
+            window.ends_before,
+            limit,
+            offset,
+        )
+        .await?
     } else {
         let instances = visible_instances(&user, &st.db).await?;
-        let ids: Vec<_> = instances.iter().map(|(i, _)| i.get_id().clone()).collect();
+        let visible: Vec<_> = instances.iter().map(|(i, _)| i.get_id().clone()).collect();
         // Drafts show only where the caller manages the instance (as one of
         // its teachers — the manager+ path above already saw everything).
-        let managed: HashSet<String> = instances
+        let managed: Vec<_> = instances
             .iter()
             .filter(|(_, manages)| *manages)
-            .map(|(instance, _)| instance.get_id().key())
+            .map(|(instance, _)| instance.get_id().clone())
             .collect();
-        let mut exams = service::exam::list_for_class_course_courses(&st.db, &ids).await?;
-        exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_class_course().key()));
-        exams
+        service::exam::list_windowed(
+            &st.db,
+            Some(&visible),
+            Some(&managed),
+            window.starts_after,
+            window.ends_after,
+            window.starts_before,
+            window.ends_before,
+            limit,
+            offset,
+        )
+        .await?
     };
-    let exams = window.apply(exams)?;
-    let total = exams.len() as i64;
-    // Paged in the web layer: the draft filter and the window are Rust.
-    let items = paginate(&exams, limit, offset)
-        .iter()
-        .map(ExamResponse::new)
-        .collect();
+    let items = exams.iter().map(ExamResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

@@ -24,23 +24,9 @@ use crate::service;
 use crate::state::AppState;
 
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, Scheduled, WindowParams,
-    check_not_past, check_time_range, paginate, person_map, set_or_clear,
+    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, WindowParams, check_not_past,
+    check_time_range, paginate, person_map, set_or_clear,
 };
-
-impl Scheduled for Event {
-    fn starts_at_ms(&self) -> Option<i64> {
-        self.get_starts_at().map(|at| at.as_millis())
-    }
-
-    fn ends_at_ms(&self) -> Option<i64> {
-        self.get_ends_at().map(|at| at.as_millis())
-    }
-
-    fn order_key(&self) -> String {
-        self.get_id().key()
-    }
-}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -358,7 +344,10 @@ async fn create_event(
 /// milliseconds) narrows the list to upcoming/unfinished events and flips the
 /// order to ascending by schedule, so `?ends_after=<now>&limit=20` returns the
 /// twenty *soonest* events rather than the twenty newest-created. Events with
-/// no schedule are excluded by either parameter.
+/// no schedule are excluded by either parameter. `?starts_before=` /
+/// `?ends_before=` are the mirror bounds (strictly before); with any bound
+/// set the page, the count, and the window share one SQL `WHERE`, so a
+/// filtered page never decodes the events it skips.
 #[utoipa::path(
     get,
     path = "/",
@@ -378,13 +367,20 @@ async fn list_events(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<EventResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let events = window.apply(service::event::list_all(&st.db).await?)?;
-    let total = events.len() as i64;
-    // Paged in the web layer: `WindowParams` filters and re-orders in Rust.
-    let items = paginate(&events, limit, offset)
-        .iter()
-        .map(EventResponse::new)
-        .collect();
+    window.validate()?;
+    // The window and the page are one SQL statement; `total` is a count over
+    // the same WHERE, so a filtered page never loads the rows it skips.
+    let (events, total) = service::event::list_windowed(
+        &st.db,
+        window.starts_after,
+        window.ends_after,
+        window.starts_before,
+        window.ends_before,
+        limit,
+        offset,
+    )
+    .await?;
+    let items = events.iter().map(EventResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

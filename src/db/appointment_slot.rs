@@ -11,6 +11,7 @@
 //! texts; the constraint is the authority a racing publish answers to.
 
 use crate::database::{Database, exclusion_violation, tx_with_retry, unique_violation};
+use crate::db::page::PagedList;
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotNote, SlotSeries};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -184,23 +185,28 @@ pub async fn read(
     Ok(slot)
 }
 
-/// A teacher's own calendar, earliest first.
+/// A teacher's own calendar, earliest first. `starts_after` cuts the read in
+/// the SQL, so asking for the upcoming window never loads the whole past to
+/// slice it in the caller — a calendar of years of weekly publishes stays a
+/// bounded scan. The predicate is the same either way, so the filtered and
+/// unfiltered reads answer in one shared shape.
 pub async fn list_for_teacher(
     db: &Database,
     teacher: &UserId,
+    starts_after: Option<Timestamp>,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let slots = query_as!(
-        AppointmentSlot,
-        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
-         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
-         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
-         FROM appointment_slot WHERE teacher = $1 \
-         ORDER BY starts_at ASC, id ASC",
-        teacher.uuid()
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(slots)
+    let mut from_where = String::from("appointment_slot WHERE teacher = $1");
+    if starts_after.is_some() {
+        from_where.push_str(" AND starts_at >= $2");
+    }
+    let mut list =
+        PagedList::new(from_where, "ORDER BY starts_at ASC, id ASC").bind(teacher.uuid());
+    if let Some(after) = starts_after {
+        list = list.bind(after.as_millis());
+    }
+    // Unpaged on purpose: the callers slice the window in the web layer.
+    let (rows, _) = list.run(None, 0, db).await?;
+    Ok(rows)
 }
 
 /// Every slot whose window has not opened yet, earliest first — the bookable
@@ -216,19 +222,33 @@ pub async fn list_for_teacher(
 pub async fn list_upcoming(
     db: &Database,
     from: Timestamp,
+    teacher: Option<&UserId>,
+    starts_after: Option<Timestamp>,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let slots = query_as!(
-        AppointmentSlot,
-        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
-         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
-         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
-         FROM appointment_slot WHERE starts_at > $1 \
-         ORDER BY starts_at ASC, id ASC",
-        from.as_millis()
-    )
-    .fetch_all(db)
-    .await?;
-    Ok(slots)
+    // The strict `starts_at > from` bound is the bookable calendar itself and
+    // never moves; the optional filters only narrow inside it, each taking
+    // the placeholder number its bind position gives it.
+    let mut from_where = String::from("appointment_slot WHERE starts_at > $1");
+    let mut next = 2;
+    if starts_after.is_some() {
+        from_where.push_str(&format!(" AND starts_at >= ${next}"));
+        next += 1;
+    }
+    if teacher.is_some() {
+        from_where.push_str(&format!(" AND teacher = ${next}"));
+    }
+    let mut list =
+        PagedList::new(from_where, "ORDER BY starts_at ASC, id ASC").bind(from.as_millis());
+    if let Some(after) = starts_after {
+        list = list.bind(after.as_millis());
+    }
+    if let Some(teacher) = teacher {
+        list = list.bind(teacher.uuid());
+    }
+    // Unpaged on purpose: the web layer retains the live teachers' rows and
+    // slices the page after that filter, so the window cannot move into SQL.
+    let (rows, _) = list.run(None, 0, db).await?;
+    Ok(rows)
 }
 
 pub async fn list_for_series(

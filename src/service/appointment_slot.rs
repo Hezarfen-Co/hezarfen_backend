@@ -27,21 +27,37 @@ pub async fn read(
     appointment_slot::read(db, id).await
 }
 
-/// A teacher's own calendar, earliest first — the web layer's calendar read.
+/// A teacher's own calendar, earliest first — the plain, unfiltered read.
 pub async fn list_for_teacher(
     db: &Database,
     teacher: &UserId,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    appointment_slot::list_for_teacher(db, teacher).await
+    appointment_slot::list_for_teacher(db, teacher, None).await
+}
+
+/// The calendar read the slots door runs: `teacher`'s published rows,
+/// earliest first, cut to windows starting at or after `starts_after` when
+/// the caller asked. The cut is the SQL's, so a calendar with years of past
+/// publishes answers from the asked-for window onward without loading its
+/// whole history to slice it afterwards.
+pub async fn list_calendar(
+    db: &Database,
+    teacher: &UserId,
+    starts_after: Option<Timestamp>,
+) -> Result<Vec<AppointmentSlot>, AppError> {
+    appointment_slot::list_for_teacher(db, teacher, starts_after).await
 }
 
 /// Every slot whose window has not opened yet, earliest first — the bookable
-/// calendar a requester browses.
+/// calendar a requester browses, narrowed by the door's optional `teacher`
+/// and `starts_after` filters (which only cut inside the upcoming set).
 pub async fn list_upcoming(
     db: &Database,
     from: Timestamp,
+    teacher: Option<&UserId>,
+    starts_after: Option<Timestamp>,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    appointment_slot::list_upcoming(db, from).await
+    appointment_slot::list_upcoming(db, from, teacher, starts_after).await
 }
 
 /// Every slot of one recurring publish, earliest first.
@@ -562,5 +578,95 @@ mod tests {
             Err(AppError::ConflictOwned(_))
         ));
         assert!(list_for_teacher(&db, &teacher).await.unwrap().is_empty());
+    }
+
+    /// The calendar read stays within the named teacher's rows after the
+    /// rewrite to the runtime builder — the slots door's whole visibility
+    /// universe hangs on that predicate.
+    #[tokio::test]
+    async fn the_calendar_read_names_only_its_own_teachers_rows() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let ali = a_person(&db, "ali", "teacher").await;
+        let ayse = a_person(&db, "ayse", "teacher").await;
+        create(&db, &ali, at(1_000), at(2_000), None).await.unwrap();
+        create(&db, &ayse, at(3_000), at(4_000), None).await.unwrap();
+
+        let calendar = list_for_teacher(&db, &ali).await.unwrap();
+        assert_eq!(calendar.len(), 1);
+        assert_eq!(calendar[0].get_teacher(), &ali);
+    }
+
+    /// The calendar cut is the SQL's: `starts_after` drops the past
+    /// occurrences from the read instead of loading the whole history for the
+    /// caller to slice, so the filtered length the web layer reports is the
+    /// filtered count. The instant is inclusive.
+    #[tokio::test]
+    async fn the_calendar_start_cut_is_sql_side_and_inclusive() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let now = Timestamp::now().as_millis();
+        create(&db, &teacher, at(now - 10_000), at(now - 5_000), None)
+            .await
+            .unwrap();
+        create(&db, &teacher, at(now + 10_000), at(now + 20_000), None)
+            .await
+            .unwrap();
+
+        // Absent: both, earliest first — the calendar as it has always read.
+        let all = list_for_teacher(&db, &teacher).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].get_starts_at().as_millis() < all[1].get_starts_at().as_millis());
+
+        // Filtered: only the future one; the cut instant itself would match.
+        let upcoming = list_calendar(&db, &teacher, Some(at(now))).await.unwrap();
+        assert_eq!(upcoming.len(), 1);
+        assert_eq!(upcoming[0].get_starts_at().as_millis(), now + 10_000);
+    }
+
+    /// The bookable read narrows inside the upcoming set: the strict
+    /// `starts_at > now` bound never moves, the teacher filter names one
+    /// publisher, and the instant cut is inclusive. Absent, the read is the
+    /// whole calendar exactly as before.
+    #[tokio::test]
+    async fn the_upcoming_read_narrows_without_moving_the_bound() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let ali = a_person(&db, "ali", "teacher").await;
+        let ayse = a_person(&db, "ayse", "teacher").await;
+        let now = Timestamp::now().as_millis();
+        create(&db, &ali, at(now - 10_000), at(now - 5_000), None)
+            .await
+            .unwrap();
+        create(&db, &ali, at(now + 5_000), at(now + 10_000), None)
+            .await
+            .unwrap();
+        create(&db, &ali, at(now + 60_000), at(now + 90_000), None)
+            .await
+            .unwrap();
+        create(&db, &ayse, at(now + 30_000), at(now + 40_000), None)
+            .await
+            .unwrap();
+
+        let from = at(now);
+        // Absent: the strict bound holds — ali's past slot is out, three in.
+        let all = list_upcoming(&db, from, None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // teacher: only that teacher, past stays out.
+        let ali_only = list_upcoming(&db, from, Some(&ali), None).await.unwrap();
+        assert_eq!(ali_only.len(), 2);
+        assert!(ali_only.iter().all(|slot| slot.get_teacher() == &ali));
+
+        // starts_after is inclusive: the two slots at or after the cut.
+        let cut = list_upcoming(&db, from, None, Some(at(now + 30_000)))
+            .await
+            .unwrap();
+        assert_eq!(cut.len(), 2);
+
+        // Both filters together.
+        let both = list_upcoming(&db, from, Some(&ayse), Some(at(now + 30_000)))
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].get_teacher(), &ayse);
     }
 }

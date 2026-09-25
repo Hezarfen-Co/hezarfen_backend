@@ -37,9 +37,28 @@ pub async fn read(db: &Database, id: &EventId) -> Result<Option<Event>, AppError
     event::read(db, id).await
 }
 
-/// Every event, newest first.
-pub async fn list_all(db: &Database) -> Result<Vec<Event>, AppError> {
-    event::list_all(db).await
+/// The `GET /events` list — visibility-free (every authenticated user sees
+/// every event), the schedule window and the page pushed into SQL. All four
+/// window bounds absent is the unfiltered, newest-first read.
+pub async fn list_windowed(
+    db: &Database,
+    starts_after: Option<i64>,
+    ends_after: Option<i64>,
+    starts_before: Option<i64>,
+    ends_before: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Event>, i64), AppError> {
+    event::list_windowed(
+        db,
+        starts_after,
+        ends_after,
+        starts_before,
+        ends_before,
+        limit,
+        offset,
+    )
+    .await
 }
 
 /// Only what the request carried is written: an omitted field (`None`) is

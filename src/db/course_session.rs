@@ -173,19 +173,36 @@ pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSe
 /// An instance's sessions, most recent lesson first. Ordered by `starts_at`
 /// (not id): a timetable is read by when the lesson happens, not by when
 /// the row was created.
+///
+/// `starts_after`/`starts_before` narrow the list to a half-open
+/// `[starts_after, starts_before)` on `starts_at` — a calendar month is
+/// `[month_start, next_month_start)` — with the page and the count sharing
+/// the one `WHERE`. Absent bounds leave today's unfiltered read.
 pub async fn list_for_class_course(
     db: &Database,
     class_course: &ClassCourseId,
+    starts_after: Option<i64>,
+    starts_before: Option<i64>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<CourseSession>, i64), AppError> {
-    PagedList::new(
-        "course_session WHERE class_course = $1",
-        "ORDER BY starts_at DESC, id DESC",
-    )
-    .bind(class_course.uuid())
-    .run::<CourseSession>(limit, offset, db)
-    .await
+    let from_where = match (starts_after, starts_before) {
+        (Some(_), Some(_)) => {
+            "course_session WHERE class_course = $1 AND starts_at >= $2 AND starts_at < $3"
+        }
+        (Some(_), None) => "course_session WHERE class_course = $1 AND starts_at >= $2",
+        (None, Some(_)) => "course_session WHERE class_course = $1 AND starts_at < $2",
+        (None, None) => "course_session WHERE class_course = $1",
+    };
+    let mut list = PagedList::new(from_where, "ORDER BY starts_at DESC, id DESC")
+        .bind(class_course.uuid());
+    if let Some(after) = starts_after {
+        list = list.bind(after);
+    }
+    if let Some(before) = starts_before {
+        list = list.bind(before);
+    }
+    list.run::<CourseSession>(limit, offset, db).await
 }
 
 /// Request-scoped: the handler holds nothing across its read and this
@@ -338,5 +355,101 @@ mod tests {
             make,
         )
         .await;
+    }
+
+    /// One section, three lessons an hour apart across `now`. Starts differ
+    /// per row: the section's `UNIQUE (class_course, starts_at)` refuses a
+    /// shared instant, and the window bounds below hang off that middle
+    /// lesson's exact start.
+    async fn three_sessions(db: &Database) -> (ClassCourseId, i64) {
+        let (instance, _) = crate::db::course::a_test_instance(db).await;
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, created_at, role) \
+             VALUES ($1, $2, 0, 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("session-window-{}", &teacher.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        let now = Timestamp::now().as_millis();
+        for starts_at in [now - 3_600_000, now, now + 3_600_000] {
+            create(
+                db,
+                &instance,
+                &teacher,
+                SessionTopic::try_new("limits").unwrap(),
+                Timestamp::from_millis(starts_at),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        (instance, now)
+    }
+
+    #[tokio::test]
+    async fn the_session_window_is_half_open_on_starts_at() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let (instance, now) = three_sessions(&db).await;
+
+        // Absent bounds: every session, most recent lesson first.
+        let (rows, total) = list_for_class_course(&db, &instance, None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        let starts: Vec<_> = rows.iter().map(|s| s.get_starts_at().as_millis()).collect();
+        assert_eq!(starts, vec![now + 3_600_000, now, now - 3_600_000]);
+
+        // starts_after is inclusive: the middle lesson (exactly `now`) stays,
+        // and the order does not flip.
+        let (rows, total) = list_for_class_course(&db, &instance, Some(now), None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        let starts: Vec<_> = rows.iter().map(|s| s.get_starts_at().as_millis()).collect();
+        assert_eq!(starts, vec![now + 3_600_000, now]);
+
+        // starts_before is strict: the middle lesson is out.
+        let (rows, total) = list_for_class_course(&db, &instance, None, Some(now), None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].get_starts_at().as_millis(), now - 3_600_000);
+
+        // The half-open pair pins exactly the middle lesson.
+        let (rows, total) = list_for_class_course(
+            &db,
+            &instance,
+            Some(now),
+            Some(now + 3_600_000),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].get_starts_at().as_millis(), now);
+
+        // The limit pages the filtered set; total is the filtered count.
+        let (rows, total) = list_for_class_course(&db, &instance, Some(now), None, Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!((rows.len(), total), (1, 2));
+        assert_eq!(rows[0].get_starts_at().as_millis(), now + 3_600_000);
+
+        // An instant naming no lesson is an empty page, not an error.
+        let (rows, total) = list_for_class_course(
+            &db,
+            &instance,
+            Some(now + 30 * 86_400_000),
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty() && total == 0);
     }
 }

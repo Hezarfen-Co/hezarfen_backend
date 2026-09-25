@@ -63,8 +63,38 @@ pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, Ap
     homework::read(db, id).await
 }
 
-pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
-    homework::list_all(db).await
+/// The optional predicates of the cross-instance homework reads — the
+/// `?due_after=&due_before=&class_course=` scoping of `GET /homework`.
+/// Absent fields widen the read; none of them widens the caller's
+/// visibility, which the web layer still applies on top.
+#[derive(Debug, Clone, Default)]
+pub struct HomeworkListFilter {
+    /// Keep homework due at or after this instant (Unix ms) — the open tab.
+    pub due_after: Option<i64>,
+    /// Keep homework due before this instant (Unix ms) — the past tab.
+    pub due_before: Option<i64>,
+    /// Keep only this class×course instance's homework.
+    pub class_course: Option<ClassCourseId>,
+}
+
+/// Every homework, newest first — the manager+ view, narrowed by `filter`
+/// in SQL and paged in the database (a manager retains nothing in Rust, so
+/// the window and the count are both the database's).
+pub async fn list_all(
+    db: &Database,
+    filter: &HomeworkListFilter,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Homework>, i64), AppError> {
+    homework::list_all(
+        db,
+        filter.due_after,
+        filter.due_before,
+        filter.class_course.as_ref(),
+        limit,
+        offset,
+    )
+    .await
 }
 
 /// The homework of one class×course instance, newest first — the read behind
@@ -77,12 +107,22 @@ pub async fn list_for_class_course(
 }
 
 /// Every homework of every instance in `instances` (one query) — the read
-/// behind a caller's visible courses.
+/// behind a caller's visible courses, narrowed by `filter` in SQL. Unpaged:
+/// the caller may still drop rows in Rust (a student's audience), so a
+/// window here could only hide rows that trim was about to keep.
 pub async fn list_for_class_courses(
     db: &Database,
     instances: &[ClassCourseId],
+    filter: &HomeworkListFilter,
 ) -> Result<Vec<Homework>, AppError> {
-    homework::list_for_class_courses(db, instances).await
+    homework::list_for_class_courses(
+        db,
+        instances,
+        filter.due_after,
+        filter.due_before,
+        filter.class_course.as_ref(),
+    )
+    .await
 }
 
 /// The homework of one instance that `user` is meant to see — the per-instance

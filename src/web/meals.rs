@@ -93,6 +93,40 @@ struct MenuRange {
     to: Option<String>,
 }
 
+/// Optional slot filter on `GET /meals/menus`. Its own extractor, so
+/// `GET /meals/attendance/{user}` — which shares [`MenuRange`] for its date
+/// bounds — gains no dead `slot` param.
+#[derive(Debug, Deserialize, IntoParams)]
+struct MenuSlotFilter {
+    /// Keep only menus published for this meal slot, named exactly as the
+    /// menu snapshotted it.
+    #[param(example = "lunch")]
+    slot: Option<String>,
+}
+
+impl MenuSlotFilter {
+    /// The slot text to bind, trimmed. Deliberately *not* checked against
+    /// the school's current `meal_slots`: a menu snapshots its slot's name
+    /// at publish, so a slot retired since must still find the menus
+    /// published under it — an unknown name simply matches nothing (an
+    /// empty page, not a `400`). An empty value, though, filters nothing
+    /// and says nothing: refused, naming the field.
+    fn resolve(self) -> Result<Option<String>, AppError> {
+        let Some(raw) = self.slot else {
+            return Ok(None);
+        };
+        let slot = raw.trim();
+        if slot.is_empty() {
+            return Err(ValidationError::Invalid {
+                field: "slot",
+                reason: "must name a meal slot and may not be empty",
+            }
+            .into());
+        }
+        Ok(Some(slot.to_string()))
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 struct CreateDish {
     #[schema(example = "Mercimek çorbası", max_length = 100)]
@@ -283,15 +317,22 @@ async fn create_menu(
 /// `YYYY-MM-DD`, each bound held to the same real-calendar-day rule a menu's
 /// own date is). Paged via `?limit=&offset=` (omit `limit` for the full list);
 /// returns a `{items, total, limit, offset}` envelope.
+///
+/// Narrow to one meal slot with `?slot=` — matched exactly against the slot
+/// text each menu snapshotted at publish, not against the school's current
+/// `meal_slots`, so a slot retired since still finds its menus and an
+/// unknown name is an empty page rather than an error. `?slot=` (empty) is a
+/// `400`. The filter runs in SQL: `total` counts the filtered rows, and
+/// `limit`/`offset` window inside them.
 #[utoipa::path(
     get,
     path = "/menus",
     tag = "meals",
     security(("session_cookie" = [])),
-    params(MenuRange, PageParams),
+    params(MenuRange, MenuSlotFilter, PageParams),
     responses(
         (status = 200, description = "A page of menus (the full list when unpaged)", body = Page<MenuResponse>),
-        (status = 400, description = "Date bound that is not a real YYYY-MM-DD calendar day, or a malformed limit or offset", body = ErrorResponse),
+        (status = 400, description = "Date bound that is not a real YYYY-MM-DD calendar day, an empty slot, or a malformed limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -299,13 +340,22 @@ async fn list_menus(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(range): Query<MenuRange>,
+    Query(filter): Query<MenuSlotFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<MenuResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let from = range.from.as_deref().map(MenuDate::try_new).transpose()?;
     let to = range.to.as_deref().map(MenuDate::try_new).transpose()?;
-    let (menus, total) =
-        service::menu::list(&st.db, from.as_ref(), to.as_ref(), limit, offset).await?;
+    let slot = filter.resolve()?;
+    let (menus, total) = service::menu::list(
+        &st.db,
+        from.as_ref(),
+        to.as_ref(),
+        slot.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     // The dish/people join runs over the page alone, so it shrinks with it.
     let items = menu_responses(&menus, user.get_id(), &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))

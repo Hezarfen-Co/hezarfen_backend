@@ -8,6 +8,7 @@ use crate::db::page::{PagedList, Param};
 use crate::domain::message::{
     Folder, Message, MessageBody, MessageId, MessageLabel, MessageSubject,
 };
+use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -55,14 +56,21 @@ pub async fn send(
 /// dynamic string assembled, minus the interpolation. They ride the
 /// [`PagedList`] builder (the paged-list exemption), so the page and its
 /// count always see the same predicate.
+///
+/// `q` is an optional free-text needle over subject and body, folded
+/// case- and diacritic-insensitively on both sides ([`search_fold`] /
+/// [`search_fold_sql`]); a blank needle searches nothing.
 pub async fn list_folder(
     db: &Database,
     user: &UserId,
     folder: Folder,
     read: Option<bool>,
+    q: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Message>, i64), AppError> {
+    // A blank needle searches nothing, exactly like an absent one.
+    let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
     let home_arm = folder == Folder::Inbox;
     let mut from = match folder {
         Folder::Sent => "message WHERE sender = $1 AND sender_folder = 'sent'".to_string(),
@@ -76,8 +84,20 @@ pub async fn list_folder(
     };
     // The `read` filter binds after whichever placeholders the folder shape
     // spent (`$1` is always the user; the home-folder arm spends `$2`).
+    let mut next = if home_arm { 3 } else { 2 };
     if read.is_some() {
-        from.push_str(&format!(" AND read = ${}", if home_arm { 3 } else { 2 }));
+        from.push_str(&format!(" AND read = ${next}"));
+        next += 1;
+    }
+    // The needle rides the same fold on both sides (`position`, not `LIKE`,
+    // keeps `%` and `_` literal). Subject or body — this query joins no
+    // counterparty, so names are not searched.
+    if needle.is_some() {
+        from.push_str(&format!(
+            " AND (position(${next} in {}) > 0 OR position(${next} in {}) > 0)",
+            search_fold_sql("subject"),
+            search_fold_sql("body"),
+        ));
     }
     let mut builder = PagedList::new(from, "ORDER BY id DESC").bind(user.uuid());
     if home_arm {
@@ -85,6 +105,9 @@ pub async fn list_folder(
     }
     if let Some(read) = read {
         builder = builder.bind(Param::Bool(read));
+    }
+    if let Some(needle) = needle {
+        builder = builder.bind(needle);
     }
     builder.run(limit, offset, db).await
 }
@@ -280,9 +303,10 @@ mod tests {
             sent.push(message.get_id().key().to_string());
         }
 
-        let (listed, total) = list_folder(&db, &recipient, Folder::Inbox, None, None, 0)
-            .await
-            .unwrap();
+        let (listed, total) =
+            list_folder(&db, &recipient, Folder::Inbox, None, None, None, 0)
+                .await
+                .unwrap();
         assert_eq!(total, 25);
         sent.reverse();
         let read_back: Vec<String> = listed
@@ -290,5 +314,164 @@ mod tests {
             .map(|row| row.get_id().key().to_string())
             .collect();
         assert_eq!(read_back, sent);
+    }
+
+    /// `q` folds case and Turkish diacritics on both sides, matches subject
+    /// or body, composes with `read`, and pages after the filter (`total`
+    /// counts matches, not rows). The folder predicate still scopes the
+    /// search: a stranger's folders stay empty no matter what the needle
+    /// matches in someone else's mail.
+    #[tokio::test]
+    async fn q_searches_subject_and_body_and_composes_with_read() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let sender = crate::db::class_member::tests::fixture_user(&db, "q-gonderen").await;
+        let recipient = crate::db::class_member::tests::fixture_user(&db, "q-alici").await;
+        let stranger = crate::db::class_member::tests::fixture_user(&db, "q-yabanci").await;
+
+        let subject_hit = send(
+            &db,
+            &sender,
+            &recipient,
+            MessageSubject::try_new("Matematik Etüt").unwrap(),
+            MessageBody::try_new("saat üçte").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let body_hit = send(
+            &db,
+            &sender,
+            &recipient,
+            MessageSubject::try_new("duyuru").unwrap(),
+            MessageBody::try_new("İSTANBUL gezisi etüt sonrası").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        send(
+            &db,
+            &sender,
+            &recipient,
+            MessageSubject::try_new("toplantı").unwrap(),
+            MessageBody::try_new("alakasız").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let subject_key = subject_hit.get_id().key().to_string();
+        let body_key = body_hit.get_id().key().to_string();
+
+        // Absent and blank needles both see the whole folder.
+        let (_, total) =
+            list_folder(&db, &recipient, Folder::Inbox, None, None, None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 3);
+        let (_, total) =
+            list_folder(&db, &recipient, Folder::Inbox, None, Some("   "), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 3);
+
+        // Subject hit through the fold: `etut` finds `Etüt`.
+        let (hits, total) =
+            list_folder(&db, &recipient, Folder::Inbox, None, Some("etut"), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 2);
+        let keys: Vec<String> = hits
+            .iter()
+            .map(|message| message.get_id().key().to_string())
+            .collect();
+        assert!(keys.contains(&subject_key));
+        assert!(keys.contains(&body_key));
+
+        // Body hit, case-insensitive in both directions.
+        let (hits, total) = list_folder(
+            &db,
+            &recipient,
+            Folder::Inbox,
+            None,
+            Some("İsTaNbUl"),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].get_id().key().to_string(), body_key);
+
+        // A needle matching nothing: an empty page, not an error.
+        let (hits, total) = list_folder(
+            &db,
+            &recipient,
+            Folder::Inbox,
+            None,
+            Some("yok boyle bir sey"),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 0);
+        assert!(hits.is_empty());
+
+        // The window runs after the filter: `total` counts matches.
+        let (hits, total) = list_folder(
+            &db,
+            &recipient,
+            Folder::Inbox,
+            None,
+            Some("etut"),
+            Some(1),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 1);
+
+        // Composes with `read`: one match read, the other not.
+        set_read(&db, subject_hit, true).await.unwrap();
+        let (_, total) = list_folder(
+            &db,
+            &recipient,
+            Folder::Inbox,
+            Some(true),
+            Some("etut"),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 1);
+        let (hits, total) = list_folder(
+            &db,
+            &recipient,
+            Folder::Inbox,
+            Some(false),
+            Some("etut"),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].get_id().key().to_string(), body_key);
+
+        // The folder predicate still scopes the search: the stranger's own
+        // folders are empty even though the needle matches other users' mail.
+        let (hits, total) =
+            list_folder(&db, &stranger, Folder::Inbox, None, Some("etut"), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 0);
+        assert!(hits.is_empty());
+        let (hits, total) =
+            list_folder(&db, &stranger, Folder::Sent, None, Some("etut"), None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 0);
+        assert!(hits.is_empty());
     }
 }

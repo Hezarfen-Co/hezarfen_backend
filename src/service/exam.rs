@@ -113,8 +113,34 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
     exam::read(db, id).await
 }
 
-pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
-    exam::list_all(db).await
+/// The `GET /exams` list. `visible`/`managed` are the non-manager read (the
+/// exams of the caller's visible instances, a draft only where they manage
+/// the owner instance); both `None` is the manager+ whole-table read. The
+/// schedule window, the visibility, the draft rule, the page, and the count
+/// share one SQL `WHERE` — see [`exam::list_windowed`].
+pub async fn list_windowed(
+    db: &Database,
+    visible: Option<&[ClassCourseId]>,
+    managed: Option<&[ClassCourseId]>,
+    starts_after: Option<i64>,
+    ends_after: Option<i64>,
+    starts_before: Option<i64>,
+    ends_before: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Exam>, i64), AppError> {
+    exam::list_windowed(
+        db,
+        visible,
+        managed,
+        starts_after,
+        ends_after,
+        starts_before,
+        ends_before,
+        limit,
+        offset,
+    )
+    .await
 }
 
 /// One instance's exams, newest first — the read behind
@@ -124,16 +150,6 @@ pub async fn list_for_class_course(
     class_course: &ClassCourseId,
 ) -> Result<Vec<Exam>, AppError> {
     exam::list_for_class_course(db, class_course).await
-}
-
-/// Every exam of every instance in `instances` (one query) — the report-card
-/// and marks reports' cross-instance read, and the list behind a caller's
-/// visible instances.
-pub async fn list_for_class_course_courses(
-    db: &Database,
-    instances: &[ClassCourseId],
-) -> Result<Vec<Exam>, AppError> {
-    exam::list_for_class_course_courses(db, instances).await
 }
 
 /// Every exam of every catalog course in `courses` (one query) — the catalog
@@ -820,5 +836,173 @@ mod tests {
             2,
             "neither refusal wrote"
         );
+    }
+
+    /// An exam with full control over the schedule and the draft flag — the
+    /// window and draft-rule tests need shapes [`exam_on`] does not make.
+    async fn exam_shaped(
+        db: &Database,
+        instance: &ClassCourse,
+        schedule: ExamSchedule,
+        draft: bool,
+        title: &str,
+    ) -> Exam {
+        let creator = crate::db::class_member::tests::fixture_user(db, "window-author").await;
+        let term = crate::db::term::a_test_term(db).await;
+        let allowed = Settings::defaults().get_exam_kinds().to_vec();
+        crate::db::exam::create(
+            db,
+            &creator,
+            instance.get_id(),
+            &term,
+            ExamTitle::try_new(title).unwrap(),
+            ExamDescription::try_new("").unwrap(),
+            ExamKind::try_new("yazili", &allowed).unwrap(),
+            schedule,
+            ExamAttemptLimit::try_new(1).unwrap(),
+            true,
+            false,
+            draft,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `list_windowed` in SQL must answer exactly what the old
+    /// list-and-retain read answered: visibility (any addressed instance),
+    /// the draft rule (only where the caller manages the owner instance),
+    /// the schedule window (schedule-less rows out, ascending order), and a
+    /// `total` that is the filtered count even when the page is short.
+    #[tokio::test]
+    async fn the_exam_list_window_keeps_visibility_and_draft_rules() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = staff(&db, "window-mudur", Role::Manager).await;
+        let algebra = crate::db::class_member::tests::a_course("algebra", &db).await;
+        let geometry = crate::db::class_member::tests::a_course("geometry", &db).await;
+        let a = instance_in(&db, manager.get_id(), "8-A", &algebra, None).await;
+        let b = instance_in(&db, manager.get_id(), "8-B", &geometry, None).await;
+
+        let now = Timestamp::now().as_millis();
+        let sync =
+            |starts_at: i64| -> ExamSchedule {
+                ExamSchedule::try_new(
+                    Some(ExamMode::try_new("sync").unwrap()),
+                    Some(Timestamp::from_millis(starts_at)),
+                    Some(Timestamp::from_millis(starts_at + 3_600_000)),
+                    None,
+                )
+                .unwrap()
+            };
+        // On A: a scheduled exam ahead, a scheduled draft ahead, a
+        // window-less (`sync`-less, so no-mode) published exam, and one that
+        // already ran. On B: a draft of *another* instance.
+        let ahead = exam_shaped(&db, &a, sync(now + 3_600_000), false, "ahead").await;
+        let ahead_draft = exam_shaped(&db, &a, sync(now + 3_600_000), true, "ahead-draft").await;
+        let open = exam_shaped(&db, &a, ExamSchedule::default(), false, "open").await;
+        let ran = exam_shaped(&db, &a, sync(now - 3_600_000), false, "ran").await;
+        let other_draft = exam_shaped(&db, &b, sync(now + 3_600_000), true, "other-draft").await;
+
+        // Manager+: the whole table, newest first.
+        let (rows, total) = list_windowed(&db, None, None, None, None, None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 5);
+        let listed: Vec<_> = rows.iter().map(|exam| exam.get_id()).cloned().collect();
+        assert_eq!(
+            listed,
+            [&other_draft, &ran, &open, &ahead_draft, &ahead]
+                .into_iter()
+                .map(|exam| exam.get_id().clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Manager+ WITH a window: the window predicates must name the
+        // unaliased `exam` (the audience join only exists on the other
+        // branch). This exact call 500'd with "missing FROM-clause entry for
+        // table e" while the predicates were `e.`-qualified.
+        let (rows, total) = list_windowed(&db, None, None, None, Some(now), None, None, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        let listed: Vec<_> = rows.iter().map(|exam| exam.get_id()).cloned().collect();
+        assert_eq!(
+            listed,
+            [&ahead, &ahead_draft, &other_draft]
+                .into_iter()
+                .map(|exam| exam.get_id().clone())
+                .collect::<Vec<_>>()
+        );
+        let (_, total) =
+            list_windowed(&db, None, None, None, None, Some(now + 45 * 60_000), None, None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 1, "starts_before keeps only the already-run exam");
+
+        // A viewer of A who manages nothing: A's published exams only — both
+        // drafts (A's own and the other instance's) stay hidden.
+        let visible = vec![a.get_id().clone()];
+        let nothing: Vec<ClassCourseId> = Vec::new();
+        let (rows, total) =
+            list_windowed(&db, Some(&visible), Some(&nothing), None, None, None, None, None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 3);
+        assert!(rows.iter().all(|exam| !exam.is_draft()));
+
+        // A's teacher manages A: sees A's draft — and still not B's.
+        let manages_a = vec![a.get_id().clone()];
+        let (rows, total) =
+            list_windowed(&db, Some(&visible), Some(&manages_a), None, None, None, None, None, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 4);
+        assert!(rows.iter().any(|exam| exam.get_id() == ahead_draft.get_id()));
+        assert!(!rows.iter().any(|exam| exam.get_id() == other_draft.get_id()));
+
+        // The window rides the same WHERE: `ends_after=now` keeps the
+        // scheduled ahead pair (the draft included — a draft is visible where
+        // it is visible), drops the open exam (no schedule) and the one that
+        // ran, and flips the order to schedule ascending, id tie-break.
+        let (rows, total) = list_windowed(
+            &db,
+            Some(&visible),
+            Some(&manages_a),
+            None,
+            Some(now),
+            None,
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 2);
+        let listed: Vec<_> = rows.iter().map(|exam| exam.get_id()).cloned().collect();
+        assert_eq!(listed, vec![ahead.get_id().clone(), ahead_draft.get_id().clone()]);
+
+        // A short page of the filtered set still reports the filtered total.
+        let (rows, total) = list_windowed(
+            &db,
+            Some(&visible),
+            Some(&manages_a),
+            None,
+            Some(now),
+            None,
+            None,
+            Some(1),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((rows.len(), total), (1, 2));
+
+        // A viewer of B manages nothing, and B's only exam is a draft: the
+        // draft wall leaves them an empty page, not an error.
+        let sees_b = vec![b.get_id().clone()];
+        let (rows, total) =
+            list_windowed(&db, Some(&sees_b), Some(&nothing), None, None, None, None, None, 0)
+                .await
+                .unwrap();
+        assert!(rows.is_empty() && total == 0);
     }
 }

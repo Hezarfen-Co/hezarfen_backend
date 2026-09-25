@@ -168,6 +168,44 @@ struct BankQuestionFilter {
     visibility: Option<String>,
 }
 
+impl BankQuestionFilter {
+    /// Validate + canonicalize: a malformed `subject`/`owner` key is a 400
+    /// naming the field, never the nil id silently matching nothing — same
+    /// as [`super::offerings::OfferingFilter`]. `owner=me` is the caller.
+    fn resolve(&self, caller: &UserId) -> Result<(Option<SubjectId>, Option<UserId>), AppError> {
+        let subject = match self.subject.as_deref().map(str::trim) {
+            None => None,
+            Some(key) => {
+                let id = SubjectId::from_key(key);
+                if id.uuid().is_nil() {
+                    return Err(ValidationError::Invalid {
+                        field: "subject",
+                        reason: "must be a hyphenated uuid",
+                    }
+                    .into());
+                }
+                Some(id)
+            }
+        };
+        let owner = match self.owner.as_deref().map(str::trim) {
+            None => None,
+            Some("me") => Some(*caller),
+            Some(key) => {
+                let id = UserId::from_key(key);
+                if id.uuid().is_nil() {
+                    return Err(ValidationError::Invalid {
+                        field: "owner",
+                        reason: "must be a hyphenated uuid",
+                    }
+                    .into());
+                }
+                Some(id)
+            }
+        };
+        Ok((subject, owner))
+    }
+}
+
 /// A bank template as its readers see it — `correct` included (teacher+ only,
 /// so the answer key is theirs to see). Its images, if any, are fetched
 /// through the image endpoints.
@@ -482,6 +520,10 @@ async fn create_question(
 /// carries the resolved `subject_name`/`owner_name` so a client needn't look
 /// them up per row, plus `used_count` — how many exam questions were copied out
 /// of that template (one grouped query for the page, not one per row).
+///
+/// A `subject`/`owner` key that is empty or not a hyphenated uuid is a 400
+/// naming the field; a well-formed id that names nothing is just an empty
+/// page.
 #[utoipa::path(
     get,
     path = "/",
@@ -490,7 +532,7 @@ async fn create_question(
     params(BankQuestionFilter, PageParams),
     responses(
         (status = 200, description = "A page of the bank's templates (all of them when unpaged)", body = Page<BankQuestionResponse>),
-        (status = 400, description = "Invalid limit, offset, or visibility", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, subject, owner, or visibility", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -502,11 +544,7 @@ async fn list_questions(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BankQuestionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let subject = filter.subject.as_deref().map(SubjectId::from_key);
-    let owner = filter.owner.as_deref().map(|owner| match owner {
-        "me" => *user.get_id(),
-        id => UserId::from_key(id),
-    });
+    let (subject, owner) = filter.resolve(user.get_id())?;
     // Same newtype the PATCH validates against, so an unknown shelf is the same
     // 400 ("visibility must be private or school") on both routes.
     let visibility = filter
@@ -1017,5 +1055,78 @@ mod tests {
         let student = user("ogrenci", Role::Student, &db).await;
         assert!(!can_see(&question, &student));
         assert!(can_see(&question, &admin));
+    }
+
+    /// The field a filter's validation error names, or a panic.
+    fn invalid_field(result: Result<(Option<SubjectId>, Option<UserId>), AppError>) -> &'static str {
+        match result {
+            Err(AppError::Validation(ValidationError::Invalid { field, .. })) => field,
+            other => panic!("expected a field validation error, got {other:?}"),
+        }
+    }
+
+    /// A malformed or empty `subject`/`owner` key is a 400 naming the field —
+    /// never the nil id silently matching nothing. `owner=me` is the caller,
+    /// and a well-formed key passes through unchanged.
+    #[tokio::test]
+    async fn subject_and_owner_keys_are_validated() {
+        let (db, _leases) = init_test_db().await;
+        let caller = user("ogretmen", Role::Teacher, &db).await;
+
+        let filter = |subject: Option<&str>, owner: Option<&str>| BankQuestionFilter {
+            subject: subject.map(str::to_string),
+            owner: owner.map(str::to_string),
+            q: None,
+            visibility: None,
+        };
+
+        assert_eq!(
+            invalid_field(filter(Some("not-a-uuid"), None).resolve(caller.get_id())),
+            "subject"
+        );
+        assert_eq!(
+            invalid_field(filter(Some(""), None).resolve(caller.get_id())),
+            "subject"
+        );
+        assert_eq!(
+            invalid_field(filter(None, Some("not-a-uuid")).resolve(caller.get_id())),
+            "owner"
+        );
+        assert_eq!(
+            invalid_field(filter(None, Some(" ")).resolve(caller.get_id())),
+            "owner"
+        );
+
+        // `me` resolves to the caller; a well-formed key passes through.
+        let (_, owner) = filter(None, Some("me")).resolve(caller.get_id()).unwrap();
+        assert_eq!(owner, Some(*caller.get_id()));
+        let well_formed = "019732e3-7b00-7000-8000-00000000dead";
+        let (subject, owner) = filter(Some(well_formed), Some(well_formed))
+            .resolve(caller.get_id())
+            .unwrap();
+        assert_eq!(subject.map(|s| s.uuid()), Some(UserId::from_key(well_formed).uuid()));
+        assert_eq!(owner.map(|o| o.uuid()), Some(UserId::from_key(well_formed).uuid()));
+    }
+
+    /// A well-formed id that names nothing is a 200 with an empty page and
+    /// `total` 0 — only a malformed key is a 400.
+    #[tokio::test]
+    async fn a_well_formed_but_unmatched_owner_is_an_empty_page() {
+        let (db, _leases) = init_test_db().await;
+        let stranger = UserId::from_key("019732e3-7b00-7000-8000-00000000dead");
+        let (items, total) = bank_question::list(
+            &db,
+            None,
+            Some(&stranger),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
     }
 }

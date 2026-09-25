@@ -31,8 +31,16 @@ pub async fn read(db: &Database, id: &CourseId) -> Result<Option<Course>, AppErr
     course::read(db, id).await
 }
 
-pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
-    course::list_all(db).await
+/// The catalog the visible list's manager arm serves, optionally narrowed by
+/// the `GET /courses` filters (`kind`, folded `q`) — pushed into the SQL so
+/// listing one kind is not a full-catalog pull.
+pub async fn list_filtered(
+    db: &Database,
+    kind: Option<CourseKind>,
+    q: Option<&str>,
+    taught: Option<bool>,
+) -> Result<Vec<Course>, AppError> {
+    course::list_filtered(db, kind, q, taught).await
 }
 
 pub async fn list_enrolled(

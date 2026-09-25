@@ -135,21 +135,30 @@ pub async fn find(
 
 /// Menus, newest day first. `from`/`to` are inclusive `YYYY-MM-DD` bounds;
 /// either may be omitted (`NULL` bound). The comparison is lexical, which
-/// is chronological for this format.
+/// is chronological for this format. `slot`, when given, keeps only menus
+/// published under that exact snapshotted slot text — deliberately not
+/// checked against the school's current `meal_slots`, so a retired slot
+/// still finds its menus and an unknown name matches nothing.
 pub async fn list(
     db: &Database,
     from: Option<&MenuDate>,
     to: Option<&MenuDate>,
+    slot: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Menu>, i64), AppError> {
+    // One WHERE for the page and the count alike: a slot filter moves
+    // `total` with the items, so page numbers count the rows actually
+    // returned.
     PagedList::new(
         "menu WHERE ($1::text IS NULL OR date >= $1::text) \
-         AND ($2::text IS NULL OR date <= $2::text)",
+         AND ($2::text IS NULL OR date <= $2::text) \
+         AND ($3::text IS NULL OR slot = $3::text)",
         "ORDER BY date DESC, slot ASC, id DESC",
     )
     .bind(Param::OptText(from.map(|date| date.as_str().to_string())))
     .bind(Param::OptText(to.map(|date| date.as_str().to_string())))
+    .bind(Param::OptText(slot.map(|slot| slot.to_string())))
     .run(limit, offset, db)
     .await
 }

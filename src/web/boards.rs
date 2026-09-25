@@ -212,6 +212,11 @@ struct ListFilter {
     /// for both. A closed board is never deleted, so this is how a heavy
     /// creator trims a list of retired boards.
     open: Option<bool>,
+    /// Free-text search over the title: a case- and diacritic-insensitive
+    /// substring (`geometri` finds `Geometri`). Literal text — `%` and `_`
+    /// carry no special meaning. Blank means no search.
+    #[param(example = "geometri")]
+    q: Option<String>,
 }
 
 /// Every board the caller may open — the ones they created and the ones they
@@ -223,6 +228,10 @@ struct ListFilter {
 /// that has spent its lifetime stroke budget but was never drawn on again, are
 /// both still open — the closing stamp is only ever written by `/close` or by
 /// the append that the lifetime cap refuses.
+///
+/// `?q=` narrows further by title: a case- and diacritic-insensitive
+/// substring, composed with `open`; `total` counts the matches. Blank means
+/// no search.
 #[utoipa::path(
     get,
     path = "/",
@@ -243,8 +252,15 @@ async fn list_boards(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BoardResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (boards, total) =
-        board::list_for_user(&st.db, user.get_id(), filter.open, limit, offset).await?;
+    let (boards, total) = board::list_for_user(
+        &st.db,
+        user.get_id(),
+        filter.open,
+        filter.q.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     let items = boards.iter().map(BoardResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }

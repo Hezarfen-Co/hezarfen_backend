@@ -20,16 +20,18 @@ pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuest
     pool_question::read(db, id).await
 }
 
-/// Every question, newest first — the teacher+ view (approval queue and
-/// pool in one list).
-pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
-    pool_question::list_all(db).await
-}
-
-/// The pool as a non-staff user sees it, newest first: every approved
-/// question, plus the caller's own pending ones.
-pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQuestion>, AppError> {
-    pool_question::list_visible_to(db, user).await
+/// One page of the caller's question list — visibility gate and optional
+/// status filter in one SQL `WHERE`, so `total` counts the filtered set.
+/// `viewer = None` is the teacher+ view (everything); `Some(me)` the pool
+/// plus the caller's own pending questions.
+pub async fn list(
+    db: &Database,
+    viewer: Option<&UserId>,
+    status: Option<&str>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<PoolQuestion>, i64), AppError> {
+    pool_question::list(db, viewer, status, limit, offset).await
 }
 
 /// Approve a pending question, stamping `approver`. A `None` from the

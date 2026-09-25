@@ -10,8 +10,9 @@
 
 use crate::constant::COURSE_TABLE;
 use crate::database::{Database, tx_with_retry, unique_violation};
-use crate::db::page::PagedList;
+use crate::db::page::{PagedList, Param};
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
+use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use sqlx::PgConnection;
@@ -115,6 +116,63 @@ pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
     )
     .fetch_all(db)
     .await?;
+    Ok(rows.into_iter().map(CourseRow::into_course).collect())
+}
+
+/// The catalog the visible list's manager arm serves — the whole table,
+/// newest first — with the `GET /courses` optional filters pushed into the
+/// SQL `WHERE`, so listing one kind (or searching, or the taught/untaught
+/// axis) is not a full-catalog pull the caller then throws most of away.
+/// `kind` is the exact flavor; `q` is a case- and diacritic-insensitive
+/// fragment of the title or the description (blank = no text filter): needle
+/// and columns both go through [`crate::domain::text_fold`], so `satranc`
+/// finds `Satranç` and back. `position` rather than `LIKE` keeps the needle
+/// a *literal* substring — no `%`/`_` wildcard surprises. `taught` keys on
+/// the row's own attachment counter: `true` keeps the courses a class
+/// section teaches (`class_course_count > 0`), `false` the ones nothing
+/// attaches yet. Every filter is part of the one `WHERE` the window and any
+/// count share ([`PagedList`]), so a filtered total can never disagree with
+/// the rows it counts.
+pub async fn list_filtered(
+    db: &Database,
+    kind: Option<CourseKind>,
+    q: Option<&str>,
+    taught: Option<bool>,
+) -> Result<Vec<Course>, AppError> {
+    let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Param> = Vec::new();
+    if let Some(kind) = &kind {
+        binds.push(Param::Text(kind.as_str().to_string()));
+        clauses.push(format!("kind = ${}", binds.len()));
+    }
+    if let Some(taught) = taught {
+        binds.push(Param::I64(0));
+        clauses.push(format!(
+            "class_course_count {} ${}",
+            if taught { ">" } else { "=" },
+            binds.len()
+        ));
+    }
+    if let Some(needle) = &needle {
+        binds.push(Param::Text(needle.clone()));
+        let at = binds.len();
+        clauses.push(format!(
+            "(position(${at} in {}) > 0 OR position(${at} in {}) > 0)",
+            search_fold_sql("title"),
+            search_fold_sql("description"),
+        ));
+    }
+    let from_where = if clauses.is_empty() {
+        "course WHERE true".to_string()
+    } else {
+        format!("course WHERE {}", clauses.join(" AND "))
+    };
+    let mut page = PagedList::new(from_where, "ORDER BY id DESC");
+    for bind in binds {
+        page = page.bind(bind);
+    }
+    let (rows, _) = page.run::<CourseRow>(None, 0, db).await?;
     Ok(rows.into_iter().map(CourseRow::into_course).collect())
 }
 

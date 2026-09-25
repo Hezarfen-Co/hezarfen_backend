@@ -5,6 +5,7 @@
 use sqlx::PgConnection;
 
 use crate::database::{Database, foreign_key_violation, tx_with_retry};
+use crate::db::page::{PagedList, Param};
 use crate::domain::class_course::ClassCourseId;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
@@ -205,24 +206,96 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
     .await?)
 }
 
-/// The exams, newest first — `ORDER BY id` on a UUIDv7 column is creation
-/// order, the sort the old record ids gave for free.
-pub async fn list_all(db: &Database) -> Result<Vec<Exam>, AppError> {
-    Ok(sqlx::query_as!(
-        Exam,
-        r#"SELECT id AS "id: ExamId", creator AS "creator: UserId",
-                  class_course AS "class_course: ClassCourseId", term AS "term: TermId",
-                  title AS "title: ExamTitle", description AS "description: ExamDescription",
-                  kind AS "kind: ExamKind", mode AS "mode: ExamMode",
-                  starts_at AS "starts_at: Timestamp",
-                  ends_at AS "ends_at: Timestamp",
-                  duration_ms AS "duration_ms: ExamDuration",
-                  max_attempts AS "max_attempts: ExamAttemptLimit",
-                  allow_rejoin, allow_review, draft
-           FROM exam ORDER BY id DESC"#,
-    )
-    .fetch_all(db)
-    .await?)
+/// The exams list behind `GET /exams`, paged by the database — visibility,
+/// the draft rule, the schedule window, the `LIMIT/OFFSET` and the `total`
+/// count all share one `WHERE` per branch, so a filtered page never decodes
+/// the exams it skips.
+///
+/// `visible`/`managed` are the non-manager read: the exams addressed to any
+/// of `visible` (through `exam_audience`, deduplicated — a shared exam is one
+/// exam), with `NOT draft OR owner ∈ managed`, today's rule unchanged — a
+/// draft shows only to someone who manages its owner instance. Both `None` is
+/// the manager+ whole-table read.
+///
+/// The four optional bounds are [`crate::web::page::WindowParams`]'s schedule
+/// window, validated upstream. All four absent keeps `id DESC` (newest
+/// first); any bound set drops window-less exams (no `mode` → both schedule
+/// columns null, so every predicate is `NULL`-rejecting) and flips the order
+/// to ascending by schedule — `starts_at`, falling back to `ends_at`, ties by
+/// id — the order `WindowParams::apply` used to produce in Rust.
+pub async fn list_windowed(
+    db: &Database,
+    visible: Option<&[ClassCourseId]>,
+    managed: Option<&[ClassCourseId]>,
+    starts_after: Option<i64>,
+    ends_after: Option<i64>,
+    starts_before: Option<i64>,
+    ends_before: Option<i64>,
+    limit: Option<i64>,
+    offset: i64,
+) -> Result<(Vec<Exam>, i64), AppError> {
+    // Window predicates and binds move together: each bound appends its
+    // predicate with the placeholder number its bind position lands on. The
+    // two visibility binds of the non-manager branch claim $1 and $2, so the
+    // window numbering continues after them.
+    let base = usize::from(visible.is_some()) * 2;
+    let mut conds: Vec<String> = Vec::new();
+    let mut bounds: Vec<i64> = Vec::new();
+    let mut bound = |column: &str, op: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            conds.push(format!("{column} {op} ${}", base + bounds.len() + 1));
+            bounds.push(value);
+        }
+    };
+    bound("starts_at", ">", starts_after);
+    bound("starts_at", "<", starts_before);
+    bound("COALESCE(ends_at, starts_at)", ">", ends_after);
+    bound("COALESCE(ends_at, starts_at)", "<", ends_before);
+    let window = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", conds.join(" AND "))
+    };
+    let (from_where, mut binds): (String, Vec<Param>) = match visible {
+        None => (
+            if conds.is_empty() {
+                "exam".to_owned()
+            } else {
+                format!("exam WHERE {}", conds.join(" AND "))
+            },
+            Vec::new(),
+        ),
+        Some(visible) => {
+            let managed = managed.expect("visible and managed travel together");
+            (
+                format!(
+                    "(SELECT DISTINCT ON (e.id) e.* \
+                     FROM exam e \
+                     JOIN exam_audience a ON a.exam = e.id \
+                     WHERE a.class_course = ANY($1::uuid[]) \
+                       AND (NOT e.draft OR e.class_course = ANY($2::uuid[])){window} \
+                     ORDER BY e.id)"
+                ),
+                vec![
+                    Param::Texts(visible.iter().map(ClassCourseId::key).collect()),
+                    Param::Texts(managed.iter().map(ClassCourseId::key).collect()),
+                ],
+            )
+        }
+    };
+    let order = if conds.is_empty() {
+        "ORDER BY id DESC"
+    } else {
+        "ORDER BY COALESCE(starts_at, ends_at) ASC, id ASC"
+    };
+    let mut list = PagedList::new(from_where, order);
+    for bind in binds.drain(..) {
+        list = list.bind(bind);
+    }
+    for value in bounds {
+        list = list.bind(value);
+    }
+    list.run::<Exam>(limit, offset, db).await
 }
 
 /// The exams of one instance, newest first.
@@ -737,7 +810,8 @@ mod tests {
     /// route funnels through `class_course_of`, which answers
     /// `Internal("exam references a missing course")`, so an orphan **500s
     /// forever** on `GET`/`PATCH`/`DELETE /exams/{id}` — undeletable — while
-    /// [`crate::db::exam::list_all`] still hands it to every manager+ on `GET /exams`.
+    /// [`crate::db::exam::list_windowed`] still hands it to every manager+ on
+    /// `GET /exams`.
     ///
     /// [`create`] therefore *writes* the course row rather than reading
     /// it ([`cap::touch_and_create`]); the harness and the window it races in

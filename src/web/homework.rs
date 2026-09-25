@@ -15,7 +15,7 @@ use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -138,21 +138,81 @@ async fn homework_with_instance(
     Ok((homework, instance))
 }
 
+/// The optional `?due_after=&due_before=&class_course=` scoping of the list.
+/// `due_after` keeps homework due at or after an instant (the frontend's open
+/// tab), `due_before` keeps what is due before one (the past tab) — the two
+/// bounds share no instant and leave no gap — and `class_course` scopes the
+/// list to one instance. Absent, each field filters nothing.
+#[derive(Debug, Deserialize, IntoParams)]
+struct HomeworkListFilter {
+    /// Keep homework due at or after this instant (Unix ms).
+    due_after: Option<i64>,
+    /// Keep homework due before this instant (Unix ms).
+    due_before: Option<i64>,
+    /// Keep only this class×course instance's homework (an instance id).
+    #[param(example = "019732e3-7b00-7000-8000-00000000face")]
+    class_course: Option<String>,
+}
+
+impl HomeworkListFilter {
+    /// Validate the raw query into the service-layer scope. A negative due
+    /// bound, an empty instance key, and a key that is not a hyphenated uuid
+    /// (the nil id included — [`ClassCourseId::from_key`] lands there) are
+    /// refused with the field named; a well-formed id that names no row
+    /// simply matches nothing.
+    fn resolve(self) -> Result<service::homework::HomeworkListFilter, AppError> {
+        let invalid =
+            |field: &'static str, reason: &'static str| AppError::Validation(ValidationError::Invalid { field, reason });
+        let due_after = match self.due_after {
+            None => None,
+            Some(ms) if ms < 0 => return Err(invalid("due_after", "must not be negative")),
+            Some(ms) => Some(ms),
+        };
+        let due_before = match self.due_before {
+            None => None,
+            Some(ms) if ms < 0 => return Err(invalid("due_before", "must not be negative")),
+            Some(ms) => Some(ms),
+        };
+        let class_course = match self.class_course.as_deref().map(str::trim) {
+            None => None,
+            Some("") => return Err(invalid("class_course", "must not be empty")),
+            Some(key) => {
+                let instance = ClassCourseId::from_key(key);
+                if instance.uuid().is_nil() {
+                    return Err(invalid("class_course", "must be a hyphenated uuid"));
+                }
+                Some(instance)
+            }
+        };
+        Ok(service::homework::HomeworkListFilter {
+            due_after,
+            due_before,
+            class_course,
+        })
+    }
+}
+
 /// List the homework across the caller's instances — their "my homework" view —
 /// paged via `?limit=&offset=` (omit `limit` for all of it). Manager+ see every
 /// instance's homework; a teacher sees the homework of instances they run; a
 /// student sees only the homework they are assigned (whole-roster ones plus any
 /// subset that names them, each with its `assigned` narrowed to themselves).
 /// Returns a `{items, total, limit, offset}` envelope.
+///
+/// `due_after` and `due_before` (Unix ms) carry the frontend's open and past
+/// tabs — due at or after an instant, due before one — and `class_course`
+/// scopes the list to a single instance, all before anything leaves the
+/// database. Omitted, the response is the caller's whole visible homework,
+/// unchanged.
 #[utoipa::path(
     get,
     path = "/",
     tag = "homework",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, HomeworkListFilter),
     responses(
         (status = 200, description = "A page of the caller's visible homework (all of it when unpaged)", body = Page<HomeworkResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, or filter", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -160,33 +220,40 @@ async fn list_homework(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
+    Query(filter): Query<HomeworkListFilter>,
 ) -> Result<Json<Page<HomeworkResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
+    let filter = filter.resolve()?;
     // The instances this caller manages — empty for a manager+, who manages all
     // of them, and who is told apart by this flag.
     let manages_all = user.get_role().at_least(Role::Manager);
-    let mut managed: Vec<ClassCourseId> = Vec::new();
-    let homework = if manages_all {
-        service::homework::list_all(&st.db).await?
-    } else {
-        let instances = visible_instances(&user, &st.db).await?;
-        let ids: Vec<ClassCourseId> = instances
-            .iter()
-            .map(|(instance, _)| instance.get_id().clone())
-            .collect();
-        // A student sees only the homework they are assigned; a teacher who
-        // manages an instance sees all of its homework (the manager+ path above
-        // already saw everything).
-        managed = instances
-            .iter()
-            .filter(|(_, manages)| *manages)
-            .map(|(instance, _)| instance.get_id().clone())
-            .collect();
-        let mut homework = service::homework::list_for_class_courses(&st.db, &ids).await?;
-        homework
-            .retain(|hw| managed.contains(hw.get_class_course()) || hw.student_sees(user.get_id()));
-        homework
-    };
+    if manages_all {
+        // The SQL WHERE is the whole filter on this path: a manager retains
+        // nothing in Rust, so the window and the count both run in the
+        // database and `total` comes back with the page.
+        let (homework, total) =
+            service::homework::list_all(&st.db, &filter, limit, offset).await?;
+        let items = homework.iter().map(HomeworkResponse::new).collect();
+        return Ok(Json(Page::new(items, total, limit, offset)));
+    }
+    let instances = visible_instances(&user, &st.db).await?;
+    let ids: Vec<ClassCourseId> = instances
+        .iter()
+        .map(|(instance, _)| instance.get_id().clone())
+        .collect();
+    // A student sees only the homework they are assigned; a teacher who
+    // manages an instance sees all of its homework (the manager+ path above
+    // already saw everything).
+    let managed: Vec<ClassCourseId> = instances
+        .iter()
+        .filter(|(_, manages)| *manages)
+        .map(|(instance, _)| instance.get_id().clone())
+        .collect();
+    let mut homework = service::homework::list_for_class_courses(&st.db, &ids, &filter).await?;
+    // The audience retain stays after the SQL filter and before the window,
+    // so `total` is the post-retain length, never a page sliced before it.
+    homework
+        .retain(|hw| managed.contains(hw.get_class_course()) || hw.student_sees(user.get_id()));
     let total = homework.len() as i64;
     // Paged in the web layer: the audience filter above is per-row Rust. The
     // subset roster rides along only for the rows the caller manages — to a
@@ -195,7 +262,7 @@ async fn list_homework(
     let items = paginate(&homework, limit, offset)
         .iter()
         .map(|hw| {
-            if manages_all || managed.contains(hw.get_class_course()) {
+            if managed.contains(hw.get_class_course()) {
                 HomeworkResponse::new(hw)
             } else {
                 HomeworkResponse::for_viewer(hw, user.get_id())
@@ -1276,4 +1343,409 @@ async fn homework_report(
         });
     }
     Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use crate::database::init_test_tenants;
+    use crate::db::session;
+    use crate::domain::homework::HomeworkTitle;
+    use crate::domain::role::Role;
+    use crate::domain::subject::{SubjectDescription, SubjectName};
+    use crate::domain::user::Username;
+    use crate::tenant::{DEMO_SCHOOL_ID, SchoolId};
+
+    const DAY: i64 = 86_400_000;
+
+    /// The app behind a live school cookie for `user`, plus the tenant
+    /// registry handle. The router is the real one, so the cookie, the
+    /// tenant resolution, and the published query params are all exercised.
+    async fn app_for(username: &str, role: Role) -> (Router, String, crate::database::Database) {
+        let tenants = init_test_tenants().await;
+        let school = tenants
+            .get(&SchoolId::try_parse(DEMO_SCHOOL_ID).unwrap())
+            .await
+            .expect("the demo school");
+        let user = crate::service::user::create(&school, Username::try_new(username).unwrap(), None)
+            .await
+            .unwrap();
+        let user = crate::service::user::set_role(&school, user.get_id(), role)
+            .await
+            .unwrap()
+            .0;
+        let token = session::create(&school, user.get_id()).await.unwrap();
+        let cookie = format!("session={DEMO_SCHOOL_ID}.{}", token.token().as_str());
+        let state = AppState {
+            db: tenants.control().clone(),
+            tenants,
+            files_path: std::env::temp_dir(),
+            cookie_secure: false,
+            rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
+            chatbot_limit: Default::default(),
+            rag_limit: Default::default(),
+            exam_presence: Default::default(),
+            board_hub: Default::default(),
+            ai: None,
+            metrics: crate::telemetry::Metrics::noop(),
+        };
+        (crate::build_router(state), cookie, school)
+    }
+
+    /// One homework with a chosen due instant and audience on `instance`.
+    async fn seed_homework_on(
+        db: &crate::database::Database,
+        instance: &ClassCourseId,
+        course: &crate::domain::course::CourseId,
+        due_at: i64,
+        title: &str,
+        assigned: Option<Vec<UserId>>,
+    ) -> Homework {
+        let subject = crate::db::subject::create(
+            db,
+            course,
+            SubjectName::try_new(title).unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        let teacher = crate::service::user::create(db, Username::try_new(title).unwrap(), None)
+            .await
+            .unwrap();
+        crate::db::homework::create(
+            db,
+            instance,
+            subject.get_id(),
+            HomeworkTitle::try_new(title).unwrap(),
+            None,
+            Timestamp::from_millis(due_at),
+            assigned,
+            teacher.get_id(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// One homework with a chosen due instant and audience on a fresh
+    /// instance; returns the instance and the row.
+    async fn seed_homework(
+        db: &crate::database::Database,
+        due_at: i64,
+        title: &str,
+        assigned: Option<Vec<UserId>>,
+    ) -> (ClassCourseId, Homework) {
+        let (instance, course) = crate::db::course::a_test_instance(db).await;
+        let homework =
+            seed_homework_on(db, &instance, &course, due_at, title, assigned).await;
+        (instance, homework)
+    }
+
+    /// A student put on the live roster of the class `instance` belongs to —
+    /// the membership `visible_instances` reads for a student.
+    async fn join_class(
+        db: &crate::database::Database,
+        instance: &ClassCourseId,
+        student: &UserId,
+    ) {
+        let instance = crate::service::class_course::read(db, instance)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO class_member (id, class, app_user, added_by, joined_at) \
+             VALUES ($1, $2, $3, $3, 0)",
+        )
+        .bind(crate::domain::class_group::ClassGroupId::generate().uuid())
+        .bind(instance.get_class().uuid())
+        .bind(student.uuid())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    async fn get(app: &Router, uri: &str, cookie: &str) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, json)
+    }
+
+    /// The manager path: the due window and the instance scope narrow in SQL,
+    /// the page window applies after the filter, and `total` stays the
+    /// filtered length. Absent params are exactly the old response.
+    #[tokio::test]
+    async fn manager_filters_open_past_and_instance_in_sql() {
+        let now = Timestamp::now().as_millis();
+        let (app, cookie, school) = app_for("mudur-filter", Role::Manager).await;
+        let (_, past) = seed_homework(&school, now - DAY, "past-here", None).await;
+        let (_, open) = seed_homework(&school, now + DAY, "open-here", None).await;
+        let (there, open_there) = seed_homework(&school, now + 2 * DAY, "open-there", None).await;
+
+        // Absent params: every row, newest first — the old response.
+        let (status, body) = get(&app, "/homework", &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 3);
+        let ids: Vec<String> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                open_there.get_id().key(),
+                open.get_id().key(),
+                past.get_id().key()
+            ]
+        );
+
+        // The open tab: due at or after the bound.
+        let (status, body) = get(&app, &format!("/homework?due_after={now}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        assert!(
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["due_at"].as_i64().unwrap() >= now)
+        );
+
+        // The past tab: due strictly before the bound — no overlap, no gap.
+        let (status, body) = get(&app, &format!("/homework?due_before={now}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], past.get_id().key().to_string());
+
+        // The instance scope: only `there`'s rows.
+        let (status, body) = get(
+            &app,
+            &format!("/homework?class_course={}", there.key()),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], open_there.get_id().key().to_string());
+
+        // A well-formed id that names no row: an empty page, not a 404.
+        let stranger = ClassCourseId::generate();
+        let (status, body) = get(
+            &app,
+            &format!("/homework?class_course={}", stranger.key()),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 0);
+        assert!(body["items"].as_array().unwrap().is_empty());
+
+        // The window applies after the filter; total is the filtered count.
+        let (status, body) =
+            get(&app, &format!("/homework?due_after={now}&limit=1"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        let (status, body) =
+            get(&app, &format!("/homework?due_after={now}&offset=1"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["items"][0]["id"], open.get_id().key().to_string());
+    }
+
+    /// A bad filter is a 400 naming the field: negative due bounds, and an
+    /// instance key that is empty, not a uuid, or the nil uuid.
+    #[tokio::test]
+    async fn bad_filters_are_400_naming_the_field() {
+        let (app, cookie, _school) = app_for("mudur-hata", Role::Manager).await;
+        for (uri, field) in [
+            ("/homework?due_after=-1", "due_after"),
+            ("/homework?due_before=-5", "due_before"),
+            ("/homework?class_course=", "class_course"),
+            ("/homework?class_course=%20", "class_course"),
+            ("/homework?class_course=not-a-uuid", "class_course"),
+            (
+                "/homework?class_course=00000000-0000-0000-0000-000000000000",
+                "class_course",
+            ),
+        ] {
+            let (status, body) = get(&app, uri, &cookie).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be a 400");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(field),
+                "{uri} must name {field}: {body}"
+            );
+        }
+    }
+
+    /// The audience wall survives the filter: a student still sees only the
+    /// homework they are assigned, a teacher still sees their instances'
+    /// homework, and the manager sees every instance — all narrowed by the
+    /// same params.
+    #[tokio::test]
+    async fn audience_walls_survive_the_filter() {
+        let now = Timestamp::now().as_millis();
+        let (app, _, school) = app_for("ogretmen-seyirci", Role::Student).await;
+        // The same registry also holds the actors; mint them directly.
+        let ali = crate::service::user::create(&school, Username::try_new("ali-filter").unwrap(), None)
+            .await
+            .unwrap();
+        let veli = crate::service::user::create(&school, Username::try_new("veli-filter").unwrap(), None)
+            .await
+            .unwrap();
+        let teacher = crate::service::user::create(
+            &school,
+            Username::try_new("hocasi-filter").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let teacher = crate::service::user::set_role(&school, teacher.get_id(), Role::Teacher)
+            .await
+            .unwrap()
+            .0;
+        let manager = crate::service::user::create(
+            &school,
+            Username::try_new("mudur-seyirci").unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let manager = crate::service::user::set_role(&school, manager.get_id(), Role::Manager)
+            .await
+            .unwrap()
+            .0;
+
+        let (instance, course) = crate::db::course::a_test_instance(&school).await;
+        let whole_open = seed_homework_on(&school, &instance, &course, now + DAY, "acik-genel", None).await;
+        let subset_open = seed_homework_on(
+            &school,
+            &instance,
+            &course,
+            now + DAY,
+            "acik-secili",
+            Some(vec![*ali.get_id()]),
+        )
+        .await;
+        let past = seed_homework_on(&school, &instance, &course, now - DAY, "gecmis-genel", None).await;
+        join_class(&school, &instance, ali.get_id()).await;
+        join_class(&school, &instance, veli.get_id()).await;
+        crate::db::class_course_teacher::assign(&school, &instance, teacher.get_id())
+            .await
+            .unwrap();
+
+        let ali_cookie = format!(
+            "session={DEMO_SCHOOL_ID}.{}",
+            session::create(&school, ali.get_id())
+                .await
+                .unwrap()
+                .token()
+                .as_str()
+        );
+        let veli_cookie = format!(
+            "session={DEMO_SCHOOL_ID}.{}",
+            session::create(&school, veli.get_id())
+                .await
+                .unwrap()
+                .token()
+                .as_str()
+        );
+        let teacher_cookie = format!(
+            "session={DEMO_SCHOOL_ID}.{}",
+            session::create(&school, teacher.get_id())
+                .await
+                .unwrap()
+                .token()
+                .as_str()
+        );
+        let manager_cookie = format!(
+            "session={DEMO_SCHOOL_ID}.{}",
+            session::create(&school, manager.get_id())
+                .await
+                .unwrap()
+                .token()
+                .as_str()
+        );
+
+        // Ali: open tab only, and the subset names him — narrowed to him.
+        let (status, body) = get(&app, &format!("/homework?due_after={now}"), &ali_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        let ids: Vec<String> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                subset_open.get_id().key(),
+                whole_open.get_id().key()
+            ]
+        );
+        let subset = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == subset_open.get_id().key())
+            .unwrap();
+        assert_eq!(
+            subset["assigned"],
+            serde_json::json!([ali.get_id().key().to_string()]),
+            "a student's subset roster is narrowed to themselves"
+        );
+
+        // Veli shares the class but not the subset: the open tab hides it.
+        let (status, body) = get(&app, &format!("/homework?due_after={now}"), &veli_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], whole_open.get_id().key().to_string());
+
+        // The teacher manages the instance: every open row of it, roster and
+        // all — the past row stays behind the filter, not the audience.
+        let (status, body) =
+            get(&app, &format!("/homework?due_after={now}"), &teacher_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        assert!(body["items"].as_array().unwrap().iter().any(|row| row["id"]
+            == subset_open.get_id().key()
+            && row["assigned"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1));
+
+        // The manager sees every instance's homework, narrowed by the params.
+        let (status, body) = get(&app, &format!("/homework?due_before={now}"), &manager_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["id"], past.get_id().key().to_string());
+    }
 }

@@ -365,19 +365,67 @@ async fn search_users(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
+/// The admin directory's optional `roles` narrowing: a comma-separated list
+/// of role names, e.g. `roles=manager,admin` for the two staff tabs in one
+/// read. Absent (`None`) is every user — today's response, unchanged.
+#[derive(Debug, Deserialize, IntoParams)]
+struct ListUsersFilter {
+    /// Keep only users whose role is in this comma-separated set: `student`,
+    /// `parent`, `teacher`, `manager`, or `admin` (an OR, not an AND). Omit
+    /// to list every role.
+    roles: Option<String>,
+}
+
+impl ListUsersFilter {
+    /// Resolve `roles` into the filter set. Each token is trimmed, then
+    /// parsed with [`Role::try_from_str`] — the same vocabulary
+    /// `GET /users/search` parses `role` with. An empty value (`?roles=`), a
+    /// blank token (`roles=manager,`), or an unknown name is a `400` naming
+    /// `roles` — the same refusal shape every other closed set answers with,
+    /// never a silently empty page.
+    fn resolve(&self) -> Result<Option<Vec<Role>>, ValidationError> {
+        let Some(raw) = self.roles.as_deref() else {
+            return Ok(None);
+        };
+        raw.split(',')
+            .map(|token| {
+                Role::try_from_str(token.trim()).map_err(|err| match err {
+                    // The parser names its field `role`; this param is the
+                    // plural `roles`, so the refusal must name what the
+                    // request actually carried.
+                    ValidationError::Invalid { reason, .. } => ValidationError::Invalid {
+                        field: "roles",
+                        reason,
+                    },
+                    err => err,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+}
+
 /// List every user with their role, newest first. Admin only. Paged: pass
 /// `?limit=&offset=` to take a window (omit `limit` for the whole list); the
 /// response is a `{items, total, limit, offset}` envelope where `total` counts
 /// every user.
+///
+/// The optional `roles` parameter narrows the directory to a set of roles —
+/// a comma-separated list (`roles=manager,admin` is the two staff tabs in
+/// one read, an OR). Omitted, the response is the whole roster. The window
+/// and `total` are taken after the narrowing, so `total` counts the filtered
+/// set and paging stays inside it. Each name is the vocabulary
+/// `GET /users/search` parses; an unknown name, a blank value, or a blank
+/// token is a `400` naming `roles`.
 #[utoipa::path(
     get,
     path = "/",
     tag = "users",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(PageParams, ListUsersFilter),
     responses(
         (status = 200, description = "A page of users (the full list when unpaged)", body = Page<UserResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit or offset, or an unknown `roles` entry", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
     ),
@@ -386,9 +434,12 @@ async fn list_users(
     State(st): State<AppState>,
     _admin: RequireAdmin,
     Query(page): Query<PageParams>,
+    Query(filter): Query<ListUsersFilter>,
 ) -> Result<Json<Page<UserResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (users, total) = crate::service::user::list_all(&st.db, limit, offset).await?;
+    let roles = filter.resolve()?;
+    let (users, total) =
+        crate::service::user::list_all(&st.db, roles.as_deref(), limit, offset).await?;
     let items = users.iter().map(UserResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1590,4 +1641,51 @@ async fn drop_avatar(st: &AppState, user: &UserId) -> Result<StatusCode, AppErro
     };
     remove_blob(&st.files_path, file).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter(roles: Option<&str>) -> ListUsersFilter {
+        ListUsersFilter {
+            roles: roles.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn absent_roles_is_every_user() {
+        assert_eq!(filter(None).resolve().unwrap(), None);
+    }
+
+    #[test]
+    fn roles_parse_into_the_role_set() {
+        // The manager tab is one OR set, not an intersection.
+        assert_eq!(
+            filter(Some("manager,admin")).resolve().unwrap(),
+            Some(vec![Role::Manager, Role::Admin])
+        );
+        assert_eq!(
+            filter(Some("student")).resolve().unwrap(),
+            Some(vec![Role::Student])
+        );
+        // A stray space rides the trim, like every other query value.
+        assert_eq!(
+            filter(Some(" teacher ")).resolve().unwrap(),
+            Some(vec![Role::Teacher])
+        );
+    }
+
+    #[test]
+    fn a_bad_roles_value_is_refused_naming_roles() {
+        // Empty value, unknown name, blank token, whitespace-only token, and
+        // the non-assignable service principal — all the same field naming.
+        for bad in ["", "nope", "manager,", "manager, ,admin", "ai"] {
+            let err = filter(Some(bad)).resolve().unwrap_err();
+            let ValidationError::Invalid { field, .. } = err else {
+                panic!("expected Invalid for {bad:?}, got {err}");
+            };
+            assert_eq!(field, "roles", "{bad:?} must name the roles field");
+        }
+    }
 }

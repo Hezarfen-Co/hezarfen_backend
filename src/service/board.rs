@@ -181,10 +181,11 @@ pub async fn list_for_user(
     db: &Database,
     user: &UserId,
     open: Option<bool>,
+    q: Option<&str>,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Board>, i64), AppError> {
-    board::list_for_user(db, user, open, limit, offset).await
+    board::list_for_user(db, user, open, q, limit, offset).await
 }
 
 pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Result<Board, AppError> {

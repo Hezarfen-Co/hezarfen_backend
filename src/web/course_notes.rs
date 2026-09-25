@@ -27,7 +27,7 @@ use crate::domain::course_note_file::{
     CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
 };
 use crate::domain::rag_output::{RagOutput, RagOutputId};
-use crate::error::{AppError, ErrorResponse};
+use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::module::Module;
 use crate::service;
 use crate::service::course::{can_manage_course, can_view_course};
@@ -160,9 +160,40 @@ struct CourseFilter {
     course: String,
 }
 
+impl CourseFilter {
+    /// Validate: `course` is required, so an empty key is a 400 ("must not
+    /// be empty") and a non-uuid is a 400 naming the field — never the nil
+    /// id silently 404ing as a missing course. A well-formed id that names
+    /// no course stays a 404: the course read below must succeed for the
+    /// auth check.
+    fn resolve(&self) -> Result<CourseId, AppError> {
+        let key = self.course.trim();
+        if key.is_empty() {
+            return Err(ValidationError::Invalid {
+                field: "course",
+                reason: "must not be empty",
+            }
+            .into());
+        }
+        let id = CourseId::from_key(key);
+        if id.uuid().is_nil() {
+            return Err(ValidationError::Invalid {
+                field: "course",
+                reason: "must be a hyphenated uuid",
+            }
+            .into());
+        }
+        Ok(id)
+    }
+}
+
 /// List a course's notes, newest first. Visible to whoever can view the
 /// course (its creator, a manager/admin, or anyone the course reaches).
 /// Paged via `?limit=&offset=`.
+///
+/// `course` must be a hyphenated uuid: empty or malformed is a 400 naming
+/// the field; a well-formed id that names no course stays a 404, since the
+/// course must be read for the auth check.
 #[utoipa::path(
     get,
     path = "/",
@@ -171,7 +202,7 @@ struct CourseFilter {
     params(CourseFilter, PageParams),
     responses(
         (status = 200, description = "A page of the course's notes (all of them when unpaged)", body = Page<CourseNoteResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid limit, offset, or course key", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not reached by the course, and not its creator or a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -183,7 +214,8 @@ async fn list(
     Query(filter): Query<CourseFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseNoteResponse>>, AppError> {
-    let course = crate::service::course::read(&st.db, &CourseId::from_key(&filter.course))
+    let course_id = filter.resolve()?;
+    let course = crate::service::course::read(&st.db, &course_id)
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -719,4 +751,55 @@ async fn reindex_rag(
     // is the note as it stands now.
     spawn_index(&st, &tenant, note);
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `course` is required and must be a real key: empty is "must not be
+    /// empty", a non-uuid is "must be a hyphenated uuid" — never the nil id
+    /// silently 404ing as a missing course. A well-formed id passes through,
+    /// and one that names no course stays on the 404 path (the course read
+    /// the handler runs next must miss for the auth check).
+    #[tokio::test]
+    async fn course_key_is_validated_before_the_course_read() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let filter = |course: &str| CourseFilter {
+            course: course.to_string(),
+        };
+
+        match filter("").resolve() {
+            Err(AppError::Validation(ValidationError::Invalid { field, reason })) => {
+                assert_eq!(field, "course");
+                assert_eq!(reason, "must not be empty");
+            }
+            other => panic!("expected an empty-course error, got {other:?}"),
+        }
+        match filter("   ").resolve() {
+            Err(AppError::Validation(ValidationError::Invalid { field, reason })) => {
+                assert_eq!(field, "course");
+                assert_eq!(reason, "must not be empty");
+            }
+            other => panic!("expected a blank-course error, got {other:?}"),
+        }
+        match filter("not-a-uuid").resolve() {
+            Err(AppError::Validation(ValidationError::Invalid { field, reason })) => {
+                assert_eq!(field, "course");
+                assert_eq!(reason, "must be a hyphenated uuid");
+            }
+            other => panic!("expected a malformed-course error, got {other:?}"),
+        }
+
+        // A well-formed id passes through; if it names no course, the read
+        // the handler does next misses and the route answers 404.
+        let id = filter("019732e3-7b00-7000-8000-00000000dead")
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            id.uuid(),
+            uuid::Uuid::parse_str("019732e3-7b00-7000-8000-00000000dead").unwrap()
+        );
+        assert!(service::course::read(&db, &id).await.unwrap().is_none());
+    }
 }
