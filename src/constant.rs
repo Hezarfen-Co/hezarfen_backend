@@ -935,7 +935,7 @@ pub const MAX_RAG_QUESTIONS: u32 = 20;
 /// Default per-minute message limit for the RAG nest, when the school sets
 /// none — a lower ceiling than the chatbot's, since every message here spends
 /// a retrieval over the whole course-note corpus before it generates anything.
-pub const DEFAULT_RAG_RATE_LIMIT: u32 = 6;
+pub const DEFAULT_RAG_RATE_LIMIT: u32 = 600;
 
 /// The most citations one `rag.chat` answer may carry into its stored reply.
 /// The service is a trust boundary — everything it sends is written verbatim
@@ -1052,13 +1052,13 @@ pub const AI_API_ALLOWLIST: &[&str] = &[
 // --- rate limiting -----------------------------------------------------
 
 /// Default requests-per-minute-per-IP for `/auth/login` + `/auth/register`.
-pub const DEFAULT_AUTH_RATE_LIMIT: u32 = 10;
+pub const DEFAULT_AUTH_RATE_LIMIT: u32 = 1_000;
 /// Default requests-per-minute-per-IP across the whole API.
-pub const DEFAULT_API_RATE_LIMIT: u32 = 300;
+pub const DEFAULT_API_RATE_LIMIT: u32 = 30_000;
 /// Default chatbot messages per minute *per user*. Sits far above a human
 /// typing while still blunting a scripted fan-out at the AI service behind the
 /// bridge — which is the cost this tier rations, not this process.
-pub const DEFAULT_CHATBOT_RATE_LIMIT: u32 = 20;
+pub const DEFAULT_CHATBOT_RATE_LIMIT: u32 = 2_000;
 
 /// Once the bucket map holds this many distinct clients, a new key sweeps out
 /// the expired entries and, if that frees nothing, evicts the least-spent live
@@ -1083,11 +1083,10 @@ pub const PURGE_AT: usize = 10_000;
 /// does `429` the newcomers, which refusing them outright would have done for
 /// free. Clients already in the map are unaffected throughout. Sized for the
 /// genuine side: this is a *request* budget, not a client one (a keyless client
-/// spends it on every request, not just its first), so roughly 10 requests a
-/// second for all newcomers together — far under any single client's API tier,
-/// and only ever in force while 10k buckets sit exhausted at once, which is an
-/// attack and not a school day.
-pub const RATE_LIMIT_OVERFLOW_MAX: u32 = 600;
+/// spends it on every request, not just its first), so roughly 1000 requests a
+/// second for all newcomers together, and only ever in force while 10k buckets
+/// sit exhausted at once, which is an attack and not a school day.
+pub const RATE_LIMIT_OVERFLOW_MAX: u32 = 60_000;
 
 /// The shared counter the limiter folds its local admits into, so a window's
 /// budget survives a restart (see [`crate::rate_limit`]).

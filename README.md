@@ -822,14 +822,14 @@ routes cannot quietly gain a status they never return.
 
 Requests are limited per client IP over a fixed 60-second window, in two tiers:
 `/auth/login` + `/auth/register` get a strict budget
-(`RATE_LIMIT_AUTH_PER_MINUTE`, default 10) against credential brute-force,
+(`RATE_LIMIT_AUTH_PER_MINUTE`, default 1000) against credential brute-force,
 and every route — Swagger included — shares a generous catch-all
-(`RATE_LIMIT_API_PER_MINUTE`, default 300). Exceeding either answers `429` with
+(`RATE_LIMIT_API_PER_MINUTE`, default 30000). Exceeding either answers `429` with
 a `Retry-After` header (seconds). Set a limit to `0` to disable that tier —
 useful for load tests.
 
 Sending a chatbot message adds a third tier, and it is keyed by **user id**,
-not by IP (`RATE_LIMIT_CHATBOT_PER_MINUTE`, default 20), because an inference
+not by IP (`RATE_LIMIT_CHATBOT_PER_MINUTE`, default 2000), because an inference
 costs the school real money and a shared-IP classroom must not spend one
 student's budget on another's. `0` disables it like the other two. It is
 charged before anything is written, so a `429` leaves no trace (see
@@ -850,7 +850,7 @@ new key first sweeps out lapsed windows, then evicts the least-spent live
 buckets, and never a bucket that has reached its limit (freeing one would hand
 back the refusal it was enforcing). If every bucket is exhausted there is
 nothing to evict, and a client that has never been seen gets no bucket of its
-own: those clients are metered together against one shared budget of 600
+own: those clients are metered together against one shared budget of 60000
 requests a minute for all of them. Refusing them outright would let an attacker
 who can fill the map `429` the whole school; admitting them freely would make a
 filled map the way to buy unmetered throughput. Only reachable under a

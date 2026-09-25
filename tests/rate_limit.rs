@@ -674,10 +674,15 @@ async fn a_limit_of_fifty_admits_exactly_fifty_requests() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// Every route, at the ACTUAL shipped limits: request `limit` passes, request
+/// Every route is behind a limiter: request `limit` passes, request
 /// `limit + 1` answers 429. The route list is pulled from the app's own
 /// OpenAPI document, so an endpoint added tomorrow is covered automatically;
 /// `/` and the Swagger mount don't appear there and are appended by hand.
+///
+/// The census uses a small budget. The shipped API tier is 30_000 a minute;
+/// hammering that once per route would be millions of requests. Production-scale
+/// exactness lives in the in-memory boundary test. This one proves the wiring:
+/// credential routes hit the auth tier, everything else the api tier.
 ///
 /// Each (method, path) pair poses as its own client IP, giving it a fresh
 /// bucket. Requests carry no body — extractors reject them long after the
@@ -685,11 +690,13 @@ async fn a_limit_of_fifty_admits_exactly_fifty_requests() {
 /// endpoints cheap (no argon2 runs for a body-less request).
 #[tokio::test]
 async fn every_route_enforces_the_shipped_limit_plus_one() {
-    use hezarfen_backend::constant::{DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT};
+    // Small on purpose. See the comment above.
+    const CENSUS_AUTH: u32 = 2;
+    const CENSUS_API: u32 = 2;
 
     let app = app_with(RateLimitConfig {
-        auth_per_minute: DEFAULT_AUTH_RATE_LIMIT,
-        api_per_minute: DEFAULT_API_RATE_LIMIT,
+        auth_per_minute: CENSUS_AUTH,
+        api_per_minute: CENSUS_API,
         trust_proxy: true,
     })
     .await;
@@ -727,9 +734,9 @@ async fn every_route_enforces_the_shipped_limit_plus_one() {
         // api tier.
         let limit = if ["/auth/login", "/auth/register", "/builder/login"].contains(&path.as_str())
         {
-            DEFAULT_AUTH_RATE_LIMIT
+            CENSUS_AUTH
         } else {
-            DEFAULT_API_RATE_LIMIT
+            CENSUS_API
         };
 
         for n in 1..=limit {

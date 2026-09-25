@@ -508,17 +508,17 @@ struct RateLimits {
     /// Fixed window every tier is counted over, seconds.
     window_secs: u64,
     /// Per-IP budget for `/auth/login` and `/auth/register`.
-    #[schema(example = 10)]
+    #[schema(example = 1000)]
     auth_per_minute: u32,
     /// Per-IP budget across the whole API, this endpoint included.
-    #[schema(example = 300)]
+    #[schema(example = 30000)]
     api_per_minute: u32,
     /// Per-*user* budget for sending chatbot messages (keyed by account, not
     /// address, so it survives a changing IP).
-    #[schema(example = 20)]
+    #[schema(example = 2000)]
     chatbot_per_minute: u32,
     /// Per-*user* budget for sending RAG messages, keyed the same way.
-    #[schema(example = 6)]
+    #[schema(example = 600)]
     rag_per_minute: u32,
 }
 
