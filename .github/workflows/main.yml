@@ -29,6 +29,14 @@
 # cancels an in-flight Deploy (two deploys racing would interleave the
 # compose stack).
 #
+# Fail-fast: Clippy is ~2 minutes, Build-and-test up to 90. A red Clippy
+# still leaves the suite burning runner minutes for nothing — the deploy
+# already gates on both, so the outcome is decided. The `clippy-guard`
+# job fires the moment Clippy concludes red and cancels the whole run,
+# killing the in-flight suite. Parallelism is untouched: the guard only
+# ever runs on the failure path. (GitHub has no native "sibling job
+# failed → cancel the rest"; the run-cancel API is the door.)
+#
 # The split is the recovery story, not ceremony:
 #   * "Re-run failed jobs" on a run whose Deploy step failed re-runs ONLY the
 #     ~1-minute deploy job — the built image is still in the run's artifact.
@@ -136,6 +144,24 @@ jobs:
           save-if: false
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Fires the moment Clippy concludes red and cancels the run, killing the
+  # in-flight Build-and-test instead of letting it burn up to 90 minutes on
+  # a run whose outcome is already decided. Skipped on a green Clippy and on
+  # workflow_dispatch (Clippy itself is skipped there, which is not a
+  # failure). Needs `actions: write` to cancel the run.
+  clippy-guard:
+    name: Cancel run on Clippy failure
+    needs: clippy
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel"
 
   build:
     name: Build and test
