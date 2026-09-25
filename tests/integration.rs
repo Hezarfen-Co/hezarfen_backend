@@ -18040,9 +18040,14 @@ async fn chat_content_is_required_and_capped_by_the_school() {
 async fn chat_rate_limit_refuses_before_anything_is_written() {
     // 20 messages a minute per user (the documented tier). The limiter is
     // charged first, so the refused turn leaves no row behind — and no other
-    // user inherits the window.
+    // user inherits the window. The tier is pinned, not the shipped default:
+    // production budgets are far higher, and the test wants the refusal a
+    // couple of turns away, not two thousand.
+    use hezarfen_backend::rate_limit::UserRateLimiter;
+
     let ai = chat_bridge().await;
-    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+    let (app, db) =
+        chat_app_limited(Some(ai.bridge.clone()), UserRateLimiter::per_user_minute(20)).await;
     let ali = login(&app, "ali").await;
     let thread = new_thread(&app, &ali).await;
 
@@ -19905,7 +19910,9 @@ async fn bank_question_create_get_list_and_instantiate() {
     let res = send(&app, "GET", "/bank-questions", Some(&teacher), None).await;
     assert_eq!(common::items(&res.body).len(), 1);
 
-    // `?subject=` matches, and a foreign id excludes.
+    // `?subject=` matches, a valid foreign id excludes — and a malformed key
+    // is the 400 that names the field, never a silent empty page (the same
+    // rule the offerings filter follows).
     let res = send(
         &app,
         "GET",
@@ -19918,12 +19925,22 @@ async fn bank_question_create_get_list_and_instantiate() {
     let res = send(
         &app,
         "GET",
-        "/bank-questions?subject=nope",
+        &format!("/bank-questions?subject={}", Uuid::new_v4()),
         Some(&teacher),
         None,
     )
     .await;
     assert_eq!(common::items(&res.body).len(), 0);
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?subject=nope",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert_eq!(res.body["error"], "subject: must be a hyphenated uuid");
 
     // Instantiate into an exam under one of the course's subjects.
     let now = Timestamp::now().as_millis();
