@@ -438,18 +438,31 @@ struct CourseListFilter {
     taught: Option<bool>,
 }
 
+/// The parsed [`CourseListFilter`] — one named field per query parameter,
+/// ready for [`visible_courses_filtered`].
+#[derive(Debug)]
+struct ResolvedCourseFilter {
+    kind: Option<CourseKind>,
+    q: Option<String>,
+    taught: Option<bool>,
+}
+
 impl CourseListFilter {
     /// `kind` parses through the write-path validator, so an unknown or empty
     /// spelling is the same 400 a create/PATCH gets; `taught` needs no parse —
     /// the query extractor itself 400s a `?taught=` that is not `true`/`false`,
     /// naming the field; `q` passes through raw — each arm trims, folds and
     /// blanks it identically.
-    fn resolve(self) -> Result<(Option<CourseKind>, Option<String>, Option<bool>), AppError> {
+    fn resolve(self) -> Result<ResolvedCourseFilter, AppError> {
         let kind = match self.kind {
             Some(kind) => Some(CourseKind::try_new(&kind)?),
             None => None,
         };
-        Ok((kind, self.q, self.taught))
+        Ok(ResolvedCourseFilter {
+            kind,
+            q: self.q,
+            taught: self.taught,
+        })
     }
 }
 
@@ -483,11 +496,13 @@ async fn list_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (kind, q, taught) = filter.resolve()?;
+    let filters = filter.resolve()?;
     // The filters ride inside the visible set — SQL for a manager, the
     // union's tail in Rust below one — so total is the filtered length
     // before the window is cut.
-    let courses = visible_courses_filtered(&user, &st.db, kind, q.as_deref(), taught).await?;
+    let courses =
+        visible_courses_filtered(&user, &st.db, filters.kind, filters.q.as_deref(), filters.taught)
+            .await?;
     let total = courses.len() as i64;
     // Paged in the web layer: the visible set is a Rust union of two lists.
     let window = paginate(&courses, limit, offset);
@@ -1009,16 +1024,16 @@ mod tests {
                 "{kind:?}: {err:?}"
             );
         }
-        let (kind, q, taught) = CourseListFilter {
+        let resolved = CourseListFilter {
             kind: Some("club".to_string()),
             q: Some("  ".to_string()),
             taught: None,
         }
         .resolve()
         .unwrap();
-        assert_eq!(kind.as_ref().map(CourseKind::as_str), Some("club"));
-        assert_eq!(q.as_deref(), Some("  "));
-        assert_eq!(taught, None);
+        assert_eq!(resolved.kind.as_ref().map(CourseKind::as_str), Some("club"));
+        assert_eq!(resolved.q.as_deref(), Some("  "));
+        assert_eq!(resolved.taught, None);
     }
 
     /// Manager arm: kind and q narrow the catalog, total is the filtered

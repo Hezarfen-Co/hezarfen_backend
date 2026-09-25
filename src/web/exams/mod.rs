@@ -255,22 +255,19 @@ async fn list_exams(
 ) -> Result<Json<Page<ExamResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     window.validate()?;
+    let params = service::exam::WindowedListParams {
+        starts_after: window.starts_after,
+        ends_after: window.ends_after,
+        starts_before: window.starts_before,
+        ends_before: window.ends_before,
+        limit,
+        offset,
+    };
     // Visibility and the draft rule ride the same WHERE as the page and the
     // count: a manager+ reads the whole table, everyone else the exams of
     // their visible instances — a draft only where they manage the instance.
     let (exams, total) = if user.get_role().at_least(Role::Manager) {
-        service::exam::list_windowed(
-            &st.db,
-            None,
-            None,
-            window.starts_after,
-            window.ends_after,
-            window.starts_before,
-            window.ends_before,
-            limit,
-            offset,
-        )
-        .await?
+        service::exam::list_windowed(&st.db, None, None, params).await?
     } else {
         let instances = visible_instances(&user, &st.db).await?;
         let visible: Vec<_> = instances.iter().map(|(i, _)| i.get_id().clone()).collect();
@@ -281,18 +278,7 @@ async fn list_exams(
             .filter(|(_, manages)| *manages)
             .map(|(instance, _)| instance.get_id().clone())
             .collect();
-        service::exam::list_windowed(
-            &st.db,
-            Some(&visible),
-            Some(&managed),
-            window.starts_after,
-            window.ends_after,
-            window.starts_before,
-            window.ends_before,
-            limit,
-            offset,
-        )
-        .await?
+        service::exam::list_windowed(&st.db, Some(&visible), Some(&managed), params).await?
     };
     let items = exams.iter().map(ExamResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))

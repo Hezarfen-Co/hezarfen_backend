@@ -206,6 +206,26 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
     .await?)
 }
 
+/// The schedule window and the page of [`list_windowed`], in one struct —
+/// the fields outgrew a readable argument list. The four optional bounds
+/// are [`crate::web::page::WindowParams`]'s schedule window, validated
+/// upstream. The default is the windowless, unpaged read: all four bounds
+/// absent keeps `id DESC` (newest first); any bound set drops window-less
+/// exams (no `mode` → both schedule columns null, so every predicate is
+/// `NULL`-rejecting) and flips the order to ascending by schedule —
+/// `starts_at`, falling back to `ends_at`, ties by id — the order
+/// `WindowParams::apply` used to produce in Rust.
+#[derive(Default)]
+pub struct WindowedListParams {
+    pub starts_after: Option<i64>,
+    pub ends_after: Option<i64>,
+    pub starts_before: Option<i64>,
+    pub ends_before: Option<i64>,
+    /// `None` = the full list.
+    pub limit: Option<i64>,
+    pub offset: i64,
+}
+
 /// The exams list behind `GET /exams`, paged by the database — visibility,
 /// the draft rule, the schedule window, the `LIMIT/OFFSET` and the `total`
 /// count all share one `WHERE` per branch, so a filtered page never decodes
@@ -216,24 +236,20 @@ pub async fn read(db: &Database, id: &ExamId) -> Result<Option<Exam>, AppError> 
 /// exam), with `NOT draft OR owner ∈ managed`, today's rule unchanged — a
 /// draft shows only to someone who manages its owner instance. Both `None` is
 /// the manager+ whole-table read.
-///
-/// The four optional bounds are [`crate::web::page::WindowParams`]'s schedule
-/// window, validated upstream. All four absent keeps `id DESC` (newest
-/// first); any bound set drops window-less exams (no `mode` → both schedule
-/// columns null, so every predicate is `NULL`-rejecting) and flips the order
-/// to ascending by schedule — `starts_at`, falling back to `ends_at`, ties by
-/// id — the order `WindowParams::apply` used to produce in Rust.
 pub async fn list_windowed(
     db: &Database,
     visible: Option<&[ClassCourseId]>,
     managed: Option<&[ClassCourseId]>,
-    starts_after: Option<i64>,
-    ends_after: Option<i64>,
-    starts_before: Option<i64>,
-    ends_before: Option<i64>,
-    limit: Option<i64>,
-    offset: i64,
+    params: WindowedListParams,
 ) -> Result<(Vec<Exam>, i64), AppError> {
+    let WindowedListParams {
+        starts_after,
+        ends_after,
+        starts_before,
+        ends_before,
+        limit,
+        offset,
+    } = params;
     // Window predicates and binds move together: each bound appends its
     // predicate with the placeholder number its bind position lands on. The
     // two visibility binds of the non-manager branch claim $1 and $2, so the

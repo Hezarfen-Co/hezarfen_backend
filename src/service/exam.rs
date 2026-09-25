@@ -24,6 +24,8 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 use crate::service::exam_attempt::require_open;
 
+pub use crate::db::exam::WindowedListParams;
+
 /// Publish (or draft) an exam on one class×course instance, inside one term.
 ///
 /// Two refusals stand in front of the write. The instance's catalog course
@@ -122,25 +124,9 @@ pub async fn list_windowed(
     db: &Database,
     visible: Option<&[ClassCourseId]>,
     managed: Option<&[ClassCourseId]>,
-    starts_after: Option<i64>,
-    ends_after: Option<i64>,
-    starts_before: Option<i64>,
-    ends_before: Option<i64>,
-    limit: Option<i64>,
-    offset: i64,
+    params: WindowedListParams,
 ) -> Result<(Vec<Exam>, i64), AppError> {
-    exam::list_windowed(
-        db,
-        visible,
-        managed,
-        starts_after,
-        ends_after,
-        starts_before,
-        ends_before,
-        limit,
-        offset,
-    )
-    .await
+    exam::list_windowed(db, visible, managed, params).await
 }
 
 /// One instance's exams, newest first — the read behind
@@ -903,7 +889,7 @@ mod tests {
         let other_draft = exam_shaped(&db, &b, sync(now + 3_600_000), true, "other-draft").await;
 
         // Manager+: the whole table, newest first.
-        let (rows, total) = list_windowed(&db, None, None, None, None, None, None, None, 0)
+        let (rows, total) = list_windowed(&db, None, None, WindowedListParams::default())
             .await
             .unwrap();
         assert_eq!(total, 5);
@@ -920,9 +906,17 @@ mod tests {
         // unaliased `exam` (the audience join only exists on the other
         // branch). This exact call 500'd with "missing FROM-clause entry for
         // table e" while the predicates were `e.`-qualified.
-        let (rows, total) = list_windowed(&db, None, None, None, Some(now), None, None, None, 0)
-            .await
-            .unwrap();
+        let (rows, total) = list_windowed(
+            &db,
+            None,
+            None,
+            WindowedListParams {
+                ends_after: Some(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(total, 3);
         let listed: Vec<_> = rows.iter().map(|exam| exam.get_id()).cloned().collect();
         assert_eq!(
@@ -932,10 +926,17 @@ mod tests {
                 .map(|exam| exam.get_id().clone())
                 .collect::<Vec<_>>()
         );
-        let (_, total) =
-            list_windowed(&db, None, None, None, None, Some(now + 45 * 60_000), None, None, 0)
-                .await
-                .unwrap();
+        let (_, total) = list_windowed(
+            &db,
+            None,
+            None,
+            WindowedListParams {
+                starts_before: Some(now + 45 * 60_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(total, 1, "starts_before keeps only the already-run exam");
 
         // A viewer of A who manages nothing: A's published exams only — both
@@ -943,7 +944,7 @@ mod tests {
         let visible = vec![a.get_id().clone()];
         let nothing: Vec<ClassCourseId> = Vec::new();
         let (rows, total) =
-            list_windowed(&db, Some(&visible), Some(&nothing), None, None, None, None, None, 0)
+            list_windowed(&db, Some(&visible), Some(&nothing), WindowedListParams::default())
                 .await
                 .unwrap();
         assert_eq!(total, 3);
@@ -952,7 +953,7 @@ mod tests {
         // A's teacher manages A: sees A's draft — and still not B's.
         let manages_a = vec![a.get_id().clone()];
         let (rows, total) =
-            list_windowed(&db, Some(&visible), Some(&manages_a), None, None, None, None, None, 0)
+            list_windowed(&db, Some(&visible), Some(&manages_a), WindowedListParams::default())
                 .await
                 .unwrap();
         assert_eq!(total, 4);
@@ -967,12 +968,10 @@ mod tests {
             &db,
             Some(&visible),
             Some(&manages_a),
-            None,
-            Some(now),
-            None,
-            None,
-            None,
-            0,
+            WindowedListParams {
+                ends_after: Some(now),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -985,12 +984,11 @@ mod tests {
             &db,
             Some(&visible),
             Some(&manages_a),
-            None,
-            Some(now),
-            None,
-            None,
-            Some(1),
-            0,
+            WindowedListParams {
+                ends_after: Some(now),
+                limit: Some(1),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1000,7 +998,7 @@ mod tests {
         // draft wall leaves them an empty page, not an error.
         let sees_b = vec![b.get_id().clone()];
         let (rows, total) =
-            list_windowed(&db, Some(&sees_b), Some(&nothing), None, None, None, None, None, 0)
+            list_windowed(&db, Some(&sees_b), Some(&nothing), WindowedListParams::default())
                 .await
                 .unwrap();
         assert!(rows.is_empty() && total == 0);

@@ -32,6 +32,8 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
+pub use crate::db::appointment::RequesterListParams;
+
 /// Request `slot`. Lands `pending`: publishing availability is not consent
 /// to a specific person and topic.
 ///
@@ -126,24 +128,9 @@ pub async fn read(db: &Database, id: &AppointmentId) -> Result<Option<Appointmen
 pub async fn list_for_requester(
     db: &Database,
     requester: &UserId,
-    status: Option<AppointmentStatus>,
-    starts_after: Option<Timestamp>,
-    starts_before: Option<Timestamp>,
-    teacher: Option<&UserId>,
-    limit: Option<i64>,
-    offset: i64,
+    params: RequesterListParams<'_>,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
-    appointment::list_for_requester(
-        db,
-        requester,
-        status,
-        starts_after,
-        starts_before,
-        teacher,
-        limit,
-        offset,
-    )
-    .await
+    appointment::list_for_requester(db, requester, params).await
 }
 
 /// Every booking aimed at `teacher`, newest first — the request inbox,
@@ -909,13 +896,17 @@ mod tests {
 
         // Absent: all three, newest first — the shape today's callers see.
         let (rows, total) =
-            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+            list_for_requester(&db, &veli, RequesterListParams::default()).await.unwrap();
         assert_eq!((rows.len(), total), (3, 3));
 
         // status: only the approved one, and total is the filtered count.
-        let (rows, total) = list_for_requester(&db, &veli, Some(AppointmentStatus::Approved), None, None, None,
-            None,
-            0,
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                status: Some(AppointmentStatus::Approved),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -923,25 +914,41 @@ mod tests {
         assert_eq!(rows[0].get_id(), approved.get_id());
 
         // No state matches: an empty page, not an error.
-        let (rows, total) = list_for_requester(&db, &veli, Some(AppointmentStatus::Rejected), None, None, None,
-            None,
-            0,
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                status: Some(AppointmentStatus::Rejected),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         assert_eq!((rows.len(), total), (0, 0));
 
         // teacher joins through the slot: only the bookings on ali's slots.
-        let (rows, total) =
-            list_for_requester(&db, &veli, None, None, None, Some(&ali), None, 0).await.unwrap();
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                teacher: Some(&ali),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!((rows.len(), total), (2, 2));
         assert!(rows.iter().all(|row| row.get_id() != approved.get_id()));
 
         // starts_after judges the effective start: the pending meeting (at
         // now + 60_000) is out; the approved and cancelled ones stay.
-        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now + 150_000)), None, None,
-            None,
-            0,
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                starts_after: Some(at(now + 150_000)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -949,11 +956,28 @@ mod tests {
         assert!(rows.iter().all(|row| row.get_id() != pending.get_id()));
 
         // The window applies after the filter; total stays the filtered count.
-        let (page1, total) =
-            list_for_requester(&db, &veli, None, None, None, None, Some(1), 0).await.unwrap();
+        let (page1, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!((page1.len(), total), (1, 3));
-        let (page2, total) =
-            list_for_requester(&db, &veli, None, None, None, None, Some(1), 1).await.unwrap();
+        let (page2, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                limit: Some(1),
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!((page2.len(), total), (1, 3));
         assert_ne!(page1[0].get_id(), page2[0].get_id());
 
@@ -963,9 +987,13 @@ mod tests {
         propose(&db, pending.get_id(), at(now + 500_000), at(now + 560_000), &ali)
             .await
             .unwrap();
-        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now + 400_000)), None, None,
-            None,
-            0,
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                starts_after: Some(at(now + 400_000)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1005,18 +1033,30 @@ mod tests {
             .await
             .unwrap();
         let (rows, total) =
-            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+            list_for_requester(&db, &veli, RequesterListParams::default()).await.unwrap();
         assert_eq!((rows.len(), total), (3, 3), "the windowless row still lists");
-        let (rows, total) = list_for_requester(&db, &veli, None, Some(at(now)), None, None,
-            None,
-            0,
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                starts_after: Some(at(now)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         assert_eq!((rows.len(), total), (2, 2), "the windowless row has no start to match");
         assert!(rows.iter().all(|row| row.get_id() != cancelled.get_id()));
-        let (rows, total) =
-            list_for_requester(&db, &veli, None, None, None, Some(&ali), None, 0).await.unwrap();
+        let (rows, total) = list_for_requester(
+            &db,
+            &veli,
+            RequesterListParams {
+                teacher: Some(&ali),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!((rows.len(), total), (1, 1), "a windowless row names no teacher");
         assert_eq!(rows[0].get_id(), pending.get_id());
     }
@@ -1051,19 +1091,17 @@ mod tests {
 
         // Absent: both — the set is unchanged without the bound.
         let (rows, total) =
-            list_for_requester(&db, &veli, None, None, None, None, None, 0).await.unwrap();
+            list_for_requester(&db, &veli, RequesterListParams::default()).await.unwrap();
         assert_eq!((rows.len(), total), (2, 2));
 
         // before: only the early booking survives.
         let (rows, total) = list_for_requester(
             &db,
             &veli,
-            None,
-            None,
-            Some(at(now + 150_000)),
-            None,
-            None,
-            0,
+            RequesterListParams {
+                starts_before: Some(at(now + 150_000)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1076,12 +1114,10 @@ mod tests {
         let (rows, total) = list_for_requester(
             &db,
             &veli,
-            None,
-            None,
-            Some(at(now + 200_000)),
-            None,
-            None,
-            0,
+            RequesterListParams {
+                starts_before: Some(at(now + 200_000)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1100,12 +1136,11 @@ mod tests {
         let (rows, total) = list_for_requester(
             &db,
             &veli,
-            None,
-            Some(at(now + 150_000)),
-            Some(at(now + 260_000)),
-            None,
-            None,
-            0,
+            RequesterListParams {
+                starts_after: Some(at(now + 150_000)),
+                starts_before: Some(at(now + 260_000)),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

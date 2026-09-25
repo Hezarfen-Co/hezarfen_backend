@@ -440,7 +440,7 @@ mod tests {
 
     /// The whole unwindowed log — the read the old `list_for_user` gave —
     /// for tests that just want the sessions.
-    async fn whole_log<'a>(user: &UserId, db: &Database) -> Vec<PomodoroSession> {
+    async fn whole_log(user: &UserId, db: &Database) -> Vec<PomodoroSession> {
         page_for_user(db, user, None, None, None, 0)
             .await
             .unwrap()

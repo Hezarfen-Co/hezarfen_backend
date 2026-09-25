@@ -132,6 +132,22 @@ where
     Ok(appointment)
 }
 
+/// The optional filters and the page of [`list_for_requester`], in one
+/// struct — the fields outgrew a readable argument list. The default is
+/// the unfiltered, unpaged read.
+#[derive(Default)]
+pub struct RequesterListParams<'a> {
+    pub status: Option<AppointmentStatus>,
+    /// The meeting's effective start bounds, `[after, before)`.
+    pub starts_after: Option<Timestamp>,
+    pub starts_before: Option<Timestamp>,
+    /// The booked slot's teacher.
+    pub teacher: Option<&'a UserId>,
+    /// `None` = the full list.
+    pub limit: Option<i64>,
+    pub offset: i64,
+}
+
 /// The caller's own bookings, newest first. The optional filters narrow the
 /// read: `status` matches the stored state, `starts_after`/`starts_before`
 /// bound the meeting's effective start — a standing proposal, the slot's
@@ -145,13 +161,16 @@ where
 pub async fn list_for_requester(
     db: &Database,
     requester: &UserId,
-    status: Option<AppointmentStatus>,
-    starts_after: Option<Timestamp>,
-    starts_before: Option<Timestamp>,
-    teacher: Option<&UserId>,
-    limit: Option<i64>,
-    offset: i64,
+    params: RequesterListParams<'_>,
 ) -> Result<(Vec<Appointment>, i64), AppError> {
+    let RequesterListParams {
+        status,
+        starts_after,
+        starts_before,
+        teacher,
+        limit,
+        offset,
+    } = params;
     // Spell the appointment columns against the join alias, so the derived
     // table's row keeps the exact names [`Appointment`] decodes and the
     // slot's duplicate column names never leak in. The plain shape aliases

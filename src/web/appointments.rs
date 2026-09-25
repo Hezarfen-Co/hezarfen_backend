@@ -819,12 +819,14 @@ async fn list_appointments(
         service::appointment::list_for_requester(
             &st.db,
             user.get_id(),
-            status,
-            starts_after,
-            starts_before,
-            narrow_to.as_ref(),
-            limit,
-            offset,
+            service::appointment::RequesterListParams {
+                status,
+                starts_after,
+                starts_before,
+                teacher: narrow_to.as_ref(),
+                limit,
+                offset,
+            },
         )
         .await?
     };
